@@ -1,0 +1,38 @@
+# Cargo配置文件 - 优化编译时间
+
+[build]
+# 并行编译作业数，设置为CPU核心数
+jobs = 4
+
+[profile.dev]
+# 开发模式优化编译时间
+opt-level = 0      # 不优化，加快编译
+debug = true       # 包含调试信息
+split-debuginfo = "unpacked"  # 在支持的平台上加快链接
+incremental = true # 增量编译
+
+[profile.dev.package."*"]
+# 对依赖包进行基本优化，只编译一次
+opt-level = 1
+
+[profile.test]
+# 测试模式优化
+opt-level = 1      # 基本优化
+debug = true       # 保留调试信息
+
+[profile.release]
+# 发布模式 - 全面优化
+opt-level = 3
+lto = true         # 链接时优化
+codegen-units = 1  # 减少代码生成单元以获得更好的优化
+strip = true       # 移除符号表
+
+# 使用更快的链接器（如果可用）
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# 缓存设置
+[net]
+retry = 2
+git-fetch-with-cli = true
