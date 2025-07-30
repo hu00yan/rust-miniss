@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  rust-miniss:
+    build: .
+    container_name: rust-miniss-dev
+    volumes:
+      - .:/workspace/rust-miniss
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/workspace/rust-miniss/target
+    working_dir: /workspace/rust-miniss
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=1
+    # 特权模式用于性能测试和CPU亲和性设置
+    privileged: true
+    # 分配更多资源用于测试
+    cpus: '4.0'
+    mem_limit: 4g
+    stdin_open: true
+    tty: true
+    command: bash
+
+volumes:
+  cargo-cache:
+  target-cache:
