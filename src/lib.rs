@@ -1,31 +1,114 @@
 //! rust-miniss: A minimal async runtime inspired by Seastar
-//! 
+//!
 //! This crate provides a high-performance async runtime with:
 //! - Shared-nothing architecture (one thread per CPU core)
 //! - Lock-free cross-CPU communication
 //! - io-uring for high-performance I/O on Linux
 //! - Custom Future/Promise implementation for educational purposes
+//!
+//! # Timer Utilities
+//!
+//! The runtime provides several timer utilities for async timing operations:
+//!
+//! - [`timer::sleep()`] - Asynchronously wait for a duration
+//! - [`timer::timeout()`] - Apply a timeout to any future
+//! - [`timer::Interval`] - Create repeating timers for periodic tasks
+//!
+//! ## Examples
+//!
+//! ```rust,no_run
+//! use rust_miniss::timer;
+//! use std::time::Duration;
+//!
+//! # async fn example() {
+//! // Sleep for 1 second
+//! timer::sleep(Duration::from_secs(1)).await;
+//!
+//! // Apply a timeout to an operation
+//! let result = timer::timeout(Duration::from_secs(5), async {
+//!     // Some long-running operation
+//!     timer::sleep(Duration::from_secs(2)).await;
+//!     "completed"
+//! }).await;
+//!
+//! // Create a periodic interval
+//! let mut interval = timer::Interval::new(Duration::from_millis(100));
+//! for _ in 0..5 {
+//!     interval.tick().await;
+//!     println!("tick");
+//! }
+//! # }
+//! ```
+//!
+//! # Graceful Shutdown via Signals
+//!
+//! The runtime supports graceful shutdown through signal handling. When enabled
+//! with the `signal` feature, the runtime can listen for termination signals
+//! (SIGTERM, SIGINT) and initiate a graceful shutdown sequence.
+//!
+//! ## Signal Handling Example
+//!
+//! ```rust,no_run
+//! use rust_miniss::{Runtime, timer};
+//! use std::time::Duration;
+//!
+//! # #[cfg(feature = "signal")]
+//! # async fn main_loop() {
+//! let runtime = Runtime::new();
+//!
+//! // Set up signal handling for graceful shutdown
+//! # #[cfg(feature = "signal")]
+//! let shutdown_signal = rust_miniss::signal::wait_for_signal(&["SIGTERM", "SIGINT"]);
+//!
+//! // Your main application logic
+//! let main_task = async {
+//!     loop {
+//!         // Do some work
+//!         timer::sleep(Duration::from_millis(100)).await;
+//!         println!("Working...");
+//!     }
+//! };
+//!
+//! // Wait for either the main task to complete or a shutdown signal
+//! # #[cfg(feature = "signal")]
+//! tokio::select! {
+//!     _ = main_task => {
+//!         println!("Main task completed");
+//!     }
+//!     signal = shutdown_signal => {
+//!         println!("Received signal: {:?}, shutting down gracefully...", signal);
+//!         // Perform cleanup operations here
+//!         timer::sleep(Duration::from_millis(100)).await; // Cleanup time
+//!     }
+//! }
+//! # }
+//! ```
 
 #![deny(warnings)]
 
-pub mod future;
-pub mod task;
-pub mod waker;
-pub mod executor;
-pub mod cpu;
-pub mod multicore;
-pub mod config;
-pub mod io;
 pub mod buffer;
+pub mod config;
+pub mod cpu;
+pub mod executor;
+pub mod future;
+pub mod io;
+pub mod multicore;
+pub mod task;
+pub mod timer;
+pub mod waker;
+
+#[cfg(feature = "signal")]
+pub mod signal;
 
 // Re-export core types
-pub use future::{Future, Promise};
-pub use executor::{Runtime, Executor};
-pub use task::{Task, TaskBuilder, TaskError, TaskResult, spawn};
-pub use multicore::{MultiCoreRuntime, init_runtime};
-pub use cpu::Cpu;
-pub use io::{IoBackend, Op, IoToken, CompletionKind, IoError, DummyIoBackend};
 pub use buffer::{Buffer, BufferPool};
+pub use cpu::Cpu;
+pub use executor::{Executor, Runtime};
+pub use future::{Future, Promise};
+pub use io::{CompletionKind, DummyIoBackend, IoBackend, IoError, IoToken, Op};
+pub use multicore::{init_runtime, MultiCoreRuntime};
+pub use task::{spawn, Task, TaskBuilder, TaskError, TaskResult};
+pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWheel};
 
 /// Error types for the runtime
 pub mod error {
@@ -35,10 +118,10 @@ pub mod error {
     pub enum RuntimeError {
         #[error("Runtime not initialized")]
         NotInitialized,
-        
+
         #[error("Task execution failed: {0}")]
         TaskFailed(String),
-        
+
         #[error("IO operation failed: {0}")]
         IoFailed(#[from] std::io::Error),
     }
@@ -47,7 +130,7 @@ pub mod error {
 }
 
 /// Convenience function to create a new runtime and run a future
-pub fn block_on<F>(future: F) -> F::Output 
+pub fn block_on<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {

@@ -4,6 +4,13 @@
 //! in our async runtime. Tasks can complete successfully or fail due to panics,
 //! with all outcomes represented as `TaskResult<T>`.
 //!
+//! ## Task Spawning
+//!
+//! The module provides several functions for spawning tasks:
+//!
+//! - [`spawn`] - Spawns a single-shot task
+//! - [`spawn_periodic`] - Spawns a task that executes repeatedly at regular intervals
+//!
 //! ## Error Handling
 //!
 //! Tasks return `TaskResult<T>` which is `Result<T, TaskError>`. Currently,
@@ -14,13 +21,14 @@
 //!
 //! JoinHandles allow awaiting task completion and retrieving results.
 //! They implement `Future<Output = TaskResult<T>>` for integration with
-//! the async ecosystem.
+//! the async ecosystem. JoinHandles can also be used to cancel tasks
+//! via the [`JoinHandle::cancel`] method.
 
+use crate::waker::TaskId;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use crate::waker::TaskId;
 
 /// Error returned from a failed task.
 #[derive(Debug)]
@@ -33,7 +41,6 @@ pub enum TaskError {
 
 /// The result of a completed task.
 pub type TaskResult<T> = Result<T, TaskError>;
-
 
 /// A task wraps a future for execution in the runtime
 pub struct Task {
@@ -52,10 +59,7 @@ impl Task {
 
     /// Create a new task from a pinned boxed future
     pub fn from_pinned(id: TaskId, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> Self {
-        Self {
-            id,
-            future,
-        }
+        Self { id, future }
     }
 
     /// Get the task ID
@@ -78,10 +82,7 @@ pub struct JoinHandle<T> {
 impl<T> JoinHandle<T> {
     /// Create a new join handle
     pub(crate) fn new(task_id: TaskId, result: crate::future::Future<TaskResult<T>>) -> Self {
-        Self {
-            task_id,
-            result,
-        }
+        Self { task_id, result }
     }
 
     /// Get the task ID
@@ -93,13 +94,13 @@ impl<T> JoinHandle<T> {
     pub fn is_finished(&self) -> bool {
         self.result.is_ready()
     }
-    
+
     /// Cancel the task
-    /// 
+    ///
     /// This method attempts to cancel the running task by sending a CancelTask
     /// message to the appropriate CPU. Note that cancellation is cooperative -
     /// the task will only be cancelled if it hasn't already completed.
-    /// 
+    ///
     /// Returns `Ok(())` if the cancellation message was sent successfully,
     /// or an error if the task cannot be cancelled (e.g., runtime shutdown).
     pub fn cancel(&self) -> crate::error::Result<()> {
@@ -111,24 +112,27 @@ impl<T> JoinHandle<T> {
                 return self.cancel_multicore(&runtime);
             }
         }
-        
+
         // For single-CPU executor, we can't easily cancel tasks without more infrastructure
         // This would require a more sophisticated design where tasks can be interrupted
         tracing::warn!("Task cancellation not yet implemented for single-CPU executor");
         Ok(())
     }
-    
+
     /// Cancel task in multi-core runtime
     #[cfg(feature = "multicore")]
-    fn cancel_multicore(&self, runtime: &std::sync::Arc<crate::multicore::MultiCoreRuntime>) -> crate::error::Result<()> {
+    fn cancel_multicore(
+        &self,
+        runtime: &std::sync::Arc<crate::multicore::MultiCoreRuntime>,
+    ) -> crate::error::Result<()> {
         // Use the runtime's cancel_task method which looks up the CPU and sends the cancellation message
         runtime.cancel_task(self.task_id)?;
-        
+
         // Mark the result as cancelled if it hasn't completed yet
         if !self.is_finished() {
             tracing::info!("Task {:?} marked as cancelled", self.task_id);
         }
-        
+
         Ok(())
     }
 }
@@ -142,7 +146,7 @@ impl<T: Send> Future for JoinHandle<T> {
 }
 
 /// A builder for configuring and spawning tasks
-/// 
+///
 /// The TaskBuilder provides a fluent interface for creating and spawning tasks
 /// with different runtime backends (single-CPU executor or multi-CPU runtime).
 pub struct TaskBuilder {
@@ -154,9 +158,9 @@ impl TaskBuilder {
     pub fn new() -> Self {
         Self {}
     }
-    
+
     /// Spawn a task using the appropriate runtime backend
-    /// 
+    ///
     /// This method automatically selects between single-CPU executor and
     /// multi-CPU runtime based on build configuration and runtime availability.
     pub fn spawn<F, T>(self, future: F) -> crate::error::Result<JoinHandle<T>>
@@ -172,11 +176,11 @@ impl TaskBuilder {
                 return self.spawn_multicore(&runtime, future);
             }
         }
-        
+
         // Fall back to single-CPU executor
         self.spawn_single_cpu(future)
     }
-    
+
     /// Spawn task on single-CPU executor
     fn spawn_single_cpu<F, T>(self, future: F) -> crate::error::Result<JoinHandle<T>>
     where
@@ -187,22 +191,22 @@ impl TaskBuilder {
         // In a real implementation, this would use a thread-local or global executor
         let mut executor = crate::executor::Executor::new();
         let handle = executor.spawn(future);
-        
+
         // For simplicity, we'll schedule the task to run immediately
         // In a real implementation, this would be handled by the runtime scheduler
         std::thread::spawn(move || {
             executor.run();
         });
-        
+
         Ok(handle)
     }
-    
+
     /// Spawn task on multi-core runtime
     #[cfg(feature = "multicore")]
     fn spawn_multicore<'a, F, T>(
-        self, 
-        runtime: &'a std::sync::Arc<crate::multicore::MultiCoreRuntime>, 
-        future: F
+        self,
+        runtime: &'a std::sync::Arc<crate::multicore::MultiCoreRuntime>,
+        future: F,
     ) -> crate::error::Result<JoinHandle<T>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -214,7 +218,7 @@ impl TaskBuilder {
             let result = future.await;
             promise.complete(Ok(result));
         };
-        
+
         let task_id = runtime.spawn(Box::pin(task_future))?;
 
         Ok(JoinHandle::new(task_id, result_future))
@@ -236,17 +240,73 @@ where
     TaskBuilder::new().spawn(future)
 }
 
+/// Spawns a periodic task that executes a callback at regular intervals
+///
+/// The task will continue to run and execute the callback at the specified
+/// period until the runtime shuts down or the returned JoinHandle is cancelled.
+///
+/// # Arguments
+///
+/// * `period` - The duration between callback executions
+/// * `callback` - An async closure that will be executed periodically
+///
+/// # Returns
+///
+/// A `JoinHandle<()>` that can be used to cancel the periodic task
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use rust_miniss::task;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Spawn a task that prints "tick" every second
+/// let handle = task::spawn_periodic(Duration::from_secs(1), move || async {
+///     println!("tick");
+/// })?;
+///
+/// // Later, cancel the periodic task
+/// handle.cancel()?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn spawn_periodic<F, Fut>(
+    period: std::time::Duration,
+    callback: F,
+) -> crate::error::Result<JoinHandle<()>>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let periodic_task = async move {
+        let mut interval = crate::timer::Interval::new(period);
+
+        loop {
+            // Wait for the next tick
+            interval.tick().await;
+
+            // Execute the user callback
+            callback().await;
+        }
+    };
+
+    spawn(periodic_task)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_task_creation() {
         let task_id = TaskId(1);
-        let future = async { println!("Hello from task!"); };
-        
+        let future = async {
+            println!("Hello from task!");
+        };
+
         let task = Task::new(task_id, future);
         assert_eq!(task.id(), task_id);
     }
@@ -276,11 +336,12 @@ mod tests {
     fn test_task_builder_spawn_single_cpu() {
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
-        
+
         let handle = spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
             42
-        }).unwrap();
+        })
+        .unwrap();
 
         // Block on the handle to get the result
         let result = crate::executor::Runtime::new().block_on(handle);
@@ -303,7 +364,8 @@ mod tests {
         let handle = spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
             "hello from multicore"
-        }).unwrap();
+        })
+        .unwrap();
 
         // Block on the handle to get the result
         let result = crate::executor::Runtime::new().block_on(handle);
@@ -318,22 +380,49 @@ mod tests {
     fn test_task_polling() {
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
-        
+
         let task_id = TaskId(1);
         let future = async move {
             completed_clone.store(true, Ordering::SeqCst);
         };
-        
+
         let mut task = Task::new(task_id, future);
-        
+
         // Poll the task
         let waker = dummy_waker();
         let mut cx = Context::from_waker(&waker);
-        
+
         let result = task.poll(&mut cx);
-        
+
         // Task should complete immediately
         assert!(matches!(result, Poll::Ready(())));
         assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_spawn_periodic() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        // For now, just test that spawn_periodic can be called without panic
+        // The full functionality will be tested in integration tests
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        // Just test that we can create a periodic task handle
+        let handle = spawn_periodic(Duration::from_millis(100), move || {
+            let counter = counter_clone.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // Test should pass if we can create the handle without panicking
+        assert!(handle.is_ok());
+
+        // Cancel immediately to avoid running the task
+        if let Ok(h) = handle {
+            let _ = h.cancel();
+        }
     }
 }

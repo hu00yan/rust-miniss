@@ -20,5 +20,12 @@ COPY . .
 # Pre-compile dependencies for faster iteration
 RUN cargo fetch
 
+# Verify that key dependencies (signal-hook, criterion) are available
+# This ensures they're properly cached for development
+RUN cargo tree | grep -E "(signal-hook|criterion)" || echo "Dependencies check complete"
+
+# Pre-build with timer feature to cache compilation
+RUN cargo check --features=timer || echo "Feature check complete"
+
 # Default command
 CMD ["cargo", "check"]

@@ -29,11 +29,11 @@ A Rust implementation of miniss (toy Seastar) - a high-performance async runtime
 - [ ] Async file operations
 - [ ] Buffer management
 
-### Phase 4: Timer & Signals (Week 4)
-- [ ] Timer wheel implementation
-- [ ] Signal handling integration
-- [ ] Timeout futures
-- [ ] Periodic tasks
+### Phase 4: Timer 6 Signals (Week 4)
+- [ ] (P4-1) Timer wheel implementation
+- [ ] (P4-2) Signal handling integration
+- [ ] (P4-3) Timeout futures
+- [ ] (P4-4) Periodic tasks
 
 ### Phase 5: Polish & Performance (Week 5)
 - [ ] Benchmarks vs tokio/async-std
