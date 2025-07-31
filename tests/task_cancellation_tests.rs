@@ -6,6 +6,9 @@
 //! 3. Cancel after completion
 
 use rust_miniss::multicore;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Once};
+use std::time::Duration;
 
 #[cfg(test)]
 mod task_cancellation_tests {
@@ -34,10 +37,12 @@ mod task_cancellation_tests {
         let started = Arc::new(AtomicBool::new(false));
         let started_clone = started.clone();
 
-        let task_id = runtime.spawn_on(0, async move {
-            started_clone.store(true, Ordering::SeqCst);
-            // Simple task that just completes
-        }).unwrap();
+        let task_id = runtime
+            .spawn_on(0, async move {
+                started_clone.store(true, Ordering::SeqCst);
+                // Simple task that just completes
+            })
+            .unwrap();
 
         // Cancel immediately before the task has a chance to start
         runtime.cancel_task(task_id).unwrap();
@@ -46,7 +51,10 @@ mod task_cancellation_tests {
         std::thread::sleep(Duration::from_millis(50));
 
         // Task should not have started
-        assert!(!started.load(Ordering::SeqCst), "Task should not have started after cancellation");
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "Task should not have started after cancellation"
+        );
 
         // Runtime will be cleaned up by Drop
     }
@@ -65,11 +73,13 @@ mod task_cancellation_tests {
         let started_clone = started.clone();
         let completed_clone = completed.clone();
 
-        let task_id = runtime.spawn_on(1, async move {
-            started_clone.store(true, Ordering::SeqCst);
-            // Just mark as completed - this tests if the task runs at all
-            completed_clone.store(true, Ordering::SeqCst);
-        }).unwrap();
+        let task_id = runtime
+            .spawn_on(1, async move {
+                started_clone.store(true, Ordering::SeqCst);
+                // Just mark as completed - this tests if the task runs at all
+                completed_clone.store(true, Ordering::SeqCst);
+            })
+            .unwrap();
 
         // Wait for task to start
         while !started.load(Ordering::SeqCst) {
@@ -84,7 +94,10 @@ mod task_cancellation_tests {
 
         // Task should have started but not completed
         assert!(started.load(Ordering::SeqCst), "Task should have started");
-        assert!(!completed.load(Ordering::SeqCst), "Task should not have completed due to cancellation");
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "Task should not have completed due to cancellation"
+        );
     }
 
     /// Test canceling a task after it has already completed
@@ -99,10 +112,12 @@ mod task_cancellation_tests {
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
 
-        let task_id = runtime.spawn_on(0, async move {
-            // Quick task that completes immediately
-            completed_clone.store(true, Ordering::SeqCst);
-        }).unwrap();
+        let task_id = runtime
+            .spawn_on(0, async move {
+                // Quick task that completes immediately
+                completed_clone.store(true, Ordering::SeqCst);
+            })
+            .unwrap();
 
         // Wait for task to complete
         while !completed.load(Ordering::SeqCst) {
@@ -114,9 +129,12 @@ mod task_cancellation_tests {
 
         // Try to cancel after completion - should return error
         let cancel_result = runtime.cancel_task(task_id);
-        
+
         // Should get an error indicating task is not found or already completed
-        assert!(cancel_result.is_err(), "Canceling completed task should return error");
+        assert!(
+            cancel_result.is_err(),
+            "Canceling completed task should return error"
+        );
     }
 
     /// Test that task_cpu_map is properly maintained
@@ -132,15 +150,19 @@ mod task_cancellation_tests {
 
         // Spawn tasks on different CPUs
         for cpu_id in 0..3 {
-            let task_id = runtime.spawn_on(cpu_id, async {
-                // Simple task for testing cancellation
-            }).unwrap();
+            let task_id = runtime
+                .spawn_on(cpu_id, async {
+                    // Simple task for testing cancellation
+                })
+                .unwrap();
             task_ids.push(task_id);
         }
 
         // All tasks should be successfully cancelable (meaning they're tracked)
         for task_id in task_ids {
-            runtime.cancel_task(task_id).expect("Should be able to cancel tracked task");
+            runtime
+                .cancel_task(task_id)
+                .expect("Should be able to cancel tracked task");
         }
     }
 
@@ -159,10 +181,12 @@ mod task_cancellation_tests {
         // Spawn multiple long-running tasks
         for i in 0..10 {
             let execution_count_clone = execution_count.clone();
-            let task_id = runtime.spawn_on(i % 2, async move {
-                execution_count_clone.fetch_add(1, Ordering::SeqCst);
-                // Simple task that completes quickly
-            }).unwrap();
+            let task_id = runtime
+                .spawn_on(i % 2, async move {
+                    execution_count_clone.fetch_add(1, Ordering::SeqCst);
+                    // Simple task that completes quickly
+                })
+                .unwrap();
             task_ids.push(task_id);
         }
 
@@ -185,7 +209,7 @@ mod task_cancellation_tests {
     /// Test JoinHandle cancellation interface
     #[test]
     #[ignore] // TODO: Fix hanging issue in cancellation tests
-    #[cfg(feature = "multicore")] 
+    #[cfg(feature = "multicore")]
     fn test_join_handle_cancel() {
         // Initialize runtime
         setup_runtime();
@@ -197,16 +221,22 @@ mod task_cancellation_tests {
         let handle = rust_miniss::task::spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
             42
-        }).unwrap();
+        })
+        .unwrap();
 
         // Cancel via JoinHandle
-        handle.cancel().expect("Should be able to cancel via JoinHandle");
+        handle
+            .cancel()
+            .expect("Should be able to cancel via JoinHandle");
 
         // Give time for cancellation to take effect
         std::thread::sleep(Duration::from_millis(150));
 
         // Task should not have completed
-        assert!(!completed.load(Ordering::SeqCst), "Task should not complete after cancellation");
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "Task should not complete after cancellation"
+        );
     }
 
     /// Test task cancellation with CPU cleanup
@@ -222,10 +252,12 @@ mod task_cancellation_tests {
         let started_clone = started.clone();
 
         // Spawn task that waits to be woken up
-        let task_id = runtime.spawn_on(0, async move {
-            started_clone.store(true, Ordering::SeqCst);
-            // Simple task
-        }).unwrap();
+        let task_id = runtime
+            .spawn_on(0, async move {
+                started_clone.store(true, Ordering::SeqCst);
+                // Simple task
+            })
+            .unwrap();
 
         // Wait for task to start
         while !started.load(Ordering::SeqCst) {
@@ -238,7 +270,10 @@ mod task_cancellation_tests {
         // Try to cancel again - should fail since task is removed from CPU
         std::thread::sleep(Duration::from_millis(50));
         let second_cancel = runtime.cancel_task(task_id);
-        assert!(second_cancel.is_err(), "Second cancellation should fail as task is removed");
+        assert!(
+            second_cancel.is_err(),
+            "Second cancellation should fail as task is removed"
+        );
     }
 
     /// Test error handling for invalid task IDs
@@ -252,7 +287,10 @@ mod task_cancellation_tests {
         // Try to cancel a non-existent task
         let fake_task_id = rust_miniss::waker::TaskId(99999);
         let result = runtime.cancel_task(fake_task_id);
-        
-        assert!(result.is_err(), "Canceling non-existent task should return error");
+
+        assert!(
+            result.is_err(),
+            "Canceling non-existent task should return error"
+        );
     }
 }

@@ -21,5 +21,9 @@ fn basic_task_spawning_benchmark(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, runtime_creation_benchmark, basic_task_spawning_benchmark);
+criterion_group!(
+    benches,
+    runtime_creation_benchmark,
+    basic_task_spawning_benchmark
+);
 criterion_main!(benches);

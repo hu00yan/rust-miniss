@@ -1,7 +1,7 @@
-use std::{ops::Deref, io::IoSlice};
 use once_cell::sync::Lazy;
-use std::sync::Mutex;
 use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::{io::IoSlice, ops::Deref};
 
 const BUFFER_SIZE: usize = 4096;
 const POOL_SIZE: usize = 100;
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn test_buffer_deref() {
         let buffer = BufferPool::get();
-        let slice: &[u8] = &*buffer;
+        let slice: &[u8] = &buffer;
         assert_eq!(slice.len(), BUFFER_SIZE);
     }
 
@@ -105,14 +105,14 @@ mod tests {
         // Get a buffer
         let buffer1 = BufferPool::get();
         let ptr1 = buffer1.as_ptr();
-        
+
         // Recycle it
         buffer1.recycle();
-        
+
         // Get another buffer - should reuse the recycled one
         let buffer2 = BufferPool::get();
         let ptr2 = buffer2.as_ptr();
-        
+
         // They should be the same underlying allocation
         assert_eq!(ptr1, ptr2);
     }
@@ -124,7 +124,7 @@ mod tests {
             let buffer = BufferPool::get();
             buffer.recycle();
         }
-        
+
         // The pool should be capped at POOL_SIZE
         CPU_BUFFER_POOL.with(|pool| {
             let pool = pool.lock().unwrap();

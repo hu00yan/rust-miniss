@@ -9,22 +9,10 @@ pub trait IoBackend: Send + Sync + 'static {
 // Define types needed for the trait
 #[derive(Debug, Clone)]
 pub enum Op {
-    Read {
-        fd: i32,
-        offset: u64,
-        len: usize,
-    },
-    Write {
-        fd: i32,
-        offset: u64,
-        data: Vec<u8>,
-    },
-    Fsync {
-        fd: i32,
-    },
-    Close {
-        fd: i32,
-    },
+    Read { fd: i32, offset: u64, len: usize },
+    Write { fd: i32, offset: u64, data: Vec<u8> },
+    Fsync { fd: i32 },
+    Close { fd: i32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,13 +22,19 @@ pub struct IoToken {
 
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+impl Default for IoToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IoToken {
     pub fn new() -> Self {
         Self {
             id: TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
-    
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -71,8 +65,8 @@ impl std::fmt::Display for IoError {
 
 impl std::error::Error for IoError {}
 
-use std::task::{Context, Poll};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 // Conditional compilation for different I/O backends
 #[cfg(any(target_os = "macos", feature = "kqueue"))]
@@ -81,7 +75,7 @@ pub mod kqueue;
 #[cfg(any(all(unix, not(target_os = "macos")), feature = "epoll"))]
 pub mod epoll;
 
-#[cfg(any(target_os = "linux", feature = "io-uring"))]
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod uring;
 
 #[cfg(any(target_os = "macos", feature = "kqueue"))]
@@ -90,7 +84,7 @@ pub use kqueue::KqueueBackend;
 #[cfg(any(all(unix, not(target_os = "macos")), feature = "epoll"))]
 pub use epoll::EpollBackend;
 
-#[cfg(any(target_os = "linux", feature = "io-uring"))]
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use uring::IoUringBackend;
 
 // Dummy backend for testing - provides no-op implementations
@@ -110,13 +104,13 @@ impl DummyIoBackend {
             simulate_completions: false,
         }
     }
-    
+
     pub fn with_completions() -> Self {
         Self {
             simulate_completions: true,
         }
     }
-    
+
     pub fn simulate_completion(op: &Op) -> Result<CompletionKind, IoError> {
         match op {
             Op::Read { len, .. } => Ok(CompletionKind::Read {
@@ -165,7 +159,11 @@ mod tests {
     #[test]
     fn test_dummy_backend_submit() {
         let backend = DummyIoBackend::new();
-        let op = Op::Read { fd: 1, offset: 0, len: 1024 };
+        let op = Op::Read {
+            fd: 1,
+            offset: 0,
+            len: 1024,
+        };
         let token = backend.submit(op);
         assert!(token.id() > 0);
     }
@@ -175,7 +173,7 @@ mod tests {
         let backend = DummyIoBackend::new();
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        
+
         match backend.poll_complete(&mut cx) {
             Poll::Ready(completions) => {
                 assert!(completions.is_empty());
@@ -186,9 +184,13 @@ mod tests {
 
     #[test]
     fn test_simulate_completion_read() {
-        let op = Op::Read { fd: 1, offset: 0, len: 100 };
+        let op = Op::Read {
+            fd: 1,
+            offset: 0,
+            len: 100,
+        };
         let result = DummyIoBackend::simulate_completion(&op);
-        
+
         match result {
             Ok(CompletionKind::Read { bytes_read, data }) => {
                 assert_eq!(bytes_read, 100);
@@ -202,9 +204,13 @@ mod tests {
     #[test]
     fn test_simulate_completion_write() {
         let data = vec![1, 2, 3, 4, 5];
-        let op = Op::Write { fd: 1, offset: 0, data: data.clone() };
+        let op = Op::Write {
+            fd: 1,
+            offset: 0,
+            data: data.clone(),
+        };
         let result = DummyIoBackend::simulate_completion(&op);
-        
+
         match result {
             Ok(CompletionKind::Write { bytes_written }) => {
                 assert_eq!(bytes_written, data.len());
@@ -219,7 +225,7 @@ mod tests {
         let err = IoError::Io(io_err);
         let display = format!("{}", err);
         assert!(display.contains("IO error"));
-        
+
         let other_err = IoError::Other("custom error".to_string());
         let display = format!("{}", other_err);
         assert_eq!(display, "Other error: custom error");

@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 # Core async primitives
 futures = "0.3"
 pin-project-lite = "0.2"
+pin-project = "1.1"
 
 # Concurrency utilities
 crossbeam = "0.8"
@@ -34,6 +35,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 num_cpus = "1.16"
 rand = "0.8"
+signal-hook = "0.3"
 
 
 [dev-dependencies]
@@ -53,6 +55,10 @@ name = "task_builder_demo"
 name = "runtime_benchmarks"
 harness = false
 
+[[bench]]
+name = "timer_benchmarks"
+harness = false
+
 [features]
 # Focus on io-uring backend for high performance
 default = []
@@ -60,6 +66,8 @@ multicore = []
 epoll = []
 kqueue = []
 io-uring = []
+signal = []
+timer = []
 
 [profile.release]
 lto = true

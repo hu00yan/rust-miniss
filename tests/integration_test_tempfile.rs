@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod integration_tests {
-    use tempfile::tempfile;
-    use std::io::{Read, Write, Seek, SeekFrom};
     use crc::{Crc, CRC_32_ISO_HDLC};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use tempfile::tempfile;
 
     #[test]
     fn test_tempfile_read_write_crc32() {
@@ -10,7 +10,7 @@ mod integration_tests {
 
         let data = b"Hello, async world!";
         temp_file.write_all(data).unwrap();
-        
+
         // Verify crc32
         let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC);
         let expected_crc32 = crc.checksum(data);
@@ -24,4 +24,3 @@ mod integration_tests {
         assert_eq!(crc.checksum(&buffer), expected_crc32);
     }
 }
-

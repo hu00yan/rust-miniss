@@ -20,7 +20,12 @@ case "${1:-help}" in
         ;;
     "test")
         echo "🧪 Running tests..."
-        docker-compose run --rm rust-miniss cargo test ${@:2}
+        # Default to timer feature if no features specified
+        if [[ "${@:2}" != *"--features"* ]]; then
+            docker-compose run --rm rust-miniss cargo test --features=timer ${@:2}
+        else
+            docker-compose run --rm rust-miniss cargo test ${@:2}
+        fi
         ;;
     "bench")
         echo "📊 Running benchmarks..."
@@ -40,7 +45,7 @@ case "${1:-help}" in
         echo "  build   - Build the development container"
         echo "  shell   - Start an interactive shell in the container"
         echo "  check   - Run cargo check"
-        echo "  test    - Run cargo test (pass additional args)"
+        echo "  test    - Run cargo test (defaults to --features=timer)"
         echo "  bench   - Run cargo bench (pass additional args)"
         echo "  clean   - Clean up containers"
         echo "  help    - Show this help"

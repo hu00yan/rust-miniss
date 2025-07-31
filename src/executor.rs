@@ -1,5 +1,5 @@
 //! Single-threaded executor with panic isolation
-//! 
+//!
 //! This module provides a basic single-threaded async executor that can
 //! run futures to completion. The executor implements robust error handling
 //! by catching panics at the polling level, ensuring that panicked tasks
@@ -9,7 +9,7 @@
 //!
 //! Every task poll operation is wrapped with `std::panic::catch_unwind` to provide
 //! isolation between tasks. When a task panics:
-//! 
+//!
 //! 1. The panic is caught and logged
 //! 2. The task is marked as completed (removed from the task queue)
 //! 3. Other tasks continue to execute normally
@@ -18,19 +18,22 @@
 //! JoinHandles return `TaskResult<T>` which is `Result<T, TaskError>` where
 //! `TaskError::Panic` contains the panic payload for analysis.
 
+use crossbeam_queue::SegQueue;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use crossbeam_queue::SegQueue;
 
-use crate::task::{Task, JoinHandle};
+use crate::task::{JoinHandle, Task};
 use crate::waker::{MinissWaker, TaskId};
 
 /// A single-threaded async runtime
+use std::sync::atomic::AtomicBool;
+
 pub struct Runtime {
     executor: Mutex<Executor>,
+    pub shutdown_flag: Arc<AtomicBool>,
 }
 
 impl Runtime {
@@ -38,6 +41,7 @@ impl Runtime {
     pub fn new() -> Self {
         Self {
             executor: Mutex::new(Executor::new()),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -133,7 +137,7 @@ impl Executor {
 
         // Create the task
         let task = Task::new(task_id, wrapped_future);
-        
+
         // Add to our task list and ready queue
         self.tasks.insert(task_id, task);
         self.ready_queue.push(task_id);
@@ -203,12 +207,11 @@ impl Default for Executor {
 }
 
 /// Create a dummy waker for futures that don't need to be woken
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_runtime_creation() {
@@ -237,22 +240,22 @@ mod tests {
     #[test]
     fn test_executor_tick() {
         let mut executor = Executor::new();
-        
+
         // No tasks initially
         assert_eq!(executor.task_count(), 0);
         assert!(!executor.tick()); // No progress possible
-        
+
         // Add a task
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
-        
+
         let _handle = executor.spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
             42
         });
-        
+
         assert_eq!(executor.task_count(), 1);
-        
+
         // Tick should run the task
         assert!(executor.tick());
         assert!(completed.load(Ordering::SeqCst));
@@ -263,7 +266,7 @@ mod tests {
     fn test_executor_run() {
         let mut executor = Executor::new();
         let counter = Arc::new(AtomicU32::new(0));
-        
+
         // Spawn multiple tasks
         for i in 0..5 {
             let counter_clone = counter.clone();
@@ -271,14 +274,14 @@ mod tests {
                 counter_clone.fetch_add(i, Ordering::SeqCst);
             });
         }
-        
+
         assert_eq!(executor.task_count(), 5);
-        
+
         // Run all tasks to completion
         executor.run();
-        
+
         assert_eq!(executor.task_count(), 0);
-        assert_eq!(counter.load(Ordering::SeqCst), 0 + 1 + 2 + 3 + 4);
+        assert_eq!(counter.load(Ordering::SeqCst), 1 + 2 + 3 + 4);
     }
 
     #[test]
@@ -359,57 +362,64 @@ mod tests {
 
         executor.run();
 
-        assert_eq!(completed_count.load(Ordering::SeqCst), 5, "All non-panicking tasks should complete");
+        assert_eq!(
+            completed_count.load(Ordering::SeqCst),
+            5,
+            "All non-panicking tasks should complete"
+        );
     }
 
     // Additional tests for regression prevention
-    
+
     #[test]
     fn test_string_literals_in_asserts() {
         // Test that string literals in assert messages work correctly
         let mut executor = Executor::new();
         let success = Arc::new(AtomicBool::new(false));
         let success_clone = success.clone();
-        
+
         executor.spawn(async move {
             success_clone.store(true, Ordering::SeqCst);
         });
-        
+
         executor.run();
-        
+
         // This should not cause compilation errors with string literals
-        assert!(success.load(Ordering::SeqCst), "Task should have completed successfully");
+        assert!(
+            success.load(Ordering::SeqCst),
+            "Task should have completed successfully"
+        );
     }
-    
+
     #[test]
     fn test_complex_assert_messages() {
         // Test complex assert messages with various characters
         let mut executor = Executor::new();
         let counter = Arc::new(AtomicU32::new(0));
-        
+
         for _i in 0..3 {
             let counter_clone = counter.clone();
             executor.spawn(async move {
                 counter_clone.fetch_add(1, Ordering::SeqCst);
             });
         }
-        
+
         executor.run();
-        
+
         assert_eq!(
-            counter.load(Ordering::SeqCst), 
-            3, 
-            "All tasks should complete: expected 3, got {}", 
+            counter.load(Ordering::SeqCst),
+            3,
+            "All tasks should complete: expected 3, got {}",
             counter.load(Ordering::SeqCst)
         );
     }
-    
+
     #[test]
     fn test_vector_contains_operations() {
         // Specifically test the vector contains operations that were fixed
         let mut executor = Executor::new();
         let results = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         // Spawn tasks with specific values
         for i in [42, 100, 255] {
             let results = results.clone();
@@ -417,34 +427,34 @@ mod tests {
                 results.lock().unwrap().push(i);
             });
         }
-        
+
         executor.run();
-        
+
         let final_results = results.lock().unwrap();
         assert_eq!(final_results.len(), 3);
-        
+
         // Test all the contains operations that were previously broken
         assert!(final_results.contains(&42), "Should contain 42");
         assert!(final_results.contains(&100), "Should contain 100");
         assert!(final_results.contains(&255), "Should contain 255");
-        
+
         // Ensure they don't contain values we didn't add
         assert!(!final_results.contains(&0), "Should not contain 0");
         assert!(!final_results.contains(&999), "Should not contain 999");
     }
-    
+
     #[test]
     fn test_task_isolation_with_detailed_messages() {
         // Test task isolation with detailed error messages
         let mut executor = Executor::new();
         let completed_tasks = Arc::new(AtomicU32::new(0));
         let panic_tasks = Arc::new(AtomicU32::new(0));
-        
+
         // Mix of panicking and non-panicking tasks
         for i in 0..6 {
             let completed_clone = completed_tasks.clone();
             let panic_clone = panic_tasks.clone();
-            
+
             if i % 3 == 0 {
                 // Panicking task
                 executor.spawn(async move {
@@ -458,21 +468,21 @@ mod tests {
                 });
             }
         }
-        
+
         executor.run();
-        
+
         assert_eq!(
-            completed_tasks.load(Ordering::SeqCst), 
-            4, 
+            completed_tasks.load(Ordering::SeqCst),
+            4,
             "Expected 4 non-panicking tasks to complete"
         );
         assert_eq!(
-            panic_tasks.load(Ordering::SeqCst), 
-            2, 
+            panic_tasks.load(Ordering::SeqCst),
+            2,
             "Expected 2 panicking tasks to run before panicking"
         );
     }
-    
+
     #[test]
     fn test_runtime_spawn_and_completion() {
         // Test the Runtime struct's spawn method with proper string handling
@@ -481,45 +491,48 @@ mod tests {
         let mut executor = Executor::new();
         let result = Arc::new(std::sync::Mutex::new(Vec::new()));
         let result_clone = result.clone();
-        
+
         let handle = executor.spawn(async move {
-            result_clone.lock().unwrap().push("task completed".to_string());
+            result_clone
+                .lock()
+                .unwrap()
+                .push("task completed".to_string());
             "done"
         });
-        
+
         // Run the executor to complete the task
         executor.run();
-        
+
         // Check that the task completed
         assert!(handle.is_finished());
-        
+
         let final_result = result.lock().unwrap();
         assert!(
             final_result.contains(&"task completed".to_string()),
             "Runtime spawn should complete successfully"
         );
     }
-    
+
     #[test]
     fn test_task_result_success() {
         // Test that successful tasks return Ok results
         let runtime = Runtime::new();
         let _handle = runtime.spawn(async { 42 });
-        
+
         // In a real scenario, we'd need to run the executor to completion first
         // For now, we can test the type structure
         // The handle should return a TaskResult<i32> when awaited
         // This test mainly validates the type definitions
     }
-    
-    #[test] 
+
+    #[test]
     fn test_join_handle_with_result_type() {
         // Test JoinHandle with TaskResult return type
         let mut executor = Executor::new();
         let success_handle = executor.spawn(async { "success" });
-        
+
         executor.run();
-        
+
         assert!(success_handle.is_finished());
         // Note: In the current implementation, we can't easily test the TaskResult
         // without making the JoinHandle awaitable in sync context, which would require

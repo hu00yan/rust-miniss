@@ -33,6 +33,13 @@ jobs:
             runner: ubuntu-latest
             features: "epoll"
             target: x86_64-unknown-linux-gnu
+
+          # Linux + timer signal backend
+          - os: linux
+            backend: timer_signal
+            runner: ubuntu-latest
+            features: "timer"
+            target: x86_64-unknown-linux-gnu
             
           # macOS + kqueue backend
           - os: macos
@@ -159,11 +166,18 @@ jobs:
         cargo check --features multicore
         cargo test --features multicore
 
+    - name: Test timer feature
+      run: |
+        echo "Testing timer feature"
+        cargo check --features timer
+        cargo test --features timer
+
     - name: Test combined features
       run: |
         echo "Testing combined feature sets"
         cargo check --features "epoll,multicore"
         cargo check --features "kqueue,multicore"
+        cargo check --features "timer,multicore"
 
     - name: Test all features together
       run: |

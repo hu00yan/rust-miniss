@@ -1,10 +1,13 @@
 //! TaskBuilder demonstration
-//! 
+//!
 //! This example shows how to use the TaskBuilder to spawn tasks
 //! with automatic runtime backend selection.
 
-use rust_miniss::{TaskBuilder, spawn};
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use rust_miniss::{spawn, TaskBuilder};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Demo 2: Using the convenience spawn function
     println!("\n2. Using convenience spawn function:");
     let counter = Arc::new(AtomicU32::new(0));
-    
+
     // Spawn multiple tasks
     let mut handles = Vec::new();
     for i in 0..5 {
@@ -46,9 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Give background threads some time to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    
+
     println!("Final counter value: {}", counter.load(Ordering::SeqCst));
-    
+
     println!("\n3. TaskBuilder automatic backend selection:");
     println!("   - Without multicore feature: Uses single-CPU executor");
     #[cfg(feature = "multicore")]
