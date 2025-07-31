@@ -15,6 +15,8 @@ pub mod executor;
 pub mod cpu;
 pub mod multicore;
 pub mod config;
+pub mod io;
+pub mod buffer;
 
 // Re-export core types
 pub use future::{Future, Promise};
@@ -22,6 +24,8 @@ pub use executor::{Runtime, Executor};
 pub use task::{Task, TaskBuilder, TaskError, TaskResult, spawn};
 pub use multicore::{MultiCoreRuntime, init_runtime};
 pub use cpu::Cpu;
+pub use io::{IoBackend, Op, IoToken, CompletionKind, IoError, DummyIoBackend};
+pub use buffer::{Buffer, BufferPool};
 
 /// Error types for the runtime
 pub mod error {
