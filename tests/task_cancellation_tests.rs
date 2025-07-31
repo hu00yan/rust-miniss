@@ -5,19 +5,16 @@
 //! 2. Cancel during execution  
 //! 3. Cancel after completion
 
-use rust_miniss::*;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
 use rust_miniss::multicore;
 
 #[cfg(test)]
 mod task_cancellation_tests {
     use super::*;
+    #[allow(dead_code)]
     use std::sync::Once;
-
+    #[allow(dead_code)]
     static INIT: Once = Once::new();
-
+    #[allow(dead_code)]
     fn setup_runtime() {
         INIT.call_once(|| {
             multicore::init_runtime(Some(4)).unwrap();
@@ -197,7 +194,7 @@ mod task_cancellation_tests {
         let completed_clone = completed.clone();
 
         // Use the task module spawn function
-        let handle = task::spawn(async move {
+        let handle = rust_miniss::task::spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
             42
         }).unwrap();

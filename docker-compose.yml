@@ -2,13 +2,15 @@ version: '3.8'
 
 services:
   rust-miniss:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
     container_name: rust-miniss-dev
     volumes:
-      - .:/workspace/rust-miniss
-      - cargo-cache:/usr/local/cargo/registry
-      - target-cache:/workspace/rust-miniss/target
-    working_dir: /workspace/rust-miniss
+      - .:/workspace
+      - cargo-cache:/root/.cargo/registry
+      - target-cache:/workspace/target
+    working_dir: /workspace
     environment:
       - RUST_LOG=debug
       - RUST_BACKTRACE=1

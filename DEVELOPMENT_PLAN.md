@@ -94,6 +94,46 @@ pub struct IoUringBackend {
 - File I/O setup: < 1μs
 
 ## Development Environment
-- Linux VM/Container for io-uring testing
-- macOS fallback using kqueue
-- Continuous benchmarking with criterion
+
+### Containerized Development (Recommended)
+Since io-uring is Linux-only, use containers for development on any platform:
+
+```bash
+# Quick start with the development script
+./dev.sh build    # Build the container
+./dev.sh shell    # Start interactive development
+./dev.sh check    # Quick compilation check
+./dev.sh test     # Run tests
+```
+
+### Manual Docker Setup
+If you prefer manual control:
+
+```bash
+# Build and run the development container
+docker-compose build
+docker-compose run --rm rust-miniss bash
+
+# Inside container, you have full Rust toolchain + io-uring support
+cargo check
+cargo test --features=multicore
+```
+
+### Platform-Specific Testing
+- **Linux (container)**: Full io-uring backend testing
+- **macOS (native)**: Development best with containerized Linux environment
+  ```bash
+  # Focus on io-uring backend
+  cargo test --features=multicore
+  ```
+
+### Development Focus
+We are prioritizing `io-uring` due to its high performance.
+Leverage development environments like OrbStack or Docker for Linux testing.
+```bash
+# Build with the default high-performance io-uring backend
+cargo build 
+
+# Enable multicore support for testing
+cargo build --features=multicore
+```

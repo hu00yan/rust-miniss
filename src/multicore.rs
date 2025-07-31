@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use crate::cpu::{Cpu, CpuHandle};
 use crate::error::{Result, RuntimeError};
 use crate::waker::TaskId;
+use crate::io::DummyIoBackend;
 
 /// Multi-core runtime that manages multiple CPU executors
 #[derive(Debug)]
@@ -48,7 +49,8 @@ impl MultiCoreRuntime {
             let thread_handle = thread::Builder::new()
                 .name(format!("miniss-cpu-{}", cpu_id))
                 .spawn(move || {
-                    let mut cpu = Cpu::new(cpu_id, receiver);
+                    let io_backend = Arc::new(DummyIoBackend::new());
+                    let mut cpu = Cpu::new(cpu_id, receiver, io_backend);
                     cpu.run();
                 })
                 .map_err(|e| RuntimeError::TaskFailed(format!("Failed to spawn CPU thread {}: {}", cpu_id, e)))?;
