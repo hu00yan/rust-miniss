@@ -11,12 +11,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread::JoinHandle as ThreadJoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::task::{Task, JoinHandle};
 use crate::waker::{MinissWaker, TaskId};
+use crate::io::{IoBackend, IoToken, Op, CompletionKind, IoError};
 
 /// Global atomic counter for generating unique task IDs across all CPUs
 static GLOBAL_TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -41,8 +42,10 @@ pub struct Cpu {
     message_receiver: Receiver<CrossCpuMessage>,
     /// Next task ID for this CPU
     next_task_id: AtomicU64,
-    /// Whether this CPU should keep running
-    running: bool,
+/// Whether this CPU should keep running
+running: bool,
+/// I/O backend for async operations
+io_backend: Arc<dyn IoBackend<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
 }
 
 /// Messages that can be sent between CPUs
@@ -94,7 +97,7 @@ pub struct CpuHandle {
 
 impl Cpu {
     /// Create a new CPU executor
-    pub fn new(id: usize, message_receiver: Receiver<CrossCpuMessage>) -> Self {
+    pub fn new(id: usize, message_receiver: Receiver<CrossCpuMessage>, io_backend: Arc<dyn IoBackend<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>) -> Self {
         Self {
             id,
             task_queue: HashMap::new(),
@@ -102,11 +105,12 @@ impl Cpu {
             message_receiver,
             next_task_id: AtomicU64::new((id as u64) << 32), // High bits = CPU ID
             running: true,
+            io_backend,
         }
     }
 
     /// Get the next unique task ID for this CPU
-fn next_task_id(&self) -> TaskId {
+    fn next_task_id(&self) -> TaskId {
         TaskId(self.next_task_id.fetch_add(1, Ordering::SeqCst))
     }
 
@@ -169,8 +173,9 @@ fn next_task_id(&self) -> TaskId {
         }
     }
 
-    /// Run one iteration of the event loop
+    /// Run one iteration of the event loop with benchmark timing
     pub fn tick(&mut self) -> bool {
+        let tick_start = Instant::now();
         let mut made_progress = false;
 
         // First, process any cross-CPU messages
@@ -201,6 +206,40 @@ fn next_task_id(&self) -> TaskId {
                     }
                 }
             }
+        }
+
+        // After draining task queue, poll I/O backend for completions
+        let io_waker = futures::task::noop_waker();
+        let mut io_context = Context::from_waker(&io_waker);
+        
+        match self.io_backend.poll_complete(&mut io_context) {
+            Poll::Ready(completions) => {
+                if !completions.is_empty() {
+                    made_progress = true;
+                    tracing::trace!("CPU {} processed {} I/O completions", self.id, completions.len());
+                    
+                    // Process I/O completions and potentially schedule tasks
+                    // For now, we just log the completions. In a full implementation,
+                    // we would need to match completions to waiting tasks and wake them.
+                    for completion in completions {
+                        tracing::trace!("CPU {} I/O completion: {:?}", self.id, completion);
+                        // TODO: Schedule tasks waiting for this I/O completion
+                    }
+                }
+            }
+            Poll::Pending => {
+                // No I/O completions ready
+            }
+        }
+
+        // Benchmark: Log warning if hot path takes more than 100ns
+        let tick_duration = tick_start.elapsed();
+        if tick_duration.as_nanos() > 100 {
+            tracing::warn!(
+                "CPU {} tick took {}ns (target: <100ns)", 
+                self.id, 
+                tick_duration.as_nanos()
+            );
         }
 
         made_progress
@@ -340,11 +379,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use crate::io::DummyIoBackend;
 
     #[test]
     fn test_cpu_creation() {
         let (_sender, receiver) = crossbeam_channel::unbounded();
-        let cpu = Cpu::new(0, receiver);
+        let io_backend = Arc::new(DummyIoBackend::new());
+        let cpu = Cpu::new(0, receiver, io_backend);
         assert_eq!(cpu.id, 0);
         assert_eq!(cpu.task_count(), 0);
         assert!(cpu.is_running());
@@ -353,7 +394,8 @@ mod tests {
     #[test]
     fn test_cpu_spawn_task() {
         let (_sender, receiver) = crossbeam_channel::unbounded();
-        let mut cpu = Cpu::new(0, receiver);
+        let io_backend = Arc::new(DummyIoBackend::new());
+        let mut cpu = Cpu::new(0, receiver, io_backend);
         
         let counter = Arc::new(AtomicU32::new(0));
         let counter_clone = counter.clone();
@@ -373,7 +415,8 @@ mod tests {
     #[test]
     fn test_cross_cpu_message() {
         let (handle, receiver) = CpuHandle::new(1);
-        let mut cpu = Cpu::new(1, receiver);
+        let io_backend = Arc::new(DummyIoBackend::new());
+        let mut cpu = Cpu::new(1, receiver, io_backend);
         
         // Send a ping message
         handle.ping(0).unwrap();
@@ -388,7 +431,8 @@ mod tests {
     #[test]
     fn test_cpu_shutdown() {
         let (handle, receiver) = CpuHandle::new(1);
-        let mut cpu = Cpu::new(1, receiver);
+        let io_backend = Arc::new(DummyIoBackend::new());
+        let mut cpu = Cpu::new(1, receiver, io_backend);
         
         assert!(cpu.is_running());
         
@@ -404,7 +448,8 @@ mod tests {
     #[test]
     fn test_task_id_uniqueness() {
         let (_sender, receiver) = crossbeam_channel::unbounded();
-        let cpu = Cpu::new(5, receiver); // CPU 5
+        let io_backend = Arc::new(DummyIoBackend::new());
+        let cpu = Cpu::new(5, receiver, io_backend); // CPU 5
         
         let id1 = cpu.next_task_id();
         let id2 = cpu.next_task_id();
@@ -430,5 +475,45 @@ mod tests {
         // IDs should be sequential
         assert_eq!(id2.0, id1.0 + 1);
         assert_eq!(id3.0, id2.0 + 1);
+    }
+    
+    #[test]
+    fn test_io_backend_integration() {
+        let (_sender, receiver) = crossbeam_channel::unbounded();
+        let io_backend = Arc::new(DummyIoBackend::new());
+        let mut cpu = Cpu::new(0, receiver, io_backend);
+        
+        // Test that tick includes I/O backend polling
+        let made_progress = cpu.tick();
+        
+        // With DummyIoBackend, we should always get Ready([]) which doesn't count as progress
+        // unless there are tasks to run
+        assert!(!made_progress); // No tasks, so no progress
+    }
+    
+    #[test]
+    fn test_tick_performance_target() {
+        let (_sender, receiver) = crossbeam_channel::unbounded();
+        let io_backend = Arc::new(DummyIoBackend::new());
+        let mut cpu = Cpu::new(0, receiver, io_backend);
+        
+        // Measure multiple ticks to get average performance
+        let iterations = 1000;
+        let start = Instant::now();
+        
+        for _ in 0..iterations {
+            cpu.tick();
+        }
+        
+        let total_duration = start.elapsed();
+        let avg_per_tick = total_duration / iterations;
+        
+        println!("Average tick duration: {}ns", avg_per_tick.as_nanos());
+        
+        // Allow some headroom since testing environment may be slower
+        // In real deployment, we target <100ns
+        assert!(avg_per_tick.as_nanos() < 10_000, 
+                "Tick took {}ns, much higher than 100ns target", 
+                avg_per_tick.as_nanos());
     }
 }

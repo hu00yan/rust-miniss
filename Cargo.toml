@@ -19,10 +19,14 @@ crossbeam-channel = "0.5"
 dashmap = "5.5"
 
 # System programming
-nix = { version = "0.27", features = ["signal", "time", "sched"] }
+nix = { version = "0.27", features = ["signal", "time", "sched", "fs"] }
 libc = "0.2"
+mio = { version = "0.8", features = ["os-poll", "net", "os-ext"] }
 
-# IO backends (Linux only)
+# I/O backends - focus on io-uring for Linux (Linux only)
+
+# Buffer management
+bytes = "1"
 
 # Utilities
 thiserror = "1.0"
@@ -31,16 +35,13 @@ tracing-subscriber = "0.3"
 num_cpus = "1.16"
 rand = "0.8"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.6"
 
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.4"
 tokio = { version = "1", features = ["full"] }
-
-# Target platform: Linux only
-# Use OrbStack or Docker for development on macOS
+tempfile = "3.8"
+crc = "3.0"
 
 [[example]]
 name = "hello_world"
@@ -48,9 +49,22 @@ name = "hello_world"
 [[example]]
 name = "task_builder_demo"
 
+[[bench]]
+name = "runtime_benchmarks"
+harness = false
+
 [features]
+# Focus on io-uring backend for high performance
+default = []
 multicore = []
+epoll = []
+kqueue = []
+io-uring = []
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
