@@ -13,10 +13,21 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::task::{Task, JoinHandle};
 use crate::waker::{MinissWaker, TaskId};
+
+/// Global atomic counter for generating unique task IDs across all CPUs
+static GLOBAL_TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a globally unique task ID
+/// 
+/// This function ensures that task IDs are unique across all CPUs,
+/// preventing collisions during cross-CPU task submission.
+fn generate_global_task_id() -> TaskId {
+    TaskId(GLOBAL_TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst))
+}
 
 /// Represents a single CPU core with its own executor
 pub struct Cpu {
@@ -109,9 +120,10 @@ fn next_task_id(&self) -> TaskId {
         let (result_future, promise) = crate::future::Future::new();
 
         // Wrap the user's future to complete our promise when done
+        // Panics will be caught at the polling level
         let wrapped_future = async move {
             let result = future.await;
-            promise.complete(result);
+            promise.complete(Ok(result));
         };
 
         // Create the task
@@ -177,6 +189,10 @@ fn next_task_id(&self) -> TaskId {
                         // Task completed, don't put it back
                         made_progress = true;
                         tracing::trace!("CPU {} completed task {:?}", self.id, task_id);
+                        
+                        // Note: In a full implementation, we would need to notify the runtime
+                        // to remove this task from the task_cpu_map. For now, we rely on
+                        // the runtime's cancel operation to handle cleanup when tasks are not found.
                     }
                     Poll::Pending => {
                         // Task is still pending, put it back
@@ -194,7 +210,7 @@ fn next_task_id(&self) -> TaskId {
     pub fn run(&mut self) {
         tracing::info!("CPU {} starting event loop", self.id);
         
-        #[cfg(target_os = "linux")]
+        // Set CPU affinity if supported
         self.set_cpu_affinity();
 
         use crossbeam_channel::RecvTimeoutError;
@@ -204,7 +220,7 @@ fn next_task_id(&self) -> TaskId {
 
             // If the ready queue is empty, wait for a new message.
             if self.ready_queue.is_empty() {
-                match self.message_receiver.recv_timeout(Duration::from_millis(10)) {
+                match self.message_receiver.recv_timeout(Duration::from_millis(crate::config::CPU_THREAD_TIMEOUT_MS)) {
                     Ok(msg) => {
                         self.handle_message(msg);
                     }
@@ -242,6 +258,12 @@ fn next_task_id(&self) -> TaskId {
         self.task_queue.len()
     }
 
+    /// No-op for non-Linux platforms
+    #[cfg(not(target_os = "linux"))]
+    fn set_cpu_affinity(&self) {
+        // Not supported on this platform
+    }
+
     /// Check if this CPU is still running
     pub fn is_running(&self) -> bool {
         self.running
@@ -251,7 +273,11 @@ fn next_task_id(&self) -> TaskId {
 impl CpuHandle {
     /// Create a new CPU handle
     pub fn new(cpu_id: usize) -> (Self, Receiver<CrossCpuMessage>) {
-        let (sender, receiver) = unbounded();
+        // Use bounded channels for back-pressure control
+        // Bounded channels prevent uncontrolled memory growth under high load.
+        // The capacity is configurable via config::CROSS_CPU_CHANNEL_CAPACITY
+        // for tuning based on workload requirements.
+        let (sender, receiver) = crossbeam_channel::bounded(crate::config::CROSS_CPU_CHANNEL_CAPACITY);
         
         let handle = Self {
             cpu_id,
@@ -263,17 +289,20 @@ impl CpuHandle {
     }
 
     /// Submit a task to this CPU from another CPU
-    pub fn submit_task<F>(&self, task: F) -> Result<(), crossbeam_channel::SendError<CrossCpuMessage>>
+    /// Returns the generated task ID for tracking purposes
+    pub fn submit_task<F>(&self, task: F) -> Result<TaskId, crossbeam_channel::SendError<CrossCpuMessage>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let task_id = TaskId(rand::random()); // In practice, we'd want a better ID scheme
+        // Use global atomic counter for robust task ID generation (Issue #6)
+        // This ensures unique task IDs across all CPUs without collisions.
+        let task_id = generate_global_task_id();
         let message = CrossCpuMessage::SubmitTask {
             task_id,
             task: Box::new(task),
         };
         
-        self.sender.send(message)
+        self.sender.send(message).map(|_| task_id)
     }
 
     /// Send a shutdown signal to this CPU
@@ -284,6 +313,11 @@ impl CpuHandle {
     /// Ping this CPU (for testing)
     pub fn ping(&self, from_cpu: usize) -> Result<(), crossbeam_channel::SendError<CrossCpuMessage>> {
         self.sender.send(CrossCpuMessage::Ping { reply_to: from_cpu })
+    }
+
+    /// Cancel a specific task on this CPU
+    pub fn cancel_task(&self, task_id: TaskId) -> Result<(), crossbeam_channel::SendError<CrossCpuMessage>> {
+        self.sender.send(CrossCpuMessage::CancelTask(task_id))
     }
 
     /// Set the thread handle (called after spawning the CPU thread)
@@ -309,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_cpu_creation() {
-        let (_, receiver) = unbounded();
+        let (_sender, receiver) = crossbeam_channel::unbounded();
         let cpu = Cpu::new(0, receiver);
         assert_eq!(cpu.id, 0);
         assert_eq!(cpu.task_count(), 0);
@@ -318,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_cpu_spawn_task() {
-        let (_, receiver) = unbounded();
+        let (_sender, receiver) = crossbeam_channel::unbounded();
         let mut cpu = Cpu::new(0, receiver);
         
         let counter = Arc::new(AtomicU32::new(0));
@@ -369,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_task_id_uniqueness() {
-        let (_, receiver) = unbounded();
+        let (_sender, receiver) = crossbeam_channel::unbounded();
         let cpu = Cpu::new(5, receiver); // CPU 5
         
         let id1 = cpu.next_task_id();
@@ -380,5 +414,21 @@ mod tests {
         // Check that CPU ID is encoded in high bits
         assert_eq!(id1.0 >> 32, 5);
         assert_eq!(id2.0 >> 32, 5);
+    }
+
+    #[test]
+    fn test_global_task_id_generation() {
+        let id1 = generate_global_task_id();
+        let id2 = generate_global_task_id();
+        let id3 = generate_global_task_id();
+        
+        // All IDs should be unique
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+        
+        // IDs should be sequential
+        assert_eq!(id2.0, id1.0 + 1);
+        assert_eq!(id3.0, id2.0 + 1);
     }
 }

@@ -9,7 +9,7 @@ use crossbeam_queue::SegQueue;
 
 /// A task ID that uniquely identifies a task in the executor
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TaskId(pub(crate) u64);
+pub struct TaskId(pub u64);
 
 impl TaskId {
     pub fn cpu_id(&self) -> usize {

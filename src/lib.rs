@@ -6,17 +6,20 @@
 //! - io-uring for high-performance I/O on Linux
 //! - Custom Future/Promise implementation for educational purposes
 
+#![deny(warnings)]
+
 pub mod future;
 pub mod task;
 pub mod waker;
 pub mod executor;
 pub mod cpu;
 pub mod multicore;
+pub mod config;
 
 // Re-export core types
 pub use future::{Future, Promise};
 pub use executor::{Runtime, Executor};
-pub use task::Task;
+pub use task::{Task, TaskBuilder, TaskError, TaskResult, spawn};
 pub use multicore::{MultiCoreRuntime, init_runtime};
 pub use cpu::Cpu;
 

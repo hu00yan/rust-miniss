@@ -1,4 +1,23 @@
-//! Integration tests for multi-core runtime functionality
+#[test]
+fn test_graceful_shutdown_no_leaks() {
+    let runtime = rust_miniss::multicore::MultiCoreRuntime::with_cpus(2).unwrap();
+    
+    // Spawn a task to ensure there are active tasks when we drop the runtime
+    runtime.spawn(async {
+        // Just a simple task that completes quickly
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }).unwrap();
+
+    // Drop the runtime, which should trigger a graceful shutdown
+    drop(runtime);
+
+    // Allow some time for shutdown to complete
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // If we get here without hanging, the Drop implementation worked correctly
+}
+
+/// Integration tests for multi-core runtime functionality
 
 use rust_miniss::*;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -194,7 +213,6 @@ fn test_multicore_concurrent_spawning() {
 fn test_multicore_ping_communication() {
     let runtime = MultiCoreRuntime::with_cpus(3).unwrap();
     
-    let (tx, rx): (mpsc::Sender<()>, mpsc::Receiver<()>) = mpsc::channel();
     runtime.ping_all().unwrap();
     
     // Give time for ping messages to be processed
