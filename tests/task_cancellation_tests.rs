@@ -6,9 +6,7 @@
 //! 3. Cancel after completion
 
 use rust_miniss::multicore;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Once};
-use std::time::Duration;
+// Unused imports removed to fix warnings
 
 #[cfg(test)]
 mod task_cancellation_tests {

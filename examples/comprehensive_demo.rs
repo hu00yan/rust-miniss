@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Feature 1: Timer and Timeout Functionality
     println!("\n⏰ Feature 1: Timer and Timeout Operations");
-    runtime.block_on(demonstrate_timer_features())?;
+    let _ = runtime.block_on(demonstrate_timer_features())?;
     
     // Feature 2: Simple Async Work
     println!("\n🔄 Feature 2: Simple Async Work");

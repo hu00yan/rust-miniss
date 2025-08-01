@@ -55,16 +55,15 @@ impl MultiCoreRuntime {
 
             // Spawn the CPU thread
             let thread_handle = thread::Builder::new()
-                .name(format!("miniss-cpu-{}", cpu_id))
+                .name(format!("miniss-cpu-{cpu_id}"))
                 .spawn(move || {
                     let io_backend = Arc::new(DummyIoBackend::new());
                     let mut cpu = Cpu::new(cpu_id, receiver, io_backend);
                     cpu.run();
                 })
                 .map_err(|e| {
-                    RuntimeError::TaskFailed(format!(
-                        "Failed to spawn CPU thread {}: {}",
-                        cpu_id, e
+                      RuntimeError::TaskFailed(format!(
+                        "Failed to spawn CPU thread {cpu_id}: {e}"
                     ))
                 })?;
 
@@ -130,7 +129,7 @@ impl MultiCoreRuntime {
 
         if let Some(handles) = &self.cpu_handles {
             let task_id = handles[cpu_id].submit_task(future).map_err(|e| {
-                RuntimeError::TaskFailed(format!("Failed to submit task to CPU {}: {}", cpu_id, e))
+                RuntimeError::TaskFailed(format!("Failed to submit task to CPU {cpu_id}: {e}"))
             })?;
             self.task_cpu_map.insert(task_id, cpu_id);
             Ok(task_id)
@@ -160,8 +159,7 @@ impl MultiCoreRuntime {
                 if cpu_id < handles.len() {
                     handles[cpu_id].cancel_task(task_id).map_err(|e| {
                         RuntimeError::TaskFailed(format!(
-                            "Failed to send cancel message to CPU {}: {}",
-                            cpu_id, e
+                            "Failed to send cancel message to CPU {cpu_id}: {e}"
                         ))
                     })?;
 
@@ -170,8 +168,7 @@ impl MultiCoreRuntime {
                     Ok(())
                 } else {
                     Err(RuntimeError::TaskFailed(format!(
-                        "Invalid CPU ID {} for task {:?}",
-                        cpu_id, task_id
+                        "Invalid CPU ID {cpu_id} for task {task_id:?}"
                     )))
                 }
             } else {
@@ -179,8 +176,7 @@ impl MultiCoreRuntime {
             }
         } else {
             Err(RuntimeError::TaskFailed(format!(
-                "Task {:?} not found or already completed",
-                task_id
+                "Task {task_id:?} not found or already completed"
             )))
         }
     }
@@ -213,14 +209,14 @@ impl MultiCoreRuntime {
 
         if let Some(handles) = &self.cpu_handles {
             handles[cpu_id].submit_task(task).map_err(|e| {
-                RuntimeError::TaskFailed(format!("Failed to submit task to CPU {}: {}", cpu_id, e))
+                RuntimeError::TaskFailed(format!("Failed to submit task to CPU {cpu_id}: {e}"))
             })?;
         }
 
         // Wait for the result
         receiver
             .recv()
-            .map_err(|e| RuntimeError::TaskFailed(format!("Failed to receive result: {}", e)))
+            .map_err(|e| RuntimeError::TaskFailed(format!("Failed to receive result: {e}")))
     }
 
     /// Run a future to completion on any available CPU
@@ -239,12 +235,11 @@ impl MultiCoreRuntime {
 
         if let Some(handles) = &self.cpu_handles {
             for (from_cpu, _handle) in handles.iter().enumerate() {
-                for to_cpu in 0..self.num_cpus {
+                for (to_cpu, handle) in handles.iter().enumerate().take(self.num_cpus) {
                     if from_cpu != to_cpu {
-                        handles[to_cpu].ping(from_cpu).map_err(|e| {
+                        handle.ping(from_cpu).map_err(|e| {
                             RuntimeError::TaskFailed(format!(
-                                "Failed to ping CPU {} from CPU {}: {}",
-                                to_cpu, from_cpu, e
+                                "Failed to ping CPU {to_cpu} from CPU {from_cpu}: {e}"
                             ))
                         })?;
                     }
@@ -295,8 +290,7 @@ impl MultiCoreRuntime {
                     Err(e) => {
                         tracing::error!("Failed to join CPU {} thread: {:?}", cpu_id, e);
                         return Err(RuntimeError::TaskFailed(format!(
-                            "Failed to join CPU {} thread: {:?}",
-                            cpu_id, e
+                            "Failed to join CPU {cpu_id} thread: {e:?}"
                         )));
                     }
                 }

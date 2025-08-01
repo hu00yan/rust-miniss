@@ -25,7 +25,7 @@ pub struct MinissWaker {
 
 impl MinissWaker {
     /// Create a new waker for the given task
-    pub fn new(task_id: TaskId, queue: Arc<SegQueue<TaskId>>) -> Waker {
+    pub fn create_waker(task_id: TaskId, queue: Arc<SegQueue<TaskId>>) -> Waker {
         let waker = Arc::new(MinissWaker { task_id, queue });
         let raw_waker = RawWaker::new(Arc::into_raw(waker) as *const (), &VTABLE);
         unsafe { Waker::from_raw(raw_waker) }
@@ -72,7 +72,7 @@ mod tests {
         let queue = Arc::new(SegQueue::new());
         let task_id = TaskId(42);
 
-        let waker = MinissWaker::new(task_id, queue.clone());
+        let waker = MinissWaker::create_waker(task_id, queue.clone());
 
         // Wake the task
         waker.wake();
@@ -86,7 +86,7 @@ mod tests {
         let queue = Arc::new(SegQueue::new());
         let task_id = TaskId(99);
 
-        let waker1 = MinissWaker::new(task_id, queue.clone());
+        let waker1 = MinissWaker::create_waker(task_id, queue.clone());
         let waker2 = waker1.clone();
 
         // Both wakers should work
@@ -104,7 +104,7 @@ mod tests {
         let queue = Arc::new(SegQueue::new());
         let task_id = TaskId(123);
 
-        let waker = MinissWaker::new(task_id, queue.clone());
+        let waker = MinissWaker::create_waker(task_id, queue.clone());
 
         // Wake by reference
         waker.wake_by_ref();

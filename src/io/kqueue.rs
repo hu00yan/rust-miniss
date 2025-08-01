@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crate::io::{CompletionKind, IoBackend, IoError, IoToken, Op};
 
 thread_local! {
-    static CPU_POLL: std::cell::RefCell<Option<Poll>> = std::cell::RefCell::new(None);
+    static CPU_POLL: std::cell::RefCell<Option<Poll>> = const { std::cell::RefCell::new(None) };
 }
 
 /// High-performance kqueue backend for macOS
@@ -93,7 +93,7 @@ impl KqueueBackend {
 impl KqueueState {
     /// Create a poll instance for event processing
     fn create_poll() -> Result<Poll, IoError> {
-        Poll::new().map_err(|e| IoError::Other(format!("Failed to create kqueue poll: {}", e)))
+        Poll::new().map_err(|e| IoError::Other(format!("Failed to create kqueue poll: {e}")))
     }
 
     /// Set file descriptor to non-blocking mode
@@ -101,13 +101,13 @@ impl KqueueState {
         use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
         let flags = fcntl(fd, FcntlArg::F_GETFL)
-            .map_err(|e| IoError::Other(format!("Failed to get fd flags: {}", e)))?;
+            .map_err(|e| IoError::Other(format!("Failed to get fd flags: {e}")))?;
 
         let mut flags = OFlag::from_bits_truncate(flags);
         flags.insert(OFlag::O_NONBLOCK);
 
         fcntl(fd, FcntlArg::F_SETFL(flags))
-            .map_err(|e| IoError::Other(format!("Failed to set fd non-blocking: {}", e)))?;
+            .map_err(|e| IoError::Other(format!("Failed to set fd non-blocking: {e}")))?;
 
         Ok(())
     }
@@ -131,7 +131,7 @@ impl KqueueState {
         let mut source_fd = SourceFd(&fd);
         poll.registry()
             .register(&mut source_fd, mio_token, Interest::READABLE)
-            .map_err(|e| IoError::Other(format!("Failed to register fd for read: {}", e)))?;
+            .map_err(|e| IoError::Other(format!("Failed to register fd for read: {e}")))?;
 
         // Store the pending operation
         let pending_op = PendingOperation {
@@ -167,7 +167,7 @@ impl KqueueState {
         let mut source_fd = SourceFd(&fd);
         poll.registry()
             .register(&mut source_fd, mio_token, Interest::WRITABLE)
-            .map_err(|e| IoError::Other(format!("Failed to register fd for write: {}", e)))?;
+            .map_err(|e| IoError::Other(format!("Failed to register fd for write: {e}")))?;
 
         // Store the pending operation
         let pending_op = PendingOperation {
@@ -235,7 +235,7 @@ impl KqueueState {
 
         // Poll for events with zero timeout (non-blocking)
         poll.poll(&mut events, Some(Duration::from_millis(0)))
-            .map_err(|e| IoError::Other(format!("Failed to poll events: {}", e)))?;
+            .map_err(|e| IoError::Other(format!("Failed to poll events: {e}")))?;
 
         for event in events.iter() {
             let mio_token = event.token();
