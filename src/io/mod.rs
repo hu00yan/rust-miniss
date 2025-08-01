@@ -57,8 +57,8 @@ pub enum IoError {
 impl std::fmt::Display for IoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IoError::Io(err) => write!(f, "IO error: {}", err),
-            IoError::Other(msg) => write!(f, "Other error: {}", msg),
+            IoError::Io(err) => write!(f, "IO error: {err}"),
+            IoError::Other(msg) => write!(f, "Other error: {msg}"),
         }
     }
 }

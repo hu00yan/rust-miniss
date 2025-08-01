@@ -152,7 +152,7 @@ impl Executor {
         while let Some(task_id) = self.ready_queue.pop() {
             if let Some(mut task) = self.tasks.remove(&task_id) {
                 // Create a waker for this task
-                let waker = MinissWaker::new(task_id, self.ready_queue.clone());
+                let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
                 let mut context = Context::from_waker(&waker);
 
                 // Poll the task, catching any panics
@@ -172,7 +172,7 @@ impl Executor {
                     }
                     Err(_panic_payload) => {
                         // Task panicked, log it and continue with other tasks
-                        eprintln!("Task {:?} panicked", task_id);
+                        eprintln!("Task {task_id:?} panicked");
                         made_progress = true;
                         // Don't put the task back - it's considered "completed" due to panic
                     }

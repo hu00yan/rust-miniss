@@ -197,7 +197,7 @@ let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
         while let Some(task_id) = self.ready_queue.pop() {
             if let Some(mut task) = self.task_queue.remove(&task_id) {
                 // Create a waker for this task
-                let waker = MinissWaker::new(task_id, self.ready_queue.clone());
+                let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
                 let mut context = Context::from_waker(&waker);
 
                 // Poll the task
@@ -264,7 +264,7 @@ let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
 
     /// Schedule a timer to expire at a specific time
     pub fn schedule_timer(&mut self, at: Instant, task_id: TaskId) {
-        let waker = MinissWaker::new(task_id, self.ready_queue.clone());
+            let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
         self.timer.schedule(at, waker);
     }
 

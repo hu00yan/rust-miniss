@@ -85,9 +85,7 @@ impl SignalHandler {
                                 for (cpu_id, sender) in handles.iter().enumerate() {
                                     if let Err(e) = sender.send(CrossCpuMessage::Shutdown) {
                                         tracing::warn!(
-                                            "Failed to send shutdown signal to CPU {}: {}",
-                                            cpu_id,
-                                            e
+                                            "Failed to send shutdown signal to CPU {cpu_id}: {e}"
                                         );
                                     }
                                 }
@@ -95,7 +93,7 @@ impl SignalHandler {
 
                             tracing::info!("Graceful shutdown initiated");
                         } else {
-                            tracing::warn!("Received second signal {}, forcing exit", signal);
+                            tracing::warn!("Received second signal {signal}, forcing exit");
                             std::process::exit(1);
                         }
                     }

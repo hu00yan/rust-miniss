@@ -108,7 +108,7 @@ impl<T> JoinHandle<T> {
         // In a more sophisticated implementation, we'd track which CPU the task is on
         #[cfg(feature = "multicore")]
         {
-            if let Ok(runtime) = std::panic::catch_unwind(|| crate::multicore::runtime()) {
+            if let Ok(runtime) = std::panic::catch_unwind(crate::multicore::runtime) {
                 return self.cancel_multicore(&runtime);
             }
         }
@@ -172,7 +172,7 @@ impl TaskBuilder {
         #[cfg(feature = "multicore")]
         {
             // Use the public runtime() function to access the global runtime
-            if let Ok(runtime) = std::panic::catch_unwind(|| crate::multicore::runtime()) {
+            if let Ok(runtime) = std::panic::catch_unwind(crate::multicore::runtime) {
                 return self.spawn_multicore(&runtime, future);
             }
         }
@@ -203,9 +203,9 @@ impl TaskBuilder {
 
     /// Spawn task on multi-core runtime
     #[cfg(feature = "multicore")]
-    fn spawn_multicore<'a, F, T>(
+    fn spawn_multicore<F, T>(
         self,
-        runtime: &'a std::sync::Arc<crate::multicore::MultiCoreRuntime>,
+        runtime: &std::sync::Arc<crate::multicore::MultiCoreRuntime>,
         future: F,
     ) -> crate::error::Result<JoinHandle<T>>
     where
