@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Feature 2: Simple Async Work
     println!("\n🔄 Feature 2: Simple Async Work");
-    runtime.block_on(async {
+    let _ = runtime.block_on(async {
         println!("  Running async work...");
         timer::sleep(Duration::from_millis(50)).await;
         println!("  ✅ Async work completed!");
