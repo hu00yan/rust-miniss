@@ -20,3 +20,15 @@ pub const CROSS_CPU_CHANNEL_CAPACITY: usize = 1000;
 /// but uses more CPU cycles, while a larger value reduces CPU usage but
 /// may delay shutdown.
 pub const CPU_THREAD_TIMEOUT_MS: u64 = 10;
+
+/// Initial capacity for task queue HashMap to reduce allocations
+///
+/// Pre-allocating the task queue reduces allocations during runtime.
+/// This should be set based on expected concurrent task count per CPU.
+pub const INITIAL_TASK_QUEUE_CAPACITY: usize = 128;
+
+/// Expected number of wakeups per timer expiration cycle
+///
+/// This optimizes the Vec allocation for expired timer wakers.
+/// Most workloads have few simultaneous timer expirations.
+pub const EXPECTED_WAKEUP_COUNT: usize = 16;

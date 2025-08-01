@@ -82,7 +82,7 @@ impl TimerWheel {
     pub fn new(num_slots: usize, resolution_ms: u64) -> Self {
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
-            slots.push(VecDeque::new());
+            slots.push(VecDeque::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT));
         }
 
         Self {

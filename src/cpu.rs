@@ -102,7 +102,7 @@ impl Cpu {
     ) -> Self {
         Self {
             id,
-            task_queue: HashMap::new(),
+task_queue: HashMap::with_capacity(crate::config::INITIAL_TASK_QUEUE_CAPACITY),
             ready_queue: Arc::new(SegQueue::new()),
             message_receiver,
             next_task_id: AtomicU64::new((id as u64) << 32), // High bits = CPU ID
@@ -186,7 +186,7 @@ impl Cpu {
 
         // Expire timers and wake ready tasks
         let now = Instant::now();
-        let mut ready_wakers = Vec::new();
+let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
         self.timer.expire(now, &mut ready_wakers);
         for waker in ready_wakers {
             waker.wake();
