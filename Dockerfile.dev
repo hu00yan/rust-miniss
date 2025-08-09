@@ -1,15 +1,21 @@
 FROM ubuntu:22.04
 
-# Install system dependencies
+# Install system dependencies and benchmarking tools (wrk, hyperfine)
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     curl \
+    wrk \
+    hyperfine \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Install Rust (pinned toolchain for reproducibility)
+# Pin to Rust 1.88.0 to match local development environment
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && /root/.cargo/bin/rustup toolchain install 1.88.0 \
+    && /root/.cargo/bin/rustup default 1.88.0
 ENV PATH="/root/.cargo/bin:${PATH}"
+ENV RUSTUP_TOOLCHAIN=1.88.0
 
 # Set working directory
 WORKDIR /workspace
