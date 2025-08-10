@@ -48,40 +48,37 @@
 //!
 //! ## Signal Handling Example
 //!
-//! ```rust,no_run
-//! use rust_miniss::{Runtime, timer};
+//! ```rust,ignore
+//! use rust_miniss::{Runtime, timer, signal::SignalHandler};
+//! use std::sync::atomic::{AtomicBool, Ordering};
+//! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! # #[cfg(feature = "signal")]
-//! # async fn main_loop() {
 //! let runtime = Runtime::new();
+//! let shutdown_flag = Arc::new(AtomicBool::new(false));
 //!
 //! // Set up signal handling for graceful shutdown
-//! # #[cfg(feature = "signal")]
-//! let shutdown_signal = rust_miniss::signal::wait_for_signal(&["SIGTERM", "SIGINT"]);
+//! #[cfg(feature = "signal")]
+//! {
+//!     let handler = SignalHandler::new(shutdown_flag.clone());
+//!     handler.start();
+//! }
 //!
-//! // Your main application logic
-//! let main_task = async {
+//! runtime.block_on(async {
+//!     // Your main application logic
 //!     loop {
+//!         if shutdown_flag.load(Ordering::SeqCst) {
+//!             println!("Received shutdown signal, exiting gracefully...");
+//!             // Perform cleanup operations here
+//!             timer::sleep(Duration::from_millis(100)).await;
+//!             break;
+//!         }
+//!         
 //!         // Do some work
 //!         timer::sleep(Duration::from_millis(100)).await;
 //!         println!("Working...");
 //!     }
-//! };
-//!
-//! // Wait for either the main task to complete or a shutdown signal
-//! # #[cfg(feature = "signal")]
-//! tokio::select! {
-//!     _ = main_task => {
-//!         println!("Main task completed");
-//!     }
-//!     signal = shutdown_signal => {
-//!         println!("Received signal: {:?}, shutting down gracefully...", signal);
-//!         // Perform cleanup operations here
-//!         timer::sleep(Duration::from_millis(100)).await; // Cleanup time
-//!     }
-//! }
-//! # }
+//! });
 //! ```
 
 #![deny(warnings)]

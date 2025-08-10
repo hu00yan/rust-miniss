@@ -18,8 +18,23 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check for notification configuration
+        id: check_secrets
+        run: |
+          echo "Checking for notification webhook configuration..."
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "slack_configured=true" >> $GITHUB_OUTPUT
+          else
+            echo "slack_configured=false" >> $GITHUB_OUTPUT
+          fi
+          if [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            echo "discord_configured=true" >> $GITHUB_OUTPUT
+          else
+            echo "discord_configured=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Send Slack notification (if configured)
-        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        if: steps.check_secrets.outputs.slack_configured == 'true'
         run: |
           set -euo pipefail
           msg=":x: Workflow '${{ github.event.workflow_run.name }}' failed in ${{ github.repository }} (ref ${{ github.ref }}). Run: ${{ github.event.workflow_run.html_url }}"
@@ -27,9 +42,10 @@ jobs:
           curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
 
       - name: Send Discord notification (if configured)
-        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        if: steps.check_secrets.outputs.discord_configured == 'true'
         run: |
           set -euo pipefail
           msg=":x: Workflow '${{ github.event.workflow_run.name }}' failed in ${{ github.repository }} (ref ${{ github.ref }}). Run: ${{ github.event.workflow_run.html_url }}"
@@ -37,3 +53,12 @@ jobs:
           curl -H 'Content-Type: application/json' -X POST -d "$payload" "$DISCORD_WEBHOOK_URL"
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        continue-on-error: true
+
+      - name: Log notification status
+        if: always()
+        run: |
+          echo "Notification workflow completed."
+          if [ "${{ steps.check_secrets.outputs.slack_configured }}" != "true" ] && [ "${{ steps.check_secrets.outputs.discord_configured }}" != "true" ]; then
+            echo "⚠️ No notification webhooks configured. To enable notifications, set SLACK_WEBHOOK_URL or DISCORD_WEBHOOK_URL in repository secrets."
+          fi

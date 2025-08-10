@@ -57,7 +57,6 @@ async fn main() {
             }
         });
     }
-
 }
 
 #[cfg(not(feature = "signal"))]
