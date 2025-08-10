@@ -8,9 +8,9 @@
 use rust_miniss::multicore;
 // Conditional imports for multicore tests only
 #[cfg(feature = "multicore")]
-use std::sync::Arc;
-#[cfg(feature = "multicore")]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(feature = "multicore")]
+use std::sync::Arc;
 #[cfg(feature = "multicore")]
 use std::time::Duration;
 
