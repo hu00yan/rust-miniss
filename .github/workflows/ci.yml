@@ -24,33 +24,11 @@ jobs:
       matrix:
         include:
           # Linux + io-uring (native io-uring backend on Linux)
-          # TODO: Consider using self-hosted runners with Orbstack for optimal performance
           - os: linux
             backend: io-uring
             runner: ubuntu-latest
             features: "io-uring"
             target: x86_64-unknown-linux-gnu
-          
-          # Linux + epoll backend
-          - os: linux
-            backend: epoll  
-            runner: ubuntu-latest
-            features: "epoll"
-            target: x86_64-unknown-linux-gnu
-
-          # Linux + timer signal backend
-          - os: linux
-            backend: timer_signal
-            runner: ubuntu-latest
-            features: "timer"
-            target: x86_64-unknown-linux-gnu
-            
-          # macOS + kqueue backend
-          - os: macos
-            backend: kqueue
-            runner: macos-latest
-            features: "kqueue"
-            target: x86_64-apple-darwin
 
     steps:
     - name: Checkout code
@@ -158,16 +136,11 @@ jobs:
         cargo check
         cargo test
 
-    - name: Test epoll feature
+    - name: Test io-uring feature
       run: |
-        echo "Testing epoll feature"
-        cargo check --features epoll
-        cargo test --features epoll
-
-    - name: Test kqueue feature (compile only on Linux)
-      run: |
-        echo "Testing kqueue feature compilation"
-        cargo check --features kqueue
+        echo "Testing io-uring feature"
+        cargo check --features io-uring
+        cargo test --features io-uring
 
     - name: Test multicore feature
       run: |
@@ -175,18 +148,11 @@ jobs:
         cargo check --features multicore
         cargo test --features multicore
 
-    - name: Test timer feature
-      run: |
-        echo "Testing timer feature"
-        cargo check --features timer
-        cargo test --features timer
-
     - name: Test combined features
       run: |
-        echo "Testing combined feature sets"
-        cargo check --features "epoll,multicore"
-        cargo check --features "kqueue,multicore"
-        cargo check --features "timer,multicore"
+        echo "Testing io-uring with multicore"
+        cargo check --features "io-uring,multicore"
+        cargo test --features "io-uring,multicore"
 
     - name: Test all features together
       run: |
@@ -211,15 +177,10 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y liburing-dev build-essential
 
-    - name: Run criterion benchmarks (default)
+    - name: Run criterion benchmarks (io-uring)
       run: |
-        echo "Running benchmarks with default features"
-        cargo bench --bench runtime_benchmarks -- --output-format json | tee benchmark_results_default.json
-
-    - name: Run criterion benchmarks (epoll)
-      run: |
-        echo "Running benchmarks with epoll backend"
-        cargo bench --features epoll --bench runtime_benchmarks -- --output-format json | tee benchmark_results_epoll.json
+        echo "Running benchmarks with io-uring backend"
+        cargo bench --features io-uring --bench runtime_benchmarks -- --output-format json | tee benchmark_results_iouring.json
 
     - name: Run criterion benchmarks (all features)
       run: |
@@ -260,10 +221,4 @@ jobs:
     - name: Cross-compile check
       run: |
         echo "Cross-compiling for ${{ matrix.target }}"
-        if [[ "${{ matrix.target }}" == *"linux"* ]]; then
-          cross check --target ${{ matrix.target }} --features epoll
-        elif [[ "${{ matrix.target }}" == *"apple"* ]]; then
-          cross check --target ${{ matrix.target }} --features kqueue
-        else
-          cross check --target ${{ matrix.target }}
-        fi
+        cross check --target ${{ matrix.target }} --features io-uring
