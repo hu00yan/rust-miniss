@@ -6,9 +6,12 @@
 //! 3. Cancel after completion
 
 use rust_miniss::multicore;
-// Unused imports removed to fix warnings
+// Conditional imports for multicore tests only
+#[cfg(feature = "multicore")]
 use std::sync::Arc;
+#[cfg(feature = "multicore")]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(feature = "multicore")]
 use std::time::Duration;
 
 #[cfg(test)]
