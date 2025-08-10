@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     wrk \
     hyperfine \
+    valgrind \
+    heaptrack \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust (pinned toolchain for reproducibility)
