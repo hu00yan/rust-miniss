@@ -1,0 +1,31 @@
+# See https://pre-commit.com for usage
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (check)
+        entry: bash -c 'cargo fmt --all -- --check'
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+      - id: cargo-clippy
+        name: cargo clippy (all targets/features, deny warnings)
+        entry: bash -c 'cargo clippy --all-targets --all-features -- -D warnings'
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+      - id: cargo-deny
+        name: cargo deny check
+        entry: bash -c 'cargo deny check'
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+      - id: codespell
+        name: codespell
+        args: ["--config", ".codespellrc"]

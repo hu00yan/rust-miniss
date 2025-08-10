@@ -1,0 +1,20 @@
+name: Typos
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run typos
+        uses: crate-ci/typos@master
+        with:
+          config: .typos.toml
+          files: .
+

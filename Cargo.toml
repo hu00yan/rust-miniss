@@ -36,7 +36,7 @@ tracing-subscriber = "0.3"
 num_cpus = "1.16"
 rand = "0.8"
 signal-hook = "0.3"
-tokio = { version = "1", features = ["signal"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "signal", "io-util"] }
 
 
 [dev-dependencies]
@@ -53,12 +53,28 @@ name = "hello_world"
 [[example]]
 name = "task_builder_demo"
 
+[[example]]
+name = "http_echo"
+path = "examples/http_echo.rs"
+
+[[bin]]
+name = "http_echo_tokio"
+path = "bench_compare/http_echo_tokio.rs"
+
 [[bench]]
 name = "runtime_benchmarks"
 harness = false
 
 [[bench]]
 name = "timer_benchmarks"
+harness = false
+
+[[bench]]
+name = "cross_cpu_latency"
+harness = false
+
+[[bench]]
+name = "scheduling_throughput"
 harness = false
 
 [features]

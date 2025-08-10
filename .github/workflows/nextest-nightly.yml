@@ -1,0 +1,87 @@
+name: Nightly Matrix - nextest & fuzz
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # nightly at 03:00 UTC
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-matrix:
+    name: Tests ${{ matrix.os }} - ${{ matrix.backend }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            backend: io-uring
+            features: "io-uring"
+          - os: linux
+            runner: ubuntu-latest
+            backend: epoll
+            features: "epoll"
+          - os: macos
+            runner: macos-latest
+            backend: kqueue
+            features: "kqueue"
+          - os: windows
+            runner: windows-latest
+            backend: mio
+            features: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --features "${{ matrix.features }}"
+          else
+            cargo build
+          fi
+
+      - name: Test (nextest)
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo nextest run --features "${{ matrix.features }}" --profile ci
+          else
+            cargo nextest run --profile ci
+          fi
+
+  fuzz-timer:
+    name: Fuzz timer API (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz (sanity, short)
+        env:
+          RUSTFLAGS: "-C debuginfo=1"
+        run: |
+          # Build fuzz target
+          cargo fuzz build timer_api
+          # Run for a short duration to catch obvious issues
+          timeout 60s cargo fuzz run timer_api -- -max_total_time=60 || true

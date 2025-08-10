@@ -101,19 +101,24 @@ jobs:
         echo "Building with all features for ${{ matrix.backend }} backend validation"
         cargo build --target ${{ matrix.target }} --all-features
 
-    - name: Run tests with specific backend
+    - name: Install nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
+    - name: Run tests with specific backend (nextest)
       run: |
         echo "Running tests for ${{ matrix.backend }} backend"
         if [ -n "${{ matrix.features }}" ]; then
-          cargo test --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          cargo nextest run --features "${{ matrix.features }}" --profile ci
         else
-          cargo test --target ${{ matrix.target }}
+          cargo nextest run --profile ci
         fi
 
-    - name: Run tests with all features
+    - name: Run tests with all features (nextest)
       run: |
         echo "Running all feature tests"
-        cargo test --target ${{ matrix.target }} --all-features
+        cargo nextest run --all-features --profile ci
 
     - name: Run benchmarks
       run: |

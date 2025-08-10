@@ -1,0 +1,17 @@
+# This CODEOWNERS file automatically requests reviews from specific teams based on paths.
+# Learn more: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for all files (optional)
+# *       @runtime-team
+
+# Core executor module
+core/**        @runtime-team
+
+# io-uring backend
+io-uring/**    @io-team
+
+# timer / signals
+# Adjust paths to match your repo structure if different
+src/timer/**   @systems-team
+src/signals/** @systems-team
+

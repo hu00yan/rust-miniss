@@ -1,0 +1,111 @@
+name: Benchmarks and Profiling
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    name: Run Criterion, perf stat, and Flamegraphs
+    runs-on: [self-hosted, linux]
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -C debuginfo=1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure perf and dependencies
+        shell: bash
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y linux-tools-common linux-tools-generic linux-tools-`uname -r` perf
+          fi
+
+      - name: Install cargo-flamegraph
+        shell: bash
+        run: |
+          if ! command -v cargo-flamegraph >/dev/null 2>&1; then
+            cargo install flamegraph
+          fi
+
+      - name: Run perf stat for Criterion benches
+        shell: bash
+        run: |
+          set -euxo pipefail
+          perf stat -d -d -d -- cargo bench --all --no-default-features || true
+
+      - name: Run Criterion benches (HTML reports)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo bench --all --no-default-features
+
+      - name: Generate Flamegraphs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p flamegraphs
+          # Generate flamegraphs for each bench target (best-effort)
+          for b in runtime_benchmarks timer_benchmarks cross_cpu_latency scheduling_throughput; do
+            if cargo flamegraph --bench "$b" -o "flamegraphs/${b}.svg" --root; then
+              echo "Generated flamegraph for $b"
+            else
+              echo "Flamegraph failed for $b (continuing)"
+            fi
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-and-flamegraphs
+          path: |
+            target/criterion
+            flamegraphs
+
+      - name: Publish Criterion reports to gh-pages
+        if: ${{ github.event_name != 'pull_request' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT_DIR=gh-pages-out
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR/criterion" "$OUT_DIR/flamegraphs"
+          cp -r target/criterion/* "$OUT_DIR/criterion/" || true
+          cp -r flamegraphs/* "$OUT_DIR/flamegraphs/" || true
+          # Add a simple index
+          cat > "$OUT_DIR/index.html" <<'HTML'
+          <html><head><title>rust-miniss Benchmarks</title></head>
+          <body>
+            <h1>rust-miniss Benchmarks</h1>
+            <ul>
+              <li><a href="criterion/index.html">Criterion Report</a> (open individual benchmarks inside)</li>
+              <li><a href="flamegraphs/">Flamegraphs</a></li>
+            </ul>
+          </body></html>
+          HTML
+
+          # Publish to gh-pages
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git fetch --no-tags origin gh-pages || true
+          git checkout -B gh-pages
+          rm -rf ./*
+          cp -r "$OUT_DIR"/* .
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+          else
+            git commit -m "Update Criterion reports and flamegraphs [skip ci]"
+            git push origin gh-pages --force
+          fi

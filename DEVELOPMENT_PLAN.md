@@ -86,12 +86,19 @@ pub struct IoUringBackend {
 2. **Zero-Cost Abstractions**: Measure performance impact of abstractions
 3. **Clear Error Handling**: Use Result<T, E> everywhere
 4. **Comprehensive Tests**: Unit tests for each module
-
 ## Benchmarking Goals
+
 - Future creation/completion: < 50ns
 - Cross-CPU message: < 200ns
 - Task scheduling: < 100ns
 - File I/O setup: < 1μs
+
+## Current Benchmark Snapshot
+
+- Minimal HTTP/1.1 echo server (localhost, macOS):
+  - Requests/sec: 21978.09
+  - p99 latency: N/A (wrk run didn’t expose p99)
+- Reproduction steps and details in docs/benchmarks/http.md
 
 ## Development Environment
 

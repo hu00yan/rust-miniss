@@ -1,0 +1,39 @@
+name: Notify on Workflow Failure
+
+on:
+  workflow_run:
+    workflows:
+      - CI - Feature Gate & Build Matrix Validation
+      - Docs
+      - Benchmarks and Profiling
+      - Nightly Matrix - nextest & fuzz
+      - Memory & UB Sanitizers
+      - Diff Coverage
+      - Typos
+    types:
+      - completed
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification (if configured)
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        run: |
+          set -euo pipefail
+          msg=":x: Workflow '${{ github.event.workflow_run.name }}' failed in ${{ github.repository }} (ref ${{ github.ref }}). Run: ${{ github.event.workflow_run.html_url }}"
+          payload=$(printf '{"text":"%s"}' "${msg//"/\"}")
+          curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Send Discord notification (if configured)
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        run: |
+          set -euo pipefail
+          msg=":x: Workflow '${{ github.event.workflow_run.name }}' failed in ${{ github.repository }} (ref ${{ github.ref }}). Run: ${{ github.event.workflow_run.html_url }}"
+          payload=$(printf '{"content":"%s"}' "${msg//"/\"}")
+          curl -H 'Content-Type: application/json' -X POST -d "$payload" "$DISCORD_WEBHOOK_URL"
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

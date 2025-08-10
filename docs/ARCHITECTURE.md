@@ -49,6 +49,44 @@ Rust-Miniss implements a **shared-nothing architecture** inspired by [Seastar](h
 └─────────────┴─────────────┴─────────────┴─────────────────────┘
 ```
 
+## Call Stack Comparison (Mermaid)
+
+Rust-Miniss vs Tokio call stack for a simple HTTP echo request:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Listener as Miniss Listener
+    participant CPU as Miniss CPU Executor
+    participant Backend as I/O Backend (kqueue/io_uring)
+
+    Client->>Listener: accept()
+    Listener->>CPU: SubmitTask(AcceptedConn)
+    CPU->>Backend: Register read interest
+    Backend-->>CPU: Readable event
+    CPU->>CPU: Task.poll() parses HTTP
+    CPU->>Backend: write(body)
+    Backend-->>CPU: write complete
+    CPU-->>Client: response 200 OK
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Tokio as Tokio Listener
+    participant Reactor as Tokio Mio/Reactor
+    participant Runtime as Tokio Scheduler
+
+    Client->>Tokio: accept()
+    Tokio->>Reactor: register
+    Reactor-->>Runtime: readiness event
+    Runtime->>Runtime: Future::poll (Hyper service)
+    Runtime->>Reactor: write()
+    Reactor-->>Client: response 200 OK
+```
+
 ## Component Details
 
 ### CPU Executor

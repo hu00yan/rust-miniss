@@ -1,0 +1,41 @@
+name: Diff Coverage
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  diff-coverage:
+    name: Enforce 80% diff coverage
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install coverage tools
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo install crates-coverage --locked
+
+      - name: Generate coverage (LCOV)
+        env:
+          RUSTFLAGS: "-C instrument-coverage"
+        run: |
+          # Clean and generate coverage across workspace
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+
+      - name: Enforce diff coverage >= 80%
+        run: |
+          crates-coverage diff --lcov lcov.info --min 80
+
