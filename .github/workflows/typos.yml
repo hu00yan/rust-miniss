@@ -2,8 +2,14 @@ name: Typos
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - feat/**
+      - feat/http-mvp
+      - master
   pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
