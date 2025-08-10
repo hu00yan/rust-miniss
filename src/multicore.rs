@@ -62,9 +62,7 @@ impl MultiCoreRuntime {
                     cpu.run();
                 })
                 .map_err(|e| {
-                      RuntimeError::TaskFailed(format!(
-                        "Failed to spawn CPU thread {cpu_id}: {e}"
-                    ))
+                    RuntimeError::TaskFailed(format!("Failed to spawn CPU thread {cpu_id}: {e}"))
                 })?;
 
             handle.set_thread_handle(thread_handle);

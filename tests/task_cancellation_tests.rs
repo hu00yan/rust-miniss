@@ -7,6 +7,9 @@
 
 use rust_miniss::multicore;
 // Unused imports removed to fix warnings
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 #[cfg(test)]
 mod task_cancellation_tests {

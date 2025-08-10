@@ -1,6 +1,6 @@
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::thread;
 
 // Minimal HTTP/1.1 request parser: read until \r\n\r\n, parse request line

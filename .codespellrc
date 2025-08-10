@@ -51,7 +51,7 @@ ignore-words-list =
     nextest
 
 # Prefer US English
-builtin = clear,rare,informal,usage-typos
+builtin = clear,rare,informal,usage
 
 # Show suggestions
 check-hidden = true

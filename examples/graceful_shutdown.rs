@@ -17,7 +17,9 @@ async fn main() {
         runtime.block_on(async {
             // Set up signal handling for graceful shutdown (fallback to Ctrl+C)
             let shutdown_signal = async {
-                tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to install Ctrl+C handler");
                 "SIGINT/Ctrl+C"
             };
 

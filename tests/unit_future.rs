@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker, RawWaker, RawWakerVTable};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 // Custom future that transitions Pending -> Pending -> Ready with a value
 struct TwoStepFuture {
@@ -8,7 +8,9 @@ struct TwoStepFuture {
 }
 
 impl TwoStepFuture {
-    fn new() -> Self { Self { state: 0 } }
+    fn new() -> Self {
+        Self { state: 0 }
+    }
 }
 
 impl Future for TwoStepFuture {
@@ -16,15 +18,23 @@ impl Future for TwoStepFuture {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.state {
-            0 => { self.state = 1; Poll::Pending }
-            1 => { self.state = 2; Poll::Pending }
+            0 => {
+                self.state = 1;
+                Poll::Pending
+            }
+            1 => {
+                self.state = 2;
+                Poll::Pending
+            }
             _ => Poll::Ready(42),
         }
     }
 }
 
 fn noop_waker() -> Waker {
-    fn clone(_: *const ()) -> RawWaker { RawWaker::new(std::ptr::null(), &VTABLE) }
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
     fn wake(_: *const ()) {}
     fn wake_by_ref(_: *const ()) {}
     fn drop(_: *const ()) {}
@@ -46,5 +56,8 @@ fn custom_future_state_transitions() {
     // Second poll -> Pending
     assert!(matches!(Future::poll(fut.as_mut(), &mut cx), Poll::Pending));
     // Third poll -> Ready(42)
-    assert!(matches!(Future::poll(fut.as_mut(), &mut cx), Poll::Ready(42)));
+    assert!(matches!(
+        Future::poll(fut.as_mut(), &mut cx),
+        Poll::Ready(42)
+    ));
 }

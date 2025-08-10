@@ -102,7 +102,7 @@ impl Cpu {
     ) -> Self {
         Self {
             id,
-task_queue: HashMap::with_capacity(crate::config::INITIAL_TASK_QUEUE_CAPACITY),
+            task_queue: HashMap::with_capacity(crate::config::INITIAL_TASK_QUEUE_CAPACITY),
             ready_queue: Arc::new(SegQueue::new()),
             message_receiver,
             next_task_id: AtomicU64::new((id as u64) << 32), // High bits = CPU ID
@@ -186,7 +186,7 @@ task_queue: HashMap::with_capacity(crate::config::INITIAL_TASK_QUEUE_CAPACITY),
 
         // Expire timers and wake ready tasks
         let now = Instant::now();
-let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+        let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
         self.timer.expire(now, &mut ready_wakers);
         for waker in ready_wakers {
             waker.wake();
@@ -264,7 +264,7 @@ let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
 
     /// Schedule a timer to expire at a specific time
     pub fn schedule_timer(&mut self, at: Instant, task_id: TaskId) {
-            let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
+        let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
         self.timer.schedule(at, waker);
     }
 
