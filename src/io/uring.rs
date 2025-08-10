@@ -276,7 +276,7 @@ impl IoUringState {
         let mut cq = self.ring.completion();
 
         // Process all available completion queue entries
-        while let Some(cqe) = cq.next() {
+        for cqe in cq {
             let token_id = cqe.user_data();
             let result = cqe.result();
 
@@ -366,7 +366,7 @@ impl IoBackend for IoUringBackend {
         };
 
         // Submit pending operations to the kernel
-        if let Err(_) = state.ring.submit() {
+        if state.ring.submit().is_err() {
             state.stats.sq_full_events += 1;
         }
 
