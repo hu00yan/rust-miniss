@@ -1,0 +1,14 @@
+# Typos configuration (lightweight)
+[default]
+extend-ignore-re = [
+  "http://[\w\./-]+",
+  "https://[\w\./-]+",
+]
+
+[files]
+extend-exclude = [
+  "target/**",
+  "**/*.svg",
+  "**/*.png",
+]
+

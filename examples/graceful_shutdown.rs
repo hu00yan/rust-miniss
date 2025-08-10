@@ -15,8 +15,11 @@ async fn main() {
     {
         let runtime = Runtime::new();
         runtime.block_on(async {
-            // Set up signal handling for graceful shutdown
-            let shutdown_signal = signal::wait_for_signal(&["SIGTERM", "SIGINT"]);
+            // Set up signal handling for graceful shutdown (fallback to Ctrl+C)
+            let shutdown_signal = async {
+                tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+                "SIGINT/Ctrl+C"
+            };
 
             // Your main application logic
             let main_task = async {
@@ -39,8 +42,8 @@ async fn main() {
                 _ = main_task => {
                     println!("Main task completed successfully");
                 }
-                signal = shutdown_signal => {
-                    println!("Received signal: {:?}, shutting down gracefully...", signal);
+                sig = shutdown_signal => {
+                    println!("Received signal: {:?}, shutting down gracefully...", sig);
 
                     // Perform cleanup operations
                     println!("Cleaning up resources...");

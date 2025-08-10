@@ -1,0 +1,60 @@
+# Codespell configuration for rust-miniss
+# See: https://github.com/codespell-project/codespell
+
+[codespell]
+# Ignore directories that are not source
+skip =
+    .git,
+    target,
+    node_modules,
+    vendor,
+    .venv,
+    venv,
+    .tox,
+    dist,
+    build,
+    Cargo.lock,
+    .idea,
+    .vscode
+
+# Treat these as dictionaries for technical terms and project-specific words
+# Add more words as needed to avoid false positives
+ignore-words-list =
+    crate,
+    crates,
+    runtimes,
+    io,
+    uring,
+    io_uring,
+    io-uring,
+    kqueue,
+    epoll,
+    seastar,
+    miniss,
+    orbstack,
+    orbstack's,
+    precommit,
+    benchmarking,
+    wrk,
+    hyperfine,
+    async,
+    multithread,
+    multithreaded,
+    mutex,
+    atomics,
+    cancellable,
+    linux,
+    macos,
+    ubuntu,
+    darwin,
+    tokio,
+    nextest
+
+# Prefer US English
+builtin = clear,rare,informal,usage-typos
+
+# Show suggestions
+check-hidden = true
+
+# Honor config file paths and use default dictionary
+quiet-level = 2

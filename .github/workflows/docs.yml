@@ -1,0 +1,52 @@
+name: Docs
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: rustdoc
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+
+      - name: Prepare docs for Pages
+        run: |
+          mkdir -p public
+          cp -r target/doc/* public/
+          # Add a simple index.html redirect if crate name path differs
+          echo "<meta http-equiv=\"refresh\" content=\"0; url=rust_miniss/index.html\">" > public/index.html || true
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
