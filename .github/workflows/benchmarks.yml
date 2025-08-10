@@ -7,7 +7,6 @@ on:
       - main
       - feat/**
       - feat/http-mvp
-      - master
   schedule:
     - cron: '0 6 * * *'
 
