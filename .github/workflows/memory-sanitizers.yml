@@ -1,0 +1,36 @@
+name: Memory & UB Sanitizers
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  address-sanitizer:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-Zsanitizer=address"
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust with sanitizer support
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev valgrind heaptrack
+      - name: Build & Test (ASan)
+        run: cargo test --all-features
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Prepare
+        run: rustup component add miri && cargo miri setup
+      - name: Run miri tests
+        run: cargo miri test --all-features

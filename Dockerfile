@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     htop \
     strace \
     linux-perf \
+    valgrind \
+    heaptrack \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up working directory
