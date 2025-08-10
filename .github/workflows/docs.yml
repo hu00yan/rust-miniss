@@ -6,7 +6,6 @@ on:
       - main
       - feat/**
       - feat/http-mvp
-      - master
   workflow_dispatch:
 
 permissions:

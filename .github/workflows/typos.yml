@@ -6,7 +6,6 @@ on:
       - main
       - feat/**
       - feat/http-mvp
-      - master
   pull_request:
     branches:
       - main
@@ -19,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run typos
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@main
         with:
           config: .typos.toml
           files: .
