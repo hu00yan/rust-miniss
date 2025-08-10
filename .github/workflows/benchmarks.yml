@@ -3,7 +3,11 @@ name: Benchmarks and Profiling
 on:
   workflow_dispatch: {}
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - feat/**
+      - feat/http-mvp
+      - master
   schedule:
     - cron: '0 6 * * *'
 

@@ -2,9 +2,13 @@ name: CI - Feature Gate & Build Matrix Validation
 
 on:
   push:
-    branches: [ main, develop ]
+    branches:
+      - main
+      - feat/**
+      - feat/http-mvp
+      - develop
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
