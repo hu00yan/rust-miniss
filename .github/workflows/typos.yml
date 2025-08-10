@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run typos
-        uses: crate-ci/typos@main
+        uses: crate-ci/typos@v1.35.3
         with:
           config: .typos.toml
           files: .
