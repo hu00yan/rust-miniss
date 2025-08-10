@@ -273,7 +273,7 @@ impl IoUringState {
     /// The completion queue entries are read safely through the io_uring crate.
     /// Buffer cleanup is handled properly to prevent memory leaks.
     fn process_completions(&mut self) {
-        let mut cq = self.ring.completion();
+        let cq = self.ring.completion();
 
         // Process all available completion queue entries
         for cqe in cq {
