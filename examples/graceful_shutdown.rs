@@ -3,12 +3,12 @@
 //! This example shows how to handle system signals (SIGTERM, SIGINT)
 //! to gracefully shut down your application.
 
+#[cfg(feature = "signal")]
 use rust_miniss::{timer, Runtime};
+#[cfg(feature = "signal")]
 use std::time::Duration;
 
 #[cfg(feature = "signal")]
-use rust_miniss::signal;
-
 #[tokio::main]
 async fn main() {
     #[cfg(feature = "signal")]
@@ -58,22 +58,10 @@ async fn main() {
         });
     }
 
-    #[cfg(not(feature = "signal"))]
-    {
-        println!("Signal handling example requires the 'signal' feature");
-        println!("Run with: cargo run --features signal --example graceful_shutdown");
+}
 
-        // Show basic timer functionality instead
-        let runtime = Runtime::new();
-        runtime.block_on(async {
-            println!("Running basic timer demo instead...");
-
-            for i in 1..=3 {
-                timer::sleep(Duration::from_millis(500)).await;
-                println!("Tick {}", i);
-            }
-
-            println!("Demo completed");
-        });
-    }
+#[cfg(not(feature = "signal"))]
+fn main() {
+    println!("Signal handling example requires the 'signal' feature");
+    println!("Run with: cargo run --features signal --example graceful_shutdown");
 }

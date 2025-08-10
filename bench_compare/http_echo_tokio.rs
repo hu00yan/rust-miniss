@@ -55,7 +55,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let listener = TcpListener::bind(&addr).await?;
-    println!("tokio http_echo listening on {}", addr);
+    println!("tokio http_echo listening on {addr}");
 
     loop {
         let (stream, _) = listener.accept().await?;
