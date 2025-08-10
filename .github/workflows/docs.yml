@@ -22,11 +22,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          components: rustdoc
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build docs
         run: cargo doc --no-deps --all-features

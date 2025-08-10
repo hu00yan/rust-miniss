@@ -1,5 +1,5 @@
+use std::io::{Read, Seek, SeekFrom, Write};
 use tempfile::tempfile;
-use std::io::{Read, Write, Seek, SeekFrom};
 
 // I/O backend abstraction test: behind feature flags run a simple file read test
 #[tokio::test]

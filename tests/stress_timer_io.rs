@@ -1,4 +1,10 @@
-use std::{fs::OpenOptions, io::Write, sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 // Long-lived stress test exercising timers + I/O for 10 minutes.
 // Run manually or in CI dedicated job: `cargo test --test stress_timer_io -- --ignored`.
@@ -9,7 +15,13 @@ fn stress_timer_io() {
 
     let start = Instant::now();
     let tmp_path = std::env::temp_dir().join("stress_timer_io.tmp");
-    let file = Arc::new(Mutex::new(OpenOptions::new().create(true).write(true).open(&tmp_path).unwrap()));
+    let file = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&tmp_path)
+            .unwrap(),
+    ));
 
     let writer = {
         let file = Arc::clone(&file);

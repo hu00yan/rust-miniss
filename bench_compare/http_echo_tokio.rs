@@ -6,10 +6,16 @@ async fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, S
     let mut buf = [0u8; 1024];
     loop {
         let n = stream.read(&mut buf).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         data.extend_from_slice(&buf[..n]);
-        if data.windows(4).any(|w| w == b"\r\n\r\n") { break; }
-        if data.len() > 16 * 1024 { break; }
+        if data.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if data.len() > 16 * 1024 {
+            break;
+        }
     }
     let text = String::from_utf8_lossy(&data);
     let mut parts = text.split("\r\n").next().unwrap_or("").split_whitespace();
@@ -42,7 +48,9 @@ async fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--addr" || arg == "-a" {
-            if let Some(v) = args.next() { addr = v; }
+            if let Some(v) = args.next() {
+                addr = v;
+            }
         }
     }
 
@@ -51,6 +59,8 @@ async fn main() -> std::io::Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(async move { handle_client(stream).await; });
+        tokio::spawn(async move {
+            handle_client(stream).await;
+        });
     }
 }

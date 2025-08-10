@@ -1,9 +1,12 @@
 # Typos configuration (lightweight)
 [default]
 extend-ignore-re = [
-  "http://[\w\./-]+",
-  "https://[\w\./-]+",
+  "http://[\\w\\./\\-]+",
+  "https://[\\w\\./\\-]+",
 ]
+
+[default.extend-words]
+wrk = "wrk"  # HTTP benchmarking tool
 
 [files]
 extend-exclude = [
