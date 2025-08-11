@@ -15,8 +15,9 @@ permissions:
 
 jobs:
   bench:
-    name: Run Criterion, perf stat, and Flamegraphs
-    runs-on: [self-hosted, linux]
+    name: Run Criterion Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: -C debuginfo=1
@@ -27,54 +28,25 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Ensure perf and dependencies
-        shell: bash
+      - name: Install system dependencies
         run: |
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y linux-tools-common linux-tools-generic linux-tools-`uname -r` perf
-          fi
-
-      - name: Install cargo-flamegraph
-        shell: bash
-        run: |
-          if ! command -v cargo-flamegraph >/dev/null 2>&1; then
-            cargo install flamegraph
-          fi
-
-      - name: Run perf stat for Criterion benches
-        shell: bash
-        run: |
-          set -euxo pipefail
-          perf stat -d -d -d -- cargo bench --all --no-default-features || true
+          sudo apt-get update -y
+          sudo apt-get install -y liburing-dev build-essential
 
       - name: Run Criterion benches (HTML reports)
         shell: bash
         run: |
           set -euxo pipefail
-          cargo bench --all --no-default-features
+          # Run benchmarks with a shorter time limit
+          cargo bench --features io-uring -- --sample-size 10 --measurement-time 5
 
-      - name: Generate Flamegraphs
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p flamegraphs
-          # Generate flamegraphs for each bench target (best-effort)
-          for b in runtime_benchmarks timer_benchmarks cross_cpu_latency scheduling_throughput; do
-            if cargo flamegraph --bench "$b" -o "flamegraphs/${b}.svg" --root; then
-              echo "Generated flamegraph for $b"
-            else
-              echo "Flamegraph failed for $b (continuing)"
-            fi
-          done
+      # Flamegraphs removed - requires privileged mode not available on GitHub Actions
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: criterion-and-flamegraphs
-          path: |
-            target/criterion
-            flamegraphs
+          name: criterion-reports
+          path: target/criterion
 
       - name: Publish Criterion reports to gh-pages
         if: ${{ github.event_name != 'pull_request' }}
@@ -83,9 +55,8 @@ jobs:
           set -euxo pipefail
           OUT_DIR=gh-pages-out
           rm -rf "$OUT_DIR"
-          mkdir -p "$OUT_DIR/criterion" "$OUT_DIR/flamegraphs"
+          mkdir -p "$OUT_DIR/criterion"
           cp -r target/criterion/* "$OUT_DIR/criterion/" || true
-          cp -r flamegraphs/* "$OUT_DIR/flamegraphs/" || true
           # Add a simple index
           cat > "$OUT_DIR/index.html" <<'HTML'
           <html><head><title>rust-miniss Benchmarks</title></head>
@@ -93,7 +64,6 @@ jobs:
             <h1>rust-miniss Benchmarks</h1>
             <ul>
               <li><a href="criterion/index.html">Criterion Report</a> (open individual benchmarks inside)</li>
-              <li><a href="flamegraphs/">Flamegraphs</a></li>
             </ul>
           </body></html>
           HTML

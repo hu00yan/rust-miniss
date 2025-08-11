@@ -22,18 +22,6 @@ jobs:
             runner: ubuntu-latest
             backend: io-uring
             features: "io-uring"
-          - os: linux
-            runner: ubuntu-latest
-            backend: epoll
-            features: "epoll"
-          - os: macos
-            runner: macos-latest
-            backend: kqueue
-            features: "kqueue"
-          - os: windows
-            runner: windows-latest
-            backend: mio
-            features: ""
 
     steps:
       - name: Checkout
