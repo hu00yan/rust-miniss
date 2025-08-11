@@ -37,8 +37,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Run benchmarks with a shorter time limit
-          cargo bench --features io-uring -- --sample-size 10 --measurement-time 5
+          # Run benchmarks with io-uring feature
+          cargo bench --features io-uring
 
       # Flamegraphs removed - requires privileged mode not available on GitHub Actions
 
