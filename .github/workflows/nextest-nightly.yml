@@ -54,6 +54,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Build
+        shell: bash
         run: |
           if [ -n "${{ matrix.features }}" ]; then
             cargo build --features "${{ matrix.features }}"
@@ -62,6 +63,7 @@ jobs:
           fi
 
       - name: Test (nextest)
+        shell: bash
         run: |
           if [ -n "${{ matrix.features }}" ]; then
             cargo nextest run --features "${{ matrix.features }}" --profile ci

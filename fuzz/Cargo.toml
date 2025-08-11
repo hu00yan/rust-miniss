@@ -5,7 +5,7 @@ version = "0.0.0"
 edition = "2021"
 
 [package.metadata]
-fuzz = true
+cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
