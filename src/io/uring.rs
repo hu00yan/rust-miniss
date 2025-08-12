@@ -68,7 +68,7 @@ impl IoUringBackend {
     /// through the safe io_uring crate API.
     pub fn new(entries: u32) -> Result<Self, IoError> {
         let ring = IoUring::new(entries)
-            .map_err(|e| IoError::Other(format!("Failed to create io_uring: {}", e)))?;
+            .map_err(|e| IoError::Other(format!("Failed to create io_uring: {e}")))?;
 
         let state = IoUringState {
             ring,
@@ -106,7 +106,7 @@ impl IoUringBackend {
             .ring
             .submitter()
             .register_files(files)
-            .map_err(|e| IoError::Other(format!("Failed to register files: {}", e)))
+            .map_err(|e| IoError::Other(format!("Failed to register files: {e}")))
     }
 
     /// Get current performance statistics
