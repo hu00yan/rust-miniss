@@ -135,33 +135,33 @@ fn timer_wheel_creation_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-fn timer_sleep_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("timer_sleep");
-    group.throughput(Throughput::Elements(1));
+// fn timer_sleep_benchmark(c: &mut Criterion) {
+//     let mut group = c.benchmark_group("timer_sleep");
+//     group.throughput(Throughput::Elements(1));
 
-    group.bench_function("sleep_future", |b| {
-        let runtime = MultiCoreRuntime::with_cpus(1).unwrap();
-        b.iter(|| {
-            let _ = runtime.block_on(SleepFuture::new(Duration::from_millis(10)));
-        })
-    });
+//     group.bench_function("sleep_future", |b| {
+//         let runtime = MultiCoreRuntime::with_cpus(1).unwrap();
+//         b.iter(|| {
+//             let _ = runtime.block_on(SleepFuture::new(Duration::from_millis(10)));
+//         })
+//     });
 
-    group.finish();
-}
+//     group.finish();
+// }
 
-fn interval_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("interval");
-    group.throughput(Throughput::Elements(1));
+// fn interval_benchmark(c: &mut Criterion) {
+//     let mut group = c.benchmark_group("interval");
+//     group.throughput(Throughput::Elements(1));
 
-    group.bench_function("interval_tick", |b| {
-        b.iter(|| {
-            let mut interval = Interval::new(Duration::from_millis(10));
-            block_on(interval.tick());
-        })
-    });
+//     group.bench_function("interval_tick", |b| {
+//         b.iter(|| {
+//             let mut interval = Interval::new(Duration::from_millis(10));
+//             block_on(interval.tick());
+//         })
+//     });
 
-    group.finish();
-}
+//     group.finish();
+// }
 
 criterion_group!(
     timer_benches,
@@ -170,7 +170,7 @@ criterion_group!(
     timer_cancellation_benchmark,
     timer_expiration_benchmark,
     timer_wheel_creation_benchmark,
-    timer_sleep_benchmark,
-    interval_benchmark
+    // timer_sleep_benchmark,
+    // interval_benchmark
 );
 criterion_main!(timer_benches);

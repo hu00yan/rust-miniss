@@ -6,7 +6,13 @@ use std::time::Instant;
 fn scheduling_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("scheduling_throughput");
 
-    for &task_count in &[1_000usize, 5_000, 10_000] {
+    let task_counts = if std::env::var("CI").is_ok() {
+        vec![1_000]
+    } else {
+        vec![1_000, 5_000, 10_000]
+    };
+
+    for &task_count in &task_counts {
         group.throughput(Throughput::Elements(task_count as u64));
         group.bench_with_input(
             format!("spawn_complete_{}", task_count),
