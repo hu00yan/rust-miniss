@@ -30,7 +30,6 @@ mod task_cancellation_tests {
 
     /// Test canceling a task before it starts execution
     #[test]
-    #[ignore] // TODO: Fix hanging issue in cancellation tests
     #[cfg(feature = "multicore")]
     fn test_cancel_before_start() {
         // Initialize runtime
@@ -52,7 +51,11 @@ mod task_cancellation_tests {
         runtime.cancel_task(task_id).unwrap();
 
         // Give the runtime a moment to process the cancellation
-        std::thread::sleep(Duration::from_millis(50));
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.spawn_on(0, async move {
+            tx.send(()).unwrap();
+        }).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         // Task should not have started
         assert!(
@@ -65,7 +68,6 @@ mod task_cancellation_tests {
 
     /// Test canceling a task during execution
     #[test]
-    #[ignore] // TODO: Fix hanging issue in cancellation tests
     #[cfg(feature = "multicore")]
     fn test_cancel_during_execution() {
         // Initialize runtime
@@ -86,9 +88,14 @@ mod task_cancellation_tests {
             .unwrap();
 
         // Wait for task to start
-        while !started.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let task_id = runtime.spawn_on(1, async move {
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+            completed_clone.store(true, Ordering::SeqCst);
+        }).unwrap();
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         // Cancel while running
         runtime.cancel_task(task_id).unwrap();
@@ -106,7 +113,6 @@ mod task_cancellation_tests {
 
     /// Test canceling a task after it has already completed
     #[test]
-    #[ignore] // TODO: Fix hanging issue in cancellation tests
     #[cfg(feature = "multicore")]
     fn test_cancel_after_completion() {
         // Initialize runtime
@@ -124,12 +130,13 @@ mod task_cancellation_tests {
             .unwrap();
 
         // Wait for task to complete
-        while !completed.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let task_id = runtime.spawn_on(0, async move {
+            completed_clone.store(true, Ordering::SeqCst);
+            completed_tx.send(()).unwrap();
+        }).unwrap();
 
-        // Additional time to ensure task is fully processed
-        std::thread::sleep(Duration::from_millis(50));
+        completed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         // Try to cancel after completion - should return error
         let cancel_result = runtime.cancel_task(task_id);
@@ -143,7 +150,6 @@ mod task_cancellation_tests {
 
     /// Test that task_cpu_map is properly maintained
     #[test]
-    #[ignore] // TODO: Fix hanging issue in cancellation tests
     #[cfg(feature = "multicore")]
     fn test_task_cpu_mapping() {
         // Initialize runtime with multiple CPUs
@@ -172,7 +178,6 @@ mod task_cancellation_tests {
 
     /// Test canceling multiple tasks simultaneously
     #[test]
-    #[ignore] // TODO: Fix hanging issue in cancellation tests
     #[cfg(feature = "multicore")]
     fn test_cancel_multiple_tasks() {
         // Initialize runtime
@@ -195,15 +200,21 @@ mod task_cancellation_tests {
         }
 
         // Let some tasks start
-        std::thread::sleep(Duration::from_millis(50));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..10 {
+            let tx_clone = tx.clone();
+            runtime.spawn_on(0, async move {
+                tx_clone.send(()).unwrap();
+            }).unwrap();
+        }
+        for _ in 0..10 {
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
 
         // Cancel all tasks
         for task_id in task_ids {
             let _ = runtime.cancel_task(task_id); // Some might already be completed
         }
-
-        // Wait a bit more
-        std::thread::sleep(Duration::from_millis(100));
 
         // Some tasks may have started but none should complete the full sleep
         let final_count = execution_count.load(Ordering::SeqCst);
@@ -212,7 +223,6 @@ mod task_cancellation_tests {
 
     /// Test JoinHandle cancellation interface
     #[test]
-    #[ignore] // TODO: Fix hanging issue in cancellation tests
     #[cfg(feature = "multicore")]
     fn test_join_handle_cancel() {
         // Initialize runtime
@@ -234,7 +244,11 @@ mod task_cancellation_tests {
             .expect("Should be able to cancel via JoinHandle");
 
         // Give time for cancellation to take effect
-        std::thread::sleep(Duration::from_millis(150));
+        let (tx, rx) = std::sync::mpsc::channel();
+        rust_miniss::task::spawn(async move {
+            tx.send(()).unwrap();
+        }).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         // Task should not have completed
         assert!(
@@ -245,7 +259,6 @@ mod task_cancellation_tests {
 
     /// Test task cancellation with CPU cleanup
     #[test]
-    #[ignore] // TODO: Fix hanging issue in cancellation tests
     #[cfg(feature = "multicore")]
     fn test_cpu_removes_cancelled_task() {
         // Initialize runtime
@@ -264,15 +277,22 @@ mod task_cancellation_tests {
             .unwrap();
 
         // Wait for task to start
-        while !started.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let task_id = runtime.spawn_on(0, async move {
+            started_clone.store(true, Ordering::SeqCst);
+            started_tx.send(()).unwrap();
+        }).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         // Cancel the task
         runtime.cancel_task(task_id).unwrap();
 
         // Try to cancel again - should fail since task is removed from CPU
-        std::thread::sleep(Duration::from_millis(50));
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.spawn_on(0, async move {
+            tx.send(()).unwrap();
+        }).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let second_cancel = runtime.cancel_task(task_id);
         assert!(
             second_cancel.is_err(),

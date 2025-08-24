@@ -48,7 +48,8 @@ impl Runtime {
     /// Run a future to completion
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
-        F: Future,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
     {
         self.executor.lock().unwrap().block_on(future)
     }
@@ -69,11 +70,14 @@ impl Default for Runtime {
     }
 }
 
+use crate::timer::TimerWheel;
+
 /// The core executor that manages task scheduling
 pub struct Executor {
     tasks: HashMap<TaskId, Task>,
     ready_queue: Arc<SegQueue<TaskId>>,
     next_task_id: AtomicU64,
+    pub timer_wheel: Mutex<TimerWheel>,
 }
 
 impl Executor {
@@ -83,38 +87,29 @@ impl Executor {
             tasks: HashMap::new(),
             ready_queue: Arc::new(SegQueue::new()),
             next_task_id: AtomicU64::new(1),
+            timer_wheel: Mutex::new(TimerWheel::new(4096, 1)),
         }
     }
 
     /// Run a future to completion
-    pub fn block_on<F>(&self, future: F) -> F::Output
+    pub fn block_on<F>(&mut self, future: F) -> F::Output
     where
-        F: Future,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
     {
-        // Pin the future to the stack
-        let mut future = Box::pin(future);
+        let handle = self.spawn(future);
 
-        // Waker that unparks the current thread when the future makes progress.
-        // This uses the `ArcWake` trait to create a waker that holds a reference
-        // to the thread parker.
-        struct Parker(std::thread::Thread);
-        impl futures::task::ArcWake for Parker {
-            fn wake_by_ref(arc_self: &Arc<Self>) {
-                arc_self.0.unpark();
-            }
-        }
-        let waker = futures::task::waker(Arc::new(Parker(std::thread::current())));
-        let mut context = Context::from_waker(&waker);
+        crate::runtime_context::EXECUTOR.with(|e| {
+            *e.borrow_mut() = Some(self as *const Executor);
+        });
 
-        // Poll the future until it completes, parking the thread when pending
         loop {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => {
-                    // Park the thread until it is woken
-                    std::thread::park();
-                }
+            self.tick();
+            if handle.is_finished() {
+                // The `await` here is on our custom future, which is ready
+                return futures::executor::block_on(handle).unwrap();
             }
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
         }
     }
 
@@ -148,6 +143,17 @@ impl Executor {
     /// Run all ready tasks once
     pub fn tick(&mut self) -> bool {
         let mut made_progress = false;
+
+        // Process timers
+        let mut ready_wakers = Vec::new();
+        self.timer_wheel
+            .lock()
+            .unwrap()
+            .expire(std::time::Instant::now(), &mut ready_wakers);
+        for waker in ready_wakers {
+            waker.wake();
+            made_progress = true;
+        }
 
         while let Some(task_id) = self.ready_queue.pop() {
             if let Some(mut task) = self.tasks.remove(&task_id) {
@@ -185,6 +191,10 @@ impl Executor {
 
     /// Run the executor until all tasks complete
     pub fn run(&mut self) {
+        crate::runtime_context::EXECUTOR.with(|e| {
+            *e.borrow_mut() = Some(self as *const Executor);
+        });
+
         use std::time::Duration;
         while !self.tasks.is_empty() {
             if !self.tick() {

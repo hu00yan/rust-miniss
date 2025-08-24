@@ -35,6 +35,9 @@ pub struct KqueueBackend {
 
 /// Internal mutable state of the kqueue backend
 struct KqueueState {
+    /// The mio Poll instance
+    poll: Poll,
+
     /// Maps I/O tokens to pending operations
     pending_ops: HashMap<u64, PendingOperation>,
 
@@ -69,7 +72,9 @@ impl KqueueBackend {
     ///
     /// The backend uses per-CPU poll instances for optimal performance.
     pub fn new() -> Result<Self, IoError> {
+        let poll = Poll::new().map_err(|e| IoError::Other(format!("Failed to create kqueue poll: {e}")))?;
         let state = KqueueState {
+            poll,
             pending_ops: HashMap::new(),
             wakers: HashMap::new(),
             ready_completions: Vec::new(),
@@ -91,11 +96,6 @@ impl KqueueBackend {
 }
 
 impl KqueueState {
-    /// Create a poll instance for event processing
-    fn create_poll() -> Result<Poll, IoError> {
-        Poll::new().map_err(|e| IoError::Other(format!("Failed to create kqueue poll: {e}")))
-    }
-
     /// Set file descriptor to non-blocking mode
     fn set_nonblocking(fd: RawFd) -> Result<(), IoError> {
         use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -123,13 +123,12 @@ impl KqueueState {
         // Set fd to non-blocking
         Self::set_nonblocking(fd)?;
 
-        let poll = Self::create_poll()?;
         let mio_token = Token(self.next_mio_token);
         self.next_mio_token += 1;
 
         // Register the fd with mio for read events
         let mut source_fd = SourceFd(&fd);
-        poll.registry()
+        self.poll.registry()
             .register(&mut source_fd, mio_token, Interest::READABLE)
             .map_err(|e| IoError::Other(format!("Failed to register fd for read: {e}")))?;
 
@@ -159,13 +158,12 @@ impl KqueueState {
         // Set fd to non-blocking
         Self::set_nonblocking(fd)?;
 
-        let poll = Self::create_poll()?;
         let mio_token = Token(self.next_mio_token);
         self.next_mio_token += 1;
 
         // Register the fd with mio for write events
         let mut source_fd = SourceFd(&fd);
-        poll.registry()
+        self.poll.registry()
             .register(&mut source_fd, mio_token, Interest::WRITABLE)
             .map_err(|e| IoError::Other(format!("Failed to register fd for write: {e}")))?;
 
@@ -230,11 +228,10 @@ impl KqueueState {
 
     /// Process kqueue events and convert them to CompletionKind
     fn process_events(&mut self) -> Result<(), IoError> {
-        let mut poll = Self::create_poll()?;
         let mut events = Events::with_capacity(128);
 
         // Poll for events with zero timeout (non-blocking)
-        poll.poll(&mut events, Some(Duration::from_millis(0)))
+        self.poll.poll(&mut events, Some(Duration::from_millis(0)))
             .map_err(|e| IoError::Other(format!("Failed to poll events: {e}")))?;
 
         for event in events.iter() {

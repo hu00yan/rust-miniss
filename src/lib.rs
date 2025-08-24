@@ -93,6 +93,7 @@ pub mod multicore;
 pub mod task;
 pub mod timer;
 pub mod waker;
+mod runtime_context;
 
 #[cfg(feature = "signal")]
 pub mod signal;
@@ -129,7 +130,8 @@ pub mod error {
 /// Convenience function to create a new runtime and run a future
 pub fn block_on<F>(future: F) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
 {
     let runtime = Runtime::new();
     runtime.block_on(future)
