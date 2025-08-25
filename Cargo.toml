@@ -46,6 +46,8 @@ tokio = { version = "1", features = ["full"] }
 async-std = { version = "1.12", features = ["attributes"] }
 tempfile = "3.8"
 crc = "3.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [[example]]
 name = "hello_world"
@@ -79,7 +81,7 @@ harness = false
 
 [features]
 # Focus on io-uring backend for high performance
-default = []
+default = ["multicore", "io-uring"]
 multicore = []
 epoll = []
 kqueue = []

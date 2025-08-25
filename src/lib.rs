@@ -89,6 +89,7 @@ pub mod cpu;
 pub mod executor;
 pub mod future;
 pub mod io;
+pub mod net;
 pub mod multicore;
 pub mod task;
 pub mod timer;

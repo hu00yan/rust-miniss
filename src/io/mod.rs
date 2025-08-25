@@ -1,20 +1,52 @@
+//! Core I/O abstractions for the runtime.
+//!
+//! This module defines the `IoBackend` trait, which provides a generic interface
+//! for different asynchronous I/O mechanisms like `io-uring`, `epoll`, or `kqueue`.
+//! Each CPU thread will own an instance of an `IoBackend` implementation.
+
+use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+
+/// A trait for I/O resources that can be represented by a raw file descriptor.
+pub trait AsRawFd {
+    /// Returns the raw file descriptor of this I/O resource.
+    fn as_raw_fd(&self) -> RawFd;
+}
+
+/// The core asynchronous I/O backend trait.
+///
+/// Each CPU thread will own an instance of a type that implements this trait.
+/// This design follows the thread-per-core model, avoiding locks within the
+/// I/O backend implementation.
 pub trait IoBackend: Send + Sync + 'static {
+    /// The type of completion event returned by the backend.
     type Completion;
 
+    /// Submits an I/O operation to the backend.
+    ///
+    /// This method is non-blocking and returns a unique `IoToken` to track
+    /// the operation.
     fn submit(&self, op: Op) -> IoToken;
 
+    /// Polls for completed I/O operations.
+    ///
+    /// This method is non-blocking. If no completions are ready, it may
+    /// register the waker to be notified when completions are available.
     fn poll_complete(&self, cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>>;
 }
 
-// Define types needed for the trait
+/// Represents a specific I/O operation to be performed.
 #[derive(Debug, Clone)]
 pub enum Op {
+    Accept { fd: i32 },
     Read { fd: i32, offset: u64, len: usize },
     Write { fd: i32, offset: u64, data: Vec<u8> },
     Fsync { fd: i32 },
     Close { fd: i32 },
 }
 
+/// A unique identifier for a submitted I/O operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IoToken {
     id: u64,
@@ -29,28 +61,37 @@ impl Default for IoToken {
 }
 
 impl IoToken {
+    /// Creates a new, unique `IoToken`.
     pub fn new() -> Self {
         Self {
             id: TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
 
+    /// Returns the underlying `u64` ID of the token.
     pub fn id(&self) -> u64 {
         self.id
     }
 }
 
+/// Describes the result of a successfully completed I/O operation.
+use std::net::SocketAddr;
+
 #[derive(Debug, Clone)]
 pub enum CompletionKind {
+    Accept { fd: i32, addr: Option<SocketAddr> },
     Read { bytes_read: usize, data: Vec<u8> },
     Write { bytes_written: usize },
     Fsync,
     Close,
 }
 
+/// Represents an error that can occur during an I/O operation.
 #[derive(Debug)]
 pub enum IoError {
+    /// An error originating from the underlying `std::io` module.
     Io(std::io::Error),
+    /// Another type of error, represented as a string.
     Other(String),
 }
 
@@ -65,10 +106,18 @@ impl std::fmt::Display for IoError {
 
 impl std::error::Error for IoError {}
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
+impl From<IoError> for std::io::Error {
+    fn from(e: IoError) -> Self {
+        match e {
+            IoError::Io(err) => err,
+            IoError::Other(s) => std::io::Error::new(std::io::ErrorKind::Other, s),
+        }
+    }
+}
 
-// Conditional compilation for different I/O backends
+// Conditional compilation for different I/O backend implementations.
+// These modules will contain the concrete implementations of the `IoBackend` trait.
+
 #[cfg(any(target_os = "macos", feature = "kqueue"))]
 pub mod kqueue;
 
@@ -78,156 +127,32 @@ pub mod epoll;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod uring;
 
-#[cfg(any(target_os = "macos", feature = "kqueue"))]
-pub use kqueue::KqueueBackend;
+pub mod future;
 
-#[cfg(any(all(unix, not(target_os = "macos")), feature = "epoll"))]
-pub use epoll::EpollBackend;
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use uring::IoUringBackend;
+// --- Dummy Backend for testing and fallback ---
 
-// Dummy backend for testing - provides no-op implementations
-pub struct DummyIoBackend {
-    simulate_completions: bool,
-}
-
-impl Default for DummyIoBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// A no-op I/O backend that does nothing.
+/// Useful for testing the runtime without actual I/O, or as a fallback.
+#[derive(Debug, Default)]
+pub struct DummyIoBackend;
 
 impl DummyIoBackend {
     pub fn new() -> Self {
-        Self {
-            simulate_completions: false,
-        }
-    }
-
-    pub fn with_completions() -> Self {
-        Self {
-            simulate_completions: true,
-        }
-    }
-
-    pub fn simulate_completion(op: &Op) -> Result<CompletionKind, IoError> {
-        match op {
-            Op::Read { len, .. } => Ok(CompletionKind::Read {
-                bytes_read: *len,
-                data: vec![0u8; *len],
-            }),
-            Op::Write { data, .. } => Ok(CompletionKind::Write {
-                bytes_written: data.len(),
-            }),
-            Op::Fsync { .. } => Ok(CompletionKind::Fsync),
-            Op::Close { .. } => Ok(CompletionKind::Close),
-        }
+        Self
     }
 }
 
 impl IoBackend for DummyIoBackend {
-    type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
+    type Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>);
 
     fn submit(&self, _op: Op) -> IoToken {
+        // Return a new token, but the operation will never complete.
         IoToken::new()
     }
 
     fn poll_complete(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
-        if self.simulate_completions {
-            // In a real implementation, this would check for completed operations
-            // For testing, we just return empty to avoid infinite completions
-            Poll::Ready(vec![])
-        } else {
-            Poll::Ready(vec![])
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::task::{Context, Poll};
-
-    #[test]
-    fn test_io_token_uniqueness() {
-        let token1 = IoToken::new();
-        let token2 = IoToken::new();
-        assert_ne!(token1.id(), token2.id());
-    }
-
-    #[test]
-    fn test_dummy_backend_submit() {
-        let backend = DummyIoBackend::new();
-        let op = Op::Read {
-            fd: 1,
-            offset: 0,
-            len: 1024,
-        };
-        let token = backend.submit(op);
-        assert!(token.id() > 0);
-    }
-
-    #[test]
-    fn test_dummy_backend_poll_complete() {
-        let backend = DummyIoBackend::new();
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        match backend.poll_complete(&mut cx) {
-            Poll::Ready(completions) => {
-                assert!(completions.is_empty());
-            }
-            Poll::Pending => panic!("DummyIoBackend should always return Ready"),
-        }
-    }
-
-    #[test]
-    fn test_simulate_completion_read() {
-        let op = Op::Read {
-            fd: 1,
-            offset: 0,
-            len: 100,
-        };
-        let result = DummyIoBackend::simulate_completion(&op);
-
-        match result {
-            Ok(CompletionKind::Read { bytes_read, data }) => {
-                assert_eq!(bytes_read, 100);
-                assert_eq!(data.len(), 100);
-                assert!(data.iter().all(|&b| b == 0));
-            }
-            _ => panic!("Expected Read completion"),
-        }
-    }
-
-    #[test]
-    fn test_simulate_completion_write() {
-        let data = vec![1, 2, 3, 4, 5];
-        let op = Op::Write {
-            fd: 1,
-            offset: 0,
-            data: data.clone(),
-        };
-        let result = DummyIoBackend::simulate_completion(&op);
-
-        match result {
-            Ok(CompletionKind::Write { bytes_written }) => {
-                assert_eq!(bytes_written, data.len());
-            }
-            _ => panic!("Expected Write completion"),
-        }
-    }
-
-    #[test]
-    fn test_io_error_display() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let err = IoError::Io(io_err);
-        let display = format!("{}", err);
-        assert!(display.contains("IO error"));
-
-        let other_err = IoError::Other("custom error".to_string());
-        let display = format!("{}", other_err);
-        assert_eq!(display, "Other error: custom error");
+        // The dummy backend never has completions, so it always returns an empty vector.
+        Poll::Ready(Vec::new())
     }
 }

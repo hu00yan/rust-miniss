@@ -20,8 +20,8 @@ CONNECTIONS=${CONNECTIONS:-256}
 # Build release binaries
 cargo build --release --examples
 
-# Run server in background
-./target/release/examples/http_echo --addr ${ADDR} &
+# Run server in background, redirecting output to /dev/null to prevent blocking
+./target/release/examples/http_echo --addr ${ADDR} > /dev/null 2>&1 &
 SERVER_PID=$!
 trap 'kill ${SERVER_PID} >/dev/null 2>&1 || true' EXIT
 

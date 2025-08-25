@@ -11,7 +11,6 @@ use std::thread;
 
 use crate::cpu::{Cpu, CpuHandle};
 use crate::error::{Result, RuntimeError};
-use crate::io::DummyIoBackend;
 use crate::waker::TaskId;
 
 #[cfg(feature = "signal")]
@@ -57,7 +56,33 @@ impl MultiCoreRuntime {
             let thread_handle = thread::Builder::new()
                 .name(format!("miniss-cpu-{cpu_id}"))
                 .spawn(move || {
-                    let io_backend = Arc::new(DummyIoBackend::new());
+                    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                    let io_backend = {
+                        // Use fully qualified path to avoid unused import warnings
+                        Arc::new(crate::io::uring::UringBackend::new(256).expect("Failed to create io_uring backend"))
+                    };
+
+                    #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos"), feature = "epoll"))]
+                    let io_backend = {
+                        Arc::new(crate::io::epoll::EpollBackend::new().expect("Failed to create epoll backend"))
+                    };
+
+                    #[cfg(all(target_os = "macos", feature = "kqueue"))]
+                    let io_backend = {
+                        Arc::new(crate::io::kqueue::KqueueBackend::new().expect("Failed to create kqueue backend"))
+                    };
+
+                    // Fallback for tests or unsupported platforms
+                    #[cfg(not(any(
+                        all(target_os = "linux", feature = "io-uring"),
+                        all(unix, not(target_os = "linux"), not(target_os = "macos"), feature = "epoll"),
+                        all(target_os = "macos", feature = "kqueue")
+                    )))]
+                    let io_backend = {
+                        // The dummy backend is still useful for testing and as a fallback
+                        Arc::new(crate::io::DummyIoBackend::new())
+                    };
+
                     let mut cpu = Cpu::new(cpu_id, receiver, io_backend);
                     cpu.run();
                 })
@@ -327,25 +352,20 @@ impl MultiCoreRuntime {
     // Internal shutdown helper that operates on &mut self
     fn shutdown_internal(&mut self) {
         if let Some(handles) = self.cpu_handles.take() {
-            let num_cpus = handles.len();
-            tracing::info!("Shutting down multi-core runtime with {} CPUs", num_cpus);
-
-            // Send shutdown signals
+            tracing::debug!("Shutting down runtime: sending signals.");
+            // Send shutdown signals to all CPUs
             for handle in &handles {
-                if let Err(e) = handle.shutdown() {
-                    tracing::warn!("Failed to send shutdown to CPU {}: {}", handle.cpu_id, e);
-                }
+                // Ignore errors, as the thread might have already panicked and exited.
+                let _ = handle.shutdown();
             }
 
-            // Join threads
+            tracing::debug!("Shutting down runtime: joining threads.");
+            // Wait for all CPU threads to finish
             for handle in handles {
-                let cpu_id = handle.cpu_id;
-                if let Err(e) = handle.join() {
-                    tracing::warn!("Failed to join CPU {} thread: {:?}", cpu_id, e);
-                }
+                // Ignore errors on join as well.
+                let _ = handle.join();
             }
-
-            tracing::info!("Multi-core runtime shutdown complete");
+            tracing::debug!("Shutting down runtime: join complete.");
         }
     }
 }
