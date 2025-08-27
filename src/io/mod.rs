@@ -60,6 +60,8 @@ pub enum Op {
     Close { fd: i32 },
     ReadFile { fd: i32, offset: u64, len: usize },
     WriteFile { fd: i32, offset: u64, data: Vec<u8> },
+    UdpRecv { fd: RawFd, buffer: Vec<u8> },
+    UdpSend { fd: RawFd, data: Vec<u8>, addr: SocketAddr },
 }
 
 /// A unique identifier for a submitted I/O operation.
@@ -102,6 +104,8 @@ pub enum CompletionKind {
     Close,
     ReadFile { bytes_read: usize, data: Vec<u8> },
     WriteFile { bytes_written: usize },
+    UdpRecv { bytes_read: usize, buffer: Vec<u8>, addr: SocketAddr },
+    UdpSend { bytes_written: usize, data: Vec<u8> },
 }
 
 /// Represents an error that can occur during an I/O operation.
