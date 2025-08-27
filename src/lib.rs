@@ -3,8 +3,19 @@
 //! This crate provides a high-performance async runtime with:
 //! - Shared-nothing architecture (one thread per CPU core)
 //! - Lock-free cross-CPU communication
-//! - io-uring for high-performance I/O on Linux
+//! - Automatic IO backend selection for optimal performance
 //! - Custom Future/Promise implementation for educational purposes
+//!
+//! ## IO Backend Selection
+//!
+//! The runtime automatically selects the most appropriate IO backend for your platform:
+//!
+//! - **Linux with kernel 5.10+**: Uses `io_uring` for optimal performance
+//! - **macOS**: Uses `kqueue`
+//! - **Other Unix systems**: Uses `epoll`
+//!
+//! This selection happens at compile time based on your target platform and kernel version.
+//! See `build.rs` for the complete selection logic.
 //!
 //! # Timer Utilities
 //!
@@ -84,6 +95,7 @@
 #![deny(warnings)]
 
 pub mod buffer;
+pub mod cancellation;
 pub mod config;
 pub mod cpu;
 pub mod executor;

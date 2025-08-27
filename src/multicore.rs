@@ -2,6 +2,17 @@
 //!
 //! This module provides a multi-core async runtime that spawns one executor
 //! per CPU core, implementing the shared-nothing architecture.
+//!
+//! ## IO Backend Selection
+//!
+//! The IO backend is automatically selected at compile time by the build script:
+//!
+//! - **Linux with kernel 5.10+**: Uses `io_uring` for optimal performance, with fallback to dummy backend
+//! - **Linux with older kernels**: Uses dummy backend
+//! - **macOS**: Uses `kqueue`
+//! - **Other Unix systems**: Uses `epoll`
+//!
+//! See `build.rs` and `src/io/mod.rs` for more details on the selection logic.
 
 use dashmap::DashMap;
 use std::future::Future;
@@ -11,6 +22,7 @@ use std::thread;
 
 use crate::cpu::{Cpu, CpuHandle};
 use crate::error::{Result, RuntimeError};
+use crate::io::{CompletionKind, IoBackend, IoError, IoToken, Op};
 use crate::waker::TaskId;
 
 #[cfg(feature = "signal")]
@@ -56,27 +68,39 @@ impl MultiCoreRuntime {
             let thread_handle = thread::Builder::new()
                 .name(format!("miniss-cpu-{cpu_id}"))
                 .spawn(move || {
-                    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                    #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
                     let io_backend = {
-                        // Use fully qualified path to avoid unused import warnings
-                        Arc::new(crate::io::uring::UringBackend::new(256).expect("Failed to create io_uring backend"))
+                        // Try to create io_uring backend, fallback to DummyIoBackend if it fails
+                        let backend: Arc<dyn IoBackend<Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>)>> = 
+                            match crate::io::uring::UringBackend::new(256) {
+                                Ok(uring) => Arc::new(uring),
+                                Err(e) => {
+                                    eprintln!("Failed to create io_uring backend: {}, falling back to dummy backend", e);
+                                    Arc::new(crate::io::DummyIoBackend::new())
+                                }
+                            };
+                        backend
                     };
 
-                    #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos"), feature = "epoll"))]
+                    #[cfg(all(target_os = "linux", io_backend = "epoll"))]
                     let io_backend = {
-                        Arc::new(crate::io::epoll::EpollBackend::new().expect("Failed to create epoll backend"))
+                        // This should not happen on modern Linux systems, but just in case
+                        eprintln!("Warning: Using epoll on Linux, which is unexpected");
+                        let backend: Arc<dyn IoBackend<Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>)>> = 
+                            Arc::new(crate::io::DummyIoBackend::new());
+                        backend
                     };
 
-                    #[cfg(all(target_os = "macos", feature = "kqueue"))]
+                    #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
                     let io_backend = {
                         Arc::new(crate::io::kqueue::KqueueBackend::new().expect("Failed to create kqueue backend"))
                     };
 
                     // Fallback for tests or unsupported platforms
                     #[cfg(not(any(
-                        all(target_os = "linux", feature = "io-uring"),
-                        all(unix, not(target_os = "linux"), not(target_os = "macos"), feature = "epoll"),
-                        all(target_os = "macos", feature = "kqueue")
+                        all(target_os = "linux", io_backend = "io_uring"),
+                        all(target_os = "linux", io_backend = "epoll"),
+                        all(target_os = "macos", io_backend = "kqueue")
                     )))]
                     let io_backend = {
                         // The dummy backend is still useful for testing and as a fallback

@@ -88,6 +88,8 @@ pub struct Cpu {
     io_backend: Arc<dyn IoBackend<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
     // New field for I/O state
     io_state: Arc<CpuIoState>,
+    // Task cancellation tracking
+    cancelled_tasks: Arc<Mutex<HashMap<TaskId, ()>>>,
 }
 
 pub enum CrossCpuMessage {
@@ -149,6 +151,7 @@ impl Cpu {
             running: true,
             io_backend,
             io_state,
+            cancelled_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -194,6 +197,11 @@ impl Cpu {
             }
             CrossCpuMessage::Ping { .. } => {}
             CrossCpuMessage::CancelTask(task_id) => {
+                // Mark the task as cancelled
+                if let Ok(mut cancelled) = self.cancelled_tasks.lock() {
+                    cancelled.insert(task_id, ());
+                }
+                // Remove from task queue if it hasn't started yet
                 self.task_queue.remove(&task_id);
             }
         }
@@ -236,6 +244,24 @@ impl Cpu {
         }
 
         while let Some(task_id) = self.ready_queue.pop() {
+            // Check if the task has been cancelled
+            let is_cancelled = if let Ok(cancelled) = self.cancelled_tasks.lock() {
+                cancelled.contains_key(&task_id)
+            } else {
+                false
+            };
+            
+            if is_cancelled {
+                // Clean up the cancelled task
+                if let Ok(mut cancelled) = self.cancelled_tasks.lock() {
+                    cancelled.remove(&task_id);
+                }
+                // Remove from task queue if it exists
+                self.task_queue.remove(&task_id);
+                made_progress = true;
+                continue;
+            }
+            
             if let Some(mut task) = self.task_queue.remove(&task_id) {
                 made_progress = true;
                 let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());

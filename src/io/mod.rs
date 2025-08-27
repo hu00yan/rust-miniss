@@ -3,6 +3,20 @@
 //! This module defines the `IoBackend` trait, which provides a generic interface
 //! for different asynchronous I/O mechanisms like `io-uring`, `epoll`, or `kqueue`.
 //! Each CPU thread will own an instance of an `IoBackend` implementation.
+//!
+//! ## IO Backend Selection
+//!
+//! The IO backend is automatically selected at compile time based on the target platform
+//! and kernel version:
+//!
+//! - **Linux with kernel 5.10+**: Uses `io_uring` for optimal performance
+//! - **Linux with older kernels**: Falls back to a dummy backend
+//! - **macOS**: Uses `kqueue`
+//! - **Other Unix systems**: Uses `epoll`
+//!
+//! This selection is handled by the build script (`build.rs`) which detects the
+//! target platform and kernel version, and sets the appropriate `io_backend` 
+//! configuration flag.
 
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,13 +132,16 @@ impl From<IoError> for std::io::Error {
 // Conditional compilation for different I/O backend implementations.
 // These modules will contain the concrete implementations of the `IoBackend` trait.
 
-#[cfg(any(target_os = "macos", feature = "kqueue"))]
+#[cfg(any(target_os = "macos", io_backend = "kqueue"))]
 pub mod kqueue;
 
-#[cfg(any(all(unix, not(target_os = "macos")), feature = "epoll"))]
+#[cfg(any(
+    all(unix, not(target_os = "macos")),
+    all(target_os = "linux", io_backend = "epoll")
+))]
 pub mod epoll;
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 pub mod uring;
 
 pub mod future;

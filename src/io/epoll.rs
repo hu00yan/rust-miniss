@@ -1,4 +1,7 @@
-#![cfg(all(unix, not(target_os = "linux"), feature = "epoll"))]
+#![cfg(any(
+    all(unix, not(target_os = "linux")),
+    all(target_os = "linux", io_backend = "epoll")
+))]
 
 //! An `epoll` (or `kqueue` via `mio`) backend for the I/O subsystem.
 //!

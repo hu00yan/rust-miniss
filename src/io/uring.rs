@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "linux", feature = "io-uring"))]
+#![cfg(all(target_os = "linux", io_backend = "io_uring"))]
 
 //! A `io-uring` backend for the I/O subsystem.
 

@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "macos", feature = "kqueue"))]
+#![cfg(all(target_os = "macos", io_backend = "kqueue"))]
 
 //! A `kqueue` backend for the I/O subsystem on macOS.
 //!

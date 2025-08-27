@@ -80,12 +80,9 @@ name = "scheduling_throughput"
 harness = false
 
 [features]
-# Focus on io-uring backend for high performance
-default = ["multicore", "io-uring"]
+# Multi-core support
+default = ["multicore"]
 multicore = []
-epoll = []
-kqueue = []
-io-uring = []
 signal = []
 timer = []
 
