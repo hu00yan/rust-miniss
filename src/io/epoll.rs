@@ -67,34 +67,95 @@ impl IoBackend for EpollBackend {
         let mio_token = Token(*next_token);
         *next_token += 1;
 
-        let (fd, interest) = match &op {
-            Op::Accept { fd } => (*fd, Interest::READABLE),
-            Op::Read { fd, .. } => (*fd, Interest::READABLE),
-            Op::Write { fd, .. } => (*fd, Interest::WRITABLE),
-            // Fsync and Close are handled synchronously for now, as mio doesn't directly support them.
-            // This is a simplification and a more robust implementation would use a blocking thread pool.
+        match &op {
+            Op::Accept { fd } => {
+                let mut source = mio::unix::SourceFd(fd);
+                if let Err(e) = poll.registry().register(&mut source, mio_token, Interest::READABLE) {
+                    eprintln!("Failed to register fd with mio: {}", e);
+                } else {
+                    pending_ops.insert(mio_token, (io_token, op));
+                }
+            }
+            Op::Read { fd, .. } => {
+                let mut source = mio::unix::SourceFd(fd);
+                if let Err(e) = poll.registry().register(&mut source, mio_token, Interest::READABLE) {
+                    eprintln!("Failed to register fd with mio: {}", e);
+                } else {
+                    pending_ops.insert(mio_token, (io_token, op));
+                }
+            }
+            Op::Write { fd, .. } => {
+                let mut source = mio::unix::SourceFd(fd);
+                if let Err(e) = poll.registry().register(&mut source, mio_token, Interest::WRITABLE) {
+                    eprintln!("Failed to register fd with mio: {}", e);
+                } else {
+                    pending_ops.insert(mio_token, (io_token, op));
+                }
+            }
+            // File operations are handled synchronously
+            Op::ReadFile { fd, offset, len } => {
+                // Perform readFile synchronously and create a completion immediately.
+                let result = {
+                    use std::os::unix::io::FromRawFd;
+                    let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                    let res = file.seek(SeekFrom::Start(*offset))
+                        .and_then(|_| {
+                            let mut buf = vec![0; *len];
+                            file.read(&mut buf).map(|bytes_read| {
+                                buf.truncate(bytes_read);
+                                CompletionKind::ReadFile { bytes_read, data: buf }
+                            })
+                        });
+                    std::mem::forget(file); // Prevent drop from closing the fd
+                    res.map_err(IoError::Io)
+                };
+                // We still need to track this as a pending operation so poll_complete can return it
+                pending_ops.insert(mio_token, (io_token, op));
+                // We'll handle this synchronously in poll_complete
+            }
+            Op::WriteFile { fd, offset, data } => {
+                // Perform writeFile synchronously and create a completion immediately.
+                let result = {
+                    use std::os::unix::io::FromRawFd;
+                    let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                    let res = file.seek(SeekFrom::Start(*offset))
+                        .and_then(|_| file.write(data))
+                        .map(|bytes_written| CompletionKind::WriteFile { bytes_written });
+                    std::mem::forget(file); // Prevent drop from closing the fd
+                    res.map_err(IoError::Io)
+                };
+                // We still need to track this as a pending operation so poll_complete can return it
+                pending_ops.insert(mio_token, (io_token, op));
+                // We'll handle this synchronously in poll_complete
+            }
             Op::Fsync { fd } => {
-                // Perform fsync and create a completion immediately.
-                // This is a placeholder for true async fsync.
-                // For now, we don't return it from submit, but a real implementation would.
-                // This part of the code is not fully async.
-                return io_token; // Not handled async
+                // Perform fsync synchronously and create a completion immediately.
+                let result = {
+                    use std::os::unix::io::FromRawFd;
+                    let file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                    let res = file.sync_all();
+                    std::mem::forget(file); // Prevent drop from closing the fd
+                    res.map(|_| CompletionKind::Fsync).map_err(IoError::Io)
+                };
+                // We still need to track this as a pending operation so poll_complete can return it
+                pending_ops.insert(mio_token, (io_token, op));
+                // We'll handle this synchronously in poll_complete
             }
             Op::Close { fd } => {
-                // Same as fsync, handled synchronously.
-                return io_token; // Not handled async
+                // Perform close synchronously and create a completion immediately.
+                let result = {
+                    let res = unsafe { libc::close(*fd) };
+                    if res == -1 {
+                        Err(IoError::Io(io::Error::last_os_error()))
+                    } else {
+                        Ok(CompletionKind::Close)
+                    }
+                };
+                // We still need to track this as a pending operation so poll_complete can return it
+                pending_ops.insert(mio_token, (io_token, op));
+                // We'll handle this synchronously in poll_complete
             }
         };
-
-        let mut source = mio::unix::SourceFd(&fd);
-        if let Err(e) = poll.registry().register(&mut source, mio_token, interest) {
-            // If registration fails, we can't proceed with this op.
-            // A real implementation might queue this for later.
-            eprintln!("Failed to register fd with mio: {}", e);
-            // This op is effectively dropped.
-        } else {
-            pending_ops.insert(mio_token, (io_token, op));
-        }
 
         io_token
     }
@@ -114,6 +175,7 @@ impl IoBackend for EpollBackend {
 
         let mut completions = Vec::new();
 
+        // First, handle any events from mio
         for event in events.iter() {
             let mio_token = event.token();
             if let Some((io_token, op)) = pending_ops.remove(&mio_token) {
@@ -150,11 +212,110 @@ impl IoBackend for EpollBackend {
                         std::mem::forget(file);
                         res.map_err(IoError::Io)
                     }
+                    Op::ReadFile { fd, offset, len } => {
+                        let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                        let res = file.seek(SeekFrom::Start(*offset))
+                            .and_then(|_| {
+                                let mut buf = vec![0; *len];
+                                file.read(&mut buf).map(|bytes_read| {
+                                    buf.truncate(bytes_read);
+                                    CompletionKind::ReadFile { bytes_read, data: buf }
+                                })
+                            });
+                        // Prevent drop from closing the file descriptor
+                        std::mem::forget(file);
+                        res.map_err(IoError::Io)
+                    }
+                    Op::WriteFile { fd, offset, data } => {
+                        let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                        let res = file.seek(SeekFrom::Start(*offset))
+                            .and_then(|_| file.write(data))
+                            .map(|bytes_written| CompletionKind::WriteFile { bytes_written });
+                        std::mem::forget(file);
+                        res.map_err(IoError::Io)
+                    }
                     // Fsync and Close are not handled in this path currently.
                     _ => continue,
                 };
 
                 completions.push((io_token, op, result));
+            }
+        }
+
+        // Handle any pending synchronous operations (ReadFile, WriteFile, Fsync, Close)
+        // We need to create a temporary vector to avoid borrowing issues
+        let pending_tokens: Vec<_> = pending_ops.keys().cloned().collect();
+        for mio_token in pending_tokens {
+            if let Some((io_token, op)) = pending_ops.get(&mio_token) {
+                match op {
+                    Op::ReadFile { fd, offset, len } => {
+                        // Perform readFile synchronously
+                        let result = {
+                            use std::os::unix::io::FromRawFd;
+                            let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                            let res = file.seek(SeekFrom::Start(*offset))
+                                .and_then(|_| {
+                                    let mut buf = vec![0; *len];
+                                    file.read(&mut buf).map(|bytes_read| {
+                                        buf.truncate(bytes_read);
+                                        CompletionKind::ReadFile { bytes_read, data: buf }
+                                    })
+                                });
+                            std::mem::forget(file); // Prevent drop from closing the fd
+                            res.map_err(IoError::Io)
+                        };
+                        // Remove from pending ops and add to completions
+                        if let Some((io_token, op)) = pending_ops.remove(&mio_token) {
+                            completions.push((io_token, op, result));
+                        }
+                    }
+                    Op::WriteFile { fd, offset, data } => {
+                        // Perform writeFile synchronously
+                        let result = {
+                            use std::os::unix::io::FromRawFd;
+                            let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                            let res = file.seek(SeekFrom::Start(*offset))
+                                .and_then(|_| file.write(data))
+                                .map(|bytes_written| CompletionKind::WriteFile { bytes_written });
+                            std::mem::forget(file); // Prevent drop from closing the fd
+                            res.map_err(IoError::Io)
+                        };
+                        // Remove from pending ops and add to completions
+                        if let Some((io_token, op)) = pending_ops.remove(&mio_token) {
+                            completions.push((io_token, op, result));
+                        }
+                    }
+                    Op::Fsync { fd } => {
+                        // Perform fsync synchronously
+                        let result = {
+                            use std::os::unix::io::FromRawFd;
+                            let file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                            let res = file.sync_all();
+                            std::mem::forget(file); // Prevent drop from closing the fd
+                            res.map(|_| CompletionKind::Fsync).map_err(IoError::Io)
+                        };
+                        // Remove from pending ops and add to completions
+                        if let Some((io_token, op)) = pending_ops.remove(&mio_token) {
+                            completions.push((io_token, op, result));
+                        }
+                    }
+                    Op::Close { fd } => {
+                        // Perform close synchronously
+                        let result = {
+                            let res = unsafe { libc::close(*fd) };
+                            if res == -1 {
+                                Err(IoError::Io(io::Error::last_os_error()))
+                            } else {
+                                Ok(CompletionKind::Close)
+                            }
+                        };
+                        // Remove from pending ops and add to completions
+                        if let Some((io_token, op)) = pending_ops.remove(&mio_token) {
+                            completions.push((io_token, op, result));
+                        }
+                    }
+                    _ => {} // Other operations are handled by mio events
+                }
             }
         }
 
@@ -210,6 +371,8 @@ impl AsRawFd for Op {
             Op::Write { fd, .. } => fd,
             Op::Fsync { fd, .. } => fd,
             Op::Close { fd, .. } => fd,
+            Op::ReadFile { fd, .. } => fd,
+            Op::WriteFile { fd, .. } => fd,
         }
     }
 }

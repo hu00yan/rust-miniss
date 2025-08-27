@@ -50,7 +50,99 @@ impl Runtime {
     where
         F: Future,
     {
-        self.executor.lock().unwrap().block_on(future)
+        // For single-threaded execution, we need to set up the I/O state
+        use crate::cpu::{set_current_io_state, clear_current_io_state, CpuIoState};
+        use crate::{IoBackend, IoToken, Op, CompletionKind, IoError};
+        use std::sync::Arc;
+        
+        // Create an appropriate I/O backend for single-threaded execution based on compile-time configuration
+        #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+        let io_backend = {
+            match crate::io::uring::UringBackend::new(32) {
+                Ok(uring) => Arc::new(uring) as Arc<dyn IoBackend<Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>)>>,
+                Err(e) => {
+                    eprintln!("Failed to create io_uring backend: {}, falling back to dummy backend", e);
+                    Arc::new(crate::io::DummyIoBackend::new())
+                }
+            }
+        };
+        
+        #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
+        let io_backend = {
+            match crate::io::kqueue::KqueueBackend::new() {
+                Ok(kqueue) => Arc::new(kqueue) as Arc<dyn IoBackend<Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>)>>,
+                Err(e) => {
+                    eprintln!("Failed to create kqueue backend: {}, falling back to dummy backend", e);
+                    Arc::new(crate::io::DummyIoBackend::new())
+                }
+            }
+        };
+        
+        // Fallback for other platforms or if the specific backend fails
+        #[cfg(not(any(
+            all(target_os = "linux", io_backend = "io_uring"),
+            all(target_os = "macos", io_backend = "kqueue")
+        )))]
+        let io_backend = {
+            Arc::new(crate::io::DummyIoBackend::new()) as Arc<dyn IoBackend<Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>)>>
+        };
+        
+        let io_state = Arc::new(CpuIoState {
+            io_backend,
+            io_wakers: Mutex::new(HashMap::new()),
+            completed_io: Mutex::new(HashMap::new()),
+        });
+        
+        // Set the current I/O state
+        set_current_io_state(io_state.clone());
+        
+        // Pin the future to the stack
+        let mut future = Box::pin(future);
+
+        // Waker that unparks the current thread when the future makes progress.
+        // This uses the `ArcWake` trait to create a waker that holds a reference
+        // to the thread parker.
+        struct Parker(std::thread::Thread);
+        impl futures::task::ArcWake for Parker {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.unpark();
+            }
+        }
+        let waker = futures::task::waker(Arc::new(Parker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+
+        // Poll the future until it completes, parking the thread when pending
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => {
+                    clear_current_io_state();
+                    return output;
+                },
+                Poll::Pending => {
+                    // Check for I/O completions
+                    let noop_waker = futures::task::noop_waker();
+                    let mut io_context = Context::from_waker(&noop_waker);
+                    
+                    // Poll the I/O backend for completions
+                    if let Poll::Ready(completions) = io_state.io_backend.poll_complete(&mut io_context) {
+                        if !completions.is_empty() {
+                            // Process completions
+                            let mut completed = io_state.completed_io.lock().unwrap();
+                            let mut wakers = io_state.io_wakers.lock().unwrap();
+                            for (token, _op, result) in completions {
+                                completed.insert(token, result);
+                                if let Some(waker) = wakers.remove(&token) {
+                                    waker.wake();
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Park the thread until it is woken
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+            }
+        }
     }
 
     /// Spawn a new task

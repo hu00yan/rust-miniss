@@ -234,9 +234,9 @@ mod concurrency_tests {
     use super::*;
     use std::future::Future as StdFuture;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::thread;
-    use std::time::Duration;
 
     // Helper to create a dummy waker
     fn dummy_waker() -> Waker {
@@ -263,6 +263,8 @@ mod concurrency_tests {
     #[test]
     fn test_concurrent_complete() {
         let (mut future, promise) = Future::<i32>::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
 
         let poller = thread::spawn(move || {
             let waker = dummy_waker();
@@ -273,6 +275,7 @@ mod concurrency_tests {
                 match StdFuture::poll(Pin::new(&mut future), &mut cx) {
                     Poll::Ready(val) => {
                         assert_eq!(val, 99);
+                        completed_clone.store(true, Ordering::SeqCst);
                         break;
                     }
                     Poll::Pending => thread::yield_now(),
@@ -281,12 +284,16 @@ mod concurrency_tests {
         });
 
         let completer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
+            // Wait a bit to ensure the poller has started polling
+            thread::yield_now();
             promise.complete(99);
         });
 
-        poller.join().unwrap();
         completer.join().unwrap();
+        poller.join().unwrap();
+        
+        // Verify that the future was completed
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[test]

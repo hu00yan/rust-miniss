@@ -33,13 +33,16 @@ fn stress_timer_io() {
                     writeln!(f, "counter {}", counter).unwrap();
                 }
                 counter += 1;
+                // Use yield instead of sleep for stress testing
+                thread::yield_now();
             }
         })
     };
 
     let timer = thread::spawn(move || {
         while start.elapsed() < Duration::from_secs(RUN_SECS) {
-            thread::sleep(Duration::from_millis(1));
+            // Use yield instead of sleep for stress testing
+            thread::yield_now();
         }
     });
 

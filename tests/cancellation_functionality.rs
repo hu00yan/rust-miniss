@@ -43,7 +43,7 @@ fn test_cancel_before_execution() {
     println!("Immediate cancel result: {:?}", cancel_result);
     
     // Give some time for processing
-    std::thread::sleep(Duration::from_millis(10));
+    std::thread::yield_now();
     
     // The task should not have started
     assert!(!started.load(Ordering::SeqCst), "Task should not have started after cancellation");

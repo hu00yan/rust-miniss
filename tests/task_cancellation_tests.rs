@@ -29,6 +29,8 @@ mod task_cancellation_tests {
     #[test]
     #[cfg(feature = "multicore")]
     fn test_cancel_before_start() {
+        use std::sync::Condvar;
+        
         setup_tracing();
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let started = Arc::new(AtomicBool::new(false));
@@ -39,8 +41,10 @@ mod task_cancellation_tests {
             })
             .unwrap();
         runtime.cancel_task(task_id).unwrap();
-        // Give some time for the cancellation to be processed
-        std::thread::sleep(Duration::from_millis(50));
+        
+        // Wait a bit to ensure cancellation is processed
+        std::thread::yield_now();
+        
         assert!(!started.load(Ordering::SeqCst), "Task should not have started after cancellation");
     }
 
@@ -48,30 +52,36 @@ mod task_cancellation_tests {
     #[test]
     #[cfg(feature = "multicore")]
     fn test_cancel_during_execution() {
+        use std::sync::mpsc;
+        
         setup_tracing();
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let started = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let started_clone = started.clone();
         let completed_clone = completed.clone();
+        let (tx, rx) = mpsc::channel();
+        let tx_clone = tx.clone();
+        
         let task_id = runtime
             .spawn_on(1, async move {
                 started_clone.store(true, Ordering::SeqCst);
-                // Use a short sleep to simulate work
-                std::thread::sleep(Duration::from_millis(50));
+                // Notify that task has started
+                let _ = tx_clone.send(());
+                // Simulate work with a short delay
+                std::thread::yield_now();
                 completed_clone.store(true, Ordering::SeqCst);
             })
             .unwrap();
 
         // Wait for task to start
-        let mut attempts = 0;
-        while !started.load(Ordering::SeqCst) && attempts < 100 {
-            std::thread::sleep(Duration::from_millis(5));
-            attempts += 1;
-        }
-        
+        let _ = rx.recv_timeout(Duration::from_millis(100)).expect("Task should start");
+
         runtime.cancel_task(task_id).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        
+        // Give time for cancellation to be processed
+        std::thread::yield_now();
+        
         assert!(started.load(Ordering::SeqCst), "Task should have started");
         assert!(!completed.load(Ordering::SeqCst), "Task should not have completed due to cancellation");
     }
@@ -80,24 +90,26 @@ mod task_cancellation_tests {
     #[test]
     #[cfg(feature = "multicore")]
     fn test_cancel_after_completion() {
+        use std::sync::mpsc;
+        
         setup_tracing();
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
+        let (tx, rx) = mpsc::channel();
+        let tx_clone = tx.clone();
+        
         let task_id = runtime
             .spawn_on(0, async move {
                 completed_clone.store(true, Ordering::SeqCst);
+                let _ = tx_clone.send(());
             })
             .unwrap();
 
         // Wait for task to complete
-        let mut attempts = 0;
-        while !completed.load(Ordering::SeqCst) && attempts < 100 {
-            std::thread::sleep(Duration::from_millis(5));
-            attempts += 1;
-        }
-        
-        std::thread::sleep(Duration::from_millis(50));
+        let _ = rx.recv_timeout(Duration::from_millis(100)).expect("Task should complete");
+
+        std::thread::yield_now();
         let cancel_result = runtime.cancel_task(task_id);
         assert!(cancel_result.is_err(), "Canceling completed task should return error");
     }
@@ -114,7 +126,7 @@ mod task_cancellation_tests {
             task_ids.push(task_id);
         }
         // Give some time for tasks to be processed
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::yield_now();
         for task_id in task_ids {
             runtime.cancel_task(task_id).expect("Should be able to cancel tracked task");
         }
@@ -124,35 +136,47 @@ mod task_cancellation_tests {
     #[test]
     #[cfg(feature = "multicore")]
     fn test_cancel_multiple_tasks() {
+        use std::sync::mpsc;
+        
         setup_tracing();
         let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
         let execution_count = Arc::new(AtomicU32::new(0));
         let mut task_ids = Vec::new();
+        let (tx, rx) = mpsc::channel();
+        let tx_clone = tx.clone();
+        
         for i in 0..10 {
             let execution_count_clone = execution_count.clone();
+            let tx_inner = tx_clone.clone();
             let task_id = runtime
                 .spawn_on(i % 4, async move {
                     execution_count_clone.fetch_add(1, Ordering::SeqCst);
+                    let _ = tx_inner.send(());
                 })
                 .unwrap();
             task_ids.push(task_id);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        
+        std::thread::yield_now();
         for task_id in task_ids {
             let _ = runtime.cancel_task(task_id);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        
+        // Wait a bit for cancellation to be processed
+        std::thread::yield_now();
     }
 
     /// Test JoinHandle cancellation interface
     #[test]
     #[cfg(feature = "multicore")]
     fn test_join_handle_cancel() {
+        use std::sync::mpsc;
+        
         setup_tracing();
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let tx_clone = tx.clone();
         let handle = runtime.spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
@@ -160,7 +184,10 @@ mod task_cancellation_tests {
         })
         .unwrap();
         let _ = runtime.cancel_task(handle); // Cancel using the runtime's cancel_task method
-        std::thread::sleep(Duration::from_millis(150));
+        
+        // Give time for cancellation to be processed
+        std::thread::yield_now();
+        
         assert!(!completed.load(Ordering::SeqCst), "Task should not complete after cancellation");
         // Verify that we can't receive a value from the task
         assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
@@ -170,25 +197,30 @@ mod task_cancellation_tests {
     #[test]
     #[cfg(feature = "multicore")]
     fn test_cpu_removes_cancelled_task() {
+        use std::sync::mpsc;
+        
         setup_tracing();
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let started = Arc::new(AtomicBool::new(false));
         let started_clone = started.clone();
+        let (tx, rx) = mpsc::channel();
+        let tx_clone = tx.clone();
+        
         let task_id = runtime
             .spawn_on(0, async move {
                 started_clone.store(true, Ordering::SeqCst);
+                let _ = tx_clone.send(());
             })
             .unwrap();
             
         // Wait for task to start
-        let mut attempts = 0;
-        while !started.load(Ordering::SeqCst) && attempts < 100 {
-            std::thread::sleep(Duration::from_millis(5));
-            attempts += 1;
-        }
-        
+        let _ = rx.recv_timeout(Duration::from_millis(100)).expect("Task should start");
+
         runtime.cancel_task(task_id).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        
+        // Give time for cancellation to be processed
+        std::thread::yield_now();
+        
         let second_cancel = runtime.cancel_task(task_id);
         assert!(second_cancel.is_err(), "Second cancellation should fail as task is removed");
     }

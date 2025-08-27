@@ -54,7 +54,7 @@ impl std::fmt::Debug for CpuIoState {
 thread_local! {
     /// A thread-local reference to the current CPU's `IoState`.
     /// This allows an `IoFuture` to get access to the I/O context of the `Cpu` it's running on.
-    static CURRENT_CPU_IO_STATE: RefCell<Option<Arc<CpuIoState>>> = RefCell::new(None);
+    pub static CURRENT_CPU_IO_STATE: RefCell<Option<Arc<CpuIoState>>> = RefCell::new(None);
 }
 
 /// Provides access to the I/O state of the current CPU thread.
@@ -67,6 +67,22 @@ pub fn io_state() -> Arc<CpuIoState> {
             .expect("I/O operation attempted outside of a miniss runtime thread")
             .clone()
     })
+}
+
+/// Sets the current CPU I/O state for the current thread.
+/// This is used to initialize the runtime context for single-threaded execution.
+pub fn set_current_io_state(io_state: Arc<CpuIoState>) {
+    CURRENT_CPU_IO_STATE.with(|cell| {
+        *cell.borrow_mut() = Some(io_state);
+    });
+}
+
+/// Clears the current CPU I/O state for the current thread.
+/// This is used to clean up the runtime context.
+pub fn clear_current_io_state() {
+    CURRENT_CPU_IO_STATE.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
 }
 
 // --- End New I/O State Management ---

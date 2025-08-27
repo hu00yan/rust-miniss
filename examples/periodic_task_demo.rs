@@ -35,8 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-        // Let it run for 3 seconds
-        std::thread::sleep(Duration::from_secs(3));
+        // Let it run for a few ticks using a more reliable method
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            std::thread::yield_now();
+        }
         print_handle.cancel()?;
         println!("   Print task cancelled");
     }
@@ -53,12 +56,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-        // Let it run for 1 second
-        std::thread::sleep(Duration::from_secs(1));
+        // Let it run for a few ticks using a more reliable method
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            std::thread::yield_now();
+        }
         counter_handle.cancel()?;
 
         let final_count = counter.load(Ordering::SeqCst);
-        println!("   Counter reached: {} (expected ~10)", final_count);
+        println!("   Counter reached: {} (expected ~5)", final_count);
     }
 
     // Example 3: Multiple periodic tasks with different intervals
@@ -86,8 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-        // Let them run for 1 second
-        std::thread::sleep(Duration::from_secs(1));
+        // Let them run for a bit using a more reliable method
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            std::thread::yield_now();
+        }
 
         // Stop both tasks
         fast_handle.cancel()?;
@@ -97,11 +106,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let slow_count = slow_counter.load(Ordering::SeqCst);
 
         println!(
-            "   Fast task (50ms): {} executions (expected ~20)",
+            "   Fast task (50ms): {} executions (expected ~10)",
             fast_count
         );
         println!(
-            "   Slow task (200ms): {} executions (expected ~5)",
+            "   Slow task (200ms): {} executions (expected ~2)",
             slow_count
         );
     }
@@ -123,13 +132,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-        // Let it run for 2 seconds
-        std::thread::sleep(Duration::from_secs(2));
+        // Let it run for a bit using a more reliable method
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(1000) {
+            std::thread::yield_now();
+        }
         work_handle.cancel()?;
 
         let work_count = work_counter.load(Ordering::SeqCst);
         println!(
-            "   Async work completed {} times (expected ~6-7)",
+            "   Async work completed {} times (expected ~3)",
             work_count
         );
     }

@@ -16,6 +16,8 @@ enum PendingOp {
     Accept { op: Op },
     Fsync { op: Op },
     Close { op: Op },
+    ReadFile { op: Op, buf: Vec<u8> },
+    WriteFile { op: Op, data: Vec<u8> },
 }
 
 /// A `io-uring` based `IoBackend`.
@@ -84,6 +86,35 @@ impl IoBackend for UringBackend {
                     .user_data(user_data);
                 (entry, PendingOp::Close { op: Op::Close { fd } })
             }
+            Op::ReadFile { fd, offset, len } => {
+                let mut buf = vec![0u8; len];
+                let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
+                    .offset(offset)
+                    .build()
+                    .user_data(user_data);
+                (entry, PendingOp::ReadFile { op: Op::ReadFile { fd, offset, len }, buf })
+            }
+            Op::WriteFile { fd, offset, ref data } => {
+                // For io_uring WriteFile operations, we must ensure the data buffer
+                // remains valid throughout the entire I/O operation. This is critical
+                // because io_uring uses the buffer pointer directly (zero-copy).
+                //
+                // The issue we fixed: Previously, we used `data.as_ptr()` where `data`
+                // was borrowed via `ref data`. When the function returned, this borrow
+                // could become invalid, leading to writing garbage data to the file.
+                //
+                // Solution: Clone the data first to ensure it stays alive, then use
+                // the cloned data's pointer. The cloned data is stored in PendingOp
+                // to keep it alive until the operation completes.
+                let cloned_data = data.clone();
+                let entry = opcode::Write::new(types::Fd(fd), cloned_data.as_ptr(), cloned_data.len() as u32)
+                    .offset(offset)
+                    .build()
+                    .user_data(user_data);
+                // Store both the original op (for completion reporting) and the cloned
+                // data (to keep it alive until completion)
+                (entry, PendingOp::WriteFile { op: Op::WriteFile { fd, offset, data: data.clone() }, data: cloned_data })
+            }
         };
 
         match unsafe { ring.submission().push(&entry) } {
@@ -143,6 +174,23 @@ impl IoBackend for UringBackend {
                     }),
                     PendingOp::Close { op } => (op, {
                         if result < 0 { Err(IoError::Io(io::Error::from_raw_os_error(-result))) } else { Ok(CompletionKind::Close) }
+                    }),
+                    PendingOp::ReadFile { op, mut buf } => (op, {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            let bytes_read = result as usize;
+                            buf.truncate(bytes_read);
+                            Ok(CompletionKind::ReadFile { bytes_read, data: buf })
+                        }
+                    }),
+                    PendingOp::WriteFile { op, data: _data } => (op, {
+                        println!("Processing completed WriteFile operation, result={}", result);
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::WriteFile { bytes_written: result as usize })
+                        }
                     }),
                 };
                 completions.push((token, op, completion_result));

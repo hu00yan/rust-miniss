@@ -28,3 +28,4 @@ Thumbs.db
 # Coverage reports
 /target/coverage/
 tarpaulin-report.html
+.aider*

@@ -58,6 +58,8 @@ pub enum Op {
     Write { fd: i32, offset: u64, data: Vec<u8> },
     Fsync { fd: i32 },
     Close { fd: i32 },
+    ReadFile { fd: i32, offset: u64, len: usize },
+    WriteFile { fd: i32, offset: u64, data: Vec<u8> },
 }
 
 /// A unique identifier for a submitted I/O operation.
@@ -98,6 +100,8 @@ pub enum CompletionKind {
     Write { bytes_written: usize },
     Fsync,
     Close,
+    ReadFile { bytes_read: usize, data: Vec<u8> },
+    WriteFile { bytes_written: usize },
 }
 
 /// Represents an error that can occur during an I/O operation.

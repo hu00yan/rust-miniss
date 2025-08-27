@@ -106,6 +106,7 @@ pub mod multicore;
 pub mod task;
 pub mod timer;
 pub mod waker;
+pub mod fs;
 
 #[cfg(feature = "signal")]
 pub mod signal;
@@ -117,8 +118,10 @@ pub use executor::{Executor, Runtime};
 pub use future::{Future, Promise};
 pub use io::{CompletionKind, DummyIoBackend, IoBackend, IoError, IoToken, Op};
 pub use multicore::{init_runtime, MultiCoreRuntime};
+pub use net::{AsyncTcpListener, AsyncTcpStream};
 pub use task::{spawn, Task, TaskBuilder, TaskError, TaskResult};
 pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWheel};
+pub use fs::AsyncFile;
 
 /// Error types for the runtime
 pub mod error {

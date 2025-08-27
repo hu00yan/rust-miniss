@@ -74,7 +74,7 @@ fn test_graceful_shutdown_no_leaks() {
     runtime
         .spawn(async {
             // Just a simple task that completes quickly
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::yield_now();
         })
         .unwrap();
 
@@ -82,7 +82,7 @@ fn test_graceful_shutdown_no_leaks() {
     drop(runtime);
 
     // Allow some time for shutdown to complete
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::yield_now();
 
     // If we get here without hanging, the Drop implementation worked correctly
 }
@@ -132,7 +132,7 @@ fn test_multicore_cross_cpu_communication() {
         runtime
             .spawn_on(cpu_id, async move {
                 // Simulate some work
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::yield_now();
                 results_clone.lock().unwrap().push(cpu_id);
                 tx_clone.send(()).unwrap();
             })
@@ -277,8 +277,8 @@ fn test_multicore_concurrent_spawning() {
         handle.join().unwrap();
     }
 
-    // Wait for all tasks to complete
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait for all tasks to complete by yielding
+    std::thread::yield_now();
 
     assert_eq!(counter.load(Ordering::SeqCst), 40);
 
@@ -295,7 +295,7 @@ fn test_multicore_ping_communication() {
 
     // Give time for ping messages to be processed
     // In a real implementation, you might want a more deterministic way to check this
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::yield_now();
 
     runtime.shutdown().unwrap();
 }
@@ -320,7 +320,7 @@ fn test_multicore_performance_comparison() {
 
     // Wait for single-core tasks
     while counter.load(Ordering::SeqCst) < task_count {
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     let single_duration = start.elapsed();
 
@@ -340,7 +340,7 @@ fn test_multicore_performance_comparison() {
 
     // Wait for multi-core tasks
     while counter2.load(Ordering::SeqCst) < task_count {
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     let multi_duration = start.elapsed();
 
@@ -426,7 +426,7 @@ fn test_multicore_graceful_shutdown() {
             .spawn(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
                 // Simulate some work
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::yield_now();
                 counter.fetch_sub(1, Ordering::SeqCst);
                 tx_clone.send(()).unwrap();
             })

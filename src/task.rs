@@ -347,8 +347,7 @@ mod tests {
         let result = crate::executor::Runtime::new().block_on(handle);
 
         assert_eq!(result.unwrap(), 42);
-        // Give the background thread a chance to complete
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // In this test, we're using the executor's block_on which should wait for completion
         assert!(completed.load(Ordering::SeqCst));
     }
 
@@ -371,8 +370,7 @@ mod tests {
         let result = crate::executor::Runtime::new().block_on(handle);
 
         assert_eq!(result.unwrap(), "hello from multicore");
-        // Give the multicore runtime a chance to complete
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // In this test, we're using the executor's block_on which should wait for completion
         assert!(completed.load(Ordering::SeqCst));
     }
 

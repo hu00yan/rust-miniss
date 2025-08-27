@@ -29,6 +29,13 @@ mio = { version = "0.8", features = ["os-poll", "net", "os-ext"] }
 # Buffer management
 bytes = "1"
 
+# HTTP parsing and types
+http = "1.0"
+httparse = "1.8"
+
+# DNS protocol
+trust-dns-proto = "0.23"
+
 # Utilities
 thiserror = "1.0"
 tracing = "0.1"
@@ -93,3 +100,23 @@ codegen-units = 1
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
+
+[[example]]
+name = "debug_write_test"
+path = "tests/debug_write_test.rs"
+
+[[example]]
+name = "simple_write_test"
+path = "tests/simple_write_test.rs"
+
+[[example]]
+name = "sync_io_test"
+path = "tests/sync_io_test.rs"
+
+[[example]]
+name = "debug_create_test"
+path = "tests/debug_create_test.rs"
+
+[[example]]
+name = "io_uring_test"
+path = "tests/io_uring_test.rs"
