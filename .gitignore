@@ -28,4 +28,8 @@ Thumbs.db
 # Coverage reports
 /target/coverage/
 tarpaulin-report.html
+# AI Assistant files
 .aider*
+.claude/
+**/.claude/
+

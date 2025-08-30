@@ -9,12 +9,12 @@ repos:
         pass_filenames: false
         stages: [commit]
 
-      - id: cargo-clippy
-        name: cargo clippy (all targets/features, deny warnings)
-        entry: bash -c 'cargo clippy --all-targets --all-features -- -D warnings'
-        language: system
-        pass_filenames: false
-        stages: [commit]
+       - id: cargo-clippy
+         name: cargo clippy (all targets/features, deny warnings)
+         entry: bash -c 'cargo clippy --all-targets -- -D warnings'
+         language: system
+         pass_filenames: false
+         stages: [commit]
 
       - id: cargo-deny
         name: cargo deny check

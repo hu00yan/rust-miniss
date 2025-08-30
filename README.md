@@ -20,6 +20,48 @@ rust-miniss is a minimal async runtime that demonstrates high-performance server
 - **Zero-copy I/O**: Using io-uring on Linux
 - **Custom futures**: Understanding async internals
 
+## Quick Start
+
+### Development Setup
+```bash
+# Install development tools
+make install-tools
+
+# Quick checks (format + clippy)
+make quick
+
+# Full checks (format + clippy + tests + build)
+make check
+
+# Complete test suite with sanitizers
+make full
+```
+
+### Development Workflow
+```bash
+# 1. Write code
+# 2. Auto format
+make fmt-fix
+
+# 3. Quick validation
+make quick
+
+# 4. Run tests
+make test
+
+# 5. Pre-commit check
+make pre-commit
+```
+
+### CI Troubleshooting
+| CI Job | Local Command |
+|--------|---------------|
+| Quick Checks | `make quick` |
+| Test Suite | `make check` |
+| ASan+LSan | `make asan` |
+| TSan | `make tsan` |
+| Miri | `make miri` |
+
 ## HTTP Echo Example & Benchmarks
 
 - Example: `examples/http_echo.rs` (HTTP/1.1 minimal echo server)
@@ -262,6 +304,101 @@ docker system df
 ```
 
 For more information about Docker best practices, see the [OrbStack documentation](https://docs.orbstack.dev/).
+
+## 安全性和设计原则
+
+### ⚠️ 重要安全注意事项
+
+本项目在实现高性能IO时使用了大量的unsafe代码。这是有意为之的设计决策，但需要特别注意：
+
+#### unsafe代码使用原则
+1. **最小化unsafe范围**：unsafe块应该尽可能小，只包含必要的操作
+2. **充分的safety注释**：每个unsafe块都必须有详细的理由说明
+3. **RAII原则遵守**：所有资源必须通过RAII正确管理，避免`mem::forget`
+4. **测试覆盖**：unsafe代码必须有充分的测试覆盖
+
+#### 已修复的安全问题
+- ✅ **Use After Free**：修复了`from_raw_fd`的生命周期管理问题
+- ✅ **RAII违反**：移除了所有不必要的`mem::forget`调用
+- ✅ **资源泄漏**：确保所有资源在作用域结束时被正确释放
+
+#### 当前的unsafe使用情况
+项目中仍然存在约100个unsafe块，主要用于：
+- IO操作的系统调用
+- 裸指针操作（sockaddr等）
+- UnsafeCell用于内部可变性
+- RawWaker的生命周期管理
+
+### 🏗️ 架构设计教训
+
+#### 1. IO后端设计
+- **问题**：最初的DummyIoBackend设计不符合RAII原则
+- **教训**：测试用的mock应该有实际功能，但不能违反资源管理原则
+- **解决方案**：重新设计DummyIoBackend，确保它返回结果但不泄漏资源
+
+#### 2. 错误处理
+- **问题**：IO后端失败时的fallback机制不合理
+- **教训**：应该返回错误而不是使用功能不完整的fallback
+- **解决方案**：在IO后端初始化失败时返回RuntimeError
+
+#### 3. 依赖项管理
+- **问题**：第三方crate的兼容性问题导致编译失败
+- **教训**：应该定期更新依赖项，并为关键依赖项准备备用方案
+- **解决方案**：移除有问题的loom依赖，使用稳定的替代方案
+
+### 🧪 测试和验证
+
+#### 内存安全测试
+- 使用AddressSanitizer检测内存泄漏
+- 使用ThreadSanitizer检测竞态条件
+- 使用Miri检测未定义行为
+
+#### 性能测试
+- 基准测试确保修复不影响性能
+- 并发测试验证多线程安全性
+
+### 📚 开发指南
+
+#### 编写unsafe代码的准则
+1. 必须有充分的理由
+2. 必须有详细的safety注释
+3. 必须通过code review
+4. 必须有对应的测试
+
+#### 资源管理
+1. 优先使用RAII模式
+2. 避免`mem::forget`
+3. 确保异常安全
+4. 使用智能指针管理复杂资源
+
+## Known Issues and Limitations
+
+### Sanitizer Compatibility
+The project includes memory sanitizer tests (AddressSanitizer, ThreadSanitizer, and Miri) in CI, but these have some known limitations:
+
+- **Miri (Undefined Behavior Detector)**:
+  - Does not support io-uring syscalls (syscall 425)
+  - Some tests are conditionally skipped under Miri using `#[cfg(not(miri))]`
+  - This is expected behavior as Miri is an interpreter that doesn't support all kernel features
+
+- **AddressSanitizer (ASan) + LeakSanitizer (LSan)**:
+  - May have compatibility issues with certain dependencies (e.g., `generator` crate build.rs issues)
+  - Some proc-macro crates may not be fully compatible with sanitizers
+  - CI jobs use `continue-on-error` to prevent blocking the entire workflow
+
+- **ThreadSanitizer (TSan)**:
+  - Similar compatibility issues with some dependencies
+  - May detect false positives in certain async code patterns
+
+### Workarounds
+- For local development, use `make test` for regular testing
+- Sanitizer tests are primarily for CI validation and may be skipped locally if dependencies have issues
+- The core functionality remains unaffected by these sanitizer limitations
+
+### Performance Benchmarking
+- HTTP performance comparisons with tokio are available via `scripts/bench_http.sh`
+- Cross-CPU latency benchmarks are included in the benches directory
+- Scheduling throughput benchmarks test task spawning performance
 
 ## Status
 

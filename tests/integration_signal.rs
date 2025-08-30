@@ -13,7 +13,7 @@ async fn signal_handling_sigterm_graceful() {
 
     // Spawn a thread to install handler and listen for SIGTERM
     let handle = std::thread::spawn(move || {
-        let mut signals = Signals::new(&[SIGTERM]).expect("create signals");
+        let mut signals = Signals::new([SIGTERM]).expect("create signals");
         // Mark that handler is installed
         ready_clone.store(true, Ordering::SeqCst);
         for sig in &mut signals {

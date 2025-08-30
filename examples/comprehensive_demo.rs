@@ -26,16 +26,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Feature 1: Timer and Timeout Functionality
     println!("\n⏰ Feature 1: Timer and Timeout Operations");
-    let _ = runtime.block_on(demonstrate_timer_features())?;
+    runtime.block_on(demonstrate_timer_features())?;
 
     // Feature 2: Simple Async Work
     println!("\n🔄 Feature 2: Simple Async Work");
-    let _ = runtime.block_on(async {
+    runtime.block_on(async {
         println!("  Running async work...");
         timer::sleep(Duration::from_millis(50)).await;
         println!("  ✅ Async work completed!");
-        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-    })?;
+    });
 
     println!("\n✅ All features demonstrated successfully!");
     println!(
@@ -46,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn demonstrate_timer_features() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn demonstrate_timer_features() -> Result<(), Box<dyn std::error::Error>> {
     // Test 1: Basic sleep
     let start = Instant::now();
     timer::sleep(Duration::from_millis(100)).await;

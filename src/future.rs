@@ -291,7 +291,7 @@ mod concurrency_tests {
 
         completer.join().unwrap();
         poller.join().unwrap();
-        
+
         // Verify that the future was completed
         assert!(completed.load(Ordering::SeqCst));
     }

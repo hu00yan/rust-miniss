@@ -41,10 +41,7 @@ impl Default for CancellationToken {
 pub trait CancellableFutureExt<T>: Sized {
     /// Wrap the future with a cancellation token
     fn cancellable(self, token: CancellationToken) -> CancellableFuture<Self> {
-        CancellableFuture {
-            inner: self,
-            token,
-        }
+        CancellableFuture { inner: self, token }
     }
 }
 
@@ -67,7 +64,7 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        
+
         // Check for cancellation
         if this.token.is_cancelled() {
             return std::task::Poll::Ready(Err(crate::task::TaskError::Cancelled));

@@ -80,10 +80,10 @@ impl AsyncFile {
         let file = std::fs::File::open(path)?;
         // Set non-blocking mode
         let fd = file.as_raw_fd();
-        let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::other)?;
         let flags = OFlag::from_bits_truncate(flags);
         let new_flags = flags | OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(new_flags)).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fcntl(fd, FcntlArg::F_SETFL(new_flags)).map_err(io::Error::other)?;
         Ok(Self { inner: file })
     }
 
@@ -112,10 +112,10 @@ impl AsyncFile {
         let file = std::fs::File::create(path)?;
         // Set non-blocking mode
         let fd = file.as_raw_fd();
-        let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::other)?;
         let flags = OFlag::from_bits_truncate(flags);
         let new_flags = flags | OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(new_flags)).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fcntl(fd, FcntlArg::F_SETFL(new_flags)).map_err(io::Error::other)?;
         Ok(Self { inner: file })
     }
 
@@ -131,7 +131,7 @@ impl AsyncFile {
     ///
     /// # Returns
     ///
-    /// * `Ok((usize, Vec<u8>))` - Tuple of (bytes_read, data)
+    /// * `Ok((usize, crate::buffer::Buffer))` - Tuple of (bytes_read, data)
     /// * `Err(io::Error)` - Failed to read from file
     ///
     /// # Examples
@@ -146,7 +146,11 @@ impl AsyncFile {
     ///     println!("Read {} bytes", bytes_read);
     /// });
     /// ```
-    pub async fn read_at(&self, offset: u64, len: usize) -> io::Result<(usize, Vec<u8>)> {
+    pub async fn read_at(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<(usize, crate::buffer::Buffer)> {
         let state = io_state();
         let op = Op::ReadFile {
             fd: self.inner.as_raw_fd(),
@@ -196,10 +200,13 @@ impl AsyncFile {
     /// ```
     pub async fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
         let state = io_state();
+        let mut buffer = crate::buffer::BufferPool::get(buf.len());
+        buffer.copy_from_slice(buf);
+
         let op = Op::WriteFile {
             fd: self.inner.as_raw_fd(),
             offset,
-            data: buf.to_vec(),
+            data: buffer,
         };
         let token = state.io_backend.submit(op);
         let future = IoFuture::new(token);

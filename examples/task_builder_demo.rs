@@ -54,9 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n3. TaskBuilder automatic backend selection:");
     println!("   - Without multicore feature: Uses single-CPU executor");
-    #[cfg(feature = "multicore")]
+
     println!("   - With multicore feature: Uses multi-CPU runtime if initialized");
-    #[cfg(not(feature = "multicore"))]
+
     println!("   - Multicore feature not enabled");
 
     Ok(())

@@ -62,6 +62,28 @@ unsafe fn waker_drop(data: *const ()) {
     Arc::from_raw(data as *const MinissWaker);
 }
 
+/// Create a dummy waker for simple polling scenarios
+/// This is used when we don't need proper task scheduling
+pub fn dummy_waker() -> Waker {
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn dummy_clone(_: *const ()) -> RawWaker {
+        dummy_raw_waker()
+    }
+    fn dummy_wake(_: *const ()) {}
+    fn dummy_wake_by_ref(_: *const ()) {}
+    fn dummy_drop(_: *const ()) {}
+
+    fn dummy_raw_waker() -> RawWaker {
+        RawWaker::new(
+            std::ptr::null(),
+            &RawWakerVTable::new(dummy_clone, dummy_wake, dummy_wake_by_ref, dummy_drop),
+        )
+    }
+
+    unsafe { Waker::from_raw(dummy_raw_waker()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,11 +2,18 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use rust_miniss::multicore::MultiCoreRuntime;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+}
 
 // Measures one-way cross-CPU message latency by having a task on CPU 0
 // submit a task to CPU 1 which signals completion back to the main thread.
 fn cross_cpu_one_way_latency(c: &mut Criterion) {
+    init_tracing();
     let runtime = Arc::new(MultiCoreRuntime::with_cpus(2).expect("runtime with 2 CPUs"));
 
     c.bench_function("cross_cpu_one_way_latency", |b| {
@@ -27,7 +34,7 @@ fn cross_cpu_one_way_latency(c: &mut Criterion) {
                     }
                 })
                 .expect("spawn_on cpu0");
-                let _ = rx.recv().unwrap();
+                rx.recv().unwrap();
             }
 
             let start = Instant::now();
@@ -46,7 +53,7 @@ fn cross_cpu_one_way_latency(c: &mut Criterion) {
                 })
                 .expect("spawn_on cpu0");
                 // Wait until CPU 1 runs the tiny task
-                let _ = rx.recv().unwrap();
+                rx.recv().unwrap();
             }
             start.elapsed()
         })

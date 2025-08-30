@@ -24,7 +24,8 @@ nix = { version = "0.27", features = ["signal", "time", "sched", "fs"] }
 libc = "0.2"
 mio = { version = "0.8", features = ["os-poll", "net", "os-ext"] }
 
-# I/O backends - focus on io-uring for Linux (Linux only)
+# I/O backends
+io-uring = "0.7"  # Available on Linux, used when kernel supports it
 
 # Buffer management
 bytes = "1"
@@ -32,9 +33,6 @@ bytes = "1"
 # HTTP parsing and types
 http = "1.0"
 httparse = "1.8"
-
-# DNS protocol
-trust-dns-proto = "0.23"
 
 # Utilities
 thiserror = "1.0"
@@ -44,17 +42,22 @@ num_cpus = "1.16"
 rand = "0.8"
 signal-hook = "0.3"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "signal", "io-util"] }
+threadpool = "1.8"
 
 
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.4"
 tokio = { version = "1", features = ["full"] }
-async-std = { version = "1.12", features = ["attributes"] }
 tempfile = "3.8"
 crc = "3.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
+ tracing = "0.1"
+ tracing-subscriber = "0.3"
+ loom = "0.7"
+
+
+
+
 
 [[example]]
 name = "hello_world"
@@ -66,9 +69,12 @@ name = "task_builder_demo"
 name = "http_echo"
 path = "examples/http_echo.rs"
 
-[[bin]]
+
+
+[[bench]]
 name = "http_echo_tokio"
-path = "bench_compare/http_echo_tokio.rs"
+path = "benches/http_echo_tokio.rs"
+harness = false
 
 [[bench]]
 name = "runtime_benchmarks"
@@ -87,36 +93,8 @@ name = "scheduling_throughput"
 harness = false
 
 [features]
-# Multi-core support
-default = ["multicore"]
-multicore = []
-signal = []
-timer = []
+default = []
 
 [profile.release]
 lto = true
 codegen-units = 1
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
-
-
-[[example]]
-name = "debug_write_test"
-path = "tests/debug_write_test.rs"
-
-[[example]]
-name = "simple_write_test"
-path = "tests/simple_write_test.rs"
-
-[[example]]
-name = "sync_io_test"
-path = "tests/sync_io_test.rs"
-
-[[example]]
-name = "debug_create_test"
-path = "tests/debug_create_test.rs"
-
-[[example]]
-name = "io_uring_test"
-path = "tests/io_uring_test.rs"

@@ -140,9 +140,12 @@ fn timer_sleep_benchmark(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("sleep_future", |b| {
-        let runtime = MultiCoreRuntime::with_cpus(1).unwrap();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
         b.iter(|| {
-            let _ = runtime.block_on(SleepFuture::new(Duration::from_millis(10)));
+            runtime.block_on(SleepFuture::new(Duration::from_millis(10)));
         })
     });
 

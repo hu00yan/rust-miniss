@@ -97,36 +97,18 @@ impl<T> JoinHandle<T> {
 
     /// Cancel the task
     ///
-    /// This method attempts to cancel the running task by sending a CancelTask
-    /// message to the appropriate CPU. Note that cancellation is cooperative -
-    /// the task will only be cancelled if it hasn't already completed.
+    /// This method attempts to cancel the running task. Note that cancellation
+    /// is cooperative - the task will only be cancelled if it hasn't already completed.
     ///
-    /// Returns `Ok(())` if the cancellation message was sent successfully,
+    /// Returns `Ok(())` if the cancellation was processed successfully,
     /// or an error if the task cannot be cancelled (e.g., runtime shutdown).
     pub fn cancel(&self) -> crate::error::Result<()> {
-        // For now, we'll use the global runtime to send the cancellation message
-        // In a more sophisticated implementation, we'd track which CPU the task is on
-        #[cfg(feature = "multicore")]
-        {
-            if let Ok(runtime) = std::panic::catch_unwind(crate::multicore::runtime) {
-                return self.cancel_multicore(&runtime);
-            }
-        }
-
-        // For single-CPU executor, we can't easily cancel tasks without more infrastructure
-        // This would require a more sophisticated design where tasks can be interrupted
-        tracing::warn!("Task cancellation not yet implemented for single-CPU executor");
-        Ok(())
-    }
-
-    /// Cancel task in multi-core runtime
-    #[cfg(feature = "multicore")]
-    fn cancel_multicore(
-        &self,
-        runtime: &std::sync::Arc<crate::multicore::MultiCoreRuntime>,
-    ) -> crate::error::Result<()> {
-        // Use the runtime's cancel_task method which looks up the CPU and sends the cancellation message
-        runtime.cancel_task(self.task_id)?;
+        // In the new thread-per-core design, task cancellation is simplified
+        // Since we don't track which CPU the task is on, we just mark it as cancelled
+        tracing::warn!(
+            "Task cancellation not fully implemented in thread-per-core runtime: {:?}",
+            self.task_id
+        );
 
         // Mark the result as cancelled if it hasn't completed yet
         if !self.is_finished() {
@@ -168,15 +150,7 @@ impl TaskBuilder {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        // Try multi-CPU runtime first if available
-        #[cfg(feature = "multicore")]
-        {
-            // Use the public runtime() function to access the global runtime
-            if let Ok(runtime) = std::panic::catch_unwind(crate::multicore::runtime) {
-                return self.spawn_multicore(&runtime, future);
-            }
-        }
-
+        // In the new queue-based design, we don't have a global runtime
         // Fall back to single-CPU executor
         self.spawn_single_cpu(future)
     }
@@ -199,29 +173,6 @@ impl TaskBuilder {
         });
 
         Ok(handle)
-    }
-
-    /// Spawn task on multi-core runtime
-    #[cfg(feature = "multicore")]
-    fn spawn_multicore<F, T>(
-        self,
-        runtime: &std::sync::Arc<crate::multicore::MultiCoreRuntime>,
-        future: F,
-    ) -> crate::error::Result<JoinHandle<T>>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let (result_future, promise) = crate::future::Future::new();
-
-        let task_future = async move {
-            let result = future.await;
-            promise.complete(Ok(result));
-        };
-
-        let task_id = runtime.spawn(Box::pin(task_future))?;
-
-        Ok(JoinHandle::new(task_id, result_future))
     }
 }
 
@@ -351,8 +302,8 @@ mod tests {
         assert!(completed.load(Ordering::SeqCst));
     }
 
+    #[cfg(not(miri))]
     #[test]
-    #[cfg(feature = "multicore")]
     fn test_task_builder_spawn_multi_core() {
         // Initialize the multi-core runtime
         crate::multicore::init_runtime(Some(2)).unwrap();

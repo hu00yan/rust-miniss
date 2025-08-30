@@ -1,12 +1,12 @@
-name: CI - Feature Gate & Build Matrix Validation
+name: CI - Build Matrix Validation
 
 on:
   push:
     branches:
       - main
       - feat/**
-      - feat/http-mvp
       - develop
+      - refactor-io-subsystem
   pull_request:
     branches: [ main ]
 
@@ -15,21 +15,10 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Test ${{ matrix.os }} - ${{ matrix.backend }}
-    runs-on: ${{ matrix.runner }}
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux + io-uring (native io-uring backend on Linux)
-          - os: linux
-            backend: io-uring
-            runner: ubuntu-latest
-            features: "io-uring"
-            target: x86_64-unknown-linux-gnu
-
+  # Quick checks first - fail fast
+  quick-checks:
+    name: Quick Checks (Format & Clippy)
+    runs-on: ubuntu-latest
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -37,7 +26,6 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        target: ${{ matrix.target }}
         components: rustfmt, clippy
 
     - name: Cache cargo registry
@@ -47,157 +35,76 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-${{ matrix.backend }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-${{ matrix.backend }}-
-          ${{ runner.os }}-cargo-
-
-    - name: Install system dependencies (Linux)
-      if: matrix.os == 'linux'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y liburing-dev build-essential
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Check formatting
       run: cargo fmt --all -- --check
 
     - name: Run clippy
-      run: |
-        if [ -n "${{ matrix.features }}" ]; then
-          cargo clippy --target ${{ matrix.target }} --features "${{ matrix.features }}" -- -D warnings
-        else
-          cargo clippy --target ${{ matrix.target }} -- -D warnings
-        fi
+      run: cargo clippy --all-targets -- -D warnings
 
-    - name: Build with specific backend
-      run: |
-        echo "Building for ${{ matrix.os }} with ${{ matrix.backend }} backend"
-        if [ -n "${{ matrix.features }}" ]; then
-          cargo build --target ${{ matrix.target }} --features "${{ matrix.features }}"
-        else
-          cargo build --target ${{ matrix.target }}
-        fi
+  # Main test suite
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    needs: quick-checks
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-    - name: Build with all features
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install system dependencies
       run: |
-        echo "Building with all features for ${{ matrix.backend }} backend validation"
-        cargo build --target ${{ matrix.target }} --all-features
+        sudo apt-get update
+        sudo apt-get install -y liburing-dev build-essential
+
+    - name: Build (debug)
+      run: cargo build --all-targets
+
+    - name: Build (release)
+      run: cargo build --release
 
     - name: Install nextest
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-nextest
 
-    - name: Run tests with specific backend (nextest)
+    - name: Run tests
+      run: cargo nextest run --all-targets
+
+    - name: Check documentation
+      run: cargo doc --all-features --no-deps
+
+    - name: Build benchmarks
+      run: cargo bench --all-targets --no-run
+
+    - name: Build examples
       run: |
-        echo "Running tests for ${{ matrix.backend }} backend"
-        if [ -n "${{ matrix.features }}" ]; then
-          cargo nextest run --features "${{ matrix.features }}" --profile ci
-        else
-          cargo nextest run --profile ci
-        fi
+        for example in examples/*.rs; do
+          if [[ -f "$example" ]]; then
+            example_name=$(basename "$example" .rs)
+            echo "Building example: $example_name"
+            cargo build --example "$example_name"
+          fi
+        done
 
-    - name: Run tests with all features (nextest)
-      run: |
-        echo "Running all feature tests"
-        cargo nextest run --all-features --profile ci
-
-    - name: Run benchmarks
-      run: |
-        echo "Running criterion benchmarks for ${{ matrix.backend }}"
-        if [ -n "${{ matrix.features }}" ]; then
-          cargo bench --target ${{ matrix.target }} --features "${{ matrix.features }}" --no-run
-        else
-          cargo bench --target ${{ matrix.target }} --no-run
-        fi
-
-  # Additional job for comprehensive feature combination testing
-  feature-combinations:
-    name: Feature Combinations Test
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt, clippy
-
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y liburing-dev build-essential
-
-    - name: Test default features
-      run: |
-        echo "Testing default feature set"
-        cargo check
-        cargo test
-
-    - name: Test io-uring feature
-      run: |
-        echo "Testing io-uring feature"
-        cargo check --features io-uring
-        cargo test --features io-uring
-
-    - name: Test multicore feature
-      run: |
-        echo "Testing multicore feature"
-        cargo check --features multicore
-        cargo test --features multicore
-
-    - name: Test combined features
-      run: |
-        echo "Testing io-uring with multicore"
-        cargo check --features "io-uring,multicore"
-        cargo test --features "io-uring,multicore"
-
-    - name: Test all features together
-      run: |
-        echo "Testing all features combined"
-        cargo check --all-features
-        cargo test --all-features
-
-  # Performance validation job
-  performance:
-    name: Performance Validation
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y liburing-dev build-essential
-
-    - name: Run criterion benchmarks (io-uring)
-      run: |
-        echo "Running benchmarks with io-uring backend"
-        cargo bench --features io-uring --bench runtime_benchmarks -- --output-format json | tee benchmark_results_iouring.json
-
-    - name: Run criterion benchmarks (all features)
-      run: |
-        echo "Running benchmarks with all features"
-        cargo bench --all-features --bench runtime_benchmarks -- --output-format json | tee benchmark_results_all.json
-
-    - name: Upload benchmark results
-      uses: actions/upload-artifact@v4
-      with:
-        name: benchmark-results
-        path: benchmark_results_*.json
-        retention-days: 30
-
-  # Build verification across architectures
+  # Cross compilation check
   cross-compile:
-    name: Cross-compilation Check - ARM64
+    name: Cross-compilation Check
     runs-on: ubuntu-latest
+    needs: quick-checks
     
     steps:
     - name: Checkout code
@@ -207,6 +114,15 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         target: aarch64-unknown-linux-gnu
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cross-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install system dependencies
       run: |
@@ -220,6 +136,4 @@ jobs:
         echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
     - name: Cross-compile check for ARM64
-      run: |
-        echo "Cross-compiling for aarch64-unknown-linux-gnu"
-        cargo check --target aarch64-unknown-linux-gnu --features io-uring
+      run: cargo check --target aarch64-unknown-linux-gnu

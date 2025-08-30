@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=================");
 
     // Initialize the runtime
-    #[cfg(feature = "multicore")]
+
     {
         rust_miniss::multicore::init_runtime(Some(2))?;
     }
@@ -140,10 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         work_handle.cancel()?;
 
         let work_count = work_counter.load(Ordering::SeqCst);
-        println!(
-            "   Async work completed {} times (expected ~3)",
-            work_count
-        );
+        println!("   Async work completed {} times (expected ~3)", work_count);
     }
 
     println!("\nAll periodic tasks completed successfully!");

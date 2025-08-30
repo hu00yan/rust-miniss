@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_queue::SegQueue;
 
-use crate::io::{CompletionKind, IoBackend, IoError, IoToken, Op};
+use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 use crate::task::{JoinHandle, Task};
 use crate::timer::TimerWheel;
 use crate::waker::{MinissWaker, TaskId};
@@ -22,7 +22,8 @@ use crate::waker::{MinissWaker, TaskId};
 /// This is shared between the `Cpu` and any `IoFuture`s running on it.
 pub struct CpuIoState {
     /// The I/O backend for submitting operations.
-    pub io_backend: Arc<dyn IoBackend<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
+    pub io_backend:
+        Arc<dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
     /// Wakers for tasks that are waiting for an I/O operation to complete.
     /// Keyed by the `IoToken` of the operation.
     pub io_wakers: Mutex<HashMap<IoToken, Waker>>,
@@ -44,17 +45,17 @@ impl Default for CpuIoState {
 impl std::fmt::Debug for CpuIoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuIoState")
-         .field("io_backend", &"<IoBackend>")
-         .field("io_wakers", &self.io_wakers)
-         .field("completed_io", &self.completed_io)
-         .finish()
+            .field("io_backend", &"<IoBackend>")
+            .field("io_wakers", &self.io_wakers)
+            .field("completed_io", &self.completed_io)
+            .finish()
     }
 }
 
 thread_local! {
     /// A thread-local reference to the current CPU's `IoState`.
     /// This allows an `IoFuture` to get access to the I/O context of the `Cpu` it's running on.
-    pub static CURRENT_CPU_IO_STATE: RefCell<Option<Arc<CpuIoState>>> = RefCell::new(None);
+    pub static CURRENT_CPU_IO_STATE: RefCell<Option<Arc<CpuIoState>>> = const { RefCell::new(None) };
 }
 
 /// Provides access to the I/O state of the current CPU thread.
@@ -101,7 +102,7 @@ pub struct Cpu {
     next_task_id: AtomicU64,
     timer: TimerWheel,
     running: bool,
-    io_backend: Arc<dyn IoBackend<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
+    io_backend: Arc<dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
     // New field for I/O state
     io_state: Arc<CpuIoState>,
     // Task cancellation tracking
@@ -132,9 +133,10 @@ impl std::fmt::Debug for CrossCpuMessage {
             CrossCpuMessage::Ping { reply_to } => {
                 f.debug_struct("Ping").field("reply_to", reply_to).finish()
             }
-            CrossCpuMessage::CancelTask(task_id) => {
-                f.debug_struct("CancelTask").field("task_id", task_id).finish()
-            }
+            CrossCpuMessage::CancelTask(task_id) => f
+                .debug_struct("CancelTask")
+                .field("task_id", task_id)
+                .finish(),
         }
     }
 }
@@ -150,7 +152,9 @@ impl Cpu {
     pub fn new(
         id: usize,
         message_receiver: Receiver<CrossCpuMessage>,
-        io_backend: Arc<dyn IoBackend<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
+        io_backend: Arc<
+            dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>,
+        >,
     ) -> Self {
         let io_state = Arc::new(CpuIoState {
             io_backend: io_backend.clone(),
@@ -208,7 +212,10 @@ impl Cpu {
                 self.ready_queue.push(task_id);
             }
             CrossCpuMessage::Shutdown => {
-                tracing::debug!("CPU {}: got Shutdown message, setting running=false", self.id);
+                tracing::debug!(
+                    "CPU {}: got Shutdown message, setting running=false",
+                    self.id
+                );
                 self.running = false;
             }
             CrossCpuMessage::Ping { .. } => {}
@@ -266,7 +273,7 @@ impl Cpu {
             } else {
                 false
             };
-            
+
             if is_cancelled {
                 // Clean up the cancelled task
                 if let Ok(mut cancelled) = self.cancelled_tasks.lock() {
@@ -277,7 +284,7 @@ impl Cpu {
                 made_progress = true;
                 continue;
             }
-            
+
             if let Some(mut task) = self.task_queue.remove(&task_id) {
                 made_progress = true;
                 let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
@@ -315,7 +322,10 @@ impl Cpu {
             self.tick();
 
             if self.ready_queue.is_empty() {
-                match self.message_receiver.recv_timeout(Duration::from_millis(crate::config::CPU_THREAD_TIMEOUT_MS)) {
+                match self
+                    .message_receiver
+                    .recv_timeout(Duration::from_millis(crate::config::CPU_THREAD_TIMEOUT_MS))
+                {
                     Ok(msg) => self.handle_message(msg),
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                         self.running = false;
@@ -355,7 +365,8 @@ impl Cpu {
 
 impl CpuHandle {
     pub fn new(cpu_id: usize) -> (Self, Receiver<CrossCpuMessage>) {
-        let (sender, receiver) = crossbeam_channel::bounded(crate::config::CROSS_CPU_CHANNEL_CAPACITY);
+        let (sender, receiver) =
+            crossbeam_channel::bounded(crate::config::CROSS_CPU_CHANNEL_CAPACITY);
         let handle = Self {
             cpu_id,
             sender,
@@ -364,12 +375,18 @@ impl CpuHandle {
         (handle, receiver)
     }
 
-    pub fn submit_task<F>(&self, task: F) -> Result<TaskId, crossbeam_channel::SendError<CrossCpuMessage>>
+    pub fn submit_task<F>(
+        &self,
+        task: F,
+    ) -> Result<TaskId, crossbeam_channel::SendError<CrossCpuMessage>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let task_id = generate_global_task_id();
-        let message = CrossCpuMessage::SubmitTask { task_id, task: Box::new(task) };
+        let message = CrossCpuMessage::SubmitTask {
+            task_id,
+            task: Box::new(task),
+        };
         self.sender.send(message).map(|_| task_id)
     }
 
@@ -377,12 +394,24 @@ impl CpuHandle {
         self.sender.send(CrossCpuMessage::Shutdown)
     }
 
-    pub fn ping(&self, from_cpu: usize) -> Result<(), crossbeam_channel::SendError<CrossCpuMessage>> {
-        self.sender.send(CrossCpuMessage::Ping { reply_to: from_cpu })
+    pub fn ping(
+        &self,
+        from_cpu: usize,
+    ) -> Result<(), crossbeam_channel::SendError<CrossCpuMessage>> {
+        self.sender
+            .send(CrossCpuMessage::Ping { reply_to: from_cpu })
     }
 
-    pub fn cancel_task(&self, task_id: TaskId) -> Result<(), crossbeam_channel::SendError<CrossCpuMessage>> {
+    pub fn cancel_task(
+        &self,
+        task_id: TaskId,
+    ) -> Result<(), crossbeam_channel::SendError<CrossCpuMessage>> {
         self.sender.send(CrossCpuMessage::CancelTask(task_id))
+    }
+
+    /// Get a reference to the sender for broadcasting messages
+    pub fn sender(&self) -> &Sender<CrossCpuMessage> {
+        &self.sender
     }
 
     pub fn set_thread_handle(&mut self, handle: ThreadJoinHandle<()>) {

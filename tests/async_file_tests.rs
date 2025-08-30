@@ -53,15 +53,20 @@ fn test_async_file_read_write() {
         // Create a temporary file
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let test_data = b"Hello, async file I/O!";
-        temp_file.write_all(test_data).expect("Failed to write to temp file");
+        temp_file
+            .write_all(test_data)
+            .expect("Failed to write to temp file");
         let temp_path = temp_file.path().to_path_buf();
 
         // Open the file asynchronously
         let async_file = AsyncFile::open(&temp_path).expect("Failed to open file");
 
         // Read from the file
-        let (bytes_read, data) = async_file.read_at(0, 1024).await.expect("Failed to read file");
-        
+        let (bytes_read, data) = async_file
+            .read_at(0, 1024)
+            .await
+            .expect("Failed to read file");
+
         assert_eq!(bytes_read, test_data.len());
         assert_eq!(&data[..bytes_read], test_data);
     });
@@ -81,15 +86,20 @@ fn test_async_file_create_write() {
 
         // Write to the file
         let test_data = b"Hello, async file creation!";
-        let bytes_written = async_file.write_at(0, test_data).await.expect("Failed to write file");
-        
+        let bytes_written = async_file
+            .write_at(0, test_data)
+            .await
+            .expect("Failed to write file");
+
         assert_eq!(bytes_written, test_data.len());
 
         // Verify the data was written
-        let mut file = std::fs::File::open(&temp_path).expect("Failed to open file for verification");
+        let mut file =
+            std::fs::File::open(&temp_path).expect("Failed to open file for verification");
         let mut contents = vec![];
         use std::io::Read;
-        file.read_to_end(&mut contents).expect("Failed to read file contents");
+        file.read_to_end(&mut contents)
+            .expect("Failed to read file contents");
         assert_eq!(contents, test_data);
     });
 }

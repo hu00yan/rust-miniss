@@ -9,7 +9,7 @@
 use crc::{Crc, CRC_32_ISO_HDLC};
 use proptest::prelude::*;
 use proptest::{prop_assert_eq, proptest};
-use rust_miniss::{BufferPool, CompletionKind, DummyIoBackend, IoBackend, IoError, IoToken, Op};
+use rust_miniss::{BufferPool, CompletionKind, DummyIoBackend, IoError, IoProvider, IoToken, Op};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::AtomicU64;
@@ -23,8 +23,8 @@ mod buffer_pool_tests {
 
     #[test]
     fn test_buffer_pool_correctness() {
-        let buffer1 = BufferPool::get();
-        let buffer2 = BufferPool::get();
+        let buffer1 = BufferPool::get(4096);
+        let buffer2 = BufferPool::get(4096);
 
         // Buffers should be distinct initially
         assert_ne!(buffer1.as_ptr(), buffer2.as_ptr());
@@ -34,14 +34,14 @@ mod buffer_pool_tests {
 
     #[test]
     fn test_buffer_pool_recycling() {
-        let buffer = BufferPool::get();
+        let buffer = BufferPool::get(4096);
         let original_ptr = buffer.as_ptr();
 
         // Recycle the buffer
         buffer.recycle();
 
         // Get a new buffer - should reuse the recycled one
-        let recycled_buffer = BufferPool::get();
+        let recycled_buffer = BufferPool::get(4096);
         assert_eq!(recycled_buffer.as_ptr(), original_ptr);
     }
 
@@ -51,7 +51,7 @@ mod buffer_pool_tests {
         let mut buffers = Vec::new();
         for _ in 0..110 {
             // POOL_SIZE is 100
-            buffers.push(BufferPool::get());
+            buffers.push(BufferPool::get(4096));
         }
 
         // Recycle all buffers
@@ -65,10 +65,10 @@ mod buffer_pool_tests {
 
     #[test]
     fn test_buffer_operations() {
-        let buffer = BufferPool::get();
+        let buffer = BufferPool::get(4096);
 
         // Test deref operations
-        let slice: &[u8] = &*buffer;
+        let slice: &[u8] = &buffer;
         assert_eq!(slice.len(), buffer.len());
 
         // Test as_ref
@@ -124,13 +124,12 @@ mod io_future_tests {
         }
     }
 
-    impl IoBackend for MockIoBackend {
+    impl IoProvider for MockIoBackend {
         type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
 
         fn submit(&self, _op: Op) -> IoToken {
-            let token = IoToken::new();
             // Store for potential completion
-            token
+            IoToken::new()
         }
 
         fn poll_complete(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
@@ -175,7 +174,7 @@ mod io_future_tests {
                 token,
                 Ok(CompletionKind::Read {
                     bytes_read: 512,
-                    data: vec![0u8; 512],
+                    data: rust_miniss::Buffer::new_zeroed(512),
                 }),
             );
         });
@@ -303,7 +302,7 @@ mod property_tests {
             for &should_get in &ops {
                 if should_get || buffers.is_empty() {
                     // Get a buffer
-                    buffers.push(BufferPool::get());
+                    buffers.push(BufferPool::get(4096));
                 } else {
                     // Recycle a buffer
                     if let Some(buffer) = buffers.pop() {

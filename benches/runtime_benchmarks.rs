@@ -1,7 +1,14 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rust_miniss::Runtime;
 
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+}
+
 fn runtime_creation_benchmark(c: &mut Criterion) {
+    init_tracing();
     c.bench_function("runtime_creation", |b| {
         b.iter(|| {
             let _runtime = black_box(Runtime::new());
@@ -10,6 +17,7 @@ fn runtime_creation_benchmark(c: &mut Criterion) {
 }
 
 fn basic_task_spawning_benchmark(c: &mut Criterion) {
+    init_tracing();
     c.bench_function("basic_task_spawn", |b| {
         b.iter(|| {
             let runtime = Runtime::new();

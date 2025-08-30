@@ -3,6 +3,12 @@ use rust_miniss::multicore::MultiCoreRuntime;
 use std::sync::mpsc::sync_channel;
 use std::time::Instant;
 
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+}
+
 fn scheduling_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("scheduling_throughput");
 
@@ -13,6 +19,7 @@ fn scheduling_throughput(c: &mut Criterion) {
             &task_count,
             |b, &n| {
                 b.iter_custom(|iters| {
+                    init_tracing();
                     // Create a runtime per measurement to avoid interference
                     let runtime = MultiCoreRuntime::with_cpus(4).expect("runtime with 4 cpus");
 
@@ -28,7 +35,7 @@ fn scheduling_throughput(c: &mut Criterion) {
                                 .expect("spawn");
                         }
                         for _ in 0..n {
-                            let _ = rx.recv().unwrap();
+                            rx.recv().unwrap();
                         }
                     }
 
@@ -44,7 +51,7 @@ fn scheduling_throughput(c: &mut Criterion) {
                                 .expect("spawn");
                         }
                         for _ in 0..n {
-                            let _ = rx.recv().unwrap();
+                            rx.recv().unwrap();
                         }
                     }
                     let elapsed = start.elapsed();

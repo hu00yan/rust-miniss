@@ -69,7 +69,7 @@
 //! let shutdown_flag = Arc::new(AtomicBool::new(false));
 //!
 //! // Set up signal handling for graceful shutdown
-//! #[cfg(feature = "signal")]
+//!
 //! {
 //!     let handler = SignalHandler::new(shutdown_flag.clone());
 //!     handler.start();
@@ -99,29 +99,31 @@ pub mod cancellation;
 pub mod config;
 pub mod cpu;
 pub mod executor;
+pub mod fs;
 pub mod future;
+pub mod http;
 pub mod io;
-pub mod net;
 pub mod multicore;
+pub mod net;
+pub mod signal;
 pub mod task;
 pub mod timer;
 pub mod waker;
-pub mod fs;
-
-#[cfg(feature = "signal")]
-pub mod signal;
 
 // Re-export core types
 pub use buffer::{Buffer, BufferPool};
 pub use cpu::Cpu;
 pub use executor::{Executor, Runtime};
+pub use fs::AsyncFile;
 pub use future::{Future, Promise};
-pub use io::{CompletionKind, DummyIoBackend, IoBackend, IoError, IoToken, Op};
-pub use multicore::{init_runtime, MultiCoreRuntime};
-pub use net::{AsyncTcpListener, AsyncTcpStream};
+pub use http::{
+    EchoHandler, HttpConnection, HttpHandler, Method, Request, Response, StaticHandler, StatusCode,
+};
+pub use io::{CompletionKind, DummyIoBackend, IoError, IoProvider, IoToken, Op};
+pub use multicore::MultiCoreRuntime;
+pub use net::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket};
 pub use task::{spawn, Task, TaskBuilder, TaskError, TaskResult};
 pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWheel};
-pub use fs::AsyncFile;
 
 /// Error types for the runtime
 pub mod error {
