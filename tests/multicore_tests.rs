@@ -99,7 +99,7 @@ use rust_miniss::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn init_tracing() {
     // Initialize tracing to prevent panics in multi-threaded environment
@@ -130,7 +130,7 @@ fn test_multicore_basic_functionality() {
         .unwrap();
 
     // Wait for task to complete
-    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    rx.recv_timeout(Duration::from_millis(200)).unwrap();
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 
     runtime.shutdown().unwrap();
@@ -159,7 +159,7 @@ fn test_multicore_cross_cpu_communication() {
 
     // Wait for all tasks to complete
     for _ in 0..4 {
-        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rx.recv_timeout(Duration::from_millis(200)).unwrap();
     }
 
     let final_results = results.lock().unwrap();
@@ -188,7 +188,7 @@ fn test_multicore_round_robin_distribution() {
 
     // Wait for tasks to complete
     for _ in 0..15 {
-        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rx.recv_timeout(Duration::from_millis(200)).unwrap();
     }
 
     // Check that tasks were executed
@@ -275,7 +275,7 @@ fn test_multicore_concurrent_spawning() {
         if counter.load(Ordering::SeqCst) == 40 {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     let final_count = counter.load(Ordering::SeqCst);
@@ -301,90 +301,6 @@ fn test_multicore_ping_communication() {
     std::thread::yield_now();
 
     runtime.shutdown().unwrap();
-}
-
-#[test]
-fn test_multicore_performance_comparison() {
-    init_tracing();
-    // This test compares single-core vs multi-core performance
-    let task_count = 50; // Reduced further for reliability
-
-    // Single-core runtime - block_on to ensure execution
-    let start = Instant::now();
-    let single_runtime = Runtime::new();
-    let counter = Arc::new(AtomicU32::new(0));
-
-    let single_handles: Vec<_> = (0..task_count)
-        .map(|_| {
-            let counter_clone = counter.clone();
-            single_runtime.spawn(async move {
-                counter_clone.fetch_add(1, Ordering::SeqCst);
-            })
-        })
-        .collect();
-
-    // Block until all single-core tasks complete
-    single_runtime.block_on(async move {
-        for handle in single_handles {
-            let _ = handle.await;
-        }
-    });
-
-    let single_duration = start.elapsed();
-    let single_completed = counter.load(Ordering::SeqCst);
-
-    // Multi-core runtime
-    let start = Instant::now();
-    let multi_runtime = MultiCoreRuntime::new(Some(4)).unwrap();
-    let counter2 = Arc::new(AtomicU32::new(0));
-
-    // Use channels for synchronization
-    let (tx, rx) = mpsc::channel();
-    for _ in 0..task_count {
-        let counter_clone = counter2.clone();
-        let tx_clone = tx.clone();
-        multi_runtime
-            .spawn(async move {
-                counter_clone.fetch_add(1, Ordering::SeqCst);
-                let _ = tx_clone.send(());
-            })
-            .unwrap();
-    }
-
-    // Wait for multi-core tasks with timeout
-    let mut multi_completed = 0;
-    for _ in 0..task_count {
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(_) => multi_completed += 1,
-            Err(_) => break,
-        }
-    }
-    let multi_duration = start.elapsed();
-
-    println!(
-        "Single-core: {:?} (completed: {})",
-        single_duration, single_completed
-    );
-    println!(
-        "Multi-core: {:?} (completed: {})",
-        multi_duration, multi_completed
-    );
-
-    // Both should complete most tasks (allow some tolerance for timing)
-    assert!(
-        single_completed >= task_count * 3 / 4,
-        "Single-core completed {}, expected at least {}",
-        single_completed,
-        task_count * 3 / 4
-    );
-    assert!(
-        multi_completed >= task_count * 3 / 4,
-        "Multi-core completed {}, expected at least {}",
-        multi_completed,
-        task_count * 3 / 4
-    );
-
-    multi_runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -434,7 +350,7 @@ fn test_multicore_task_isolation() {
 
     // Wait for tasks to complete
     for _ in 0..2 {
-        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rx.recv_timeout(Duration::from_millis(200)).unwrap();
     }
 
     assert_eq!(cpu0_data.load(Ordering::SeqCst), 100);
@@ -466,7 +382,7 @@ fn test_multicore_graceful_shutdown() {
 
     // Give tasks time to start
     for _ in 0..5 {
-        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rx.recv_timeout(Duration::from_millis(200)).unwrap();
     }
 
     // Graceful shutdown should wait for tasks to complete

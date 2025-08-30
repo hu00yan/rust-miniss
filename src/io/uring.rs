@@ -45,33 +45,23 @@ enum PendingOp {
         buffer: Buffer,
         addr_storage: Box<sockaddr_storage>,
         addr_len: Box<socklen_t>,
-        iov: Box<iovec>,
-        msg: Box<msghdr>,
     },
     UdpSend {
         op: Op,
         data: Buffer,
         addr_storage: Box<sockaddr_storage>,
         addr_len: Box<socklen_t>,
-        iov: Box<iovec>,
-        msg: Box<msghdr>,
     },
 }
 
-/// A `io-uring` based `IoBackend`.
+/// A `io-uring` based `IoProvider`.
 pub struct UringBackend {
     ring: UnsafeCell<IoUring>,
     pending_ops: UnsafeCell<HashMap<u64, PendingOp>>,
 }
 
 // SAFETY: This is safe in our thread-per-core model.
-// SAFETY: UringBackend contains UnsafeCell but is designed to be used from a single thread
-// The IoUring and HashMap are accessed only within the same thread context
-// Thread safety is ensured by the runtime's single-threaded per-CPU design
-// TODO: Consider using thread-local storage or removing Sync impl for extra safety
 unsafe impl Send for UringBackend {}
-// WARNING: Sync implementation assumes single-threaded access per backend instance
-// This is safe only because each CPU has its own UringBackend instance
 unsafe impl Sync for UringBackend {}
 
 impl UringBackend {
@@ -98,9 +88,8 @@ impl IoProvider for UringBackend {
         let (entry, pending_op) = {
             match op {
                 Op::Accept { fd } => {
-                    let mut addr_storage = Box::new(unsafe {
-                        std::mem::MaybeUninit::<sockaddr_storage>::zeroed().assume_init()
-                    });
+                    let mut addr_storage =
+                        Box::new(unsafe { std::mem::zeroed::<sockaddr_storage>() });
                     let mut addr_len =
                         Box::new(std::mem::size_of::<sockaddr_storage>() as socklen_t);
                     let entry = opcode::Accept::new(
@@ -121,14 +110,10 @@ impl IoProvider for UringBackend {
                 }
                 Op::Read { fd, offset, len } => {
                     let mut buf = BufferPool::get(len); // Get a buffer from the pool
-                    let entry = opcode::Read::new(
-                        types::Fd(fd),
-                        buf.as_mut_slice().as_mut_ptr(),
-                        len as u32,
-                    )
-                    .offset(offset)
-                    .build()
-                    .user_data(user_data);
+                    let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
+                        .offset(offset)
+                        .build()
+                        .user_data(user_data);
                     (
                         entry,
                         PendingOp::Read {
@@ -178,14 +163,10 @@ impl IoProvider for UringBackend {
                 }
                 Op::ReadFile { fd, offset, len } => {
                     let mut buf = BufferPool::get(len); // Get a buffer from the pool
-                    let entry = opcode::Read::new(
-                        types::Fd(fd),
-                        buf.as_mut_slice().as_mut_ptr(),
-                        len as u32,
-                    )
-                    .offset(offset)
-                    .build()
-                    .user_data(user_data);
+                    let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
+                        .offset(offset)
+                        .build()
+                        .user_data(user_data);
                     (
                         entry,
                         PendingOp::ReadFile {
@@ -215,7 +196,7 @@ impl IoProvider for UringBackend {
                 Op::UdpRecv { fd, mut buffer } => {
                     // Build a libc iovec and msghdr for recvmsg
                     let mut iov = Box::new(iovec {
-                        iov_base: buffer.as_mut_slice().as_mut_ptr() as *mut _,
+                        iov_base: buffer.as_mut_ptr() as *mut _,
                         iov_len: buffer.len(),
                     });
                     let mut addr_storage =
@@ -246,59 +227,53 @@ impl IoProvider for UringBackend {
                             buffer,
                             addr_storage,
                             addr_len,
-                            iov,
-                            msg,
                         },
                     )
                 }
                 Op::UdpSend { fd, data, addr } => {
-                    // Build iovec and msghdr for sendmsg (UDP send via sendmsg)
+                    // Build iovec and msghdr for sendmsg
                     let mut iov = Box::new(iovec {
                         iov_base: data.as_ptr() as *mut _,
                         iov_len: data.len(),
                     });
 
-                    // Convert SocketAddr to sockaddr_storage properly
+                    // Convert SocketAddr into sockaddr_storage
                     let mut addr_storage: Box<sockaddr_storage> =
                         Box::new(unsafe { std::mem::zeroed() });
                     let mut addr_len: Box<socklen_t> = Box::new(0);
-
+                    // fill in addr_storage using libc helpers via socket2 or manual match
                     match addr {
                         std::net::SocketAddr::V4(sa_v4) => {
+                            let in_addr = libc::sockaddr_in {
+                                sin_family: libc::AF_INET as u16,
+                                sin_port: sa_v4.port().to_be(),
+                                sin_addr: libc::in_addr {
+                                    s_addr: u32::from(*sa_v4.ip()).to_be(),
+                                },
+                                sin_zero: [0; 8],
+                            };
                             unsafe {
-                                let sin = libc::sockaddr_in {
-                                    sin_family: libc::AF_INET as u16,
-                                    sin_port: sa_v4.port().to_be(),
-                                    sin_addr: libc::in_addr {
-                                        s_addr: u32::from(*sa_v4.ip()).to_be(),
-                                    },
-                                    sin_zero: [0; 8],
-                                };
-                                // Copy the entire sockaddr_in structure to addr_storage
-                                std::ptr::copy_nonoverlapping(
-                                    &sin as *const _ as *const u8,
-                                    addr_storage.as_mut() as *mut _ as *mut u8,
-                                    std::mem::size_of::<libc::sockaddr_in>(),
+                                std::ptr::write(
+                                    addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in,
+                                    in_addr,
                                 );
                             }
                             *addr_len = std::mem::size_of::<libc::sockaddr_in>() as socklen_t;
                         }
                         std::net::SocketAddr::V6(sa_v6) => {
+                            let sin6 = libc::sockaddr_in6 {
+                                sin6_family: libc::AF_INET6 as u16,
+                                sin6_port: sa_v6.port().to_be(),
+                                sin6_flowinfo: sa_v6.flowinfo(),
+                                sin6_addr: libc::in6_addr {
+                                    s6_addr: sa_v6.ip().octets(),
+                                },
+                                sin6_scope_id: sa_v6.scope_id(),
+                            };
                             unsafe {
-                                let sin6 = libc::sockaddr_in6 {
-                                    sin6_family: libc::AF_INET6 as u16,
-                                    sin6_port: sa_v6.port().to_be(),
-                                    sin6_flowinfo: sa_v6.flowinfo(),
-                                    sin6_addr: libc::in6_addr {
-                                        s6_addr: sa_v6.ip().octets(),
-                                    },
-                                    sin6_scope_id: sa_v6.scope_id(),
-                                };
-                                // Copy the entire sockaddr_in6 structure to addr_storage
-                                std::ptr::copy_nonoverlapping(
-                                    &sin6 as *const _ as *const u8,
-                                    addr_storage.as_mut() as *mut _ as *mut u8,
-                                    std::mem::size_of::<libc::sockaddr_in6>(),
+                                std::ptr::write(
+                                    addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in6,
+                                    sin6,
                                 );
                             }
                             *addr_len = std::mem::size_of::<libc::sockaddr_in6>() as socklen_t;
@@ -318,7 +293,6 @@ impl IoProvider for UringBackend {
                     let entry = opcode::SendMsg::new(types::Fd(fd), msg.as_mut() as *mut _)
                         .build()
                         .user_data(user_data);
-
                     (
                         entry,
                         PendingOp::UdpSend {
@@ -330,8 +304,6 @@ impl IoProvider for UringBackend {
                             data,
                             addr_storage,
                             addr_len,
-                            iov,
-                            msg,
                         },
                     )
                 }
@@ -506,15 +478,7 @@ impl IoProvider for UringBackend {
                         mut buffer,
                         addr_storage,
                         addr_len,
-                        iov,
-                        msg,
                     } => {
-                        // Keep all references alive
-                        let _ = &*addr_storage as *const _;
-                        let _ = *addr_len;
-                        let _ = &*iov as *const _;
-                        let _ = &*msg as *const _;
-
                         let res = if result < 0 {
                             buffer.recycle();
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
@@ -581,15 +545,10 @@ impl IoProvider for UringBackend {
                         data,
                         addr_storage,
                         addr_len,
-                        iov,
-                        msg,
                     } => {
-                        // Keep all references alive by referencing them
+                        // touch addr_storage/addr_len so they're considered read (keeps them alive)
                         let _ = &*addr_storage as *const _;
                         let _ = *addr_len;
-                        let _ = &*iov as *const _;
-                        let _ = &*msg as *const _;
-
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
