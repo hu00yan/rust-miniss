@@ -1,0 +1,21 @@
+[package]
+name = "runtime-comparison"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tokio_echo" 
+path = "tokio_echo.rs"
+
+[[bin]]
+name = "monoio_echo"
+path = "monoio_echo.rs"
+
+[[bin]]
+name = "glommio_echo" 
+path = "glommio_echo.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+monoio = "0.2"
+glommio = "0.9"

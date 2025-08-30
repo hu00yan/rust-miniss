@@ -73,23 +73,27 @@ path = "examples/http_echo.rs"
 
 [[bench]]
 name = "http_echo_tokio"
-path = "benches/http_echo_tokio.rs"
+path = "bench/internal/http_echo_tokio.rs"
 harness = false
 
 [[bench]]
 name = "runtime_benchmarks"
+path = "bench/internal/runtime_benchmarks.rs"
 harness = false
 
 [[bench]]
 name = "timer_benchmarks"
+path = "bench/internal/timer_benchmarks.rs"
 harness = false
 
 [[bench]]
 name = "cross_cpu_latency"
+path = "bench/internal/cross_cpu_latency.rs"
 harness = false
 
 [[bench]]
 name = "scheduling_throughput"
+path = "bench/internal/scheduling_throughput.rs"
 harness = false
 
 [features]

@@ -15,7 +15,7 @@ fn main() -> std::io::Result<()> {
         let bytes_written = file.write(test_data)?;
         println!("Wrote {} bytes", bytes_written);
         assert_eq!(bytes_written, test_data.len());
-        
+
         // Sync the file
         file.sync_all()?;
     }
@@ -28,7 +28,7 @@ fn main() -> std::io::Result<()> {
         println!("Read {} bytes: {:?}", bytes_read, contents);
         assert_eq!(contents, b"test");
     }
-    
+
     println!("Test passed!");
     Ok(())
 }
