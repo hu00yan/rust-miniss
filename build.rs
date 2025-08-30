@@ -31,8 +31,7 @@ fn main() {
         match get_kernel_version() {
             Ok(version) => {
                 eprintln!("Detected kernel version: {:?}", version);
-                let io_uring_eligible =
-                    version >= (5, 10, 0) && is_io_uring_actually_supported_on_linux();
+                let io_uring_eligible = version >= (5, 10, 0) && is_io_uring_actually_supported_on_linux();
 
                 // If kernel supports io_uring (5.10+), use io_uring. Otherwise fall back to epoll.
                 if io_uring_eligible {
@@ -55,13 +54,9 @@ fn main() {
     } else if cfg!(target_os = "macos") {
         eprintln!("Enabling kqueue backend (macOS)");
         println!("cargo:rustc-cfg=io_backend=\"kqueue\"");
-    } else if cfg!(all(
-        unix,
-        not(target_os = "linux"),
-        not(target_os = "macos")
-    )) {
-        eprintln!("No specific IO backend available for this platform, using dummy backend");
-        // Don't set any io_backend cfg, let the code use DummyIoBackend
+    } else if cfg!(all(unix, not(target_os = "linux"), not(target_os = "macos"))) {
+        eprintln!("Enabling epoll backend (other Unix)");
+        println!("cargo:rustc-cfg=io_backend=\"epoll\"");
     }
 }
 
@@ -74,7 +69,7 @@ fn get_kernel_version() -> Result<(u32, u32, u32), Box<dyn std::error::Error>> {
 
 /// Parses a kernel version string like "5.10.0-8-generic" into (5, 10, 0)
 fn parse_kernel_version(version_str: &str) -> Result<(u32, u32, u32), Box<dyn std::error::Error>> {
-    let parts: Vec<&str> = version_str.trim().split(['.', '-']).collect();
+    let parts: Vec<&str> = version_str.trim().split(|c| c == '.' || c == '-').collect();
     if parts.len() >= 3 {
         let major = parts[0].parse()?;
         let minor = parts[1].parse()?;
@@ -92,8 +87,5 @@ fn parse_kernel_version(version_str: &str) -> Result<(u32, u32, u32), Box<dyn st
 /// Checks if io_uring is actually supported on this system.
 /// A more robust implementation might try to create an io_uring instance.
 fn is_io_uring_actually_supported_on_linux() -> bool {
-    // For now, be conservative and only enable io_uring on newer kernels
-    // In practice, io_uring might not be available even on supported kernels
-    // due to system configuration or container restrictions
     true
 }
