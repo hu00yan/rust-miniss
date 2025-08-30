@@ -60,8 +60,8 @@ fn main() {
         not(target_os = "linux"),
         not(target_os = "macos")
     )) {
-        eprintln!("No specific IO backend available for this platform, using dummy backend");
-        // Don't set any io_backend cfg, let the code use DummyIoBackend
+        eprintln!("Enabling epoll backend (other Unix)");
+        println!("cargo:rustc-cfg=io_backend=\"epoll\"");
     }
 }
 
@@ -92,8 +92,5 @@ fn parse_kernel_version(version_str: &str) -> Result<(u32, u32, u32), Box<dyn st
 /// Checks if io_uring is actually supported on this system.
 /// A more robust implementation might try to create an io_uring instance.
 fn is_io_uring_actually_supported_on_linux() -> bool {
-    // For now, be conservative and only enable io_uring on newer kernels
-    // In practice, io_uring might not be available even on supported kernels
-    // due to system configuration or container restrictions
     true
 }
