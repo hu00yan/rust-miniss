@@ -103,10 +103,19 @@ impl TimerWheel {
         let timer_id = TimerId::new();
         let slot_index = self.calculate_slot(at);
 
-        // SAFETY: We know slot_index is within bounds because calculate_slot
-        // ensures it's modulo num_slots. This is the single unsafe block
-        // used for performance-critical slot access to avoid bounds checking.
-        let slot = unsafe { self.slots.get_unchecked_mut(slot_index) };
+        // Verify slot_index is within bounds before accessing
+        debug_assert!(
+            slot_index < self.slots.len(),
+            "Timer wheel slot index out of bounds"
+        );
+
+        // SAFETY: We've verified slot_index is within bounds via debug_assert above
+        // and calculate_slot ensures it's modulo num_slots. However, for production
+        // safety, we should use bounds-checked access.
+        let slot = self
+            .slots
+            .get_mut(slot_index)
+            .expect("Timer slot index verified to be in bounds");
 
         slot.push_back(Entry {
             id: timer_id,

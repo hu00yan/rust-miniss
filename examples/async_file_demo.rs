@@ -27,7 +27,7 @@ fn main() -> std::io::Result<()> {
 
     runtime.block_on(async {
         println!("Starting async file I/O demo...");
-        
+
         // Create a temporary file
         let mut temp_file = NamedTempFile::new()?;
         let test_data = b"Hello, async file I/O!";
@@ -43,11 +43,15 @@ fn main() -> std::io::Result<()> {
         println!("About to read from file...");
         let (bytes_read, data) = async_file.read_at(0, 1024).await?;
         println!("Read from file completed");
-        
-        println!("Read {} bytes: {:?}", bytes_read, String::from_utf8_lossy(&data));
+
+        println!(
+            "Read {} bytes: {:?}",
+            bytes_read,
+            String::from_utf8_lossy(&data)
+        );
         assert_eq!(bytes_read, test_data.len());
         assert_eq!(&data[..bytes_read], test_data);
-        
+
         println!("File I/O test passed!");
         Ok(())
     })

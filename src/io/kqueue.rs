@@ -447,7 +447,7 @@ impl IoProvider for KqueueBackend {
 }
 
 fn syscall_accept(fd: RawFd) -> io::Result<(RawFd, std::net::SocketAddr)> {
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut storage: libc::sockaddr_storage = std::mem::MaybeUninit::zeroed().assume_init();
     let mut len = std::mem::size_of_val(&storage) as libc::socklen_t;
     let new_fd = unsafe { libc::accept(fd, &mut storage as *mut _ as *mut _, &mut len) };
 

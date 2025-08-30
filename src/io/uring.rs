@@ -65,7 +65,13 @@ pub struct UringBackend {
 }
 
 // SAFETY: This is safe in our thread-per-core model.
+// SAFETY: UringBackend contains UnsafeCell but is designed to be used from a single thread
+// The IoUring and HashMap are accessed only within the same thread context
+// Thread safety is ensured by the runtime's single-threaded per-CPU design
+// TODO: Consider using thread-local storage or removing Sync impl for extra safety
 unsafe impl Send for UringBackend {}
+// WARNING: Sync implementation assumes single-threaded access per backend instance
+// This is safe only because each CPU has its own UringBackend instance
 unsafe impl Sync for UringBackend {}
 
 impl UringBackend {
@@ -92,8 +98,9 @@ impl IoProvider for UringBackend {
         let (entry, pending_op) = {
             match op {
                 Op::Accept { fd } => {
-                    let mut addr_storage =
-                        Box::new(unsafe { std::mem::zeroed::<sockaddr_storage>() });
+                    let mut addr_storage = Box::new(unsafe {
+                        std::mem::MaybeUninit::<sockaddr_storage>::zeroed().assume_init()
+                    });
                     let mut addr_len =
                         Box::new(std::mem::size_of::<sockaddr_storage>() as socklen_t);
                     let entry = opcode::Accept::new(

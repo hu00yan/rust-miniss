@@ -7,9 +7,10 @@ use std::{
 };
 
 // Long-lived stress test exercising timers + I/O for 10 minutes.
-// Run manually or in CI dedicated job: `cargo test --test stress_timer_io -- --ignored`.
+// Run manually: `cargo test --test stress_timer_io -- --ignored --nocapture`.
+// This test is ignored in CI to prevent timeouts.
 #[test]
-#[ignore]
+#[ignore = "Long running stress test - run manually"]
 fn stress_timer_io() {
     const RUN_SECS: u64 = 600; // 10 minutes
 
@@ -18,6 +19,7 @@ fn stress_timer_io() {
     let file = Arc::new(Mutex::new(
         OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&tmp_path)
             .unwrap(),

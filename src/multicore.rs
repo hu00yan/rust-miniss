@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
@@ -125,9 +126,10 @@ impl CpuCore {
             // 4. Process timers
             work_done |= self.process_timers();
 
-            // Yield CPU if no work was done
+            // Use proper waiting mechanism instead of busy-waiting with yield
             if !work_done {
-                thread::yield_now();
+                // Consider using condition variable or park/unpark for better CPU efficiency
+                std::thread::park_timeout(Duration::from_micros(100));
             }
         }
 
@@ -494,7 +496,7 @@ impl MultiCoreRuntime {
                 RuntimeState::Running as u8,
                 RuntimeState::ShuttingDown as u8,
                 Ordering::Release,
-                Ordering::Relaxed,
+                Ordering::Acquire, // Changed from Relaxed to Acquire for failure ordering
             )
             .is_err()
         {
