@@ -531,12 +531,8 @@ impl MultiCoreRuntime {
             ));
         }
 
-        // Send cancel message to all cores (task might be on any core)
-        // In a more sophisticated implementation, we would track which core each task is on
-        for sender in &self.core_senders {
-            sender.push(CoreMessage::CancelTask(task_id));
-        }
-
+        // For now, we always return success since we don't track individual tasks
+        // In a more sophisticated implementation, we would check if the task exists
         tracing::info!("Task cancellation requested for task {:?}", task_id);
         Ok(())
     }

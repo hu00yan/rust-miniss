@@ -4,7 +4,7 @@
 //! - Shared-nothing architecture (one thread per CPU core)
 //! - Lock-free cross-CPU communication
 //! - Automatic IO backend selection for optimal performance
-//! - Custom Future/Promise implementation for educational purposes
+//! - Channel-based task communication for reliability
 //!
 //! ## IO Backend Selection
 //!
@@ -100,7 +100,6 @@ pub mod config;
 pub mod cpu;
 pub mod executor;
 pub mod fs;
-pub mod future;
 pub mod http;
 pub mod io;
 pub mod multicore;
@@ -115,7 +114,6 @@ pub use buffer::{Buffer, BufferPool};
 pub use cpu::Cpu;
 pub use executor::{Executor, Runtime};
 pub use fs::AsyncFile;
-pub use future::{Future, Promise};
 pub use http::{
     EchoHandler, HttpConnection, HttpHandler, Method, Request, Response, StaticHandler, StatusCode,
 };

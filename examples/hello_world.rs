@@ -37,18 +37,18 @@ fn main() {
     });
     println!("Final result: {}", result);
 
-    // Example 3: Using our custom Future/Promise
-    println!("\n--- Example 3: Custom Future/Promise ---");
+    // Example 3: Using task spawning (modern approach)
+    println!("\n--- Example 3: Task Spawning ---");
     let result = runtime.block_on(async {
-        let (future, promise) = rust_miniss::future::Future::new();
+        // Spawn a task and await its result
+        let handle = runtime.spawn(async {
+            println!("Task is running...");
+            "Hello from spawned task!"
+        });
 
-        // Simulate completing the promise from another context
-        // In a real scenario, this might be done from a callback or another task
-        promise.complete("Hello from Promise!");
-
-        future.await
+        handle.await.unwrap()
     });
-    println!("Promise result: {}", result);
+    println!("Task result: {}", result);
 
     println!("\n✅ All examples completed successfully!");
 }

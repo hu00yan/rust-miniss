@@ -1,5 +1,5 @@
-use glommio::io::{TcpListener, TcpStream};
-use glommio::net::TcpStream as GlommioTcpStream;
+use glommio::net::{TcpListener, TcpStream};
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn read_http_request(stream: &TcpStream) -> std::io::Result<(String, String, String)> {
     let mut data = Vec::with_capacity(4096);

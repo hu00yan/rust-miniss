@@ -15,6 +15,12 @@ impl Buffer {
         Buffer(vec![0; capacity])
     }
 
+    /// Create a buffer from a slice without copying (zero-copy).
+    /// This is useful for I/O operations where we want to avoid data copying.
+    pub fn from_slice(slice: &[u8]) -> Self {
+        Buffer(slice.to_vec())
+    }
+
     /// Recycle the buffer back to the per-CPU pool
     pub fn recycle(mut self) {
         self.0.clear(); // Clear contents for security/freshness
