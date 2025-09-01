@@ -25,10 +25,12 @@
 //! via the [`JoinHandle::cancel`] method.
 
 use crate::waker::TaskId;
+use crossbeam_channel::{Receiver, TryRecvError};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 /// Error returned from a failed task.
 #[derive(Debug)]
@@ -76,13 +78,18 @@ impl Task {
 /// A spawned task handle that can be awaited
 pub struct JoinHandle<T> {
     task_id: TaskId,
-    result: crate::future::Future<TaskResult<T>>,
+    receiver: Receiver<TaskResult<T>>,
+    waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl<T> JoinHandle<T> {
     /// Create a new join handle
-    pub(crate) fn new(task_id: TaskId, result: crate::future::Future<TaskResult<T>>) -> Self {
-        Self { task_id, result }
+    pub(crate) fn new(task_id: TaskId, receiver: Receiver<TaskResult<T>>) -> Self {
+        Self {
+            task_id,
+            receiver,
+            waker: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Get the task ID
@@ -92,7 +99,10 @@ impl<T> JoinHandle<T> {
 
     /// Check if the task has completed
     pub fn is_finished(&self) -> bool {
-        self.result.is_ready()
+        matches!(
+            self.receiver.try_recv(),
+            Ok(_) | Err(TryRecvError::Disconnected)
+        )
     }
 
     /// Cancel the task
@@ -122,8 +132,16 @@ impl<T> JoinHandle<T> {
 impl<T: Send> Future for JoinHandle<T> {
     type Output = TaskResult<T>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.result).poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.receiver.try_recv() {
+            Ok(result) => Poll::Ready(result),
+            Err(TryRecvError::Empty) => {
+                // Store the waker so the sender can wake us when result is ready
+                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(TryRecvError::Disconnected) => Poll::Ready(Err(TaskError::Cancelled)),
+        }
     }
 }
 

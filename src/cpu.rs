@@ -185,15 +185,15 @@ impl Cpu {
         T: Send + 'static,
     {
         let task_id = self.next_task_id();
-        let (result_future, promise) = crate::future::Future::new();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
         let wrapped_future = async move {
             let result = future.await;
-            promise.complete(Ok(result));
+            let _ = sender.send(Ok(result));
         };
         let task = Task::new(task_id, wrapped_future);
         self.task_queue.insert(task_id, task);
         self.ready_queue.push(task_id);
-        JoinHandle::new(task_id, result_future)
+        JoinHandle::new(task_id, receiver)
     }
 
     fn process_messages(&mut self) {

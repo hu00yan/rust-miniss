@@ -23,6 +23,7 @@ dashmap = "5.5"
 nix = { version = "0.27", features = ["signal", "time", "sched", "fs"] }
 libc = "0.2"
 mio = { version = "0.8", features = ["os-poll", "net", "os-ext"] }
+socket2 = "0.5"
 
 # I/O backends
 io-uring = "0.7"  # Available on Linux, used when kernel supports it

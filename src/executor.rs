@@ -264,13 +264,13 @@ impl Executor {
     {
         let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::SeqCst));
 
-        let (result_future, promise) = crate::future::Future::new();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
 
-        // Wrap the user's future to complete our promise when done
+        // Wrap the user's future to send result through channel
         // Panics will be caught at the polling level in tick()
         let wrapped_future = async move {
             let result = future.await;
-            promise.complete(Ok(result));
+            let _ = sender.send(Ok(result));
         };
 
         // Create the task
@@ -280,7 +280,7 @@ impl Executor {
         self.tasks.insert(task_id, task);
         self.ready_queue.push(task_id);
 
-        JoinHandle::new(task_id, result_future)
+        JoinHandle::new(task_id, receiver)
     }
 
     /// Run all ready tasks once

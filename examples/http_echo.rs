@@ -1,9 +1,8 @@
 //! An asynchronous HTTP echo server using the miniss runtime.
 
 use rust_miniss::{
-    multicore,
     net::{AsyncTcpListener, AsyncTcpStream},
-    task,
+    task, Runtime,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -40,15 +39,24 @@ async fn handle_client(stream: AsyncTcpStream) {
 }
 
 fn main() -> io::Result<()> {
+    let mut addr = String::from("127.0.0.1:8080");
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--addr" || arg == "-a" {
+            if let Some(v) = args.next() {
+                addr = v;
+            }
+        }
+    }
+
     println!("🚀 Starting HTTP Echo Server");
-    println!("Server will listen on http://127.0.0.1:8080");
-    println!("Try: curl http://127.0.0.1:8080");
+    println!("Server will listen on http://{}", addr);
+    println!("Try: curl http://{}", addr);
 
-    let runtime = multicore::MultiCoreRuntime::new(Some(2))
-        .map_err(|e| io::Error::other(format!("Runtime error: {}", e)))?;
-    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let runtime = Runtime::new();
+    let addr: SocketAddr = addr.parse().unwrap();
 
-    runtime.block_on(async move {
+    runtime.block_on(async {
         let listener = match AsyncTcpListener::bind(addr) {
             Ok(l) => l,
             Err(e) => {
@@ -66,9 +74,8 @@ fn main() -> io::Result<()> {
                     request_count += 1;
                     println!("📥 Request #{} from {:?}", request_count, client_addr);
 
-                    let _ = task::spawn(async move {
-                        handle_client(stream).await;
-                    });
+                    // Handle client directly in the main loop to avoid runtime context issues
+                    handle_client(stream).await;
                 }
                 Err(e) => {
                     eprintln!("❌ Accept error: {}", e);
@@ -78,7 +85,6 @@ fn main() -> io::Result<()> {
         }
     });
 
-    runtime.shutdown().unwrap();
     Ok(())
 }
 
