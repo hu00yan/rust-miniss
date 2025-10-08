@@ -47,8 +47,10 @@ impl IoProvider for KqueueBackend {
     type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
 
     fn submit(&self, op: Op) -> IoToken {
-        let io_token = IoToken::new();
-        let next_token = unsafe { &mut *self.next_token.get() };
+        // Allocate token from the current CPU's I/O state
+        let state = crate::cpu::io_state();
+        state.alloc_waker_slot().expect("No available waker slots");
+    }
         let poll = unsafe { &mut *self.poll.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
         let mio_token = Token(*next_token);
@@ -95,7 +97,7 @@ impl IoProvider for KqueueBackend {
                     use std::os::unix::io::FromRawFd;
                     let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
                     let res = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                        let mut buf = crate::buffer::BufferPool::get(len); // Get a buffer
+                        let mut buf = vec![0u8; len]; // Get a buffer
                         file.read(&mut buf).map(|bytes_read| {
                             unsafe {
                                 buf.set_len(bytes_read);
@@ -240,7 +242,7 @@ impl IoProvider for KqueueBackend {
                     Op::Read { fd, offset, len } => {
                         let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
                         let res = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = crate::buffer::BufferPool::get(*len);
+                            let mut buf = vec![0u8; *len];
                             file.read(&mut buf).map(|bytes_read| {
                                 unsafe {
                                     buf.set_len(bytes_read);
@@ -268,7 +270,7 @@ impl IoProvider for KqueueBackend {
                         // This path should ideally not be hit as these are handled sync in submit
                         let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
                         let res = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = crate::buffer::BufferPool::get(*len);
+                            let mut buf = vec![0u8; *len];
                             file.read(&mut buf).map(|bytes_read| {
                                 unsafe {
                                     buf.set_len(bytes_read);
@@ -379,7 +381,7 @@ impl IoProvider for KqueueBackend {
                         use std::os::unix::io::FromRawFd;
                         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
                         let res = file.seek(SeekFrom::Start(offset)).and_then(|_| {
-                            let mut buf = crate::buffer::BufferPool::get(len);
+                            let mut buf = vec![0u8; len];
                             file.read(&mut buf).map(|bytes_read| {
                                 unsafe {
                                     buf.set_len(bytes_read);

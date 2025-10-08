@@ -32,7 +32,7 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Generate unique task ID
 fn next_task_id() -> TaskId {
-    TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
+    TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Release))
 }
 
 /// Message types for inter-core communication
@@ -111,7 +111,7 @@ impl CpuCore {
 
         tracing::info!("CPU core {} started", self.id);
 
-        while !self.shutdown.load(Ordering::Relaxed) {
+        while !self.shutdown.load(Ordering::Acquire) {
             let mut work_done = false;
 
             // 1. Process inter-core messages
@@ -184,7 +184,7 @@ impl CpuCore {
                     processed += 1;
                 }
                 Some(CoreMessage::Shutdown) => {
-                    self.shutdown.store(true, Ordering::Relaxed);
+                    self.shutdown.store(true, Ordering::Release);
                     processed += 1;
                     break;
                 }
@@ -427,7 +427,7 @@ impl MultiCoreRuntime {
         let task_id = next_task_id();
 
         // Select core using round-robin
-        let core_id = self.next_core.fetch_add(1, Ordering::Relaxed) % self.num_cores;
+        let core_id = self.next_core.fetch_add(1, Ordering::AcqRel) % self.num_cores;
 
         self.spawn_on_core(core_id, task_id, future)
     }
@@ -737,7 +737,7 @@ mod tests {
 
         let _task_id = runtime
             .spawn(async move {
-                counter_clone.fetch_add(1, Ordering::Relaxed);
+                counter_clone.fetch_add(1, Ordering::Release);
             })
             .unwrap();
 
@@ -750,7 +750,7 @@ mod tests {
             Err(_) => panic!("Failed to get unique ownership of runtime"),
         }
 
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
     }
 
     #[test]

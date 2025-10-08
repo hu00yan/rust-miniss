@@ -19,20 +19,19 @@
 //! `TaskError::Panic` contains the panic payload for analysis.
 
 use crossbeam_queue::SegQueue;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::task::{JoinHandle, Task};
 use crate::waker::{MinissWaker, TaskId};
 
 /// A single-threaded async runtime
-use std::sync::atomic::AtomicBool;
-
 pub struct Runtime {
-    executor: Mutex<Executor>,
+    executor: RefCell<Executor>, // Changed from Mutex to RefCell (single-threaded)
     pub shutdown_flag: Arc<AtomicBool>,
 }
 
@@ -40,7 +39,7 @@ impl Runtime {
     /// Create a new runtime
     pub fn new() -> Self {
         Self {
-            executor: Mutex::new(Executor::new()),
+            executor: RefCell::new(Executor::new()), // Changed from Mutex::new
             shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -55,87 +54,68 @@ impl Runtime {
         use crate::{CompletionKind, IoError, IoProvider, IoToken, Op};
         use std::sync::Arc;
 
-        // Create an appropriate I/O backend for single-threaded execution based on compile-time configuration
-        #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
-        let io_backend = {
-            match crate::io::uring::UringBackend::new(32) {
-                Ok(uring) => Arc::new(uring)
-                    as Arc<
-                        dyn IoProvider<
-                            Completion = (
-                                IoToken,
-                                Op,
-                                std::result::Result<CompletionKind, IoError>,
-                            ),
-                        >,
-                    >,
-                Err(e) => {
-                    eprintln!("Failed to create io_uring backend: {}, cannot proceed", e);
-                    panic!("IO backend initialization failed: {}", e);
+        // Create an appropriate I/O backend for single-threaded execution based on compile-time features
+        let io_backend: Arc<
+            dyn IoProvider<
+                Completion = (
+                    IoToken,
+                    Op,
+                    std::result::Result<CompletionKind, IoError>,
+                ),
+            >,
+        > = {
+            #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+            {
+                match crate::io::uring::UringBackend::new(32) {
+                    Ok(uring) => Arc::new(uring),
+                    Err(e) => panic!("Failed to create io_uring backend: {}", e),
                 }
+            }
+            #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
+            {
+                match crate::io::kqueue::KqueueBackend::new() {
+                    Ok(kqueue) => Arc::new(kqueue)
+                        as Arc<
+                            dyn IoProvider<
+                                Completion = (
+                                    IoToken,
+                                    Op,
+                                    std::result::Result<CompletionKind, IoError>,
+                                ),
+                            >,
+                        >,
+                    Err(e) => panic!("Failed to create kqueue backend: {}", e),
+                }
+            }
+            #[cfg(all(target_os = "linux", io_backend = "epoll"))]
+            {
+                match crate::io::epoll::EpollBackend::new() {
+                    Ok(epoll) => Arc::new(epoll)
+                        as Arc<
+                            dyn IoProvider<
+                                Completion = (
+                                    IoToken,
+                                    Op,
+                                    std::result::Result<CompletionKind, IoError>,
+                                ),
+                            >,
+                        >,
+                    Err(e) => panic!("Failed to create epoll backend: {}", e),
+                }
+            }
+            #[cfg(not(any(
+                all(target_os = "linux", io_backend = "io_uring"),
+                all(target_os = "linux", io_backend = "epoll"),
+                all(target_os = "macos", io_backend = "kqueue")
+            )))]
+            {
+                panic!("No I/O backend enabled. Please enable 'io_uring', 'epoll', or 'kqueue' feature.");
             }
         };
 
-        #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
-        let io_backend = {
-            match crate::io::kqueue::KqueueBackend::new() {
-                Ok(kqueue) => Arc::new(kqueue)
-                    as Arc<
-                        dyn IoProvider<
-                            Completion = (
-                                IoToken,
-                                Op,
-                                std::result::Result<CompletionKind, IoError>,
-                            ),
-                        >,
-                    >,
-                Err(e) => {
-                    eprintln!("Failed to create kqueue backend: {}, cannot proceed", e);
-                    panic!("IO backend initialization failed: {}", e);
-                }
-            }
-        };
-
-        #[cfg(all(target_os = "linux", io_backend = "epoll"))]
-        let io_backend = {
-            match crate::io::epoll::EpollBackend::new() {
-                Ok(epoll) => Arc::new(epoll)
-                    as Arc<
-                        dyn IoProvider<
-                            Completion = (
-                                IoToken,
-                                Op,
-                                std::result::Result<CompletionKind, IoError>,
-                            ),
-                        >,
-                    >,
-                Err(e) => {
-                    eprintln!("Failed to create epoll backend: {}, cannot proceed", e);
-                    panic!("IO backend initialization failed: {}", e);
-                }
-            }
-        };
-
-        // Fallback for other platforms
-        #[cfg(not(any(
-            all(target_os = "linux", io_backend = "io_uring"),
-            all(target_os = "linux", io_backend = "epoll"),
-            all(target_os = "macos", io_backend = "kqueue")
-        )))]
-        let io_backend = {
-            Arc::new(crate::io::DummyIoBackend::new())
-                as Arc<
-                    dyn IoProvider<
-                        Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>),
-                    >,
-                >
-        };
-
-        let io_state = Arc::new(CpuIoState {
-            io_backend,
-            io_wakers: Mutex::new(HashMap::new()),
-            completed_io: Mutex::new(HashMap::new()),
-        });
+        let mut default_state = CpuIoState::default();
+        default_state.io_backend = io_backend;
+        let io_state = Arc::new(default_state);
 
         // Set the current I/O state
         set_current_io_state(io_state.clone());
@@ -174,10 +154,10 @@ impl Runtime {
                         if !completions.is_empty() {
                             // Process completions
                             let mut completed = io_state.completed_io.lock().unwrap();
-                            let mut wakers = io_state.io_wakers.lock().unwrap();
                             for (token, _op, result) in completions {
                                 completed.insert(token, result);
-                                if let Some(waker) = wakers.remove(&token) {
+                                // Take and wake the waker from the slab
+                                if let Some(waker) = io_state.take_waker(token) {
                                     waker.wake();
                                 }
                             }
@@ -197,7 +177,7 @@ impl Runtime {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.executor.lock().unwrap().spawn(future)
+        self.executor.borrow_mut().spawn(future) // Changed from lock().unwrap()
     }
 }
 

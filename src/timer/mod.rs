@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
@@ -62,13 +62,16 @@ impl<F: std::future::Future> FutureExt for F {}
 /// A high-performance timer wheel implementation for scheduling timeouts
 ///
 /// This implementation uses a circular buffer of timer slots with minimal
-/// unsafe code for performance-critical slot indexing.
+/// unsafe code for performance-critical slot indexing. Includes a HashMap
+/// for O(1) timer cancellation.
 pub struct TimerWheel {
     slots: Vec<VecDeque<Entry>>,
     resolution_ms: u64,
     num_slots: usize,
     current_slot: usize,
     start_time: Instant,
+    /// Maps TimerId to (slot_index, position_in_slot) for fast cancellation
+    timer_locations: HashMap<TimerId, (usize, usize)>,
 }
 
 impl Default for TimerWheel {
@@ -93,6 +96,7 @@ impl TimerWheel {
             num_slots,
             current_slot: 0,
             start_time: Instant::now(),
+            timer_locations: HashMap::new(),
         }
     }
 
@@ -109,18 +113,19 @@ impl TimerWheel {
             "Timer wheel slot index out of bounds"
         );
 
-        // SAFETY: We've verified slot_index is within bounds via debug_assert above
-        // and calculate_slot ensures it's modulo num_slots. However, for production
-        // safety, we should use bounds-checked access.
         let slot = self
             .slots
             .get_mut(slot_index)
             .expect("Timer slot index verified to be in bounds");
 
+        let position_in_slot = slot.len();
         slot.push_back(Entry {
             id: timer_id,
             waker,
         });
+
+        // Record the location for fast cancellation
+        self.timer_locations.insert(timer_id, (slot_index, position_in_slot));
 
         timer_id
     }
@@ -129,11 +134,19 @@ impl TimerWheel {
     ///
     /// Returns true if the timer was found and cancelled, false otherwise
     pub fn cancel(&mut self, id: TimerId) -> bool {
-        // Search through all slots to find and remove the timer
-        for slot in &mut self.slots {
-            if let Some(pos) = slot.iter().position(|entry| entry.id == id) {
-                slot.remove(pos);
-                return true;
+        if let Some((slot_index, position)) = self.timer_locations.remove(&id) {
+            if let Some(slot) = self.slots.get_mut(slot_index) {
+                // Check if the position is still valid (timers might have been removed before this one)
+                if position < slot.len() && slot[position].id == id {
+                    slot.remove(position);
+                    // Update positions of remaining timers in this slot
+                    for i in position..slot.len() {
+                        if let Some(location) = self.timer_locations.get_mut(&slot[i].id) {
+                            location.1 = i;
+                        }
+                    }
+                    return true;
+                }
             }
         }
         false
@@ -151,6 +164,7 @@ impl TimerWheel {
         while self.current_slot != target_slot || target_slot_offset as usize >= self.num_slots {
             let slot = &mut self.slots[self.current_slot];
             while let Some(entry) = slot.pop_front() {
+                self.timer_locations.remove(&entry.id); // Remove from location cache
                 ready.push(entry.waker);
             }
 

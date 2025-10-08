@@ -12,17 +12,18 @@ Rust-Miniss implements a **shared-nothing architecture** inspired by [Seastar](h
 - **No Shared State**: Each CPU maintains its own task queue, timer wheel, and I/O context
 - **Lock-Free Communication**: Cross-CPU communication uses SPSC (Single Producer, Single Consumer) queues
 
-### 2. Zero-Copy I/O
+### 2. Efficient I/O
 
-- **Direct Memory Access**: Uses io-uring on Linux for kernel-bypass I/O
-- **Pre-allocated Buffers**: Buffer pools to minimize allocations during I/O operations
-- **Batched Operations**: Grouping I/O operations for better throughput
+- **Multi-Backend Support**: io-uring on Linux, epoll/kqueue on other Unix systems
+- **Simple Buffering**: Direct Vec<u8> allocation for I/O operations (simplified from complex pooling)
+- **Async Operations**: Non-blocking I/O with completion-based notification
+- **Thread Pool**: Blocking file I/O handled asynchronously via thread pools
 
 ### 3. Minimal Allocations
 
-- **Memory Pools**: Pre-allocated data structures to avoid runtime allocations
+- **Direct Allocation**: Trust system allocator for buffer management
 - **RAII Management**: Automatic resource cleanup using Rust's ownership system
-- **Configured Capacities**: Tunable memory pool sizes for different workloads
+- **Thread-Local State**: Per-thread I/O state to avoid contention
 
 ## System Architecture
 
@@ -100,7 +101,8 @@ pub struct Cpu {
     ready_queue: Arc<SegQueue<TaskId>>,     // Lock-free ready queue
     message_receiver: Receiver<CrossCpuMessage>, // Cross-CPU communication
     timer: TimerWheel,                      // Local timer wheel
-    io_backend: Arc<dyn IoBackend>,         // I/O operations
+    io_state: Arc<CpuIoState>,              // Thread-local I/O context
+    cancelled_tasks: Arc<Mutex<HashMap<TaskId, ()>>>, // Cancellation tracking
 }
 ```
 
@@ -116,10 +118,10 @@ The timer wheel (`src/timer/mod.rs`) provides high-performance timeout schedulin
 
 ```rust
 pub struct TimerWheel {
-    slots: Vec<VecDeque<Entry>>,    // Circular buffer of timer slots
+    wheel: Vec<VecDeque<Entry>>,    // Circular buffer of timer slots
     resolution_ms: u64,             // Time resolution in milliseconds
+    current_tick: u64,              // Current tick count
     num_slots: usize,               // Number of slots in the wheel
-    current_slot: usize,            // Current position in the wheel
 }
 ```
 
@@ -156,17 +158,20 @@ The runtime supports multiple I/O backends based on platform:
 
 #### io-uring (Linux)
 ```rust
-pub struct IoUringBackend {
+pub struct UringBackend {
     ring: IoUring,                          // io-uring instance
-    submissions: Slab<IoCompletion>,        // Pending operations
+    pending_ops: HashMap<u64, (IoToken, Op)>, // Pending operations
+    completions: Vec<CompletionEntry>,      // Completion buffer
 }
 ```
 
 #### epoll/kqueue (Fallback)
 ```rust
 pub struct EpollBackend {
-    epoll_fd: RawFd,                        // epoll file descriptor
-    events: Vec<EpollEvent>,                // Event buffer
+    poll: mio::Poll,                        // mio Poll instance
+    events: mio::Events,                    // Event buffer
+    pending_ops: HashMap<Token, (IoToken, Op)>, // Pending operations
+    thread_pool: ThreadPool,                // For blocking file I/O
 }
 ```
 

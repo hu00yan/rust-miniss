@@ -6,9 +6,12 @@ authors = ["Your Name"]
 description = "A Rust implementation of miniss - a toy Seastar-like async runtime"
 license = "MIT OR Apache-2.0"
 
+
+
 [dependencies]
 # Core async primitives
 futures = "0.3"
+futures-util = "0.3"
 pin-project-lite = "0.2"
 pin-project = "1.1"
 
@@ -30,6 +33,7 @@ io-uring = "0.7"  # Available on Linux, used when kernel supports it
 
 # Buffer management
 bytes = "1"
+slab = "0.4.9"
 
 # HTTP parsing and types
 http = "1.0"
@@ -44,21 +48,24 @@ rand = "0.8"
 signal-hook = "0.3"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "signal", "io-util"] }
 threadpool = "1.8"
-
+tokio-util = { version = "0.7", features = ["compat"] }
+metrics = { version = "0.24", default-features = false }
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
+bumpalo = { version = "3.16.0", optional = true }
+tracing-test = "0.2.5"
 
 [dev-dependencies]
-criterion = "0.5"
-proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = { version = "1.4", features = ["std"] }  # For fuzz
 tokio = { version = "1", features = ["full"] }
 tempfile = "3.8"
 crc = "3.0"
- tracing = "0.1"
- tracing-subscriber = "0.3"
- loom = "0.7"
-
-
-
-
+tracing = "0.1"
+reqwest = { version = "0.11", features = ["blocking"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+loom = "0.7"
+hyper = { version = "1", features = ["full"] }
+tracing-test = "0.2.5"
 
 [[example]]
 name = "hello_world"
@@ -70,7 +77,27 @@ name = "task_builder_demo"
 name = "http_echo"
 path = "examples/http_echo.rs"
 
+[[example]]
+name = "http2_server"
+path = "examples/http2_server.rs"
 
+[[example]]
+name = "hyper_integration"
+path = "examples/hyper_integration.rs"
+
+[[example]]
+name = "simple_hyper_server"
+path = "examples/simple_hyper_server.rs"
+
+
+
+[[example]]
+name = "udp_buffered"
+path = "examples/udp_buffered.rs"
+
+[[example]]
+name = "metrics_server"
+path = "examples/metrics_server.rs"
 
 [[bench]]
 name = "http_echo_tokio"
@@ -98,7 +125,13 @@ path = "bench/internal/scheduling_throughput.rs"
 harness = false
 
 [features]
-default = []
+default = ["io_uring", "epoll"]
+arena = ["dep:bumpalo"]
+rent-traits = []  # Enable AsyncReadRent/WriteRent
+advanced = ["dep:bumpalo", "rent-traits"]  # Zero-copy Rent + arena
+debug = []  # Tracing spans, backtraces
+io_uring = []
+epoll = []
 
 [profile.release]
 lto = true

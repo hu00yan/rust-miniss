@@ -1,7 +1,9 @@
 # Rust build artifacts
 /target/
-**/target/
-**/*.rs.bk
+/**/*.rs.bk
+
+# Cargo registry and cache (NEVER track - auto-generated, huge)
+.cargo/
 
 # Cargo lock file (optional, usually included for applications)
 # Cargo.lock
@@ -33,4 +35,25 @@ tarpaulin-report.html
 .aider*
 .claude/
 **/.claude/
+# Debug tools (local only)
+.gdbinit
+lldbinit
+valgrind.supp
+
+# Temp dirs from tests/examples
+/tmp/test.*
+tempdir-*
+
+# Metrics exporter temp
+metrics_temp
+
+# Valgrind/Perf outputs
+vgcore.*
+perf.data
+
+# Bumpalo arenas (if leaked in tests)
+arena-leak-*
+
+# Slab pool temp (if testing)
+slab-test.*
 

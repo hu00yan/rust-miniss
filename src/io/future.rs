@@ -34,13 +34,9 @@ impl Future for IoFuture {
             return Poll::Ready(result);
         }
 
-        // The operation is not yet complete. Register the waker so the runtime
-        // can wake us up when the completion arrives.
-        state
-            .io_wakers
-            .lock()
-            .unwrap()
-            .insert(self.token, cx.waker().clone());
+        // The operation is not yet complete. Store the waker in the slab
+        // so the runtime can wake us up when the completion arrives.
+        state.store_waker(self.token, cx.waker().clone());
 
         // Return Pending to indicate that we are still waiting.
         Poll::Pending
@@ -50,11 +46,11 @@ impl Future for IoFuture {
 impl Drop for IoFuture {
     fn drop(&mut self) {
         // When the future is dropped, we need to clean up any associated state.
-        // The most important thing is to remove the waker, if it exists, to prevent
-        // a memory leak. A more advanced implementation would also attempt to
+        // The most important thing is to remove the waker from the slab, if it exists,
+        // to prevent a memory leak. A more advanced implementation would also attempt to
         // cancel the underlying I/O operation.
         let state = io_state();
-        state.io_wakers.lock().unwrap().remove(&self.token);
+        state.take_waker(self.token); // This removes the waker from the slab
         // We also remove any potential completion that might have arrived just now.
         state.completed_io.lock().unwrap().remove(&self.token);
     }

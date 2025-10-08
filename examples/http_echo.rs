@@ -1,40 +1,45 @@
 //! An asynchronous HTTP echo server using the miniss runtime.
+//! For production HTTP, integrate hyper:
+//! Add to Cargo.toml: hyper = { version = "1", features = ["http1", "server", "tcp"] }
+//! Then use hyper's Server with miniss-compatible streams.
 
 use rust_miniss::{
     net::{AsyncTcpListener, AsyncTcpStream},
     task, Runtime,
 };
+use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+
 use std::io;
 use std::net::SocketAddr;
 
-async fn handle_client(stream: AsyncTcpStream) {
+async fn handle_client(mut stream: AsyncTcpStream) {
     println!("📡 Handling HTTP client");
 
     // Read from the stream
-    match stream.read().await {
-        Ok((bytes_read, data)) => {
+    let mut buf = vec![0u8; 4096];
+    match stream.read(&mut buf).await {
+        Ok(bytes_read) => {
             println!("   Received {} bytes", bytes_read);
-            if let Ok(request) = std::str::from_utf8(&data.as_ref()[..bytes_read]) {
+            if let Ok(request) = std::str::from_utf8(&buf[..bytes_read]) {
                 println!(
                     "   Request preview: {}",
-                    &request.lines().next().unwrap_or("")
+                    request.lines().next().unwrap_or("")
                 );
+            }
+
+            // Echo back the request as response
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                bytes_read, std::str::from_utf8(&buf[..bytes_read]).unwrap_or("")
+            );
+
+            if let Err(e) = stream.write_all(response.as_bytes()).await {
+                eprintln!("   Failed to write response: {}", e);
             }
         }
         Err(e) => {
             eprintln!("   Failed to read from stream: {}", e);
-            return;
         }
-    }
-
-    // A minimal, static HTTP response
-    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello world!";
-
-    // Write the response
-    if let Err(e) = stream.write(response).await {
-        eprintln!("   Failed to write response: {}", e);
-    } else {
-        println!("   Sent HTTP response");
     }
 }
 
@@ -74,8 +79,10 @@ fn main() -> io::Result<()> {
                     request_count += 1;
                     println!("📥 Request #{} from {:?}", request_count, client_addr);
 
-                    // Handle client directly in the main loop to avoid runtime context issues
-                    handle_client(stream).await;
+                    // Spawn each client connection as a separate task for concurrency
+                    if let Err(e) = task::spawn(handle_client(stream)) {
+                        eprintln!("Failed to spawn client handler: {}", e);
+                    }
                 }
                 Err(e) => {
                     eprintln!("❌ Accept error: {}", e);
@@ -87,6 +94,31 @@ fn main() -> io::Result<()> {
 
     Ok(())
 }
+
+// Example: Integrating hyper for full HTTP/1.1 support
+// Add to Cargo.toml: hyper = { version = "1", features = ["http1", "server"] }
+// Then use tokio_util::compat::Compat to bridge miniss streams to Tokio
+//
+// async fn run_hyper_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//     use hyper::{Body, Request, Response, Server};
+//     use hyper::service::service_fn;
+//     use std::convert::Infallible;
+//     use tokio_util::compat::TokioAsyncReadCompatExt;
+//
+//     let addr = ([0, 0, 0, 0], 8080).into();
+//     let listener = AsyncTcpListener::bind(addr)?;
+//     let service = service_fn(|_req: Request<Body>| async {
+//         Ok::<_, Infallible>(Response::new(Body::from("Hello from hyper + miniss!")))
+//     });
+//
+//     // Bridge miniss stream to Tokio-compatible stream
+//     loop {
+//         let (stream, _) = listener.accept().await?;
+//         let tokio_stream = TokioAsyncReadCompatExt::compat(stream);
+//         // Then use hyper with tokio_stream
+//     }
+//     Ok(())
+// }
 
 #[allow(dead_code)]
 async fn run_server() -> io::Result<()> {

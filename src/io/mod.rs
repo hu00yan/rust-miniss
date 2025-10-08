@@ -22,8 +22,8 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use crate::buffer::Buffer; // Add Buffer import
-                           // Remove BufferPool import as it's not directly used here and causes a warning.
+
+use crate::buffer::Buffer;
 
 /// A trait for I/O resources that can be represented by a raw file descriptor.
 pub trait AsRawFd {
@@ -67,7 +67,7 @@ pub enum Op {
     Write {
         fd: i32,
         offset: u64,
-        data: Buffer, // Use Buffer for consistency
+        data: Buffer,
     },
     Fsync {
         fd: i32,
@@ -94,12 +94,31 @@ pub enum Op {
         data: Buffer,
         addr: SocketAddr,
     },
+    UdpRecvVectored {
+        fd: RawFd,
+        iovecs: Vec<Buffer>,
+    },
+    UdpSendVectored {
+        fd: RawFd,
+        iovecs: Vec<Buffer>,
+        addr: SocketAddr,
+    },
+    ReadRent {
+        fd: i32,
+        buffer: Buffer,
+    },
+    WriteRent {
+        fd: i32,
+        data: Buffer,
+    },
 }
 
 /// A unique identifier for a submitted I/O operation.
+/// Contains both a global ID and a slab index for efficient waker management.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IoToken {
     id: u64,
+    slab_index: usize,
 }
 
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -114,9 +133,20 @@ impl IoToken {
     /// Creates a new, unique `IoToken`.
     pub fn new() -> Self {
         Self {
-            id: TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed),
+            id: TOKEN_COUNTER.fetch_add(1, Ordering::Release),
+            slab_index: 0, // Will be set by CpuIoState
         }
     }
+
+    /// Creates an IoToken with a specific slab index.
+    pub(crate) fn with_slab_index(mut self, index: usize) -> Self {
+        self.slab_index = index;
+        self
+    }
+
+
+
+
 
     /// Returns the underlying `u64` ID of the token.
     pub fn id(&self) -> u64 {
@@ -140,6 +170,14 @@ pub enum CompletionKind {
     Write {
         bytes_written: usize,
     },
+    ReadVectored {
+        bytes_read: usize,
+        iovecs: (),
+    },
+    WriteVectored {
+        bytes_written: usize,
+        iovecs: (),
+    },
     Fsync,
     Close,
     ReadFile {
@@ -157,6 +195,20 @@ pub enum CompletionKind {
     UdpSend {
         bytes_written: usize,
         data: Buffer,
+    },
+    UdpRecvVectored {
+        bytes_read: usize,
+        addr: SocketAddr,
+        iovecs: Vec<Buffer>,
+    },
+    UdpSendVectored {
+        bytes_written: usize,
+    },
+    ReadRent {
+        buffer: Buffer,
+    },
+    WriteRent {
+        bytes_written: usize,
     },
 }
 
@@ -206,32 +258,8 @@ pub mod uring;
 
 pub mod future;
 
-// --- Dummy Backend for testing and fallback ---
+// Re-export backends for use in other modules
+#[cfg(all(target_os = "linux", feature = "epoll"))]
+pub use epoll::EpollBackend;
 
-/// A minimal I/O backend for testing.
-/// This backend completes operations immediately with dummy results.
-/// It's used for testing the runtime without actual I/O operations.
-#[derive(Debug, Default)]
-pub struct DummyIoBackend;
 
-impl DummyIoBackend {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl IoProvider for DummyIoBackend {
-    type Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>);
-
-    fn submit(&self, _op: Op) -> IoToken {
-        // For DummyIoBackend, we don't store operations
-        // Just return a token - the operation is considered "completed" immediately
-        IoToken::new()
-    }
-
-    fn poll_complete(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
-        // DummyIoBackend always returns Ready with empty completions
-        // This matches the test expectation that no actual operations are processed
-        Poll::Ready(Vec::new())
-    }
-}

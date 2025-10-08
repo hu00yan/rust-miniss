@@ -32,3 +32,10 @@ pub const INITIAL_TASK_QUEUE_CAPACITY: usize = 128;
 /// This optimizes the Vec allocation for expired timer wakers.
 /// Most workloads have few simultaneous timer expirations.
 pub const EXPECTED_WAKEUP_COUNT: usize = 16;
+
+/// Maximum expected tasks per CPU for utilization calculation
+///
+/// This is used for CPU utilization metrics and represents the
+/// theoretical maximum number of tasks that could be queued per CPU.
+/// Used for normalizing utilization percentages.
+pub const MAX_TASKS: usize = 1024;

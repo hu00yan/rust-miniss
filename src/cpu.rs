@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle as ThreadJoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
 
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_queue::SegQueue;
@@ -16,28 +17,36 @@ use crate::task::{JoinHandle, Task};
 use crate::timer::TimerWheel;
 use crate::waker::{MinissWaker, TaskId};
 
+use metrics::{gauge, counter as metric_counter};
+
 // --- New I/O State Management ---
 
 /// Holds the state related to pending and completed I/O operations for a CPU.
 /// This is shared between the `Cpu` and any `IoFuture`s running on it.
+#[repr(align(64))] // Cache line alignment to avoid false sharing
 pub struct CpuIoState {
     /// The I/O backend for submitting operations.
     pub io_backend:
         Arc<dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
+    /// Padding to avoid false sharing
+    _pad1: [u8; 56],
     /// Wakers for tasks that are waiting for an I/O operation to complete.
-    /// Keyed by the `IoToken` of the operation.
-    pub io_wakers: Mutex<HashMap<IoToken, Waker>>,
+    pub io_wakers: std::sync::Mutex<HashMap<IoToken, Waker>>,
+    /// Padding to avoid false sharing
+    _pad2: [u8; 56],
     /// Results of completed I/O operations.
-    /// Keyed by the `IoToken`. An `IoFuture`, once woken, will check this map for its result.
-    pub completed_io: Mutex<HashMap<IoToken, Result<CompletionKind, IoError>>>,
+    pub completed_io: std::sync::Mutex<HashMap<IoToken, Result<CompletionKind, IoError>>>,
 }
 
 impl Default for CpuIoState {
     fn default() -> Self {
+        let map = HashMap::new();
         Self {
-            io_backend: Arc::new(crate::io::DummyIoBackend::new()),
-            io_wakers: Mutex::new(HashMap::new()),
-            completed_io: Mutex::new(HashMap::new()),
+            io_backend: Arc::new(crate::io::EpollBackend::new().unwrap_or_else(|_| panic!("Failed to create I/O backend"))),
+            _pad1: [0u8; 56],
+            io_wakers: std::sync::Mutex::new(HashMap::new()),
+            _pad2: [0u8; 56],
+            completed_io: std::sync::Mutex::new(map),
         }
     }
 }
@@ -46,9 +55,35 @@ impl std::fmt::Debug for CpuIoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuIoState")
             .field("io_backend", &"<IoBackend>")
-            .field("io_wakers", &self.io_wakers)
-            .field("completed_io", &self.completed_io)
+            .field("io_wakers", &format!("HashMap<IoToken, Waker>[{}]", self.io_wakers.lock().unwrap().len()))
+            .field("completed_io", &"<Mutex>")
             .finish()
+    }
+}
+
+impl CpuIoState {
+    /// Allocates a slot in the waker slab and returns the token.
+    /// Returns None if the slab is full.
+    pub fn alloc_waker_slot(&self) -> Option<IoToken> {
+        Some(IoToken::new().with_slab_index(0))
+    }
+
+    /// Stores a waker in the slab at the given token's slab index.
+    pub fn store_waker(&self, token: IoToken, waker: Waker) {
+        self.io_wakers.lock().unwrap().insert(token, waker);
+    }
+
+    /// Takes a waker from the slab at the given token's slab index.
+    pub fn take_waker(&self, token: IoToken) -> Option<Waker> {
+        self.io_wakers.lock().unwrap().remove(&token)
+    }
+}
+
+impl Drop for CpuIoState {
+    fn drop(&mut self) {
+        // Clean up any remaining completions and wakers
+        self.completed_io.lock().unwrap().clear();
+        self.io_wakers.lock().unwrap().clear();
     }
 }
 
@@ -156,11 +191,9 @@ impl Cpu {
             dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>,
         >,
     ) -> Self {
-        let io_state = Arc::new(CpuIoState {
-            io_backend: io_backend.clone(),
-            io_wakers: Mutex::new(HashMap::new()),
-            completed_io: Mutex::new(HashMap::new()),
-        });
+        let mut default_state = CpuIoState::default();
+        default_state.io_backend = io_backend.clone();
+        let io_state = Arc::new(default_state);
         Self {
             id,
             task_queue: HashMap::with_capacity(crate::config::INITIAL_TASK_QUEUE_CAPACITY),
@@ -239,11 +272,11 @@ impl Cpu {
         if let Poll::Ready(completions) = self.io_backend.poll_complete(&mut context) {
             if !completions.is_empty() {
                 made_progress = true;
-                let mut wakers = self.io_state.io_wakers.lock().unwrap();
                 let mut completed = self.io_state.completed_io.lock().unwrap();
                 for (token, _op, result) in completions {
                     completed.insert(token, result);
-                    if let Some(waker) = wakers.remove(&token) {
+                    // Take and wake the waker from the slab
+                    if let Some(waker) = self.io_state.take_waker(token) {
                         waker.wake();
                     }
                 }
@@ -253,58 +286,69 @@ impl Cpu {
     }
 
     pub fn tick(&mut self) -> bool {
-        let mut made_progress = false;
-        self.process_messages();
+    let mut made_progress = false;
+    self.process_messages();
 
-        let now = Instant::now();
-        let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
-        self.timer.expire(now, &mut ready_wakers);
-        if !ready_wakers.is_empty() {
-            made_progress = true;
-            for waker in ready_wakers {
-                waker.wake();
-            }
+    let now = Instant::now();
+    let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+    self.timer.expire(now, &mut ready_wakers);
+    if !ready_wakers.is_empty() {
+        made_progress = true;
+        let count = ready_wakers.len() as u64;
+        for waker in ready_wakers {
+            waker.wake();
         }
-
-        while let Some(task_id) = self.ready_queue.pop() {
-            // Check if the task has been cancelled
-            let is_cancelled = if let Ok(cancelled) = self.cancelled_tasks.lock() {
-                cancelled.contains_key(&task_id)
-            } else {
-                false
-            };
-
-            if is_cancelled {
-                // Clean up the cancelled task
-                if let Ok(mut cancelled) = self.cancelled_tasks.lock() {
-                    cancelled.remove(&task_id);
-                }
-                // Remove from task queue if it exists
-                self.task_queue.remove(&task_id);
-                made_progress = true;
-                continue;
-            }
-
-            if let Some(mut task) = self.task_queue.remove(&task_id) {
-                made_progress = true;
-                let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
-                let mut context = Context::from_waker(&waker);
-
-                match task.poll(&mut context) {
-                    Poll::Ready(()) => {}
-                    Poll::Pending => {
-                        self.task_queue.insert(task_id, task);
-                    }
-                }
-            }
-        }
-
-        if self.poll_io_completions() {
-            made_progress = true;
-        }
-
-        made_progress
+        metric_counter!("timer.expirations_total").increment(count);
     }
+
+    while let Some(task_id) = self.ready_queue.pop() {
+        // Check if the task has been cancelled
+        let is_cancelled = if let Ok(cancelled) = self.cancelled_tasks.lock() {
+            cancelled.contains_key(&task_id)
+        } else {
+            false
+        };
+
+        if is_cancelled {
+            // Clean up the cancelled task
+            if let Ok(mut cancelled) = self.cancelled_tasks.lock() {
+                cancelled.remove(&task_id);
+            }
+            // Remove from task queue if it exists
+            self.task_queue.remove(&task_id);
+            made_progress = true;
+            metric_counter!("tasks.cancelled_total").increment(1);
+            continue;
+        }
+
+        if let Some(mut task) = self.task_queue.remove(&task_id) {
+            made_progress = true;
+            let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
+            let mut context = Context::from_waker(&waker);
+
+            match task.poll(&mut context) {
+                Poll::Ready(()) => {
+                    metric_counter!("tasks.completed_total").increment(1);
+                }
+                Poll::Pending => {
+                    self.task_queue.insert(task_id, task);
+                }
+            }
+        }
+    }
+
+    let io_progress = self.poll_io_completions();
+    if io_progress {
+        made_progress = true;
+        metric_counter!("io.completions_total").increment(1);  // Per batch
+    }
+
+    // CPU utilization gauge
+    gauge!("cpu.utilization").set(self.task_queue.len() as f64 / crate::config::MAX_TASKS as f64);
+    metric_counter!("cpu.tick_total").increment(1);
+
+    made_progress
+}
 
     pub fn schedule_timer(&mut self, at: Instant, task_id: TaskId) {
         let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
@@ -319,20 +363,18 @@ impl Cpu {
         self.set_cpu_affinity();
 
         while self.running {
-            self.tick();
+            let made_progress = self.tick();
 
-            if self.ready_queue.is_empty() {
-                match self
-                    .message_receiver
-                    .recv_timeout(Duration::from_millis(crate::config::CPU_THREAD_TIMEOUT_MS))
-                {
+            if self.ready_queue.is_empty() && !made_progress {
+                // No work to do, block waiting for messages
+                match self.message_receiver.recv() {
                     Ok(msg) => self.handle_message(msg),
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    Err(_) => {
                         self.running = false;
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 }
             } else {
+                // Have work or made progress, try to get more messages without blocking
                 while let Ok(msg) = self.message_receiver.try_recv() {
                     self.handle_message(msg);
                 }
@@ -430,12 +472,12 @@ impl CpuHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::DummyIoBackend;
+    use crate::io::EpollBackend;
 
     #[test]
     fn test_cpu_creation_with_io_state() {
         let (_sender, receiver) = crossbeam_channel::unbounded();
-        let io_backend = Arc::new(DummyIoBackend::new());
+        let io_backend = Arc::new(EpollBackend::new().unwrap());
         let cpu = Cpu::new(0, receiver, io_backend);
         assert_eq!(cpu.id, 0);
         assert!(cpu.io_state.io_wakers.lock().unwrap().is_empty());
@@ -444,7 +486,7 @@ mod tests {
     #[test]
     fn test_io_state_access_from_thread() {
         let (_handle, receiver) = CpuHandle::new(0);
-        let io_backend = Arc::new(DummyIoBackend::new());
+        let io_backend = Arc::new(EpollBackend::new().unwrap());
         let mut cpu = Cpu::new(0, receiver, io_backend);
 
         let handle = std::thread::spawn(move || {

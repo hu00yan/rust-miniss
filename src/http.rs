@@ -4,6 +4,7 @@
 //! It supports basic HTTP/1.1 request parsing and response generation.
 
 use crate::net::AsyncTcpStream;
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -220,13 +221,15 @@ impl HttpConnection {
     }
 
     /// Read and parse HTTP request from the connection
-    pub async fn read_request(&self) -> io::Result<Request> {
-        let (_, buffer) = self.stream.read().await?;
+    pub async fn read_request(&mut self) -> io::Result<Request> {
+        let mut buffer = [0u8; 4096];
+        let n = self.stream.read(&mut buffer).await?;
+        let buffer = &buffer[..n];
         Request::parse(buffer.as_ref())
     }
 
     /// Send HTTP response to the connection
-    pub async fn send_response(&self, response: Response) -> io::Result<()> {
+    pub async fn send_response(&mut self, response: Response) -> io::Result<()> {
         let response_bytes = response.to_bytes();
         self.stream.write_all(&response_bytes).await
     }

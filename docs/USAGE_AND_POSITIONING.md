@@ -7,29 +7,34 @@ Why this project exists (the "why"):
 
 What it is (today):
 - A minimal async runtime prototype with:
-  - Per-CPU executors (feature-gated) and cross-CPU message passing.
-  - Timer utilities (sleep, timeout, interval, periodic tasks).
-  - Example networking path (HTTP echo) demonstrating end-to-end async flow.
-- Not a drop-in replacement for Tokio/Seastar; rather a focused learning and experimentation tool.
+  - Multi-core runtime (thread-per-core architecture) with shared-nothing design
+  - Timer utilities (sleep, timeout, interval, periodic tasks)
+  - Async networking (TCP/UDP with non-blocking I/O using epoll/io-uring)
+  - HTTP echo server example with performance optimizations
+- Educational tool for understanding async runtime internals and high-performance I/O
 
-What it is not (yet):
-- A production-grade runtime or a full port of miniss into Rust.
-- A comprehensive I/O stack with all platform features (e.g., advanced io_uring usage in production settings).
+What it is not:
+- A production-grade runtime (missing advanced features, optimizations)
+- Drop-in replacement for Tokio/Async-std
+- Comprehensive I/O stack (limited platform support, features)
 
 How to use (practical today):
 - As a lightweight runtime for small experiments:
-  - Single-threaded: drive async code with `Runtime::new().block_on(...)`.
+  - Multi-core: use `Runtime::new_multi_core()` for thread-per-core execution.
   - Timers: compose `sleep`, `timeout`, and `Interval` for scheduling.
   - Periodic work: `task::spawn_periodic` for recurring jobs.
 - As a reference for architecture:
-  - Study per-CPU executors, message passing, and timer wheel structure.
-  - Compare call stacks with Tokio to understand design trade-offs.
+  - Study per-CPU executors, cross-CPU messaging, timer wheels, and async I/O backends.
+  - Compare performance with Tokio/Monoio/Glommio using included benchmarks.
 - As a networking playground:
-  - Use `examples/http_echo.rs` as a template for simple TCP protocols and measure baseline behavior.
+  - Use `examples/http_echo.rs` as a template for TCP servers and measure performance.
+  - Experiment with UDP operations and buffer management.
 
 Benchmarks & environment:
-- We record quick local numbers for development iteration.
+- Includes HTTP benchmark comparing rust-miniss vs Tokio/Monoio/Glommio.
+- Run `./bench/scripts/bench_http.sh` for automated performance testing.
 - Authoritative benchmarks should be run on Linux with io_uring enabled; record CPU, memory, OS, and Rust version alongside results for reproducibility.
+- Recent optimizations reduced CPU usage in event loops and improved I/O efficiency.
 
 Roadmap alignment (why this direction):
 - Validate design assumptions (shared-nothing, lock-free fast paths) with small, measurable slices.

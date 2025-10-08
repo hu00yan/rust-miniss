@@ -8,14 +8,13 @@
 //!
 //! ## IO Backend Selection
 //!
-//! The runtime automatically selects the most appropriate IO backend for your platform:
+//! The runtime automatically selects the most appropriate IO backend at runtime:
 //!
-//! - **Linux with kernel 5.10+**: Uses `io_uring` for optimal performance
+//! - **Linux with kernel 5.10+ and io_uring support**: Uses `io_uring` for optimal performance
 //! - **macOS**: Uses `kqueue`
 //! - **Other Unix systems**: Uses `epoll`
 //!
-//! This selection happens at compile time based on your target platform and kernel version.
-//! See `build.rs` for the complete selection logic.
+//! This selection happens at runtime by checking kernel version and io_uring availability.
 //!
 //! # Timer Utilities
 //!
@@ -94,6 +93,8 @@
 
 #![deny(warnings)]
 
+
+
 pub mod buffer;
 pub mod cancellation;
 pub mod config;
@@ -110,18 +111,21 @@ pub mod timer;
 pub mod waker;
 
 // Re-export core types
-pub use buffer::{Buffer, BufferPool};
+pub use buffer::Buffer;
 pub use cpu::Cpu;
 pub use executor::{Executor, Runtime};
 pub use fs::AsyncFile;
 pub use http::{
     EchoHandler, HttpConnection, HttpHandler, Method, Request, Response, StaticHandler, StatusCode,
 };
-pub use io::{CompletionKind, DummyIoBackend, IoError, IoProvider, IoToken, Op};
+pub use io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 pub use multicore::MultiCoreRuntime;
 pub use net::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket};
 pub use task::{spawn, Task, TaskBuilder, TaskError, TaskResult};
 pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWheel};
+
+// Re-export futures::io traits for convenience
+pub use futures::io::{AsyncRead, AsyncWrite};
 
 /// Error types for the runtime
 pub mod error {

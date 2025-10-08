@@ -15,6 +15,6 @@ impl Default for TimerId {
 impl TimerId {
     /// Generates a new unique TimerId
     pub fn new() -> Self {
-        TimerId(TIMER_COUNTER.fetch_add(1, Ordering::Relaxed))
+        TimerId(TIMER_COUNTER.fetch_add(1, Ordering::Release))
     }
 }

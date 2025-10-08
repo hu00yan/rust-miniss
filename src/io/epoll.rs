@@ -1,6 +1,6 @@
 #![cfg(any(
     all(unix, not(target_os = "linux")),
-    all(target_os = "linux", io_backend = "epoll")
+    all(target_os = "linux", feature = "epoll")
 ))]
 
 //! An `epoll` (or `kqueue` via `mio`) backend for the I/O subsystem.
@@ -27,6 +27,7 @@ use threadpool::ThreadPool;
 #[derive(Debug)]
 struct SafeFdFile {
     file: Option<std::fs::File>,
+    #[allow(dead_code)]
     fd: RawFd,
 }
 
@@ -72,7 +73,7 @@ pub struct EpollBackend {
     /// Thread pool for blocking file I/O operations
     thread_pool: Arc<ThreadPool>,
     /// Completed operations from the thread pool
-    completed_ops: UnsafeCell<Vec<(IoToken, Op, Result<CompletionKind, IoError>)>>,
+    completed_ops: Arc<std::sync::Mutex<Vec<(IoToken, Op, Result<CompletionKind, IoError>)>>>,
 }
 
 // SAFETY: The `EpollBackend` is designed to be thread-local. It is created within a
@@ -96,7 +97,7 @@ impl EpollBackend {
             udp_recv_buffers: UnsafeCell::new(HashMap::new()),
             next_token: UnsafeCell::new(0),
             thread_pool,
-            completed_ops: UnsafeCell::new(Vec::new()),
+            completed_ops: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 }
@@ -105,7 +106,9 @@ impl IoProvider for EpollBackend {
     type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
 
     fn submit(&self, op: Op) -> IoToken {
-        let io_token = IoToken::new();
+        // Allocate token from the current CPU's I/O state
+        let state = crate::cpu::io_state();
+        let io_token = state.alloc_waker_slot().expect("No available waker slots");
 
         // SAFETY: We have exclusive, single-threaded access.
         let next_token = unsafe { &mut *self.next_token.get() };
@@ -151,7 +154,7 @@ impl IoProvider for EpollBackend {
             }
             // File operations are handled asynchronously in thread pool
             Op::ReadFile { fd, offset, len } => {
-                let completed_ops_ptr = self.completed_ops.get();
+                let completed_ops = self.completed_ops.clone();
                 let thread_pool = self.thread_pool.clone();
                 let op_clone = op.clone();
                 let io_token_copy = io_token;
@@ -167,23 +170,22 @@ impl IoProvider for EpollBackend {
                             .as_mut()
                             .seek(SeekFrom::Start(offset_copy))
                             .and_then(|_| {
-                                let mut buf = crate::buffer::BufferPool::get(len_copy);
-                                safe_file.as_mut().write(&buf).map(|bytes_written| {
-                                    CompletionKind::WriteFile { bytes_written }
+                                let mut buf = vec![0u8; len_copy];
+                                safe_file.as_mut().read(&mut buf).map(|bytes_read| {
+                                    unsafe { buf.set_len(bytes_read); }
+                                    CompletionKind::ReadFile { bytes_read, data: buf }
                                 })
                             });
                         // SafeFdFile will be automatically dropped here, ensuring fd is closed
                         res.map_err(IoError::Io)
                     };
 
-                    // SAFETY: We know this pointer is valid as long as EpollBackend exists
-                    unsafe {
-                        (*completed_ops_ptr).push((io_token_copy, op_clone, result));
-                    }
+                    let mut completed_ops = completed_ops.lock().unwrap();
+                    completed_ops.push((io_token_copy, op_clone, result));
                 });
             }
             Op::WriteFile { fd, offset, data } => {
-                let completed_ops_ptr = self.completed_ops.get();
+                let completed_ops = self.completed_ops.clone();
                 let thread_pool = self.thread_pool.clone();
                 let op_clone = op.clone();
                 let io_token_copy = io_token;
@@ -193,14 +195,13 @@ impl IoProvider for EpollBackend {
 
                 thread_pool.execute(move || {
                     let result = {
-                        use std::os::unix::io::FromRawFd;
+
                         let mut safe_file = SafeFdFile::new(fd_copy);
                         let res = safe_file
                             .as_mut()
                             .seek(SeekFrom::Start(offset_copy))
                             .and_then(|_| {
-                                let mut buf = crate::buffer::BufferPool::get(len_copy);
-                                safe_file.as_mut().write(&buf).map(|bytes_written| {
+                                safe_file.as_mut().write(data_clone.as_ref()).map(|bytes_written| {
                                     CompletionKind::WriteFile { bytes_written }
                                 })
                             });
@@ -208,10 +209,8 @@ impl IoProvider for EpollBackend {
                         res.map_err(IoError::Io)
                     };
 
-                    // SAFETY: We know this pointer is valid as long as EpollBackend exists
-                    unsafe {
-                        (*completed_ops_ptr).push((io_token_copy, op_clone, result));
-                    }
+                    let mut completed_ops = completed_ops.lock().unwrap();
+                    completed_ops.push((io_token_copy, op_clone, result));
                 });
             }
             Op::UdpRecv { fd, buffer } => {
@@ -247,8 +246,8 @@ impl IoProvider for EpollBackend {
             Op::Fsync { fd } => {
                 // Fsync remains synchronous.
                 let _result = {
-                    use std::os::unix::io::FromRawFd;
-                    let safe_file = SafeFdFile::new(*fd);
+
+                    let mut safe_file = SafeFdFile::new(*fd);
                     let res = safe_file.as_mut().metadata().map(|_| CompletionKind::Fsync);
                     // SafeFdFile will be automatically dropped here
                     res.map(|_| CompletionKind::Fsync).map_err(IoError::Io)
@@ -267,6 +266,15 @@ impl IoProvider for EpollBackend {
                 };
                 pending_ops.insert(mio_token, (io_token, op));
             }
+            _ => {
+                // For unsupported operations, return an error immediately
+                let result = Err(IoError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Operation not supported by epoll backend",
+                )));
+                let mut completed_ops = self.completed_ops.lock().unwrap();
+                completed_ops.push((io_token, op, result));
+            }
         };
 
         io_token
@@ -277,14 +285,14 @@ impl IoProvider for EpollBackend {
         let poll = unsafe { &mut *self.poll.get() };
         let events = unsafe { &mut *self.events.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
-        let completed_ops = unsafe { &mut *self.completed_ops.get() };
+        let mut completed_ops = self.completed_ops.lock().unwrap();
 
         let mut completions = Vec::new();
 
         // First, collect any completed operations from the thread pool
         completions.extend(completed_ops.drain(..));
 
-        // Poll for events with a non-blocking timeout.
+        // Poll for events non-blockingly to avoid delays.
         if let Err(e) = poll.poll(events, Some(Duration::from_millis(0))) {
             // An error from poll is serious, but we'll just log it for now.
             eprintln!("mio poll error: {}", e);
@@ -316,8 +324,8 @@ impl IoProvider for EpollBackend {
                     Op::Read { fd, offset, len } => {
                         let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
                         let res = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = crate::buffer::BufferPool::get(*len);
-                            file.read(buf.as_mut()).map(|bytes_read| {
+                            let mut buf = vec![0u8; *len];
+                            file.read(&mut buf).map(|bytes_read| {
                                 unsafe {
                                     buf.set_len(bytes_read);
                                 }
@@ -346,8 +354,8 @@ impl IoProvider for EpollBackend {
                         // but included for completeness if event-driven file I/O were enabled.
                         let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
                         let res = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = crate::buffer::BufferPool::get(*len);
-                            file.read(buf.as_mut()).map(|bytes_read| {
+                            let mut buf = vec![0u8; *len];
+                            file.read(&mut buf).map(|bytes_read| {
                                 unsafe {
                                     buf.set_len(bytes_read);
                                 }
@@ -376,7 +384,7 @@ impl IoProvider for EpollBackend {
                         // Matched by `event.token()`
                         let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                         if let Some(mut buffer) = udp_recv_buffers.remove(&mio_token) {
-                            use std::os::unix::io::FromRawFd;
+    
                             let socket = unsafe { std::net::UdpSocket::from_raw_fd(*fd) };
                             let res = match socket.recv_from(buffer.as_mut()) {
                                 Ok((bytes_read, addr)) => {
@@ -418,7 +426,7 @@ impl IoProvider for EpollBackend {
                     }
                     Op::UdpSend { fd, data, addr } => {
                         // Perform UDP send operation
-                        use std::os::unix::io::FromRawFd;
+
                         let socket = unsafe { std::net::UdpSocket::from_raw_fd(*fd) };
                         let res = socket.send_to(data.as_ref(), *addr).map(|bytes_written| {
                             CompletionKind::UdpSend {
@@ -447,7 +455,7 @@ impl IoProvider for EpollBackend {
                     Op::Fsync { fd } => {
                         // Perform fsync synchronously
                         let result = {
-                            use std::os::unix::io::FromRawFd;
+    
                             let file = unsafe { std::fs::File::from_raw_fd(*fd) };
                             let res = file.sync_all();
                             // Explicitly close the file to avoid fd conflicts
@@ -488,7 +496,7 @@ impl IoProvider for EpollBackend {
 }
 
 fn syscall_accept(fd: RawFd) -> io::Result<(RawFd, std::net::SocketAddr)> {
-    let mut storage: libc::sockaddr_storage = std::mem::MaybeUninit::zeroed().assume_init();
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
     let mut len = std::mem::size_of_val(&storage) as libc::socklen_t;
     let new_fd = unsafe { libc::accept(fd, &mut storage as *mut _ as *mut _, &mut len) };
 
@@ -538,8 +546,12 @@ impl AsRawFd for Op {
             Op::Close { fd, .. } => fd,
             Op::ReadFile { fd, .. } => fd,
             Op::WriteFile { fd, .. } => fd,
-            Op::UdpRecv { fd, .. } => fd, // Add UdpRecv fd
-            Op::UdpSend { fd, .. } => fd, // Add UdpSend fd
+            Op::UdpRecv { fd, .. } => fd,
+            Op::UdpSend { fd, .. } => fd,
+            Op::UdpRecvVectored { fd, .. } => fd,
+            Op::UdpSendVectored { fd, .. } => fd,
+            Op::ReadRent { fd, .. } => fd,
+            Op::WriteRent { fd, .. } => fd,
         }
     }
 }

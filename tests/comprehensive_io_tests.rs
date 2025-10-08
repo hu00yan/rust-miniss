@@ -9,7 +9,7 @@
 use crc::{Crc, CRC_32_ISO_HDLC};
 use proptest::prelude::*;
 use proptest::{prop_assert_eq, proptest};
-use rust_miniss::{BufferPool, CompletionKind, DummyIoBackend, IoError, IoProvider, IoToken, Op};
+use rust_miniss::{CompletionKind, DummyIoBackend, IoError, IoProvider, IoToken, Op};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::AtomicU64;
@@ -17,69 +17,70 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tempfile::tempfile;
 
-#[cfg(test)]
-mod buffer_pool_tests {
-    use super::*;
+// Buffer tests removed as Buffer is now simple Vec<u8>
+// #[cfg(test)]
+// mod buffer_pool_tests {
+//     use super::*;
 
-    #[test]
-    fn test_buffer_pool_correctness() {
-        let buffer1 = BufferPool::get(4096);
-        let buffer2 = BufferPool::get(4096);
+//     #[test]
+//     fn test_buffer_pool_correctness() {
+//         let buffer1 = BufferPool::get(4096);
+//         let buffer2 = BufferPool::get(4096);
 
-        // Buffers should be distinct initially
-        assert_ne!(buffer1.as_ptr(), buffer2.as_ptr());
-        assert_eq!(buffer1.len(), 4096); // BUFFER_SIZE from buffer.rs
-        assert_eq!(buffer2.len(), 4096);
-    }
+//         // Buffers should be distinct initially
+//         assert_ne!(buffer1.as_ptr(), buffer2.as_ptr());
+//         assert_eq!(buffer1.len(), 4096); // BUFFER_SIZE from buffer.rs
+//         assert_eq!(buffer2.len(), 4096);
+//     }
 
-    #[test]
-    fn test_buffer_pool_recycling() {
-        let buffer = BufferPool::get(4096);
-        let original_ptr = buffer.as_ptr();
+//     #[test]
+//     fn test_buffer_pool_recycling() {
+//         let buffer = BufferPool::get(4096);
+//         let original_ptr = buffer.as_ptr();
 
-        // Recycle the buffer
-        buffer.recycle();
+//         // Recycle the buffer
+//         buffer.recycle();
 
-        // Get a new buffer - should reuse the recycled one
-        let recycled_buffer = BufferPool::get(4096);
-        assert_eq!(recycled_buffer.as_ptr(), original_ptr);
-    }
+//         // Get a new buffer - should reuse the recycled one
+//         let recycled_buffer = BufferPool::get(4096);
+//         assert_eq!(recycled_buffer.as_ptr(), original_ptr);
+//     }
 
-    #[test]
-    fn test_buffer_pool_size_limit() {
-        // Fill beyond pool capacity to test overflow handling
-        let mut buffers = Vec::new();
-        for _ in 0..110 {
-            // POOL_SIZE is 100
-            buffers.push(BufferPool::get(4096));
-        }
+//     #[test]
+//     fn test_buffer_pool_size_limit() {
+//         // Fill beyond pool capacity to test overflow handling
+//         let mut buffers = Vec::new();
+//         for _ in 0..110 {
+//             // POOL_SIZE is 100
+//             buffers.push(BufferPool::get(4096));
+//         }
 
-        // Recycle all buffers
-        for buffer in buffers {
-            buffer.recycle();
-        }
+//         // Recycle all buffers
+//         for buffer in buffers {
+//             buffer.recycle();
+//         }
 
-        // Pool should be capped at its maximum size
-        // This is tested internally by the buffer pool implementation
-    }
+//         // Pool should be capped at its maximum size
+//         // This is tested internally by the buffer pool implementation
+//     }
 
-    #[test]
-    fn test_buffer_operations() {
-        let buffer = BufferPool::get(4096);
+//     #[test]
+//     fn test_buffer_operations() {
+//         let buffer = BufferPool::get(4096);
 
-        // Test deref operations
-        let slice: &[u8] = &buffer;
-        assert_eq!(slice.len(), buffer.len());
+//         // Test deref operations
+//         let slice: &[u8] = &buffer;
+//         assert_eq!(slice.len(), buffer.len());
 
-        // Test as_ref
-        let as_ref_slice: &[u8] = buffer.as_ref();
-        assert_eq!(as_ref_slice.len(), buffer.len());
+//         // Test as_ref
+//         let as_ref_slice: &[u8] = buffer.as_ref();
+//         assert_eq!(as_ref_slice.len(), buffer.len());
 
-        // Test IoSlice creation
-        let io_slice = buffer.as_io_slice();
-        assert_eq!(io_slice.len(), buffer.len());
-    }
-}
+//         // Test IoSlice creation
+//         let io_slice = buffer.as_io_slice();
+//         assert_eq!(io_slice.len(), buffer.len());
+//     }
+// }
 
 #[cfg(test)]
 mod io_future_tests {

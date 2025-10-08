@@ -200,8 +200,7 @@ impl AsyncFile {
     /// ```
     pub async fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
         let state = io_state();
-        let mut buffer = crate::buffer::BufferPool::get(buf.len());
-        buffer.copy_from_slice(buf);
+        let buffer = buf.to_vec();
 
         let op = Op::WriteFile {
             fd: self.inner.as_raw_fd(),
