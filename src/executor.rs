@@ -649,30 +649,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_task_result_success() {
-        // Test that successful tasks return Ok results
-        let runtime = Runtime::new();
-        let _handle = runtime.spawn(async { 42 });
-
-        // In a real scenario, we'd need to run the executor to completion first
-        // For now, we can test the type structure
-        // The handle should return a TaskResult<i32> when awaited
-        // This test mainly validates the type definitions
-    }
-
-    #[test]
-    fn test_join_handle_with_result_type() {
-        // Test JoinHandle with TaskResult return type
-        let mut executor = Executor::new();
-        let success_handle = executor.spawn(async { "success" });
-
-        executor.run();
-
-        assert!(success_handle.is_finished());
-        // Note: In the current implementation, we can't easily test the TaskResult
-        // without making the JoinHandle awaitable in sync context, which would require
-        // more complex test infrastructure. The important thing is the type system
-        // enforces TaskResult<T> as the output type.
-    }
 }

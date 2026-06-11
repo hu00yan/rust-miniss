@@ -1,11 +1,10 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-// Multicore task distribution: use tokio multi-threaded test runtime with 4 threads
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multicore_task_distribution() {
+#[test]
+fn multicore_task_distribution() {
+    let runtime = rust_miniss::MultiCoreRuntime::new(Some(4)).expect("create multicore runtime");
+
     let counters = Arc::new([
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -13,33 +12,20 @@ async fn multicore_task_distribution() {
         AtomicUsize::new(0),
     ]);
 
-    let tasks: Vec<_> = (0..1000)
-        .map(|i| {
+    runtime.block_on(async {
+        for i in 0..4 {
             let counters = counters.clone();
-            tokio::spawn(async move {
-                // hash the thread id to an index 0..=3
-                let tid = std::thread::current().id();
-                // There is no stable way to map ThreadId->usize; hash its Debug repr
-                let mut hasher = DefaultHasher::new();
-                format!("{tid:?}").hash(&mut hasher);
-                let idx = (hasher.finish() % 4) as usize;
-                counters[idx].fetch_add(1, Ordering::Relaxed);
-                i
-            })
-        })
-        .collect();
+            runtime.spawn(async move {
+                for _j in 0..250 {
+                    counters[i].fetch_add(1, Ordering::Relaxed);
+                }
+            }).expect("spawn task");
+        }
 
-    let mut _sum = 0usize;
-    for t in tasks {
-        _sum += t.await.unwrap();
-    }
+        rust_miniss::timer::sleep(std::time::Duration::from_millis(200)).await;
+    });
 
     let counts: Vec<_> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    // Assert at least one worker thread observed work; OS scheduler may keep tasks on fewer threads.
-    // In some CI environments, all tasks may run on a single thread due to resource constraints.
-    let active = counts.iter().filter(|&&c| c > 0).count();
-    assert!(
-        active >= 1,
-        "expected >=1 active workers, got {active} with counts {counts:?}"
-    );
+    let total: usize = counts.iter().sum();
+    assert_eq!(total, 1000, "expected 1000 total tasks, got {total} with counts {counts:?}");
 }

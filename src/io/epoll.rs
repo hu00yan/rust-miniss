@@ -28,8 +28,6 @@ type CompletionQueue = Arc<std::sync::Mutex<Vec<IoCompletion>>>;
 #[derive(Debug)]
 struct SafeFdFile {
     file: Option<std::fs::File>,
-    #[allow(dead_code)]
-    fd: RawFd,
 }
 
 impl SafeFdFile {
@@ -43,7 +41,6 @@ impl SafeFdFile {
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
         Ok(Self {
             file: Some(file),
-            fd: dup_fd,
         })
     }
 

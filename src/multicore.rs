@@ -154,7 +154,7 @@ impl CpuCore {
             // Use proper waiting mechanism instead of busy-waiting with yield
             if !work_done {
                 // Consider using condition variable or park/unpark for better CPU efficiency
-                std::thread::park_timeout(Duration::from_micros(100));
+                std::thread::park_timeout(Duration::from_millis(1));
             }
         }
 

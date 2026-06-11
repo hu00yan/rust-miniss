@@ -4,6 +4,18 @@ use rust_miniss::Runtime;
 use std::io::Write;
 use std::net::TcpListener;
 
+fn accept_ready(listener: &TcpListener) -> std::net::TcpStream {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+}
+
 #[test]
 fn test_tcp_read_data() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -16,7 +28,7 @@ fn test_tcp_read_data() {
         client.set_nonblocking(true).unwrap();
         client.write_all(b"hello world").unwrap();
 
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_ready(&listener);
         stream.set_nonblocking(true).unwrap();
         let mut async_stream = AsyncTcpStream::from(stream);
 
@@ -39,7 +51,7 @@ fn test_tcp_read_large_payload() {
         client.set_nonblocking(true).unwrap();
         client.write_all(&payload).unwrap();
 
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_ready(&listener);
         stream.set_nonblocking(true).unwrap();
         let mut async_stream = AsyncTcpStream::from(stream);
 
@@ -69,11 +81,10 @@ fn test_tcp_read_empty_data() {
         client.set_nonblocking(true).unwrap();
         client.write_all(b"ping").unwrap();
 
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_ready(&listener);
         stream.set_nonblocking(true).unwrap();
         let mut async_stream = AsyncTcpStream::from(stream);
 
-        use futures::io::AsyncReadExt;
         let mut buf = [0u8; 64];
         let n = async_stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"ping");

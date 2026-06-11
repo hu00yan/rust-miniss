@@ -3,27 +3,31 @@
 use rust_miniss::multicore::MultiCoreRuntime;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 #[test]
-
 fn test_task_cancellation_works() {
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
-    // Test 1: Spawn a task
     let task_id = runtime.spawn(async {}).unwrap();
-    // Note: Task cancellation is not fully implemented yet
-    println!("Spawned task with ID: {task_id:?}");
 
-    // Clean shutdown
+    let result = runtime.cancel_task(task_id);
+    assert!(result.is_ok(), "cancel_task should succeed: {result:?}");
+
+    thread::sleep(Duration::from_millis(50));
+
     runtime.shutdown().unwrap();
+    match Arc::try_unwrap(runtime) {
+        Ok(rt) => rt.join().unwrap(),
+        Err(_) => panic!("Failed to get unique ownership of runtime"),
+    }
 }
 
 #[test]
-
 fn test_cancel_before_execution() {
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
-    // Create a task that sets a flag when it starts
     let started = Arc::new(AtomicBool::new(false));
     let started_clone = started.clone();
 
@@ -33,12 +37,17 @@ fn test_cancel_before_execution() {
         })
         .unwrap();
 
-    // Note: Task cancellation is not fully implemented yet
-    println!("Spawned task with ID: {task_id:?}");
+    let result = runtime.cancel_task(task_id);
+    assert!(
+        result.is_ok(),
+        "cancel_task should succeed immediately: {result:?}"
+    );
 
-    // Give some time for processing
-    std::thread::yield_now();
+    thread::sleep(Duration::from_millis(50));
 
-    // Clean shutdown
     runtime.shutdown().unwrap();
+    match Arc::try_unwrap(runtime) {
+        Ok(rt) => rt.join().unwrap(),
+        Err(_) => panic!("Failed to get unique ownership of runtime"),
+    }
 }

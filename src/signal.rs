@@ -17,7 +17,7 @@ use std::thread;
 use crate::cpu::{CpuHandle, CrossCpuMessage};
 
 /// Type for user-defined signal callbacks
-pub type SignalCallback = Box<dyn Fn(i32) + Send + Sync>;
+pub type SignalCallback = Arc<dyn Fn(i32) + Send + Sync>;
 
 /// Signal handler that manages graceful shutdown on signals
 pub struct SignalHandler {
@@ -58,13 +58,14 @@ impl SignalHandler {
         self.callbacks
             .entry(signal)
             .or_default()
-            .push(Box::new(callback));
+            .push(Arc::new(callback));
     }
 
     /// Start listening for shutdown signals in a dedicated thread
     pub fn start(&self) {
         let shutdown_flag = self.shutdown_flag.clone();
         let cpu_handles = self.cpu_handles.clone();
+        let callbacks = self.callbacks.clone();
 
         thread::spawn(move || {
             let mut signals =
@@ -88,6 +89,13 @@ impl SignalHandler {
                                             "Failed to send shutdown signal to CPU {cpu_id}: {e}"
                                         );
                                     }
+                                }
+                            }
+
+                            // Invoke user-defined callbacks for this signal
+                            if let Some(signal_callbacks) = callbacks.get(&signal) {
+                                for callback in signal_callbacks {
+                                    callback(signal);
                                 }
                             }
 

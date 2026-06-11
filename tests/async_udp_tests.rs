@@ -8,58 +8,36 @@ fn test_async_udp_send_recv() {
     let runtime = Runtime::new();
 
     runtime.block_on(async {
-        // Test 1: Basic socket creation and configuration
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let socket = AsyncUdpSocket::bind(addr).expect("Failed to bind socket");
         let local_addr = socket.local_addr().expect("Failed to get local address");
 
-        // Verify socket is bound to a valid address
         assert!(local_addr.port() > 0);
-        assert_eq!(local_addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            local_addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
 
-        // Test 2: Try to send to localhost (should work)
-        let target_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap(); // Localhost
+        let receiver_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let receiver_socket =
+            AsyncUdpSocket::bind(receiver_addr).expect("Failed to bind receiver socket");
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+
         let test_data = b"Hello, async UDP!";
 
-        // Test with a receiving socket to verify the send actually works
-        // Create a receiver socket bound to the target address
-        let receiver_socket =
-            std::net::UdpSocket::bind(target_addr).expect("Failed to bind receiver socket");
+        let bytes_sent = socket
+            .send_to(test_data, receiver_addr)
+            .await
+            .expect("Async UDP send failed");
+        assert_eq!(bytes_sent, test_data.len());
 
-        // Test async UDP send only
-        match socket.send_to(test_data, target_addr).await {
-            Ok(bytes_sent) => {
-                println!("Async UDP send succeeded: {bytes_sent} bytes sent");
-                assert_eq!(bytes_sent, test_data.len());
-
-                // Try to receive the data to verify it was sent
-                let mut buf = [0u8; 1024];
-                match receiver_socket.recv_from(&mut buf) {
-                    Ok((received, sender_addr)) => {
-                        println!(
-                            "Async UDP receive succeeded: {received} bytes from {sender_addr}"
-                        );
-                        assert_eq!(received, test_data.len());
-                        assert_eq!(&buf[..received], test_data);
-                    }
-                    Err(e) => {
-                        println!("Async UDP receive failed: {e} ({})", e.kind());
-                    }
-                }
-            }
-            Err(e) => {
-                // Check the error type
-                match e.kind() {
-                    std::io::ErrorKind::InvalidInput => {
-                        panic!("Async UDP send failed with InvalidInput - this indicates a programming error: {e}");
-                    }
-                    _ => {
-                        // Other errors (network unreachable, permission denied, etc.) are acceptable
-                        println!("Async UDP send failed with expected error: {e} ({})", e.kind());
-                    }
-                }
-            }
-        }
+        let mut buf = [0u8; 1024];
+        let (bytes_received, _sender) = receiver_socket
+            .recv_from(&mut buf)
+            .await
+            .expect("Async UDP receive failed");
+        assert_eq!(bytes_received, test_data.len());
+        assert_eq!(&buf[..bytes_received], test_data);
     });
 }
 
@@ -68,44 +46,31 @@ fn test_async_udp_multiple_sends() {
     let runtime = Runtime::new();
 
     runtime.block_on(async {
-        // Test socket creation and basic operations
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let socket = AsyncUdpSocket::bind(addr).expect("Failed to bind socket");
-        let local_addr = socket.local_addr().expect("Failed to get local address");
 
-        // Verify socket configuration
-        assert!(local_addr.port() > 0);
+        let receiver_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let receiver_socket =
+            AsyncUdpSocket::bind(receiver_addr).expect("Failed to bind receiver socket");
+        let receiver_addr = receiver_socket.local_addr().unwrap();
 
-        // Test multiple send operations to localhost
-        let target_addr: SocketAddr = "127.0.0.1:12346".parse().unwrap(); // Localhost
+        let messages: &[&[u8]] = &[b"Message 1", b"Message 2", b"Message 3"];
 
-        let messages = [
-            b"Message 1".to_vec(),
-            b"Message 2".to_vec(),
-            b"Message 3".to_vec(),
-        ];
+        for msg in messages {
+            let bytes_sent = socket
+                .send_to(msg, receiver_addr)
+                .await
+                .expect("Send failed");
+            assert_eq!(bytes_sent, msg.len());
+        }
 
-        // Send messages to the same address
-        for (i, msg) in messages.iter().enumerate() {
-            match socket.send_to(msg, target_addr).await {
-                Ok(bytes_sent) => {
-                    assert_eq!(bytes_sent, msg.len());
-                    let message_number = i + 1;
-                    println!("Message {message_number} sent successfully: {bytes_sent} bytes");
-                }
-                Err(e) => {
-                    // Check the error type
-                    match e.kind() {
-                        std::io::ErrorKind::InvalidInput => {
-                            panic!("Send {i} failed with InvalidInput - programming error: {e}");
-                        }
-                        _ => {
-                            // Other errors are acceptable
-                            println!("Message {i} failed with expected error: {e}");
-                        }
-                    }
-                }
-            }
+        let mut buf = [0u8; 1024];
+        for msg in messages {
+            let (bytes_received, _sender) = receiver_socket
+                .recv_from(&mut buf)
+                .await
+                .expect("Receive failed");
+            assert_eq!(&buf[..bytes_received], *msg);
         }
     });
 }

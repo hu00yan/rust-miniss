@@ -5,28 +5,8 @@ use futures::io::{AsyncRead, AsyncWrite};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
-// Rent traits for zero-copy (Glommio-style)
-#[allow(async_fn_in_trait)]
-pub trait AsyncReadRent {
-    async fn poll_read_rent(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        len: usize,
-    ) -> Poll<io::Result<Buffer>>;
-}
-
-#[allow(async_fn_in_trait)]
-pub trait AsyncWriteRent {
-    async fn poll_write_rent(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &Buffer,
-    ) -> Poll<io::Result<usize>>;
-}
 
 /// An asynchronous TCP listener.
 #[derive(Debug)]
@@ -117,8 +97,16 @@ impl AsRawFd for AsyncTcpStream {
 
 impl IntoRawFd for AsyncTcpStream {
     fn into_raw_fd(self) -> RawFd {
-        // We need to forget self to avoid double cleanup
         let fd = self.inner.as_raw_fd();
+        let state = crate::cpu::io_state();
+        if let Some(token) = self.read_token {
+            state.io_wakers.lock().unwrap().remove(&token);
+            state.completed_io.lock().unwrap().remove(&token);
+        }
+        if let Some(token) = self.write_token {
+            state.io_wakers.lock().unwrap().remove(&token);
+            state.completed_io.lock().unwrap().remove(&token);
+        }
         std::mem::forget(self);
         fd
     }
@@ -126,16 +114,11 @@ impl IntoRawFd for AsyncTcpStream {
 
 impl Drop for AsyncTcpStream {
     fn drop(&mut self) {
-        // Clean up any in-progress operations
         let state = io_state();
-
-        // Clean up read operation if in progress
         if let Some(token) = self.read_token {
             state.io_wakers.lock().unwrap().remove(&token);
             state.completed_io.lock().unwrap().remove(&token);
         }
-
-        // Clean up write operation if in progress
         if let Some(token) = self.write_token {
             state.io_wakers.lock().unwrap().remove(&token);
             state.completed_io.lock().unwrap().remove(&token);
@@ -152,7 +135,6 @@ impl AsyncRead for AsyncTcpStream {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
         if let Some(token) = this.read_token {
-            // Check if completed
             if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
                 this.read_token = None;
                 match result {
@@ -168,7 +150,6 @@ impl AsyncRead for AsyncTcpStream {
                     Err(e) => Poll::Ready(Err(e.into())),
                 }
             } else {
-                // Still pending, register waker
                 state
                     .io_wakers
                     .lock()
@@ -177,7 +158,6 @@ impl AsyncRead for AsyncTcpStream {
                 Poll::Pending
             }
         } else {
-            // Start new read
             let op = crate::io::Op::Read {
                 fd: this.inner.as_raw_fd(),
                 offset: 0,
@@ -185,7 +165,6 @@ impl AsyncRead for AsyncTcpStream {
             };
             let token = state.io_backend.submit(op);
             this.read_token = Some(token);
-            // Register waker and return pending
             state
                 .io_wakers
                 .lock()
@@ -263,7 +242,6 @@ impl AsyncWrite for AsyncTcpStream {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
         if let Some(token) = this.write_token {
-            // Check if completed
             if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
                 this.write_token = None;
                 match result {
@@ -277,7 +255,6 @@ impl AsyncWrite for AsyncTcpStream {
                     Err(e) => Poll::Ready(Err(e.into())),
                 }
             } else {
-                // Still pending, register waker
                 state
                     .io_wakers
                     .lock()
@@ -286,7 +263,6 @@ impl AsyncWrite for AsyncTcpStream {
                 Poll::Pending
             }
         } else {
-            // Start new write
             let op = crate::io::Op::Write {
                 fd: this.inner.as_raw_fd(),
                 offset: 0,
@@ -294,7 +270,6 @@ impl AsyncWrite for AsyncTcpStream {
             };
             let token = state.io_backend.submit(op);
             this.write_token = Some(token);
-            // Register waker and return pending
             state
                 .io_wakers
                 .lock()
@@ -358,145 +333,6 @@ impl AsyncWrite for AsyncTcpStream {
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncReadRent for AsyncTcpStream {
-    async fn poll_read_rent(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _len: usize,
-    ) -> Poll<io::Result<Buffer>> {
-        Poll::Ready(Err(io::Error::other("Not implemented")))
-    }
-}
-
-impl AsyncWriteRent for AsyncTcpStream {
-    async fn poll_write_rent(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &Buffer,
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::other("Not implemented")))
-    }
-}
-
-// Placeholder implementations for other types
-pub struct AsyncUnixStream {
-    inner: UnixStream,
-    read_token: Option<IoToken>,
-    write_token: Option<IoToken>,
-}
-
-impl AsyncUnixStream {
-    pub fn new(stream: UnixStream) -> io::Result<Self> {
-        stream.set_nonblocking(true)?;
-        Ok(Self {
-            inner: stream,
-            read_token: None,
-            write_token: None,
-        })
-    }
-
-    /// Connects to the specified Unix socket path.
-    pub async fn connect<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        let stream = UnixStream::connect(path)?;
-        Self::new(stream)
-    }
-}
-
-impl AsRawFd for AsyncUnixStream {
-    fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
-    }
-}
-
-impl IntoRawFd for AsyncUnixStream {
-    fn into_raw_fd(self) -> RawFd {
-        // We need to forget self to avoid double cleanup
-        let fd = self.inner.as_raw_fd();
-        std::mem::forget(self);
-        fd
-    }
-}
-
-impl Drop for AsyncUnixStream {
-    fn drop(&mut self) {
-        let state = io_state();
-        if let Some(token) = self.read_token {
-            state.io_wakers.lock().unwrap().remove(&token);
-            state.completed_io.lock().unwrap().remove(&token);
-        }
-        if let Some(token) = self.write_token {
-            state.io_wakers.lock().unwrap().remove(&token);
-            state.completed_io.lock().unwrap().remove(&token);
-        }
-    }
-}
-
-impl AsyncRead for AsyncUnixStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::other("Not implemented")))
-    }
-
-    fn poll_read_vectored(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _bufs: &mut [std::io::IoSliceMut<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::other("Not implemented")))
-    }
-}
-
-impl AsyncWrite for AsyncUnixStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::other("Not implemented")))
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::other("Not implemented")))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-pub struct AsyncUnixListener {
-    inner: UnixListener,
-}
-
-impl AsyncUnixListener {
-    pub fn bind<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        let listener = UnixListener::bind(path)?;
-        listener.set_nonblocking(true)?;
-        Ok(Self { inner: listener })
-    }
-
-    pub async fn accept(&self) -> io::Result<(AsyncUnixStream, std::os::unix::net::SocketAddr)> {
-        Err(io::Error::other("Not implemented"))
-    }
-}
-
-impl AsRawFd for AsyncUnixListener {
-    fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
     }
 }
 
@@ -568,11 +404,8 @@ impl AsRawFd for AsyncUdpSocket {
 
 impl IntoRawFd for AsyncUdpSocket {
     fn into_raw_fd(self) -> RawFd {
-        // We need to forget self to avoid double cleanup
         let fd = self.inner.as_raw_fd();
         std::mem::forget(self);
         fd
     }
 }
-
-// For UDP, users should use the native recv_from()/send_to() APIs.

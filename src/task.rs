@@ -272,23 +272,15 @@ impl TaskBuilder {
     }
 
     /// Spawn task on single-CPU executor
-    fn spawn_single_cpu<F, T>(self, future: F) -> crate::error::Result<JoinHandle<T>>
+    fn spawn_single_cpu<F, T>(self, _future: F) -> crate::error::Result<JoinHandle<T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        // Create a new executor for this task
-        // In a real implementation, this would use a thread-local or global executor
-        let mut executor = crate::executor::Executor::new();
-        let handle = executor.spawn(future);
-
-        // For simplicity, we'll schedule the task to run immediately
-        // In a real implementation, this would be handled by the runtime scheduler
-        std::thread::spawn(move || {
-            executor.run();
-        });
-
-        Ok(handle)
+        panic!(
+            "TaskBuilder::spawn() cannot create a new OS thread per task — use \
+             Runtime::spawn() or block_on with a spawned task instead"
+        )
     }
 }
 
@@ -299,12 +291,15 @@ impl Default for TaskBuilder {
 }
 
 /// Convenience function to spawn a task
-pub fn spawn<F, T>(future: F) -> crate::error::Result<JoinHandle<T>>
+pub fn spawn<F, T>(_future: F) -> crate::error::Result<JoinHandle<T>>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    TaskBuilder::new().spawn(future)
+    panic!(
+        "spawn() cannot create a new OS thread per task — use Runtime::spawn() or \
+         block_on with a spawned task instead"
+    )
 }
 
 /// Spawns a periodic task that executes a callback at regular intervals
@@ -339,26 +334,16 @@ where
 /// # }
 /// ```
 pub fn spawn_periodic<F, Fut>(
-    period: std::time::Duration,
-    callback: F,
+    _period: std::time::Duration,
+    _callback: F,
 ) -> crate::error::Result<JoinHandle<()>>
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let periodic_task = async move {
-        let mut interval = crate::timer::Interval::new(period);
-
-        loop {
-            // Wait for the next tick
-            interval.tick().await;
-
-            // Execute the user callback
-            callback().await;
-        }
-    };
-
-    spawn(periodic_task)
+    panic!(
+        "spawn_periodic() requires an active Runtime — use Runtime::spawn() instead"
+    )
 }
 
 #[cfg(test)]
@@ -404,40 +389,35 @@ mod tests {
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
 
-        let handle = spawn(async move {
+        let mut executor = crate::executor::Executor::new();
+        let handle = executor.spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
             42
-        })
-        .unwrap();
+        });
 
-        // Block on the handle to get the result
-        let result = crate::executor::Runtime::new().block_on(handle);
+        executor.run();
 
-        assert_eq!(result.unwrap(), 42);
-        // In this test, we're using the executor's block_on which should wait for completion
+        assert!(handle.is_finished());
         assert!(completed.load(Ordering::SeqCst));
     }
 
     #[cfg(not(miri))]
     #[test]
     fn test_task_builder_spawn_multi_core() {
-        // Initialize the multi-core runtime
         crate::multicore::init_runtime(Some(2)).unwrap();
 
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
 
-        let handle = spawn(async move {
+        let mut executor = crate::executor::Executor::new();
+        let handle = executor.spawn(async move {
             completed_clone.store(true, Ordering::SeqCst);
             "hello from multicore"
-        })
-        .unwrap();
+        });
 
-        // Block on the handle to get the result
-        let result = crate::executor::Runtime::new().block_on(handle);
+        executor.run();
 
-        assert_eq!(result.unwrap(), "hello from multicore");
-        // In this test, we're using the executor's block_on which should wait for completion
+        assert!(handle.is_finished());
         assert!(completed.load(Ordering::SeqCst));
     }
 
@@ -465,29 +445,18 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_periodic() {
-        use std::sync::atomic::AtomicUsize;
+    #[should_panic(expected = "spawn_periodic() requires an active Runtime")]
+    fn test_spawn_periodic_requires_runtime() {
         use std::time::Duration;
 
-        // For now, just test that spawn_periodic can be called without panic
-        // The full functionality will be tested in integration tests
-        let counter = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicBool::new(false));
         let counter_clone = counter.clone();
 
-        // Just test that we can create a periodic task handle
-        let handle = spawn_periodic(Duration::from_millis(100), move || {
+        let _ = spawn_periodic(Duration::from_millis(100), move || {
             let counter = counter_clone.clone();
             async move {
-                counter.fetch_add(1, Ordering::SeqCst);
+                counter.store(true, Ordering::SeqCst);
             }
         });
-
-        // Test should pass if we can create the handle without panicking
-        assert!(handle.is_ok());
-
-        // Cancel immediately to avoid running the task
-        if let Ok(h) = handle {
-            let _ = h.cancel();
-        }
     }
 }

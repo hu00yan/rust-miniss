@@ -4,6 +4,18 @@ use rust_miniss::Runtime;
 use std::io::Write;
 use std::net::TcpListener;
 
+fn accept_ready(listener: &TcpListener) -> std::net::TcpStream {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+}
+
 #[test]
 fn test_buffer_read_exact() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -16,7 +28,7 @@ fn test_buffer_read_exact() {
         client.set_nonblocking(true).unwrap();
         client.write_all(b"pinned data").unwrap();
 
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_ready(&listener);
         stream.set_nonblocking(true).unwrap();
         let mut async_stream = AsyncTcpStream::from(stream);
 
@@ -39,7 +51,7 @@ fn test_buffer_read_multipart() {
         client.write_all(b"AAA").unwrap();
         client.write_all(b"BBB").unwrap();
 
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_ready(&listener);
         stream.set_nonblocking(true).unwrap();
         let mut async_stream = AsyncTcpStream::from(stream);
 
@@ -66,7 +78,7 @@ fn test_buffer_read_zero_length() {
         client.write_all(b"data").unwrap();
         drop(client);
 
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_ready(&listener);
         stream.set_nonblocking(true).unwrap();
         let mut async_stream = AsyncTcpStream::from(stream);
 
