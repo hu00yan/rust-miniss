@@ -175,6 +175,18 @@ impl IoProvider for EpollBackend {
                     pending_ops.insert(mio_token, (io_token, op));
                 }
             }
+            Op::Connect { fd, addr: _ } => {
+                let mut source = mio::unix::SourceFd(fd);
+                if let Err(e) = poll.registry().register(
+                    &mut source,
+                    mio_token,
+                    Interest::WRITABLE,
+                ) {
+                    eprintln!("Failed to register fd for connect: {e}");
+                } else {
+                    pending_ops.insert(mio_token, (io_token, op));
+                }
+            }
             // File operations are handled asynchronously in thread pool
             Op::ReadFile { fd, offset, len } => {
                 let completed_ops = self.completed_ops.clone();
@@ -545,6 +557,17 @@ impl IoProvider for EpollBackend {
                         let _ = socket.into_raw_fd();
                         result.map_err(IoError::Io)
                     }
+                    Op::Connect { fd, addr: _ } => {
+                        let raw_fd = *fd;
+                        let sock = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+                        let result = match sock.take_error() {
+                            Ok(None) => Ok(CompletionKind::Connect),
+                            Ok(Some(e)) => Err(IoError::Io(e)),
+                            Err(e) => Err(IoError::Io(e)),
+                        };
+                        let _ = sock.into_raw_fd();
+                        result
+                    }
                     Op::ReadVectored { fd, buffers } => {
                         let mut buffers = buffers.clone();
                         let iovecs: Vec<libc::iovec> = buffers
@@ -815,6 +838,7 @@ impl AsRawFd for Op {
             Op::UdpSendVectored { fd, .. } => fd,
             Op::ReadVectored { fd, .. } => fd,
             Op::WriteVectored { fd, .. } => fd,
+            Op::Connect { fd, .. } => fd,
             Op::ReadRent { fd, .. } => fd,
             Op::WriteRent { fd, .. } => fd,
         }

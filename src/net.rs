@@ -75,11 +75,73 @@ impl AsyncTcpStream {
     }
 
     /// Connects to the specified address.
+    ///
+    /// DNS resolution is performed synchronously (blocking), but the TCP
+    /// handshake is fully async via `Op::Connect`.
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
+        use std::net::ToSocketAddrs;
+
         let addr = addr.into();
-        let std_stream = std::net::TcpStream::connect(addr)?;
-        std_stream.set_nonblocking(true)?;
-        Self::new(std_stream)
+
+        // Resolve DNS synchronously (blocking, but only for lookup).
+        // For raw IPs this is instant; for hostnames it blocks briefly.
+        let resolved = addr.to_socket_addrs()?.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "could not resolve address")
+        })?;
+
+        // Create a non-blocking TCP socket.
+        let domain = if resolved.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Set non-blocking via fcntl (SOCK_NONBLOCK is not available on macOS).
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Attempt non-blocking connect.
+        let storage = socket_addr_to_storage(&resolved);
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
+                socket_addr_len(&resolved),
+            )
+        };
+
+        if ret == 0 {
+            // Connected immediately.
+            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+            return Self::new(std_stream);
+        }
+
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            unsafe { libc::close(fd); }
+            return Err(err);
+        }
+
+        // Submit Op::Connect to the I/O backend; wait for writable event.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let stream = Self::new(std_stream)?;
+
+        let state = io_state();
+        let op = crate::io::Op::Connect { fd, addr: resolved };
+        let token = state.io_backend.submit(op);
+        let future = crate::io::future::IoFuture::new(token);
+        match future.await? {
+            crate::io::CompletionKind::Connect => Ok(stream),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
+        }
     }
 }
 
@@ -393,6 +455,57 @@ impl AsyncUdpSocket {
                 "Unexpected completion",
             )),
         }
+    }
+}
+
+fn socket_addr_to_storage(addr: &SocketAddr) -> libc::sockaddr_storage {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(a) => {
+            let sin = libc::sockaddr_in {
+                #[cfg(target_os = "macos")]
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as _,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(*a.ip()).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::write(
+                    &mut storage as *mut _ as *mut libc::sockaddr_in,
+                    sin,
+                );
+            }
+        }
+        SocketAddr::V6(a) => {
+            let sin6 = libc::sockaddr_in6 {
+                #[cfg(target_os = "macos")]
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as _,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: a.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: a.ip().octets(),
+                },
+                sin6_scope_id: a.scope_id(),
+            };
+            unsafe {
+                std::ptr::write(
+                    &mut storage as *mut _ as *mut libc::sockaddr_in6,
+                    sin6,
+                );
+            }
+        }
+    }
+    storage
+}
+
+fn socket_addr_len(addr: &SocketAddr) -> libc::socklen_t {
+    match addr {
+        SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
     }
 }
 

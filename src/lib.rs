@@ -95,6 +95,7 @@
 
 pub mod buffer;
 pub mod cancellation;
+pub mod compat;
 pub mod config;
 pub mod cpu;
 pub mod executor;
@@ -107,6 +108,8 @@ pub mod signal;
 pub mod task;
 pub mod timer;
 pub mod waker;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 // Re-export core types
 pub use buffer::Buffer;
@@ -124,6 +127,9 @@ pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWhe
 
 // Re-export futures::io traits for convenience
 pub use futures::io::{AsyncRead, AsyncWrite};
+
+// Re-export tokio compat adapter for convenience
+pub use compat::{Compat, FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 /// Error types for the runtime
 pub mod error {

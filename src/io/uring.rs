@@ -48,6 +48,10 @@ enum PendingOp {
         addr_storage: Box<sockaddr_storage>,
         addr_len: Box<socklen_t>,
     },
+    Connect {
+        op: Op,
+        addr_storage: Box<sockaddr_storage>,
+    },
     Accept {
         op: Op,
         addr_storage: Box<sockaddr_storage>,
@@ -394,6 +398,67 @@ impl IoProvider for UringBackend {
                     };
                     (entry, pending_op)
                 }
+                Op::Connect { fd, addr } => {
+                    let mut addr_storage: Box<sockaddr_storage> =
+                        Box::new(unsafe { std::mem::zeroed() });
+                    let addr_len: libc::socklen_t = match &addr {
+                        std::net::SocketAddr::V4(_) => {
+                            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+                        }
+                        std::net::SocketAddr::V6(_) => {
+                            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+                        }
+                    };
+                    match &addr {
+                        std::net::SocketAddr::V4(sa) => {
+                            let sin = libc::sockaddr_in {
+                                sin_family: libc::AF_INET as u16,
+                                sin_port: sa.port().to_be(),
+                                sin_addr: libc::in_addr {
+                                    s_addr: u32::from(*sa.ip()).to_be(),
+                                },
+                                sin_zero: [0; 8],
+                            };
+                            unsafe {
+                                std::ptr::write(
+                                    addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in,
+                                    sin,
+                                );
+                            }
+                        }
+                        std::net::SocketAddr::V6(sa) => {
+                            let sin6 = libc::sockaddr_in6 {
+                                sin6_family: libc::AF_INET6 as u16,
+                                sin6_port: sa.port().to_be(),
+                                sin6_flowinfo: sa.flowinfo(),
+                                sin6_addr: libc::in6_addr {
+                                    s6_addr: sa.ip().octets(),
+                                },
+                                sin6_scope_id: sa.scope_id(),
+                            };
+                            unsafe {
+                                std::ptr::write(
+                                    addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in6,
+                                    sin6,
+                                );
+                            }
+                        }
+                    }
+                    let entry = opcode::Connect::new(
+                        types::Fd(fd),
+                        addr_storage.as_ref() as *const _ as *const libc::sockaddr,
+                        addr_len,
+                    )
+                    .build()
+                    .user_data(user_data);
+                    (
+                        entry,
+                        PendingOp::Connect {
+                            op: Op::Connect { fd, addr },
+                            addr_storage,
+                        },
+                    )
+                }
                 _ => {
                     let result = Err(IoError::Io(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -650,6 +715,15 @@ impl IoProvider for UringBackend {
                                 bytes_written: result as usize,
                                 data,
                             })
+                        };
+                        (op, res)
+                    }
+                    PendingOp::Connect { op, addr_storage } => {
+                        let res = if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            let _ = &*addr_storage;
+                            Ok(CompletionKind::Connect)
                         };
                         (op, res)
                     }

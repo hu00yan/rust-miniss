@@ -110,6 +110,10 @@ pub enum Op {
         fd: i32,
         buffers: Vec<Buffer>,
     },
+    Connect {
+        fd: i32,
+        addr: SocketAddr,
+    },
     ReadRent {
         fd: i32,
         buffer: Buffer,
@@ -197,6 +201,7 @@ pub enum CompletionKind {
     UdpSendVectored {
         bytes_written: usize,
     },
+    Connect,
     ReadRent {
         buffer: Buffer,
     },
