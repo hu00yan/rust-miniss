@@ -7,8 +7,8 @@ This document captures benchmark results for the minimal HTTP/1.1 echo server ac
 ### Hardware
 - **CPU**: Intel/AMD x86_64 multi-core
 - **Memory**: 8GB+
-- **OS**: Linux (Ubuntu 24.04 LTS)
-- **Rust**: 1.82.0 stable
+- **OS**: Linux (Ubuntu 24.04 LTS) or macOS
+- **Rust**: Latest stable
 
 ### Benchmark Tool
 - **wrk**: `wrk -t2 -c50 -d10s http://127.0.0.1:8080/`
@@ -16,58 +16,46 @@ This document captures benchmark results for the minimal HTTP/1.1 echo server ac
 - **Threads**: 2
 - **Duration**: 10 seconds
 
-## Performance Results
-
-| Runtime | Requests/sec | Latency (avg) | CPU Usage | Memory | Architecture |
-|---------|-------------|---------------|-----------|--------|--------------|
-| **Tokio** | 6,769 | 4.43ms | ~25% | ~20MB | Work-stealing scheduler |
-| **rust-miniss** | ~3,000 | ~8-12ms | ~15% | ~15MB | Simple queue scheduler |
-| **Monoio** | ~8,000* | ~3-5ms | ~20% | ~18MB | io_uring focused |
-| **Glommio** | ~9,000* | ~2-4ms | ~18% | ~22MB | Seastar-inspired |
-
-*Estimated based on architecture and similar implementations
-
 ## How to Run Benchmarks
 
-### Automated Script
-```bash
-# Build all runtimes
-cd bench && cargo build --release
+### Running rust-miniss
 
-# Run comparison script
-./scripts/bench_http.sh 8080 10 50
+```bash
+# Build with io-uring support (Linux)
+cargo build --release --example http_echo --features io_uring
+
+# Run the server
+./target/release/examples/http_echo --addr 127.0.0.1:8080
+
+# Benchmark
+wrk -t2 -c50 -d10s http://127.0.0.1:8080/
 ```
 
-### Manual Testing
+### Running on macOS
+
 ```bash
-# Build rust-miniss
+# Build (uses kqueue via mio)
 cargo build --release --example http_echo
 
-# Build other runtimes
-cd bench && cargo build --release
+# Run the server
+./target/release/examples/http_echo --addr 127.0.0.1:8080
 
-# Test rust-miniss
-./target/release/examples/http_echo --addr 127.0.0.1:8080 &
-wrk -t2 -c50 -d10s http://127.0.0.1:8080/
-
-# Test Tokio
-./target/release/tokio_echo --addr 127.0.0.1:8080 &
+# Benchmark
 wrk -t2 -c50 -d10s http://127.0.0.1:8080/
 ```
 
-## Performance Analysis
+## Performance Characteristics
 
 ### rust-miniss Characteristics
 - **Strengths**:
-  - Low memory usage (15MB vs 20MB)
-  - Low CPU usage (~15% vs 25%)
-  - Simple, educational codebase
-  - Thread-per-core architecture ready
+  - Thread-per-core architecture eliminates contention
+  - Lock-free cross-CPU communication
+  - Panic isolation between tasks
+  - Low memory footprint
 
-- **Current Limitations**:
-  - Basic scheduler (no work-stealing)
-  - Simple I/O implementation
-  - Limited ecosystem integration
+- **I/O Backend Performance**:
+  - **io-uring (Linux 5.10+)**: Best performance with completion-based I/O
+  - **epoll/kqueue**: Good performance with readiness-based I/O
 
 ### Optimization Opportunities
 1. **Scheduler**: Implement more sophisticated task distribution
@@ -83,4 +71,19 @@ For reproducible results, record:
 - **Kernel**: `uname -r`
 - **Rust**: `rustc -V`
 - **I/O Backend**: io_uring vs epoll vs kqueue
+
+## Benchmark Commands
+
+```bash
+# Run Criterion micro-benches
+cargo bench --bench perf_benchmark
+cargo bench --bench memory_perf
+
+# Build the glommio baseline (if available)
+cargo build --manifest-path bench/runtime_comparison/Cargo.toml --release --bin glommio_echo
+
+# Compare against rust-miniss
+./target/release/examples/http_echo --addr 0.0.0.0:8080 &
+wrk -t4 -c100 -d30s http://127.0.0.1:8080
+```
 

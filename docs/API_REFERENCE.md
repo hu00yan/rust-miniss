@@ -2,7 +2,7 @@
 
 ## Overview
 
-Rust-Miniss is a high-performance async runtime implementing a shared-nothing architecture inspired by Seastar. Each CPU core runs its own event loop with lock-free cross-CPU communication.
+Rust-Miniss is a high-performance async runtime implementing a thread-per-core architecture inspired by Seastar. Each CPU core runs its own event loop with lock-free cross-CPU communication.
 
 ## Core Components
 
@@ -24,12 +24,14 @@ runtime.block_on(async {
 #### Multi-core Runtime
 
 ```rust
-use rust_miniss::MultiCoreRuntime;
+use rust_miniss::multicore::MultiCoreRuntime;
 
-let runtime = MultiCoreRuntime::new(4); // 4 CPU cores
-runtime.block_on(async {
+let runtime = MultiCoreRuntime::new(Some(4))?; // 4 CPU cores
+runtime.spawn(async {
     println!("Hello from multi-core runtime!");
-}).unwrap();
+})?;
+runtime.shutdown()?;
+runtime.join()?;
 ```
 
 ### Task Management
@@ -37,33 +39,17 @@ runtime.block_on(async {
 #### Basic Task Spawning
 
 ```rust
-use rust_miniss::{spawn, block_on};
+use rust_miniss::{Runtime, task};
 
-block_on(async {
-    let handle = spawn(async {
+let runtime = Runtime::new();
+runtime.block_on(async {
+    let handle = task::spawn(async {
         println!("Task running!");
         42
     });
     
     let result = handle.await;
     assert_eq!(result, 42);
-});
-```
-
-#### Task Cancellation
-
-```rust
-use rust_miniss::{spawn, block_on};
-use std::time::Duration;
-
-block_on(async {
-    let handle = spawn(async {
-        timer::sleep(Duration::from_secs(1)).await;
-        "completed"
-    });
-    
-    // Cancel the task before it completes
-    handle.cancel();
 });
 ```
 
@@ -86,7 +72,7 @@ async fn example() {
 #### Timeouts
 
 ```rust
-use rust_miniss::{timer, spawn};
+use rust_miniss::timer;
 use std::time::Duration;
 
 async fn example() {
@@ -94,25 +80,6 @@ async fn example() {
         timer::sleep(Duration::from_millis(500)).await;
         "completed"
     }).await;
-    
-    match result {
-        Ok(value) => println!("Completed with: {}", value),
-        Err(_) => println!("Timed out!"),
-    }
-}
-```
-
-#### Future Extension for Timeouts
-
-```rust
-use rust_miniss::timer::FutureExt;
-use std::time::Duration;
-
-async fn example() {
-    let result = async {
-        timer::sleep(Duration::from_millis(500)).await;
-        "completed"
-    }.with_timeout(Duration::from_secs(1)).await;
     
     match result {
         Ok(value) => println!("Completed with: {}", value),
@@ -171,29 +138,14 @@ async fn example() {
 
 The runtime supports graceful shutdown via OS signals.
 
-#### Basic Signal Handling
-
 ```rust
-use rust_miniss::{MultiCoreRuntime, timer};
-use std::time::Duration;
+use rust_miniss::signal::SignalHandler;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-#[cfg(feature = "signal")]
-async fn example() {
-    let runtime = MultiCoreRuntime::new(2);
-    
-    // Spawn some long-running work
-    let handle = runtime.spawn(async {
-        loop {
-            timer::sleep(Duration::from_millis(100)).await;
-            println!("Working...");
-        }
-    }).unwrap();
-    
-    // The runtime will gracefully shutdown on SIGINT/SIGTERM
-    runtime.block_on(async {
-        handle.await
-    }).unwrap();
-}
+let shutdown_flag = Arc::new(AtomicBool::new(false));
+let handler = SignalHandler::new(shutdown_flag.clone());
+handler.start();
 ```
 
 ### Cross-CPU Task Distribution
@@ -201,32 +153,28 @@ async fn example() {
 Tasks can be distributed across CPU cores for parallel execution.
 
 ```rust
-use rust_miniss::MultiCoreRuntime;
+use rust_miniss::multicore::MultiCoreRuntime;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-async fn example() {
-    let runtime = MultiCoreRuntime::new(4);
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = MultiCoreRuntime::new(Some(4))?;
     let counter = Arc::new(AtomicU32::new(0));
-    
-    let mut handles = Vec::new();
     
     // Spawn tasks across all CPUs
     for i in 0..8 {
         let counter = counter.clone();
-        let handle = runtime.spawn(async move {
+        runtime.spawn(async move {
             let current = counter.fetch_add(1, Ordering::SeqCst);
             println!("Task {} executed, total: {}", i, current + 1);
-        }).unwrap();
-        handles.push(handle);
+        })?;
     }
     
-    // Wait for all tasks to complete
-    for handle in handles {
-        handle.await;
-    }
+    runtime.shutdown()?;
+    runtime.join()?;
     
     assert_eq!(counter.load(Ordering::SeqCst), 8);
+    Ok(())
 }
 ```
 
@@ -267,19 +215,17 @@ The runtime uses `Result<T, E>` types throughout:
 ### Runtime Errors
 
 ```rust
-use rust_miniss::{MultiCoreRuntime, RuntimeError};
+use rust_miniss::error::RuntimeError;
 
-let runtime = MultiCoreRuntime::new(4);
 match runtime.spawn(async { "hello" }) {
-    Ok(handle) => {
-        let result = handle.await;
-        println!("Task completed: {}", result);
+    Ok(task_id) => {
+        println!("Task spawned with ID: {:?}", task_id);
     },
-    Err(RuntimeError::RuntimeShutdown) => {
-        println!("Runtime is shutting down");
+    Err(RuntimeError::TaskFailed(msg)) => {
+        println!("Failed to spawn task: {}", msg);
     },
     Err(e) => {
-        println!("Error spawning task: {:?}", e);
+        println!("Error: {:?}", e);
     }
 }
 ```
@@ -307,28 +253,27 @@ Enable specific functionality with feature flags:
 
 ```toml
 [dependencies]
-rust-miniss = { version = "0.1", features = ["multicore", "signal", "timer"] }
+rust-miniss = { version = "0.1", features = ["io_uring", "signal"] }
 ```
 
 ### Available Features
 
-- `multicore`: Enable multi-core runtime support
+- `io_uring`: Enable io-uring backend (Linux only)
+- `epoll`: Enable epoll backend (Linux/Unix) - enabled by default
 - `signal`: Enable signal handling for graceful shutdown
-- `timer`: Enable timer wheel and timeout functionality
-- `io-uring`: Enable io-uring backend (Linux only)
-- `epoll`: Enable epoll backend (Linux)
-- `kqueue`: Enable kqueue backend (macOS/BSD)
+- `arena`: Enable arena allocator for HTTP parsing
+- `rent-traits`: Enable AsyncReadRent/AsyncWriteRent traits
+- `advanced`: Enable zero-copy Rent + arena
+- `debug`: Enable tracing spans and backtraces
 
 ## Examples
 
 See the `examples/` directory for complete working examples:
 
 - `hello_world.rs`: Basic single-threaded usage
-- `multicore_demo.rs`: Multi-core task distribution
-- `timer_sleep.rs`: Timer and sleep functionality
-- `graceful_shutdown.rs`: Signal handling
-- `periodic_task_demo.rs`: Periodic task execution
-- `timer_api_verification.rs`: Comprehensive timer API usage
+- `http_echo.rs`: HTTP/1.1 echo server
+- `udp_buffered.rs`: UDP socket with buffered I/O
+- `metrics_server.rs`: Prometheus metrics exporter
 
 ## Safety
 
@@ -341,8 +286,8 @@ The runtime is designed to be memory-safe:
 
 ## Platform Support
 
-- **Linux**: Full support with io-uring backend
+- **Linux**: Full support with io-uring or epoll backend
 - **macOS**: Development support with kqueue backend  
-- **Windows**: Limited support (contributions welcome)
+- **Windows**: Not supported (contributions welcome)
 
 For optimal performance on Linux, use the io-uring backend in a container environment.

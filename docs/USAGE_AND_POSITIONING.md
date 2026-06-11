@@ -7,9 +7,10 @@ Why this project exists (the "why"):
 
 What it is (today):
 - A minimal async runtime prototype with:
-  - Multi-core runtime (thread-per-core architecture) with shared-nothing design
+  - Thread-per-core architecture with shared-nothing design
   - Timer utilities (sleep, timeout, interval, periodic tasks)
-  - Async networking (TCP/UDP with non-blocking I/O using epoll/io-uring)
+  - Async networking (TCP/UDP with non-blocking I/O using io-uring/epoll/kqueue)
+  - futures::io compatibility (AsyncRead/AsyncWrite traits)
   - HTTP echo server example with performance optimizations
 - Educational tool for understanding async runtime internals and high-performance I/O
 
@@ -20,8 +21,9 @@ What it is not:
 
 How to use (practical today):
 - As a lightweight runtime for small experiments:
-  - Multi-core: use `Runtime::new_multi_core()` for thread-per-core execution.
-  - Timers: compose `sleep`, `timeout`, and `Interval` for scheduling.
+  - Single-threaded: Use `Runtime::new().block_on(fut)` to drive async code.
+  - Multi-core: Use `MultiCoreRuntime::new(Some(num_cores))` for thread-per-core execution.
+  - Timers: Compose `timer::sleep`, `timer::timeout`, and `timer::Interval` for scheduling.
   - Periodic work: `task::spawn_periodic` for recurring jobs.
 - As a reference for architecture:
   - Study per-CPU executors, cross-CPU messaging, timer wheels, and async I/O backends.
@@ -32,7 +34,7 @@ How to use (practical today):
 
 Benchmarks & environment:
 - Includes HTTP benchmark comparing rust-miniss vs Tokio/Monoio/Glommio.
-- Run `./bench/scripts/bench_http.sh` for automated performance testing.
+- Run `cargo bench` for micro-benchmarks.
 - Authoritative benchmarks should be run on Linux with io_uring enabled; record CPU, memory, OS, and Rust version alongside results for reproducibility.
 - Recent optimizations reduced CPU usage in event loops and improved I/O efficiency.
 

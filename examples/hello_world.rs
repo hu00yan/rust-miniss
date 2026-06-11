@@ -5,7 +5,7 @@
 use rust_miniss::Runtime;
 
 fn main() {
-    println!("🦀 rust-miniss Hello World Example");
+    println!("rust-miniss Hello World Example");
 
     let runtime = Runtime::new();
 
@@ -15,7 +15,7 @@ fn main() {
         println!("Hello from async block!");
         42
     });
-    println!("Result: {}", result);
+    println!("Result: {result}");
 
     // Example 2: Chained async operations
     println!("\n--- Example 2: Chained operations ---");
@@ -32,10 +32,10 @@ fn main() {
         }
         .await;
 
-        println!("Adding {} + {} = {}", x, y, x + y);
+        println!("Adding {x} + {y} = {}", x + y);
         x + y
     });
-    println!("Final result: {}", result);
+    println!("Final result: {result}");
 
     // Example 3: Using task spawning (modern approach)
     println!("\n--- Example 3: Task Spawning ---");
@@ -48,7 +48,7 @@ fn main() {
 
         handle.await.unwrap()
     });
-    println!("Task result: {}", result);
+    println!("Task result: {result}");
 
-    println!("\n✅ All examples completed successfully!");
+    println!("\nAll examples completed successfully!");
 }

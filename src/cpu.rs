@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle as ThreadJoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_queue::SegQueue;
@@ -272,9 +272,13 @@ impl Cpu {
             dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>,
         >,
     ) -> Self {
-        let mut default_state = CpuIoState::default();
-        default_state.io_backend = io_backend.clone();
-        let io_state = Arc::new(default_state);
+        let io_state = Arc::new(CpuIoState {
+            io_backend: io_backend.clone(),
+            _pad1: [0u8; 56],
+            io_wakers: std::sync::Mutex::new(HashMap::new()),
+            _pad2: [0u8; 56],
+            completed_io: std::sync::Mutex::new(HashMap::new()),
+        });
         Self {
             id,
             task_queue: HashMap::with_capacity(crate::config::INITIAL_TASK_QUEUE_CAPACITY),
@@ -453,10 +457,13 @@ impl Cpu {
             let made_progress = self.tick();
 
             if self.ready_queue.is_empty() && !made_progress {
-                // No work to do, block waiting for messages
-                match self.message_receiver.recv() {
+                // No work to do, block briefly waiting for messages.
+                // Use recv_timeout instead of recv to avoid starving timers
+                // that are scheduled while the CPU is idle.
+                match self.message_receiver.recv_timeout(Duration::from_millis(1)) {
                     Ok(msg) => self.handle_message(msg),
-                    Err(_) => {
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                         self.running = false;
                     }
                 }

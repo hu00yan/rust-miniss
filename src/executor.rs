@@ -26,7 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::task::{JoinHandle, Task};
+use crate::task::{JoinHandle, JoinTaskFuture, Task};
+use crate::timer::TimerWheel;
 use crate::waker::{MinissWaker, TaskId};
 
 /// A single-threaded async runtime
@@ -57,18 +58,14 @@ impl Runtime {
         // Create an appropriate I/O backend for single-threaded execution based on compile-time features
         let io_backend: Arc<
             dyn IoProvider<
-                Completion = (
-                    IoToken,
-                    Op,
-                    std::result::Result<CompletionKind, IoError>,
-                ),
+                Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>),
             >,
         > = {
-            #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+            #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
             {
                 match crate::io::uring::UringBackend::new(32) {
                     Ok(uring) => Arc::new(uring),
-                    Err(e) => panic!("Failed to create io_uring backend: {}", e),
+                    Err(e) => panic!("Failed to create io_uring backend: {e}"),
                 }
             }
             #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
@@ -84,7 +81,7 @@ impl Runtime {
                                 ),
                             >,
                         >,
-                    Err(e) => panic!("Failed to create kqueue backend: {}", e),
+                    Err(e) => panic!("Failed to create kqueue backend: {e}"),
                 }
             }
             #[cfg(all(target_os = "linux", io_backend = "epoll"))]
@@ -100,11 +97,11 @@ impl Runtime {
                                 ),
                             >,
                         >,
-                    Err(e) => panic!("Failed to create epoll backend: {}", e),
+                    Err(e) => panic!("Failed to create epoll backend: {e}"),
                 }
             }
             #[cfg(not(any(
-                all(target_os = "linux", io_backend = "io_uring"),
+                all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"),
                 all(target_os = "linux", io_backend = "epoll"),
                 all(target_os = "macos", io_backend = "kqueue")
             )))]
@@ -122,6 +119,16 @@ impl Runtime {
 
         // Pin the future to the stack
         let mut future = Box::pin(future);
+        let mut timer_wheel = TimerWheel::default();
+        crate::cpu::set_current_timer(&mut timer_wheel);
+        let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+        struct TimerContextGuard;
+        impl Drop for TimerContextGuard {
+            fn drop(&mut self) {
+                crate::cpu::clear_current_timer();
+            }
+        }
+        let _timer_guard = TimerContextGuard;
 
         // Waker that unparks the current thread when the future makes progress.
         // This uses the `ArcWake` trait to create a waker that holds a reference
@@ -143,6 +150,8 @@ impl Runtime {
                     return output;
                 }
                 Poll::Pending => {
+                    let mut made_progress = false;
+
                     // Check for I/O completions
                     let noop_waker = futures::task::noop_waker();
                     let mut io_context = Context::from_waker(&noop_waker);
@@ -161,7 +170,20 @@ impl Runtime {
                                     waker.wake();
                                 }
                             }
+                            made_progress = true;
                         }
+                    }
+
+                    timer_wheel.expire(std::time::Instant::now(), &mut ready_timers);
+                    if !ready_timers.is_empty() {
+                        made_progress = true;
+                        for waker in ready_timers.drain(..) {
+                            waker.wake();
+                        }
+                    }
+
+                    if made_progress {
+                        continue;
                     }
 
                     // Park the thread until it is woken
@@ -244,14 +266,8 @@ impl Executor {
     {
         let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::SeqCst));
 
-        let (sender, receiver) = crossbeam_channel::bounded(1);
-
-        // Wrap the user's future to send result through channel
-        // Panics will be caught at the polling level in tick()
-        let wrapped_future = async move {
-            let result = future.await;
-            let _ = sender.send(Ok(result));
-        };
+        let (handle, completer) = JoinHandle::new(task_id);
+        let wrapped_future = JoinTaskFuture::new(future, completer);
 
         // Create the task
         let task = Task::new(task_id, wrapped_future);
@@ -260,7 +276,7 @@ impl Executor {
         self.tasks.insert(task_id, task);
         self.ready_queue.push(task_id);
 
-        JoinHandle::new(task_id, receiver)
+        handle
     }
 
     /// Run all ready tasks once
@@ -471,7 +487,7 @@ mod tests {
             let completed_count_clone = completed_count.clone();
             if i % 2 == 0 {
                 executor.spawn(async move {
-                    panic!("boom {}", i);
+                    panic!("boom {i}");
                 });
             } else {
                 executor.spawn(async move {
@@ -579,7 +595,7 @@ mod tests {
                 // Panicking task
                 executor.spawn(async move {
                     panic_clone.fetch_add(1, Ordering::SeqCst);
-                    panic!("intentional panic in task {}", i);
+                    panic!("intentional panic in task {i}");
                 });
             } else {
                 // Normal task

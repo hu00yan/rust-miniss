@@ -1,7 +1,7 @@
 use glommio::net::{TcpListener, TcpStream};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn read_http_request(stream: &TcpStream) -> std::io::Result<(String, String, String)> {
+async fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String, String)> {
     let mut data = Vec::with_capacity(4096);
     let mut buf = vec![0u8; 1024];
     
@@ -27,7 +27,7 @@ async fn read_http_request(stream: &TcpStream) -> std::io::Result<(String, Strin
     Ok((method, path, version))
 }
 
-async fn write_http_response(stream: &TcpStream) -> std::io::Result<()> {
+async fn write_http_response(stream: &mut TcpStream) -> std::io::Result<()> {
     let body = b"Hello from glommio";
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -40,8 +40,9 @@ async fn write_http_response(stream: &TcpStream) -> std::io::Result<()> {
 }
 
 async fn handle_client(stream: TcpStream) {
-    let _ = read_http_request(&stream).await;
-    let _ = write_http_response(&stream).await;
+    let mut stream = stream;
+    let _ = read_http_request(&mut stream).await;
+    let _ = write_http_response(&mut stream).await;
 }
 
 fn main() -> std::io::Result<()> {

@@ -30,7 +30,7 @@ use std::path::Path;
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use rust_miniss::{fs::AsyncFile, Runtime};
 ///
 /// let runtime = Runtime::new();
@@ -200,12 +200,11 @@ impl AsyncFile {
     /// ```
     pub async fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
         let state = io_state();
-        let buffer = buf.to_vec();
 
         let op = Op::WriteFile {
             fd: self.inner.as_raw_fd(),
             offset,
-            data: buffer,
+            data: crate::buffer::Buffer::from_slice(buf),
         };
         let token = state.io_backend.submit(op);
         let future = IoFuture::new(token);

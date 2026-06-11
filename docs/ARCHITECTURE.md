@@ -2,28 +2,28 @@
 
 ## Overview
 
-Rust-Miniss implements a **shared-nothing architecture** inspired by [Seastar](https://seastar.io/), where each CPU core operates independently with its own event loop, memory pools, and task scheduler. This design eliminates contention and maximizes CPU cache efficiency.
+Rust-Miniss implements a **thread-per-core architecture** inspired by [Seastar](https://seastar.io/), where each CPU core operates independently with its own event loop, memory pools, and task scheduler. This design eliminates contention and maximizes CPU cache efficiency.
 
 ## Core Principles
 
-### 1. Shared-Nothing Design
+### 1. Thread-Per-Core Design
 
 - **Per-CPU Executors**: Each CPU core runs a dedicated thread with its own executor
 - **No Shared State**: Each CPU maintains its own task queue, timer wheel, and I/O context
 - **Lock-Free Communication**: Cross-CPU communication uses SPSC (Single Producer, Single Consumer) queues
 
-### 2. Efficient I/O
+### 2. Multi-Backend I/O
 
-- **Multi-Backend Support**: io-uring on Linux, epoll/kqueue on other Unix systems
-- **Simple Buffering**: Direct Vec<u8> allocation for I/O operations (simplified from complex pooling)
-- **Async Operations**: Non-blocking I/O with completion-based notification
-- **Thread Pool**: Blocking file I/O handled asynchronously via thread pools
+- **io-uring**: High-performance completion-based I/O on Linux 5.10+
+- **epoll**: Readiness-based I/O on Linux and other Unix systems
+- **kqueue**: macOS support via mio
+- **Automatic Selection**: Runtime selects the best backend based on platform and kernel version
 
-### 3. Minimal Allocations
+### 3. Panic Isolation
 
-- **Direct Allocation**: Trust system allocator for buffer management
-- **RAII Management**: Automatic resource cleanup using Rust's ownership system
-- **Thread-Local State**: Per-thread I/O state to avoid contention
+- **Task Isolation**: Panics in one task don't affect others
+- **Catch Unwind**: Every task poll is wrapped with `std::panic::catch_unwind`
+- **Graceful Degradation**: System continues operating with fewer resources
 
 ## System Architecture
 
@@ -48,6 +48,7 @@ Rust-Miniss implements a **shared-nothing architecture** inspired by [Seastar](h
 │ │Backend  │ │ │Backend  │ │ │Backend  │ │                     │
 │ └─────────┘ │ └─────────┘ │ └─────────┘ │                     │
 └─────────────┴─────────────┴─────────────┴─────────────────────┘
+     SPSC Queue          SPSC Queue
 ```
 
 ## Call Stack Comparison (Mermaid)
@@ -60,7 +61,7 @@ sequenceDiagram
     participant Client
     participant Listener as Miniss Listener
     participant CPU as Miniss CPU Executor
-    participant Backend as I/O Backend (kqueue/io_uring)
+    participant Backend as I/O Backend (uring/epoll/kqueue)
 
     Client->>Listener: accept()
     Listener->>CPU: SubmitTask(AcceptedConn)
@@ -156,24 +157,30 @@ pub enum CrossCpuMessage {
 
 The runtime supports multiple I/O backends based on platform:
 
-#### io-uring (Linux)
+#### io-uring (Linux 5.10+)
 ```rust
 pub struct UringBackend {
     ring: IoUring,                          // io-uring instance
-    pending_ops: HashMap<u64, (IoToken, Op)>, // Pending operations
-    completions: Vec<CompletionEntry>,      // Completion buffer
+    pending_ops: HashMap<u64, PendingOp>,   // Pending operations
+    thread_id: std::thread::ThreadId,       // Thread affinity check
 }
 ```
 
 #### epoll/kqueue (Fallback)
 ```rust
 pub struct EpollBackend {
-    poll: mio::Poll,                        // mio Poll instance
-    events: mio::Events,                    // Event buffer
-    pending_ops: HashMap<Token, (IoToken, Op)>, // Pending operations
-    thread_pool: ThreadPool,                // For blocking file I/O
+    poll: UnsafeCell<mio::Poll>,            // mio Poll instance
+    events: UnsafeCell<mio::Events>,        // Event buffer
+    pending_ops: UnsafeCell<HashMap<Token, (IoToken, Op)>>, // Pending operations
+    thread_pool: Arc<ThreadPool>,           // For blocking file I/O
 }
 ```
+
+**Backend Selection:**
+- **Linux 5.10+ with io_uring feature**: Uses io-uring for optimal performance
+- **Linux (older or without feature)**: Uses epoll via mio
+- **macOS**: Uses kqueue via mio (reuses epoll implementation)
+- **Other Unix**: Uses epoll via mio
 
 ## Performance Design
 

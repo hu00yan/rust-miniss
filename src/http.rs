@@ -33,7 +33,7 @@ impl fmt::Display for Method {
             Method::HEAD => write!(f, "HEAD"),
             Method::OPTIONS => write!(f, "OPTIONS"),
             Method::PATCH => write!(f, "PATCH"),
-            Method::Other(method) => write!(f, "{}", method),
+            Method::Other(method) => write!(f, "{method}"),
         }
     }
 }
@@ -73,7 +73,7 @@ impl fmt::Display for StatusCode {
             500 => "Internal Server Error",
             _ => "Unknown",
         };
-        write!(f, "{} {}", self.0, reason)
+        write!(f, "{} {reason}", self.0)
     }
 }
 
@@ -200,7 +200,7 @@ impl Response {
         let mut response = format!("{} {}\r\n", self.version, self.status);
 
         for (name, value) in &self.headers {
-            response.push_str(&format!("{}: {}\r\n", name, value));
+            response.push_str(&format!("{name}: {value}\r\n"));
         }
 
         response.push_str("\r\n");
@@ -225,7 +225,7 @@ impl HttpConnection {
         let mut buffer = [0u8; 4096];
         let n = self.stream.read(&mut buffer).await?;
         let buffer = &buffer[..n];
-        Request::parse(buffer.as_ref())
+        Request::parse(buffer)
     }
 
     /// Send HTTP response to the connection

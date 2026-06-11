@@ -25,7 +25,6 @@
 //! via the [`JoinHandle::cancel`] method.
 
 use crate::waker::TaskId;
-use crossbeam_channel::{Receiver, TryRecvError};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -43,6 +42,100 @@ pub enum TaskError {
 
 /// The result of a completed task.
 pub type TaskResult<T> = Result<T, TaskError>;
+
+struct JoinState<T> {
+    result: Option<TaskResult<T>>,
+    completed: bool,
+    waker: Option<Waker>,
+}
+
+impl<T> JoinState<T> {
+    fn pending() -> Self {
+        Self {
+            result: None,
+            completed: false,
+            waker: None,
+        }
+    }
+}
+
+/// Completes a [`JoinHandle`] from the task execution side.
+pub(crate) struct JoinCompleter<T> {
+    state: Arc<Mutex<JoinState<T>>>,
+}
+
+impl<T> JoinCompleter<T> {
+    fn complete(&self, result: TaskResult<T>) {
+        let mut state = self.state.lock().unwrap();
+        if state.completed {
+            return;
+        }
+
+        state.result = Some(result);
+        state.completed = true;
+
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl<T> Drop for JoinCompleter<T> {
+    fn drop(&mut self) {
+        self.complete(Err(TaskError::Cancelled));
+    }
+}
+
+/// Wraps a user future so task success, panic, and cancellation all reach the join handle.
+pub(crate) struct JoinTaskFuture<F, T>
+where
+    F: Future<Output = T>,
+{
+    future: Pin<Box<F>>,
+    completer: Option<JoinCompleter<T>>,
+}
+
+impl<F, T> JoinTaskFuture<F, T>
+where
+    F: Future<Output = T>,
+{
+    pub(crate) fn new(future: F, completer: JoinCompleter<T>) -> Self {
+        Self {
+            future: Box::pin(future),
+            completer: Some(completer),
+        }
+    }
+}
+
+impl<F, T> Future for JoinTaskFuture<F, T>
+where
+    F: Future<Output = T>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.future.as_mut().poll(cx)
+        }));
+
+        match poll_result {
+            Ok(Poll::Ready(value)) => {
+                if let Some(completer) = this.completer.take() {
+                    completer.complete(Ok(value));
+                }
+                Poll::Ready(())
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => {
+                if let Some(completer) = this.completer.take() {
+                    completer.complete(Err(TaskError::Panic(payload)));
+                }
+                Poll::Ready(())
+            }
+        }
+    }
+}
 
 /// A task wraps a future for execution in the runtime
 pub struct Task {
@@ -78,18 +171,19 @@ impl Task {
 /// A spawned task handle that can be awaited
 pub struct JoinHandle<T> {
     task_id: TaskId,
-    receiver: Receiver<TaskResult<T>>,
-    waker: Arc<Mutex<Option<Waker>>>,
+    state: Arc<Mutex<JoinState<T>>>,
 }
 
 impl<T> JoinHandle<T> {
     /// Create a new join handle
-    pub(crate) fn new(task_id: TaskId, receiver: Receiver<TaskResult<T>>) -> Self {
-        Self {
+    pub(crate) fn new(task_id: TaskId) -> (Self, JoinCompleter<T>) {
+        let state = Arc::new(Mutex::new(JoinState::pending()));
+        let handle = Self {
             task_id,
-            receiver,
-            waker: Arc::new(Mutex::new(None)),
-        }
+            state: state.clone(),
+        };
+        let completer = JoinCompleter { state };
+        (handle, completer)
     }
 
     /// Get the task ID
@@ -99,10 +193,7 @@ impl<T> JoinHandle<T> {
 
     /// Check if the task has completed
     pub fn is_finished(&self) -> bool {
-        matches!(
-            self.receiver.try_recv(),
-            Ok(_) | Err(TryRecvError::Disconnected)
-        )
+        self.state.lock().unwrap().completed
     }
 
     /// Cancel the task
@@ -120,9 +211,14 @@ impl<T> JoinHandle<T> {
             self.task_id
         );
 
-        // Mark the result as cancelled if it hasn't completed yet
-        if !self.is_finished() {
+        let mut state = self.state.lock().unwrap();
+        if !state.completed {
+            state.result = Some(Err(TaskError::Cancelled));
+            state.completed = true;
             tracing::info!("Task {:?} marked as cancelled", self.task_id);
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
         }
 
         Ok(())
@@ -133,15 +229,17 @@ impl<T: Send> Future for JoinHandle<T> {
     type Output = TaskResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.receiver.try_recv() {
-            Ok(result) => Poll::Ready(result),
-            Err(TryRecvError::Empty) => {
-                // Store the waker so the sender can wake us when result is ready
-                *self.waker.lock().unwrap() = Some(cx.waker().clone());
-                Poll::Pending
-            }
-            Err(TryRecvError::Disconnected) => Poll::Ready(Err(TaskError::Cancelled)),
+        let mut state = self.state.lock().unwrap();
+        if let Some(result) = state.result.take() {
+            return Poll::Ready(result);
         }
+
+        if state.completed {
+            return Poll::Ready(Err(TaskError::Cancelled));
+        }
+
+        state.waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 

@@ -74,6 +74,7 @@ enum PendingOp {
 pub struct UringBackend {
     ring: UnsafeCell<IoUring>,
     pending_ops: UnsafeCell<HashMap<u64, PendingOp>>,
+    completed_ops: UnsafeCell<Vec<(IoToken, Op, Result<CompletionKind, IoError>)>>,
     thread_id: std::thread::ThreadId,
 }
 
@@ -87,6 +88,7 @@ impl UringBackend {
         Ok(Self {
             ring: UnsafeCell::new(ring),
             pending_ops: UnsafeCell::new(HashMap::new()),
+            completed_ops: UnsafeCell::new(Vec::new()),
             thread_id: std::thread::current().id(),
         })
     }
@@ -397,10 +399,8 @@ impl IoProvider for UringBackend {
                         io::ErrorKind::Unsupported,
                         "Operation not supported by io_uring backend",
                     )));
-                    eprintln!("Unsupported io_uring operation: {result:?}");
-                    // Return token without submitting — caller will get no completion.
-                    // This is a graceful degradation for operations like UdpRecvVectored,
-                    // UdpSendVectored, ReadRent, WriteRent that aren't implemented yet.
+                    let completed_ops = unsafe { &mut *self.completed_ops.get() };
+                    completed_ops.push((token, op, result));
                     return token;
                 }
             }
@@ -422,8 +422,9 @@ impl IoProvider for UringBackend {
     fn poll_complete(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
         let ring = unsafe { &mut *self.ring.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        let completed_ops = unsafe { &mut *self.completed_ops.get() };
 
-        let mut completions = Vec::new();
+        let mut completions: Vec<Self::Completion> = completed_ops.drain(..).collect();
         let mut cq = ring.completion();
         cq.sync();
 
@@ -432,10 +433,7 @@ impl IoProvider for UringBackend {
             let result = cqe.result();
 
             if let Some(pending_op) = pending_ops.remove(&token_id) {
-                let token = IoToken {
-                    id: token_id,
-                    slab_index: 0,
-                }; // TODO: proper slab index
+                let token = IoToken::new();
 
                 let (op, completion_result) = match pending_op {
                     PendingOp::Accept {

@@ -9,7 +9,7 @@ DURATION=${2:-30}
 CONNECTIONS=${3:-100}
 ADDR="http://127.0.0.1:$PORT"
 
-echo "🚀 HTTP Benchmark for rust-miniss vs tokio/monoio/glommio"
+echo "HTTP Benchmark for rust-miniss vs tokio/monoio/glommio"
 echo "Port: $PORT, Duration: ${DURATION}s, Connections: $CONNECTIONS"
 echo
 
@@ -18,7 +18,7 @@ run_benchmark() {
     local runtime=$1
     local binary=$2
     
-    echo "📊 Benchmarking $runtime..."
+    echo "Benchmarking $runtime..."
     
     # Start server in background
     $binary --addr "0.0.0.0:$PORT" &
@@ -44,41 +44,41 @@ run_benchmark() {
 
 # Check if wrk is installed
 if ! command -v wrk &> /dev/null; then
-    echo "❌ wrk is not installed. Please install it first."
+    echo "wrk is not installed. Please install it first."
     exit 1
 fi
 
 # Build all binaries
-echo "🔨 Building binaries..."
+echo "Building binaries..."
 cargo build --release --example http_echo
 cargo build --release --bin tokio_echo || echo "tokio_echo not available"
 
 # Run benchmarks
-echo "📈 Starting benchmarks..."
+echo "Starting benchmarks..."
 echo
 
 # rust-miniss
 if [ -f target/release/examples/http_echo ]; then
     run_benchmark "rust-miniss" "target/release/examples/http_echo"
 else
-    echo "❌ rust-miniss http_echo not found"
+    echo "rust-miniss http_echo not found"
 fi
 
 # tokio (if available)
 if [ -f target/release/tokio_echo ]; then
     run_benchmark "tokio" "target/release/tokio_echo"
 elif [ -f bench/runtime_comparison/tokio_echo.rs ]; then
-    echo "📦 Building tokio comparison binary..."
+    echo "Building tokio comparison binary..."
     cd bench/runtime_comparison
     cargo build --release --bin tokio_echo 2>/dev/null || {
-        echo "⚠️  Tokio comparison binary build failed"
+        echo "Tokio comparison binary build failed"
     }
     cd ../..
     if [ -f bench/runtime_comparison/target/release/tokio_echo ]; then
         run_benchmark "tokio" "bench/runtime_comparison/target/release/tokio_echo"
     fi
 else
-    echo "⚠️  Tokio comparison not available"
+    echo "Tokio comparison not available"
 fi
 
-echo "✅ Benchmark completed!"
+echo "Benchmark completed!"

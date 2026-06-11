@@ -14,23 +14,23 @@ NC='\033[0m' # No Color
 
 # 日志函数
 log_info() {
-    echo -e "${BLUE}ℹ️  $1${NC}"
+    echo -e "${BLUE}INFO  $1${NC}"
 }
 
 log_success() {
-    echo -e "${GREEN}✅ $1${NC}"
+    echo -e "${GREEN}OK   $1${NC}"
 }
 
 log_warning() {
-    echo -e "${YELLOW}⚠️  $1${NC}"
+    echo -e "${YELLOW}WARN $1${NC}"
 }
 
 log_error() {
-    echo -e "${RED}❌ $1${NC}"
+    echo -e "${RED}ERR  $1${NC}"
 }
 
 log_step() {
-    echo -e "\n${BLUE}🔄 $1${NC}"
+    echo -e "\n${BLUE}STEP $1${NC}"
 }
 
 # 检查必要工具
@@ -64,21 +64,21 @@ check_prerequisites() {
 
 # 1. 代码格式检查
 check_formatting() {
-    log_step "1️⃣ 代码格式检查 (cargo fmt)"
+    log_step "1. 代码格式检查 (cargo fmt)"
     cargo fmt --all -- --check
     log_success "代码格式正确"
 }
 
 # 2. Clippy 检查
 check_clippy() {
-    log_step "2️⃣ Clippy 检查"
+    log_step "2. Clippy 检查"
     cargo clippy --all-targets -- -D warnings
     log_success "Clippy 检查通过"
 }
 
 # 3. 编译检查
 check_compilation() {
-    log_step "3️⃣ 编译检查"
+    log_step "3. 编译检查"
     
     log_info "检查默认特性..."
     cargo check
@@ -94,7 +94,7 @@ check_compilation() {
 
 # 4. 基础测试
 run_basic_tests() {
-    log_step "4️⃣ 基础测试套件"
+    log_step "4. 基础测试套件"
     
     log_info "运行所有测试..."
     cargo test --all-targets
@@ -107,7 +107,7 @@ run_basic_tests() {
 
 # 5. Nextest (如果可用)
 run_nextest() {
-    log_step "5️⃣ Nextest 运行"
+    log_step "5. Nextest 运行"
     if command -v cargo-nextest &> /dev/null; then
         cargo nextest run --all-targets
         log_success "Nextest 通过"
@@ -118,14 +118,14 @@ run_nextest() {
 
 # 6. 文档检查
 check_docs() {
-    log_step "6️⃣ 文档检查"
+    log_step "6. 文档检查"
     cargo doc --all-features --no-deps
     log_success "文档生成成功"
 }
 
 # 7. Address Sanitizer + Leak Sanitizer
 run_asan() {
-    log_step "7️⃣ AddressSanitizer + LeakSanitizer"
+    log_step "7. AddressSanitizer + LeakSanitizer"
     log_info "这可能需要几分钟..."
     
     export RUSTFLAGS="-Zsanitizer=address,leak"
@@ -137,7 +137,7 @@ run_asan() {
 
 # 8. Thread Sanitizer (单独运行，与ASan冲突)
 run_tsan() {
-    log_step "8️⃣ ThreadSanitizer"
+    log_step "8. ThreadSanitizer"
     log_info "检测数据竞争和并发错误..."
     
     export RUSTFLAGS="-Zsanitizer=thread"
@@ -149,7 +149,7 @@ run_tsan() {
 
 # 9. Miri (检查 unsafe 代码和 UB)
 run_miri() {
-    log_step "9️⃣ Miri (undefined behavior 检查)"
+    log_step "9. Miri (undefined behavior 检查)"
     log_info "这会比较慢..."
     
     cargo +nightly miri test --all-targets
@@ -158,14 +158,14 @@ run_miri() {
 
 # 10. 基准测试编译检查
 check_benchmarks() {
-    log_step "🔟 基准测试编译检查"
+    log_step "10. 基准测试编译检查"
     cargo bench --all-targets --no-run
     log_success "基准测试编译通过"
 }
 
 # 11. 示例编译检查
 check_examples() {
-    log_step "1️⃣1️⃣ 示例编译检查"
+    log_step "11. 示例编译检查"
     
     for example in examples/*.rs; do
         if [[ -f "$example" ]]; then
@@ -182,7 +182,7 @@ check_examples() {
 main() {
     local start_time=$(date +%s)
     
-    echo -e "${BLUE}🚀 miniss 完整测试套件${NC}"
+    echo -e "${BLUE}miniss 完整测试套件${NC}"
     echo -e "${BLUE}═══════════════════════════════════${NC}"
     
     # 解析命令行参数
@@ -254,7 +254,7 @@ main() {
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
     
-    echo -e "\n${GREEN}🎉 所有检查通过！${NC}"
+    echo -e "\n${GREEN}所有检查通过！${NC}"
     echo -e "${GREEN}总耗时: ${duration}s${NC}"
     echo -e "${GREEN}可以安全提交到 CI${NC}"
 }

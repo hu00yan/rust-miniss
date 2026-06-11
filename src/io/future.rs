@@ -51,7 +51,7 @@ impl Drop for IoFuture {
         // cancel the underlying I/O operation.
         let state = io_state();
         state.take_waker(self.token); // This removes the waker from the slab
-        // We also remove any potential completion that might have arrived just now.
+                                      // We also remove any potential completion that might have arrived just now.
         state.completed_io.lock().unwrap().remove(&self.token);
     }
 }

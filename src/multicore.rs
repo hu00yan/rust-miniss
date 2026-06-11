@@ -10,19 +10,24 @@
 //! 4. **Independent IO**: Each core has its own io_uring/epoll instance
 
 use crossbeam_queue::SegQueue;
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::cpu::{
+    clear_current_io_state, clear_current_timer, set_current_io_state, set_current_timer,
+    CpuIoState,
+};
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 use crate::task::Task;
 use crate::timer::TimerWheel;
-use crate::waker::TaskId;
+use crate::waker::{MinissWaker, TaskId};
 
 /// Type alias for the IO backend completion type
 type IoCompletion = (IoToken, Op, std::result::Result<CompletionKind, IoError>);
@@ -71,15 +76,18 @@ impl std::fmt::Debug for CoreMessage {
 pub struct CpuCore {
     /// Core ID (matches physical CPU)
     id: usize,
-    /// Local task queue - no synchronization needed
-    task_queue: VecDeque<Task>,
+    /// Local task queue keyed by task ID. Readiness is tracked separately.
+    task_queue: HashMap<TaskId, Task>,
+    /// Local ready queue populated by task wakers.
+    ready_queue: Arc<SegQueue<TaskId>>,
     /// Message inbox from other cores
     message_inbox: Arc<SegQueue<CoreMessage>>,
     /// Local timer wheel
-    #[allow(dead_code)]
     timer_wheel: TimerWheel,
     /// IO backend (io_uring/epoll/kqueue)
-    io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
+    io_backend: Arc<dyn IoProvider<Completion = IoCompletion>>,
+    /// Per-core I/O state exposed to `IoFuture`s running on this core.
+    io_state: Arc<CpuIoState>,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
     /// Task counter for this core
@@ -90,15 +98,21 @@ impl CpuCore {
     /// Create new CPU core
     fn new(
         id: usize,
-        io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
+        io_backend: Arc<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
+        let mut default_state = CpuIoState::default();
+        default_state.io_backend = io_backend.clone();
+        let io_state = Arc::new(default_state);
+
         Self {
             id,
-            task_queue: VecDeque::new(),
+            task_queue: HashMap::new(),
+            ready_queue: Arc::new(SegQueue::new()),
             message_inbox: Arc::new(SegQueue::new()),
             timer_wheel: TimerWheel::new(1024, 1),
             io_backend,
+            io_state,
             shutdown,
             local_task_count: 0,
         }
@@ -108,6 +122,17 @@ impl CpuCore {
     fn run(&mut self) -> Result<()> {
         // Bind to CPU core for optimal cache locality
         self.bind_to_cpu()?;
+        set_current_io_state(self.io_state.clone());
+        set_current_timer(&mut self.timer_wheel);
+
+        struct RuntimeContextGuard;
+        impl Drop for RuntimeContextGuard {
+            fn drop(&mut self) {
+                clear_current_timer();
+                clear_current_io_state();
+            }
+        }
+        let _context_guard = RuntimeContextGuard;
 
         tracing::info!("CPU core {} started", self.id);
 
@@ -175,7 +200,8 @@ impl CpuCore {
             match self.message_inbox.pop() {
                 Some(CoreMessage::Task { id, future }) => {
                     let task = Task::from_pinned(id, future);
-                    self.task_queue.push_back(task);
+                    self.task_queue.insert(id, task);
+                    self.ready_queue.push(id);
                     self.local_task_count += 1;
                     processed += 1;
                 }
@@ -190,7 +216,9 @@ impl CpuCore {
                 }
                 Some(CoreMessage::CancelTask(task_id)) => {
                     // Remove task from queue if it exists
-                    self.task_queue.retain(|task| task.id() != task_id);
+                    if self.task_queue.remove(&task_id).is_some() {
+                        self.local_task_count = self.local_task_count.saturating_sub(1);
+                    }
                     tracing::trace!("Cancelled task {:?}", task_id);
                     processed += 1;
                 }
@@ -206,24 +234,38 @@ impl CpuCore {
         let mut executed = 0;
 
         // Execute up to 16 tasks per iteration
-        while executed < 16 && !self.task_queue.is_empty() {
-            if let Some(mut task) = self.task_queue.pop_front() {
-                // Create waker for this task
-                let waker = crate::waker::dummy_waker();
-                let mut context = std::task::Context::from_waker(&waker);
+        while executed < 16 {
+            let Some(task_id) = self.ready_queue.pop() else {
+                break;
+            };
 
-                match task.poll(&mut context) {
-                    std::task::Poll::Ready(()) => {
-                        // Task completed
-                        self.local_task_count -= 1;
-                        tracing::trace!("Task {:?} completed on core {}", task.id(), self.id);
+            if let Some(mut task) = self.task_queue.remove(&task_id) {
+                let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
+                let mut context = Context::from_waker(&waker);
+                let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    task.poll(&mut context)
+                }));
+
+                match poll_result {
+                    Ok(Poll::Ready(())) => {
+                        self.local_task_count = self.local_task_count.saturating_sub(1);
+                        tracing::trace!("Task {:?} completed on core {}", task_id, self.id);
                     }
-                    std::task::Poll::Pending => {
-                        // Task not ready, put it back
-                        self.task_queue.push_back(task);
+                    Ok(Poll::Pending) => {
+                        self.task_queue.insert(task_id, task);
+                    }
+                    Err(payload) => {
+                        self.local_task_count = self.local_task_count.saturating_sub(1);
+                        tracing::error!("Task {:?} panicked on core {}", task_id, self.id);
+                        drop(payload);
                     }
                 }
                 executed += 1;
+            } else {
+                // A stale wake can remain after cancellation; ignore it.
+                if self.task_queue.is_empty() {
+                    break;
+                }
             }
         }
 
@@ -232,22 +274,40 @@ impl CpuCore {
 
     /// Process IO completions
     fn process_io(&mut self) -> bool {
-        // Create a dummy waker for polling
-        let waker = crate::waker::dummy_waker();
-        let mut context = std::task::Context::from_waker(&waker);
-
-        // Poll IO backend for completions
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
         match self.io_backend.poll_complete(&mut context) {
-            std::task::Poll::Ready(completions) => !completions.is_empty(),
-            std::task::Poll::Pending => false,
+            Poll::Ready(completions) => {
+                if completions.is_empty() {
+                    return false;
+                }
+
+                let mut completed = self.io_state.completed_io.lock().unwrap();
+                for (token, _op, result) in completions {
+                    completed.insert(token, result);
+                    if let Some(waker) = self.io_state.take_waker(token) {
+                        waker.wake();
+                    }
+                }
+
+                true
+            }
+            Poll::Pending => false,
         }
     }
 
     /// Process timer events
     fn process_timers(&mut self) -> bool {
-        // Simple timer processing - check if any timers need processing
-        // For now, just return false as we don't have expired timer processing
-        false
+        let mut ready = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+        self.timer_wheel.expire(Instant::now(), &mut ready);
+        if ready.is_empty() {
+            return false;
+        }
+
+        for waker in ready {
+            waker.wake();
+        }
+        true
     }
 }
 
@@ -313,29 +373,26 @@ impl MultiCoreRuntime {
 
         // Create cores and start threads
         for core_id in 0..num_cores {
-            // Create IO backend for this core
-            let io_backend = Self::create_io_backend(core_id)?;
-
-            // Create core with shutdown flag
             let core_shutdown = Arc::new(AtomicBool::new(false));
-            let mut core = CpuCore::new(core_id, io_backend, core_shutdown.clone());
-
-            // Store reference to core's message queue
             let sender = Arc::new(SegQueue::new());
             core_senders.push(sender.clone());
-            core.message_inbox = sender;
 
             // Spawn thread for this core
             let handle = thread::Builder::new()
-                .name(format!("miniss-core-{}", core_id))
+                .name(format!("miniss-core-{core_id}"))
                 .spawn(move || {
+                    // io_uring instances are thread-affine; create the backend inside
+                    // the worker thread that will submit and poll its operations.
+                    let io_backend = MultiCoreRuntime::create_io_backend(core_id)?;
+                    let mut core = CpuCore::new(core_id, io_backend, core_shutdown.clone());
+                    core.message_inbox = sender;
                     let result = core.run();
                     // Set shutdown flag when core exits
                     core_shutdown.store(true, Ordering::Relaxed);
                     result
                 })
                 .map_err(|e| {
-                    RuntimeError::TaskFailed(format!("Failed to spawn core thread: {}", e))
+                    RuntimeError::TaskFailed(format!("Failed to spawn core thread: {e}"))
                 })?;
 
             join_handles.push(handle);
@@ -358,13 +415,13 @@ impl MultiCoreRuntime {
     }
 
     /// Create IO backend for a specific core
-    fn create_io_backend(core_id: usize) -> Result<Box<dyn IoProvider<Completion = IoCompletion>>> {
-        #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+    fn create_io_backend(core_id: usize) -> Result<Arc<dyn IoProvider<Completion = IoCompletion>>> {
+        #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
         {
             match crate::io::uring::UringBackend::new(1024) {
                 Ok(uring) => {
                     tracing::debug!("Core {} using io_uring backend", core_id);
-                    return Ok(Box::new(uring));
+                    return Ok(Arc::new(uring));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -381,7 +438,7 @@ impl MultiCoreRuntime {
             match crate::io::kqueue::KqueueBackend::new() {
                 Ok(kqueue) => {
                     tracing::debug!("Core {} using kqueue backend", core_id);
-                    return Ok(Box::new(kqueue));
+                    return Ok(Arc::new(kqueue));
                 }
                 Err(e) => {
                     tracing::warn!("Core {} failed to create kqueue: {}", core_id, e);
@@ -394,7 +451,7 @@ impl MultiCoreRuntime {
             match crate::io::epoll::EpollBackend::new() {
                 Ok(epoll) => {
                     tracing::debug!("Core {} using epoll backend", core_id);
-                    return Ok(Box::new(epoll));
+                    return Ok(Arc::new(epoll));
                 }
                 Err(e) => {
                     tracing::warn!("Core {} failed to create epoll: {}", core_id, e);
@@ -404,8 +461,7 @@ impl MultiCoreRuntime {
 
         // All IO backends failed - this is a critical error
         tracing::error!("Core {}: All IO backends failed to initialize", core_id);
-        Err(RuntimeError::IoFailed(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
+        Err(RuntimeError::IoFailed(std::io::Error::other(
             "No suitable IO backend available",
         )))
     }
@@ -448,8 +504,7 @@ impl MultiCoreRuntime {
         // Validate core ID
         if core_id >= self.num_cores {
             return Err(RuntimeError::TaskFailed(format!(
-                "Invalid core ID: {}",
-                core_id
+                "Invalid core ID: {core_id}"
             )));
         }
 
@@ -531,9 +586,10 @@ impl MultiCoreRuntime {
             ));
         }
 
-        // For now, we always return success since we don't track individual tasks
-        // In a more sophisticated implementation, we would check if the task exists
         tracing::info!("Task cancellation requested for task {:?}", task_id);
+        for sender in &self.core_senders {
+            sender.push(CoreMessage::CancelTask(task_id));
+        }
         Ok(())
     }
 
@@ -567,8 +623,7 @@ impl MultiCoreRuntime {
                 Err(e) => {
                     tracing::error!("Failed to join core {} thread: {:?}", core_id, e);
                     return Err(RuntimeError::TaskFailed(format!(
-                        "Thread join failed: {:?}",
-                        e
+                        "Thread join failed: {e:?}"
                     )));
                 }
             }
@@ -587,39 +642,7 @@ impl MultiCoreRuntime {
     where
         F: Future,
     {
-        // For block_on, we need a different approach since we can't easily
-        // integrate with our thread-per-core model. For now, use a simple
-        // executor on the current thread.
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-        let mut future = Box::pin(future);
-
-        // Create a dummy waker
-        fn dummy_raw_waker() -> RawWaker {
-            fn dummy_clone(_: *const ()) -> RawWaker {
-                dummy_raw_waker()
-            }
-            fn dummy_wake(_: *const ()) {}
-            fn dummy_wake_by_ref(_: *const ()) {}
-            fn dummy_drop(_: *const ()) {}
-
-            const VTABLE: RawWakerVTable =
-                RawWakerVTable::new(dummy_clone, dummy_wake, dummy_wake_by_ref, dummy_drop);
-
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-
-        loop {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(result) => return result,
-                Poll::Pending => {
-                    thread::yield_now();
-                }
-            }
-        }
+        crate::Runtime::new().block_on(future)
     }
 
     /// Block on a future on a specific CPU core
@@ -630,8 +653,7 @@ impl MultiCoreRuntime {
         // Validate core ID
         if core_id >= self.num_cores {
             return Err(RuntimeError::TaskFailed(format!(
-                "Invalid core ID: {}",
-                core_id
+                "Invalid core ID: {core_id}"
             )));
         }
 

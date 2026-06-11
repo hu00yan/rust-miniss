@@ -9,10 +9,10 @@
 //! The IO backend is automatically selected at compile time based on the target platform
 //! and kernel version:
 //!
-//! - **Linux with kernel 5.10+**: Uses `io_uring` for optimal performance
-//! - **Linux with older kernels**: Falls back to a dummy backend
-//! - **macOS**: Uses `kqueue`
-//! - **Other Unix systems**: Uses `epoll`
+//! - **Linux with kernel 5.10+ and io_uring feature**: Uses `io_uring` for optimal performance
+//! - **Linux (older kernels or without io_uring feature)**: Uses `epoll` via mio
+//! - **macOS**: Uses `kqueue` via mio (reuses epoll implementation)
+//! - **Other Unix systems**: Uses `epoll` via mio
 //!
 //! This selection is handled by the build script (`build.rs`) which detects the
 //! target platform and kernel version, and sets the appropriate `io_backend`
@@ -121,11 +121,9 @@ pub enum Op {
 }
 
 /// A unique identifier for a submitted I/O operation.
-/// Contains both a global ID and a slab index for efficient waker management.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IoToken {
     id: u64,
-    slab_index: usize,
 }
 
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -141,7 +139,6 @@ impl IoToken {
     pub fn new() -> Self {
         Self {
             id: TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed),
-            slab_index: 0, // Will be set by CpuIoState
         }
     }
 
@@ -240,13 +237,10 @@ impl From<IoError> for std::io::Error {
 // Conditional compilation for different I/O backend implementations.
 // These modules will contain the concrete implementations of the `IoBackend` trait.
 
-#[cfg(any(target_os = "macos", io_backend = "kqueue"))]
+#[cfg(io_backend = "kqueue")]
 pub mod kqueue;
 
-#[cfg(any(
-    all(unix, not(target_os = "linux")),
-    all(target_os = "linux", any(feature = "epoll", io_backend = "epoll"))
-))]
+#[cfg(any(io_backend = "epoll", all(unix, not(target_os = "linux"))))]
 pub mod epoll;
 
 #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
@@ -254,9 +248,5 @@ pub mod uring;
 
 pub mod future;
 
-// Re-export backends for use in other modules
-#[cfg(any(
-    all(unix, not(target_os = "linux")),
-    all(target_os = "linux", any(feature = "epoll", io_backend = "epoll"))
-))]
+#[cfg(any(io_backend = "epoll", all(unix, not(target_os = "linux"))))]
 pub use epoll::EpollBackend;

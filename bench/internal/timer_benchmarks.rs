@@ -39,7 +39,7 @@ fn timer_batch_insertion_benchmark(c: &mut Criterion) {
 
     for batch_size in [10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*batch_size));
-        group.bench_with_input(format!("batch_{}", batch_size), batch_size, |b, &size| {
+        group.bench_with_input(format!("batch_{batch_size}"), batch_size, |b, &size| {
             b.iter(|| {
                 let mut wheel = TimerWheel::new(4096, 1);
                 let now = Instant::now();
@@ -86,7 +86,7 @@ fn timer_expiration_benchmark(c: &mut Criterion) {
     for timer_count in [10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*timer_count));
         group.bench_with_input(
-            format!("expire_{}_timers", timer_count),
+            format!("expire_{timer_count}_timers"),
             timer_count,
             |b, &count| {
                 b.iter_batched(
@@ -122,7 +122,7 @@ fn timer_wheel_creation_benchmark(c: &mut Criterion) {
 
     for num_slots in [256, 1024, 4096, 16384].iter() {
         group.bench_with_input(
-            format!("create_{}_slots", num_slots),
+            format!("create_{num_slots}_slots"),
             num_slots,
             |b, &slots| {
                 b.iter(|| {

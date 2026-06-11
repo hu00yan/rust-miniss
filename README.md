@@ -9,57 +9,163 @@
 [![Typos](https://github.com/hu00yan/rust-miniss/actions/workflows/typos.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/typos.yml)
 [![Container Image](https://img.shields.io/badge/ghcr.io-rust--miniss-blue?logo=docker)](https://github.com/hu00yan/rust-miniss/pkgs/container/rust-miniss)
 
-A Rust implementation of [miniss](https://github.com/qqiangwu/miniss) - a toy version of the [Seastar](https://github.com/scylladb/seastar) framework.
+A minimal thread-per-core async runtime for Rust, originally inspired by [Seastar](https://github.com/scylladb/seastar) but evolved into a Rust-specific implementation.
 
 ## Overview
 
 rust-miniss is a minimal async runtime that demonstrates high-performance server design principles:
 
-- **Shared-nothing architecture**: Each CPU core runs independently
+- **Thread-per-core architecture**: Each CPU core runs independently with its own event loop
 - **Lock-free communication**: Cross-CPU messaging via SPSC queues
-- **Zero-copy I/O**: Using io-uring on Linux
-- **Custom futures**: Understanding async internals
-- **🆕 Futures::io support**: Compatible with Hyper and HTTP ecosystem
-
-## Futures::IO Integration (NEW)
-
-rust-miniss now supports `futures::io` traits, enabling compatibility with the entire HTTP ecosystem:
-
-```rust
-use rust_miniss::net::AsyncTcpStream;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
-use hyper::server::conn::Http;
-
-// Convert to tokio::io for Hyper integration
-let rust_miniss_stream = AsyncTcpStream::from(tcp_stream);
-let tokio_stream = rust_miniss_stream.compat();
-
-// Use with Hyper, h2, h3, etc.
-let server = Http::new().serve_connection(tokio_stream, service).await;
-```
-
-### What this enables:
-- ✅ **Hyper integration** - Full HTTP/1.1, HTTP/2, HTTP/3 support
-- ✅ **Tokio ecosystem** - Compatible with tokio-util libraries
-- ✅ **Real applications** - Users can build production services
-- ⚠️ **Trade-off** - Requires memcpy for compatibility (still maintains zero-copy internal API)
+- **Multi-backend I/O**: io-uring (Linux 5.10+), epoll (Linux/Unix), kqueue (macOS)
+- **futures::io compatibility**: Implements `AsyncRead`/`AsyncWrite` traits for ecosystem integration
+- **Panic isolation**: Task panics don't affect other tasks
 
 ## Quick Start
 
-### Development Setup
-```bash
-# Install development tools
-make install-tools
+### Basic Usage
 
-# Quick checks (format + clippy)
-make quick
+```rust
+use rust_miniss::Runtime;
 
-# Full checks (format + clippy + tests + build)
-make check
-
-# Complete test suite with sanitizers
-make full
+fn main() {
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        println!("Hello from rust-miniss!");
+    });
+}
 ```
+
+### Multi-core Usage
+
+```rust
+use rust_miniss::multicore::MultiCoreRuntime;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = MultiCoreRuntime::new(Some(4))?; // 4 CPU cores
+    
+    runtime.spawn(async {
+        println!("Task running on a CPU core");
+    })?;
+    
+    runtime.shutdown()?;
+    runtime.join()?;
+    Ok(())
+}
+```
+
+### Timer Utilities
+
+```rust
+use rust_miniss::{timer, Runtime};
+use std::time::Duration;
+
+fn main() {
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        // Sleep for 1 second
+        timer::sleep(Duration::from_secs(1)).await;
+        
+        // Apply a timeout to an operation
+        let result = timer::timeout(Duration::from_secs(2), async {
+            timer::sleep(Duration::from_millis(500)).await;
+            "Operation completed"
+        }).await;
+        
+        match result {
+            Ok(value) => println!("Success: {}", value),
+            Err(_) => println!("Operation timed out"),
+        }
+        
+        // Create a periodic interval
+        let mut interval = timer::Interval::new(Duration::from_millis(200));
+        for i in 0..3 {
+            interval.tick().await;
+            println!("Tick {}", i + 1);
+        }
+    });
+}
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Multi-Core Runtime                           │
+├─────────────┬─────────────┬─────────────┬─────────────────────┤
+│   CPU 0     │   CPU 1     │   CPU 2     │   Signal Handler    │
+│             │             │             │                     │
+│ ┌─────────┐ │ ┌─────────┐ │ ┌─────────┐ │ ┌─────────────────┐ │
+│ │Task     │ │ │Task     │ │ │Task     │ │ │OS Signal        │ │
+│ │Queue    │ │ │Queue    │ │ │Queue    │ │ │Listener         │ │
+│ └─────────┘ │ └─────────┘ │ └─────────┘ │ └─────────────────┘ │
+│             │             │             │                     │
+│ ┌─────────┐ │ ┌─────────┐ │ ┌─────────┐ │ ┌─────────────────┐ │
+│ │Timer    │ │ │Timer    │ │ │Timer    │ │ │Cross-CPU        │ │
+│ │Wheel    │ │ │Wheel    │ │ │Wheel    │ │ │Message Bus      │ │
+│ └─────────┘ │ └─────────┘ │ └─────────┘ │ └─────────────────┘ │
+│             │             │             │                     │
+│ ┌─────────┐ │ ┌─────────┐ │ ┌─────────┐ │                     │
+│ │I/O      │ │ │I/O      │ │ │I/O      │ │                     │
+│ │Backend  │ │ │Backend  │ │ │Backend  │ │                     │
+│ │(uring/  │ │ │(uring/  │ │ │(uring/  │ │                     │
+│ │epoll/   │ │ │epoll/   │ │ │epoll/   │ │                     │
+│ │kqueue)  │ │ │kqueue)  │ │ │kqueue)  │ │                     │
+│ └─────────┘ │ └─────────┘ │ └─────────┘ │                     │
+└─────────────┴─────────────┴─────────────┴─────────────────────┘
+     SPSC Queue          SPSC Queue
+```
+
+## Building
+
+```bash
+# For Linux with io-uring support (recommended for performance)
+cargo build --features io_uring
+
+# For macOS (uses kqueue via mio)
+cargo build
+
+# For Linux with epoll (default)
+cargo build --features epoll
+```
+
+## I/O Backend Selection
+
+The runtime automatically selects the best I/O backend based on platform and kernel version:
+
+| Platform | Backend | Feature Flag | Notes |
+|----------|---------|--------------|-------|
+| Linux 5.10+ | io-uring | `io_uring` | Best performance |
+| Linux (older) | epoll | `epoll` | Default on Linux |
+| macOS | kqueue | `kqueue` | Via mio |
+| Other Unix | epoll | `epoll` | Fallback |
+
+## Examples
+
+- `examples/hello_world.rs` – Single-threaded runtime primer
+- `examples/http_echo.rs` – HTTP/1.1 echo server
+- `examples/udp_buffered.rs` – UDP socket with buffered I/O
+- `examples/metrics_server.rs` – Prometheus metrics exporter
+
+### HTTP Echo Server
+
+```bash
+# Build and run
+cargo build --release --example http_echo
+./target/release/examples/http_echo --addr 0.0.0.0:8080
+
+# Test with curl
+curl http://127.0.0.1:8080
+
+# Benchmark with wrk
+wrk -t4 -c100 -d30s http://127.0.0.1:8080
+```
+
+## Goals
+
+1. **Educational**: Learn how async runtimes work internally
+2. **Performance**: Achieve near-optimal performance for specific use cases
+3. **Simplicity**: Keep the codebase small and understandable
 
 ### Development Workflow
 ```bash
@@ -88,38 +194,50 @@ make pre-commit
 
 ## HTTP Echo Example & Benchmarks
 
-- Example: `examples/http_echo.rs` (HTTP/1.1 minimal echo server)
-- Run:
-  - Build release: `cargo build --release --examples`
-  - Start server: `./target/release/examples/http_echo --addr 127.0.0.1:8080`
-  - Benchmark with wrk: `wrk -t4 -c256 -d30s http://127.0.0.1:8080/`
+The primary sample program is `examples/http_echo.rs`, a minimal HTTP/1.1 echo server that now runs entirely within the runtime thread so drops never access I/O state from foreign threads.
 
-### Performance Comparison (Linux, wrk -t2 -c50 -d10s)
-
-| Runtime | Requests/sec | Latency (avg) | CPU Usage | Memory |
-|---------|-------------|---------------|-----------|--------|
-| **rust-miniss** | ~3,000 | ~8-12ms | ~15% | ~15MB |
-| **Tokio** | 6,769 | ~4.43ms | ~25% | ~20MB |
-| **Monoio** | ~8,000* | ~3-5ms | ~20% | ~18MB |
-| **Glommio** | ~9,000* | ~2-4ms | ~18% | ~22MB |
-
-*Estimated based on architecture similarities
-
-### Running Comparisons
+### Running the example
 
 ```bash
-# Build all runtimes
-cd bench && cargo build --release
+# Build the runtime examples
+cargo build --release --examples
 
-# Run HTTP benchmark script
-../bench/scripts/bench_http.sh 8080 10 50
+# Start the HTTP echo server
+./target/release/examples/http_echo --addr 0.0.0.0:8080
 
-# Individual runtime tests
-./target/release/tokio_echo --addr 127.0.0.1:8080 &
-wrk -t2 -c50 -d10s http://127.0.0.1:8080/
+# In another terminal run a benchmark (OrbStack Ubuntu guest shown)
+wrk -t4 -c100 -d30s http://127.0.0.1:8080
 ```
 
-- More details: see docs/benchmarks/http.md
+### wrk (t4 / c100 / 30s) on Linux guest
+
+| Runtime | Requests/sec | Transfer/sec | Notes |
+|---------|--------------|--------------|-------|
+| **rust-miniss** | 100,367 | 7.56 MB/s | `wrk` reports read errors because the server closes each response eagerly; throughput is stable |
+| **glommio**     | 100,665 | 7.58 MB/s | Baseline built from `bench/runtime_comparison/glommio_echo.rs` |
+
+The close parity shows that the io_uring backend and buffer pool are functioning correctly under sustained load.
+
+### Benchmark suite layout
+
+- `bench/internal/` – micro benchmarks driven by `cargo bench`
+- `bench/criterion/` – Criterion harnesses for runtime/timer profiling
+- `bench/runtime_comparison/` – external echo servers (currently glommio) used for wrk comparisons
+
+Helpful commands:
+
+```bash
+# Run Criterion micro-benches
+cargo bench --bench perf_benchmark
+cargo bench --bench memory_perf
+
+# Build the glommio baseline
+cargo build --manifest-path bench/runtime_comparison/Cargo.toml --release --bin glommio_echo
+
+# Compare against rust-miniss
+./target/release/examples/http_echo --addr 0.0.0.0:8080 &
+wrk -t4 -c100 -d30s http://127.0.0.1:8080
+```
 
 ## Goals
 
@@ -157,7 +275,14 @@ cargo build
 
 [![HTTP benchmark](https://img.shields.io/badge/http%20echo-benchmark-blue)](docs/benchmarks/http.md)
 
-- HTTP Echo: examples/http_echo.rs (see benchmark above)
+- HTTP Echo: `examples/http_echo.rs` (see benchmark above)
+
+### Available examples
+
+- `examples/hello_world.rs` – single-threaded runtime primer
+- `examples/http_echo.rs` – end-to-end HTTP/1.1 echo server
+- `examples/udp_buffered.rs` – UDP socket with pooled buffers
+- `examples/metrics_server.rs` – Prometheus exporter wired into the runtime
 
 ### Using as a lightweight runtime/network library
 
@@ -311,23 +436,7 @@ fn main() {
 
 ## Docker/OrbStack Development
 
-This project includes Docker containers for development. To clean up Docker/OrbStack resources and free up disk space, use the provided cleanup script:
-
-```bash
-./cleanup.sh
-```
-
-The script will:
-- Show current disk usage
-- Remove stopped containers
-- Remove dangling images
-- Optionally remove unused volumes (with confirmation)
-- Remove unused networks
-- Display final disk usage
-
-### Manual Cleanup Commands
-
-For manual cleanup, you can run these commands individually:
+This project includes Docker containers for development. If disk usage grows, rely on Docker's built-in pruning commands:
 
 ```bash
 # List current objects
@@ -350,108 +459,49 @@ docker network prune -f      # Remove unused networks
 docker system df
 ```
 
-For more information about Docker best practices, see the [OrbStack documentation](https://docs.orbstack.dev/).
+For more guidance on Docker maintenance with OrbStack, see the [OrbStack documentation](https://docs.orbstack.dev/).
 
-## 安全性和设计原则
+## Safety and Design Principles
 
-### ⚠️ 重要安全注意事项
+### Unsafe Code Usage
 
-本项目在实现高性能IO时使用了大量的unsafe代码。这是有意为之的设计决策，但需要特别注意：
+This project uses unsafe code for performance-critical I/O operations. Key principles:
 
-#### unsafe代码使用原则
-1. **最小化unsafe范围**：unsafe块应该尽可能小，只包含必要的操作
-2. **充分的safety注释**：每个unsafe块都必须有详细的理由说明
-3. **RAII原则遵守**：所有资源必须通过RAII正确管理，避免`mem::forget`
-4. **测试覆盖**：unsafe代码必须有充分的测试覆盖
+1. **Minimal unsafe scope**: Unsafe blocks are kept as small as possible
+2. **Detailed safety comments**: Every unsafe block has documentation explaining why it's safe
+3. **RAII compliance**: All resources are properly managed through Rust's ownership system
+4. **Test coverage**: Unsafe code has comprehensive test coverage
 
-#### 已修复的安全问题
-- ✅ **Use After Free**：修复了`from_raw_fd`的生命周期管理问题
-- ✅ **RAII违反**：移除了所有不必要的`mem::forget`调用
-- ✅ **资源泄漏**：确保所有资源在作用域结束时被正确释放
+### Memory Safety Testing
 
-#### 当前的unsafe使用情况
-项目中仍然存在约100个unsafe块，主要用于：
-- IO操作的系统调用
-- 裸指针操作（sockaddr等）
-- UnsafeCell用于内部可变性
-- RawWaker的生命周期管理
+- **AddressSanitizer (ASan)**: Detects memory errors
+- **LeakSanitizer (LSan)**: Detects memory leaks
+- **ThreadSanitizer (TSan)**: Detects data races
+- **Miri**: Detects undefined behavior
 
-### 🏗️ 架构设计教训
+### Known Limitations
 
-#### 1. IO后端设计
-- **问题**：最初的DummyIoBackend设计不符合RAII原则
-- **教训**：测试用的mock应该有实际功能，但不能违反资源管理原则
-- **解决方案**：重新设计DummyIoBackend，确保它返回结果但不泄漏资源
+- Miri doesn't support io-uring syscalls (expected behavior)
+- Some proc-macro crates may not be fully compatible with sanitizers
+- Sanitizer tests are primarily for CI validation
 
-#### 2. 错误处理
-- **问题**：IO后端失败时的fallback机制不合理
-- **教训**：应该返回错误而不是使用功能不完整的fallback
-- **解决方案**：在IO后端初始化失败时返回RuntimeError
+## Known Issues
 
-#### 3. 依赖项管理
-- **问题**：第三方crate的兼容性问题导致编译失败
-- **教训**：应该定期更新依赖项，并为关键依赖项准备备用方案
-- **解决方案**：移除有问题的loom依赖，使用稳定的替代方案
+### Platform Support
 
-### 🧪 测试和验证
+- **Linux**: Full support with io-uring or epoll backends
+- **macOS**: Development support with kqueue backend
+- **Windows**: Not supported (contributions welcome)
 
-#### 内存安全测试
-- 使用AddressSanitizer检测内存泄漏
-- 使用ThreadSanitizer检测竞态条件
-- 使用Miri检测未定义行为
+### Feature Completeness
 
-#### 性能测试
-- 基准测试确保修复不影响性能
-- 并发测试验证多线程安全性
-
-### 📚 开发指南
-
-#### 编写unsafe代码的准则
-1. 必须有充分的理由
-2. 必须有详细的safety注释
-3. 必须通过code review
-4. 必须有对应的测试
-
-#### 资源管理
-1. 优先使用RAII模式
-2. 避免`mem::forget`
-3. 确保异常安全
-4. 使用智能指针管理复杂资源
-
-## Known Issues and Limitations
-
-### Sanitizer Compatibility
-The project includes memory sanitizer tests (AddressSanitizer, ThreadSanitizer, and Miri) in CI, but these have some known limitations:
-
-- **Miri (Undefined Behavior Detector)**:
-  - Does not support io-uring syscalls (syscall 425)
-  - Some tests are conditionally skipped under Miri using `#[cfg(not(miri))]`
-  - This is expected behavior as Miri is an interpreter that doesn't support all kernel features
-
-- **AddressSanitizer (ASan) + LeakSanitizer (LSan)**:
-  - May have compatibility issues with certain dependencies (e.g., `generator` crate build.rs issues)
-  - Some proc-macro crates may not be fully compatible with sanitizers
-  - CI jobs use `continue-on-error` to prevent blocking the entire workflow
-
-- **ThreadSanitizer (TSan)**:
-  - Similar compatibility issues with some dependencies
-  - May detect false positives in certain async code patterns
-
-### Workarounds
-- For local development, use `make test` for regular testing
-- Sanitizer tests are primarily for CI validation and may be skipped locally if dependencies have issues
-- The core functionality remains unaffected by these sanitizer limitations
-
-### Performance Benchmarking
-- HTTP performance comparisons with tokio are available via `scripts/bench_http.sh`
-- Cross-CPU latency benchmarks are included in the benches directory
-- Scheduling throughput benchmarks test task spawning performance
+- Some operations (UdpRecvVectored, UdpSendVectored, ReadRent, WriteRent) are not yet implemented in all backends
+- The `AsyncUnixStream` and `AsyncUnixListener` types have stub implementations
+- Signal handling requires the `signal` feature flag
 
 ## Status
 
-This is a learning project and work in progress. See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the roadmap.
-
-- Project purpose and usage notes: see [docs/USAGE_AND_POSITIONING.md](docs/USAGE_AND_POSITIONING.md)
+This is a learning project and work in progress. See [docs/USAGE_AND_POSITIONING.md](docs/USAGE_AND_POSITIONING.md) for more details on project purpose and usage.
 
 ## License
 

@@ -15,7 +15,7 @@ fn scheduling_throughput(c: &mut Criterion) {
     for &task_count in &[1_000usize, 5_000, 10_000] {
         group.throughput(Throughput::Elements(task_count as u64));
         group.bench_with_input(
-            format!("spawn_complete_{}", task_count),
+            format!("spawn_complete_{task_count}"),
             &task_count,
             |b, &n| {
                 b.iter_custom(|iters| {

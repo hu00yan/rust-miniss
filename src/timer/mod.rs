@@ -68,10 +68,10 @@ pub struct TimerWheel {
     slots: Vec<VecDeque<Entry>>,
     resolution_ms: u64,
     num_slots: usize,
-    current_slot: usize,
+    current_tick: u64,
     start_time: Instant,
-    /// Maps TimerId to (slot_index, position_in_slot) for fast cancellation
-    timer_locations: HashMap<TimerId, (usize, usize)>,
+    /// Maps TimerId to slot index for cancellation
+    timer_locations: HashMap<TimerId, usize>,
 }
 
 impl Default for TimerWheel {
@@ -83,6 +83,11 @@ impl Default for TimerWheel {
 impl TimerWheel {
     /// Creates a new TimerWheel with the specified number of slots and resolution
     pub fn new(num_slots: usize, resolution_ms: u64) -> Self {
+        assert!(num_slots > 0, "Timer wheel must have at least one slot");
+        assert!(
+            resolution_ms > 0,
+            "Timer resolution must be greater than zero"
+        );
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
             slots.push(VecDeque::with_capacity(
@@ -94,7 +99,7 @@ impl TimerWheel {
             slots,
             resolution_ms,
             num_slots,
-            current_slot: 0,
+            current_tick: 0,
             start_time: Instant::now(),
             timer_locations: HashMap::new(),
         }
@@ -105,28 +110,25 @@ impl TimerWheel {
     /// Returns a TimerId that can be used to cancel the timer
     pub fn schedule(&mut self, at: Instant, waker: Waker) -> TimerId {
         let timer_id = TimerId::new();
-        let slot_index = self.calculate_slot(at);
+        debug_assert!(self.resolution_ms > 0, "Timer resolution must be non-zero");
 
-        // Verify slot_index is within bounds before accessing
-        debug_assert!(
-            slot_index < self.slots.len(),
-            "Timer wheel slot index out of bounds"
-        );
+        let deadline_tick = self.instant_to_tick(at).max(self.current_tick);
+        let distance = deadline_tick.saturating_sub(self.current_tick);
+        let rounds = distance / self.num_slots as u64;
+        let slot_index = ((self.current_tick + distance) % self.num_slots as u64) as usize;
 
-        let slot = self
-            .slots
-            .get_mut(slot_index)
-            .expect("Timer slot index verified to be in bounds");
-
-        let position_in_slot = slot.len();
-        slot.push_back(Entry {
+        let entry = Entry {
             id: timer_id,
             waker,
-        });
+            remaining_rounds: rounds,
+        };
 
-        // Record the location for fast cancellation
-        self.timer_locations.insert(timer_id, (slot_index, position_in_slot));
+        self.slots
+            .get_mut(slot_index)
+            .expect("slot index must be valid")
+            .push_back(entry);
 
+        self.timer_locations.insert(timer_id, slot_index);
         timer_id
     }
 
@@ -134,18 +136,13 @@ impl TimerWheel {
     ///
     /// Returns true if the timer was found and cancelled, false otherwise
     pub fn cancel(&mut self, id: TimerId) -> bool {
-        if let Some((slot_index, position)) = self.timer_locations.remove(&id) {
+        if let Some(slot_index) = self.timer_locations.remove(&id) {
             if let Some(slot) = self.slots.get_mut(slot_index) {
-                // Check if the position is still valid (timers might have been removed before this one)
-                if position < slot.len() && slot[position].id == id {
-                    slot.remove(position);
-                    // Update positions of remaining timers in this slot
-                    for i in position..slot.len() {
-                        if let Some(location) = self.timer_locations.get_mut(&slot[i].id) {
-                            location.1 = i;
-                        }
+                for idx in 0..slot.len() {
+                    if slot[idx].id == id {
+                        slot.remove(idx);
+                        return true;
                     }
-                    return true;
                 }
             }
         }
@@ -156,40 +153,40 @@ impl TimerWheel {
     ///
     /// Expired timer wakers are moved to the provided ready vector
     pub fn expire(&mut self, now: Instant, ready: &mut Vec<Waker>) {
-        let elapsed = now.saturating_duration_since(self.start_time);
-        let target_slot_offset = elapsed.as_millis() as u64 / self.resolution_ms;
-        let target_slot = (target_slot_offset as usize) % self.num_slots;
+        debug_assert!(self.resolution_ms > 0, "Timer resolution must be non-zero");
 
-        // If we have advanced in time, process expired slots
-        while self.current_slot != target_slot || target_slot_offset as usize >= self.num_slots {
-            let slot = &mut self.slots[self.current_slot];
-            while let Some(entry) = slot.pop_front() {
-                self.timer_locations.remove(&entry.id); // Remove from location cache
-                ready.push(entry.waker);
-            }
+        let target_tick = self.instant_to_tick(now);
+        if target_tick < self.current_tick {
+            return;
+        }
 
-            self.current_slot = (self.current_slot + 1) % self.num_slots;
+        while self.current_tick <= target_tick {
+            let slot_index = (self.current_tick % self.num_slots as u64) as usize;
 
-            // Prevent infinite loop if we need to process more than one full wheel
-            if target_slot_offset as usize >= self.num_slots {
-                // Process the entire wheel if we've advanced more than one full rotation
-                for _ in 0..self.num_slots {
-                    let slot = &mut self.slots[self.current_slot];
-                    while let Some(entry) = slot.pop_front() {
-                        ready.push(entry.waker);
+            if let Some(slot) = self.slots.get_mut(slot_index) {
+                let mut remaining = slot.len();
+                while remaining > 0 {
+                    if let Some(mut entry) = slot.pop_front() {
+                        if entry.remaining_rounds == 0 {
+                            self.timer_locations.remove(&entry.id);
+                            ready.push(entry.waker);
+                        } else {
+                            entry.remaining_rounds -= 1;
+                            slot.push_back(entry);
+                        }
                     }
-                    self.current_slot = (self.current_slot + 1) % self.num_slots;
+                    remaining -= 1;
                 }
-                break;
             }
+
+            self.current_tick = self.current_tick.saturating_add(1);
         }
     }
 
-    /// Calculates the slot index for a given target time
-    fn calculate_slot(&self, at: Instant) -> usize {
-        let elapsed = at.saturating_duration_since(self.start_time);
-        let slot_offset = elapsed.as_millis() as u64 / self.resolution_ms;
-        (slot_offset as usize) % self.num_slots
+    fn instant_to_tick(&self, at: Instant) -> u64 {
+        let elapsed_ms = at.saturating_duration_since(self.start_time).as_millis();
+        let resolution = self.resolution_ms as u128;
+        (elapsed_ms / resolution) as u64
     }
 
     /// Returns the number of pending timers across all slots
@@ -220,7 +217,7 @@ mod tests {
         let wheel = TimerWheel::new(64, 10);
         assert_eq!(wheel.num_slots, 64);
         assert_eq!(wheel.resolution_ms, 10);
-        assert_eq!(wheel.current_slot, 0);
+        assert_eq!(wheel.current_tick, 0);
         assert_eq!(wheel.pending_count(), 0);
     }
 
@@ -339,6 +336,24 @@ mod tests {
         wheel.expire(now + Duration::from_millis(20), &mut ready);
 
         assert_eq!(ready.len(), 8);
+        assert_eq!(wheel.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_timer_long_duration() {
+        let mut wheel = TimerWheel::new(8, 1);
+        let now = wheel.start_time;
+        let waker = create_test_waker();
+
+        // Schedule timer far in the future (multiple full rotations)
+        wheel.schedule(now + Duration::from_millis(100), waker);
+
+        let mut ready = Vec::new();
+        wheel.expire(now + Duration::from_millis(99), &mut ready);
+        assert!(ready.is_empty());
+
+        wheel.expire(now + Duration::from_millis(100), &mut ready);
+        assert_eq!(ready.len(), 1);
         assert_eq!(wheel.pending_count(), 0);
     }
 }

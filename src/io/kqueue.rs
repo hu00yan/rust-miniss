@@ -1,5 +1,3 @@
-#![cfg(all(target_os = "macos", io_backend = "kqueue"))]
-
 //! kqueue backend implementation reusing the mio-based epoll backend.
 //!
 //! The epoll backend in this crate is implemented entirely in terms of `mio`'s
