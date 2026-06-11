@@ -23,7 +23,7 @@ help:
 
 # 安装必要工具
 install-tools:
-	@echo "📦 安装开发工具..."
+	@echo "安装开发工具..."
 	rustup toolchain install nightly
 	rustup component add rustfmt clippy --toolchain stable
 	rustup component add rust-src llvm-tools-preview miri --toolchain nightly
@@ -31,12 +31,12 @@ install-tools:
 
 # 格式化
 fmt:
-	@echo "🎨 检查代码格式..."
+	@echo "检查代码格式..."
 	cargo fmt --all -- --check
 
 # Clippy 检查
 clippy:
-	@echo "📎 运行 Clippy..."
+	@echo "运行 Clippy..."
 	cargo clippy --all-targets -- -D warnings
 
 # 超快检查 (提交前必须通过)
@@ -45,12 +45,12 @@ quick: fmt clippy
 
 # 基础测试
 test:
-	@echo "🧪 运行测试套件..."
+	@echo "运行测试套件..."
 	cargo test --all-targets
 
 # 构建检查
 build:
-	@echo "🔨 编译检查..."
+	@echo "编译检查..."
 	cargo build --all-targets
 	cargo build --release
 
@@ -60,12 +60,12 @@ check: quick test build
 
 # 清理
 clean:
-	@echo "🧹 清理构建产物..."
+	@echo "清理构建产物..."
 	cargo clean
 
 # 开发模式 - 监视文件变化并运行快速检查
 watch:
-	@echo "👀 监视模式 (需要安装 cargo-watch)..."
+	@echo "监视模式 (需要安装 cargo-watch)..."
 	@if ! command -v cargo-watch >/dev/null 2>&1; then \
 		echo "安装 cargo-watch..."; \
 		cargo install cargo-watch; \
@@ -74,7 +74,7 @@ watch:
 
 # CI 模拟 - 模拟 CI 环境
 ci-simulate: 
-	@echo "🤖 模拟 CI 环境..."
+	@echo "模拟 CI 环境..."
 	@echo "1️⃣ 格式检查..."
 	@$(MAKE) fmt
 	@echo "2️⃣ Clippy 检查..."
@@ -87,18 +87,18 @@ ci-simulate:
 
 # 性能测试
 bench:
-	@echo "📊 运行性能测试..."
+	@echo "运行性能测试..."
 	cargo bench --all-targets --no-run
 	cargo bench
 
 # 文档生成
 docs:
-	@echo "📚 生成文档..."
+	@echo "生成文档..."
 	cargo doc --all-features --no-deps --open
 
 # 示例编译检查
 examples:
-	@echo "📋 检查示例..."
+	@echo "检查示例..."
 	@for example in examples/*.rs; do \
 		if [ -f "$$example" ]; then \
 			example_name=$$(basename "$$example" .rs); \

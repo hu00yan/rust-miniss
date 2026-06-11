@@ -21,7 +21,7 @@ async fn multicore_task_distribution() {
                 let tid = std::thread::current().id();
                 // There is no stable way to map ThreadId->usize; hash its Debug repr
                 let mut hasher = DefaultHasher::new();
-                format!("{:?}", tid).hash(&mut hasher);
+                format!("{tid:?}").hash(&mut hasher);
                 let idx = (hasher.finish() % 4) as usize;
                 counters[idx].fetch_add(1, Ordering::Relaxed);
                 i
@@ -40,8 +40,6 @@ async fn multicore_task_distribution() {
     let active = counts.iter().filter(|&&c| c > 0).count();
     assert!(
         active >= 1,
-        "expected >=1 active workers, got {} with counts {:?}",
-        active,
-        counts
+        "expected >=1 active workers, got {active} with counts {counts:?}"
     );
 }

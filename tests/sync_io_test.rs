@@ -11,9 +11,9 @@ fn main() -> std::io::Result<()> {
     {
         let mut file = std::fs::File::create(&temp_path)?;
         let test_data = b"test";
-        println!("Writing {} bytes: {:?}", test_data.len(), test_data);
+        println!("Writing {} bytes: {test_data:?}", test_data.len());
         let bytes_written = file.write(test_data)?;
-        println!("Wrote {} bytes", bytes_written);
+        println!("Wrote {bytes_written} bytes");
         assert_eq!(bytes_written, test_data.len());
 
         // Sync the file
@@ -25,7 +25,7 @@ fn main() -> std::io::Result<()> {
         let mut file = std::fs::File::open(&temp_path)?;
         let mut contents = vec![];
         let bytes_read = file.read_to_end(&mut contents)?;
-        println!("Read {} bytes: {:?}", bytes_read, contents);
+        println!("Read {bytes_read} bytes: {contents:?}");
         assert_eq!(contents, b"test");
     }
 

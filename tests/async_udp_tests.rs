@@ -23,24 +23,27 @@ fn test_async_udp_send_recv() {
 
         // Test with a receiving socket to verify the send actually works
         // Create a receiver socket bound to the target address
-        let receiver_socket = std::net::UdpSocket::bind(target_addr).expect("Failed to bind receiver socket");
+        let receiver_socket =
+            std::net::UdpSocket::bind(target_addr).expect("Failed to bind receiver socket");
 
         // Test async UDP send only
         match socket.send_to(test_data, target_addr).await {
             Ok(bytes_sent) => {
-                println!("Async UDP send succeeded: {} bytes sent", bytes_sent);
+                println!("Async UDP send succeeded: {bytes_sent} bytes sent");
                 assert_eq!(bytes_sent, test_data.len());
 
                 // Try to receive the data to verify it was sent
                 let mut buf = [0u8; 1024];
                 match receiver_socket.recv_from(&mut buf) {
                     Ok((received, sender_addr)) => {
-                        println!("Async UDP receive succeeded: {} bytes from {}", received, sender_addr);
+                        println!(
+                            "Async UDP receive succeeded: {received} bytes from {sender_addr}"
+                        );
                         assert_eq!(received, test_data.len());
                         assert_eq!(&buf[..received], test_data);
                     }
                     Err(e) => {
-                        println!("Async UDP receive failed: {} ({})", e, e.kind());
+                        println!("Async UDP receive failed: {e} ({})", e.kind());
                     }
                 }
             }
@@ -48,11 +51,11 @@ fn test_async_udp_send_recv() {
                 // Check the error type
                 match e.kind() {
                     std::io::ErrorKind::InvalidInput => {
-                        panic!("Async UDP send failed with InvalidInput - this indicates a programming error: {}", e);
+                        panic!("Async UDP send failed with InvalidInput - this indicates a programming error: {e}");
                     }
                     _ => {
                         // Other errors (network unreachable, permission denied, etc.) are acceptable
-                        println!("Async UDP send failed with expected error: {} ({})", e, e.kind());
+                        println!("Async UDP send failed with expected error: {e} ({})", e.kind());
                     }
                 }
             }
@@ -87,20 +90,18 @@ fn test_async_udp_multiple_sends() {
             match socket.send_to(msg, target_addr).await {
                 Ok(bytes_sent) => {
                     assert_eq!(bytes_sent, msg.len());
-                    println!("Message {} sent successfully: {} bytes", i + 1, bytes_sent);
+                    let message_number = i + 1;
+                    println!("Message {message_number} sent successfully: {bytes_sent} bytes");
                 }
                 Err(e) => {
                     // Check the error type
                     match e.kind() {
                         std::io::ErrorKind::InvalidInput => {
-                            panic!(
-                                "Send {} failed with InvalidInput - programming error: {}",
-                                i, e
-                            );
+                            panic!("Send {i} failed with InvalidInput - programming error: {e}");
                         }
                         _ => {
                             // Other errors are acceptable
-                            println!("Message {} failed with expected error: {}", i, e);
+                            println!("Message {i} failed with expected error: {e}");
                         }
                     }
                 }

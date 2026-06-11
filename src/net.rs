@@ -1,13 +1,13 @@
 use crate::cpu::io_state;
 use crate::io::IoToken;
 use crate::Buffer;
+use futures::io::{AsyncRead, AsyncWrite};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use futures::io::{AsyncRead, AsyncWrite};
 
 // Rent traits for zero-copy (Glommio-style)
 #[allow(async_fn_in_trait)]
@@ -56,7 +56,10 @@ impl AsyncTcpListener {
                 let async_stream = AsyncTcpStream::new(stream)?;
                 Ok((async_stream, addr))
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected completion")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
         }
     }
 
@@ -93,8 +96,10 @@ impl AsyncTcpStream {
 
     /// Connects to the specified address.
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr.into())?;
-        Self::new(stream)
+        let addr = addr.into();
+        let std_stream = std::net::TcpStream::connect(addr)?;
+        std_stream.set_nonblocking(true)?;
+        Self::new(std_stream)
     }
 }
 
@@ -156,12 +161,19 @@ impl AsyncRead for AsyncTcpStream {
                         buf[..copy_len].copy_from_slice(&data[..copy_len]);
                         Poll::Ready(Ok(copy_len))
                     }
-                    Ok(_) => Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected completion"))),
+                    Ok(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected completion",
+                    ))),
                     Err(e) => Poll::Ready(Err(e.into())),
                 }
             } else {
                 // Still pending, register waker
-                state.io_wakers.lock().unwrap().insert(token, cx.waker().clone());
+                state
+                    .io_wakers
+                    .lock()
+                    .unwrap()
+                    .insert(token, cx.waker().clone());
                 Poll::Pending
             }
         } else {
@@ -174,18 +186,71 @@ impl AsyncRead for AsyncTcpStream {
             let token = state.io_backend.submit(op);
             this.read_token = Some(token);
             // Register waker and return pending
-            state.io_wakers.lock().unwrap().insert(token, cx.waker().clone());
+            state
+                .io_wakers
+                .lock()
+                .unwrap()
+                .insert(token, cx.waker().clone());
             Poll::Pending
         }
     }
 
     fn poll_read_vectored(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _bufs: &mut [std::io::IoSliceMut<'_>],
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-        // For simplicity, not implemented
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        let state = io_state();
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if let Some(token) = this.read_token {
+            if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
+                this.read_token = None;
+                match result {
+                    Ok(crate::io::CompletionKind::ReadVectored { bytes_read, buffers }) => {
+                        let mut remaining = bytes_read;
+                        for (owned_buf, caller_buf) in buffers.iter().zip(bufs.iter_mut()) {
+                            let copy_len =
+                                std::cmp::min(remaining, std::cmp::min(owned_buf.len(), caller_buf.len()));
+                            caller_buf[..copy_len].copy_from_slice(&owned_buf[..copy_len]);
+                            remaining -= copy_len;
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                        Poll::Ready(Ok(bytes_read))
+                    }
+                    Ok(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected completion",
+                    ))),
+                    Err(e) => Poll::Ready(Err(e.into())),
+                }
+            } else {
+                state
+                    .io_wakers
+                    .lock()
+                    .unwrap()
+                    .insert(token, cx.waker().clone());
+                Poll::Pending
+            }
+        } else {
+            let buffers: Vec<crate::Buffer> = bufs
+                .iter()
+                .map(|b| crate::Buffer::with_capacity(b.len()))
+                .collect();
+            let op = crate::io::Op::ReadVectored {
+                fd: this.inner.as_raw_fd(),
+                buffers,
+            };
+            let token = state.io_backend.submit(op);
+            this.read_token = Some(token);
+            state
+                .io_wakers
+                .lock()
+                .unwrap()
+                .insert(token, cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 
@@ -202,13 +267,22 @@ impl AsyncWrite for AsyncTcpStream {
             if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
                 this.write_token = None;
                 match result {
-                    Ok(crate::io::CompletionKind::Write { bytes_written }) => Poll::Ready(Ok(bytes_written)),
-                    Ok(_) => Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected completion"))),
+                    Ok(crate::io::CompletionKind::Write { bytes_written }) => {
+                        Poll::Ready(Ok(bytes_written))
+                    }
+                    Ok(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected completion",
+                    ))),
                     Err(e) => Poll::Ready(Err(e.into())),
                 }
             } else {
                 // Still pending, register waker
-                state.io_wakers.lock().unwrap().insert(token, cx.waker().clone());
+                state
+                    .io_wakers
+                    .lock()
+                    .unwrap()
+                    .insert(token, cx.waker().clone());
                 Poll::Pending
             }
         } else {
@@ -216,23 +290,66 @@ impl AsyncWrite for AsyncTcpStream {
             let op = crate::io::Op::Write {
                 fd: this.inner.as_raw_fd(),
                 offset: 0,
-                data: buf.to_vec(),
+                data: Buffer::from_slice(buf),
             };
             let token = state.io_backend.submit(op);
             this.write_token = Some(token);
             // Register waker and return pending
-            state.io_wakers.lock().unwrap().insert(token, cx.waker().clone());
+            state
+                .io_wakers
+                .lock()
+                .unwrap()
+                .insert(token, cx.waker().clone());
             Poll::Pending
         }
     }
 
     fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _bufs: &[std::io::IoSlice<'_>],
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        // For simplicity, not implemented
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        let state = io_state();
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if let Some(token) = this.write_token {
+            if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
+                this.write_token = None;
+                match result {
+                    Ok(crate::io::CompletionKind::WriteVectored { bytes_written }) => {
+                        Poll::Ready(Ok(bytes_written))
+                    }
+                    Ok(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected completion",
+                    ))),
+                    Err(e) => Poll::Ready(Err(e.into())),
+                }
+            } else {
+                state
+                    .io_wakers
+                    .lock()
+                    .unwrap()
+                    .insert(token, cx.waker().clone());
+                Poll::Pending
+            }
+        } else {
+            let buffers: Vec<crate::Buffer> = bufs
+                .iter()
+                .map(|b| crate::Buffer::from_slice(b))
+                .collect();
+            let op = crate::io::Op::WriteVectored {
+                fd: this.inner.as_raw_fd(),
+                buffers,
+            };
+            let token = state.io_backend.submit(op);
+            this.write_token = Some(token);
+            state
+                .io_wakers
+                .lock()
+                .unwrap()
+                .insert(token, cx.waker().clone());
+            Poll::Pending
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -250,7 +367,7 @@ impl AsyncReadRent for AsyncTcpStream {
         _cx: &mut Context<'_>,
         _len: usize,
     ) -> Poll<io::Result<Buffer>> {
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        Poll::Ready(Err(io::Error::other("Not implemented")))
     }
 }
 
@@ -260,7 +377,7 @@ impl AsyncWriteRent for AsyncTcpStream {
         _cx: &mut Context<'_>,
         _buf: &Buffer,
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        Poll::Ready(Err(io::Error::other("Not implemented")))
     }
 }
 
@@ -323,7 +440,7 @@ impl AsyncRead for AsyncUnixStream {
         _cx: &mut Context<'_>,
         _buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        Poll::Ready(Err(io::Error::other("Not implemented")))
     }
 
     fn poll_read_vectored(
@@ -331,7 +448,7 @@ impl AsyncRead for AsyncUnixStream {
         _cx: &mut Context<'_>,
         _bufs: &mut [std::io::IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        Poll::Ready(Err(io::Error::other("Not implemented")))
     }
 }
 
@@ -341,7 +458,7 @@ impl AsyncWrite for AsyncUnixStream {
         _cx: &mut Context<'_>,
         _buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        Poll::Ready(Err(io::Error::other("Not implemented")))
     }
 
     fn poll_write_vectored(
@@ -349,7 +466,7 @@ impl AsyncWrite for AsyncUnixStream {
         _cx: &mut Context<'_>,
         _bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Not implemented")))
+        Poll::Ready(Err(io::Error::other("Not implemented")))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -373,7 +490,7 @@ impl AsyncUnixListener {
     }
 
     pub async fn accept(&self) -> io::Result<(AsyncUnixStream, std::os::unix::net::SocketAddr)> {
-        Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
+        Err(io::Error::other("Not implemented"))
     }
 }
 
@@ -403,18 +520,24 @@ impl AsyncUdpSocket {
         let state = io_state();
         let op = crate::io::Op::UdpRecv {
             fd: self.inner.as_raw_fd(),
-            buffer: vec![0u8; buf.len()],
+            buffer: Buffer::new_zeroed(buf.len()),
         };
         let token = state.io_backend.submit(op);
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
-            crate::io::CompletionKind::UdpRecv { bytes_read, buffer: _, addr } => {
+            crate::io::CompletionKind::UdpRecv {
+                bytes_read,
+                buffer,
+                addr,
+            } => {
                 let copy_len = std::cmp::min(bytes_read, buf.len());
-                // Note: In real implementation, we'd copy from the returned buffer
-                // For now, this is a placeholder
+                buf[..copy_len].copy_from_slice(&buffer[..copy_len]);
                 Ok((copy_len, addr))
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected completion")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
         }
     }
 
@@ -422,14 +545,17 @@ impl AsyncUdpSocket {
         let state = io_state();
         let op = crate::io::Op::UdpSend {
             fd: self.inner.as_raw_fd(),
-            data: buf.to_vec(),
+            data: Buffer::from_slice(buf),
             addr: target,
         };
         let token = state.io_backend.submit(op);
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::UdpSend { bytes_written, .. } => Ok(bytes_written),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected completion")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
         }
     }
 }

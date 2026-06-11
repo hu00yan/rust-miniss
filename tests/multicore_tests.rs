@@ -281,8 +281,7 @@ fn test_multicore_concurrent_spawning() {
     let final_count = counter.load(Ordering::SeqCst);
     assert_eq!(
         final_count, 40,
-        "Expected 40 tasks to complete, but only {} completed",
-        final_count
+        "Expected 40 tasks to complete, but only {final_count} completed"
     );
 
     // Shutdown the runtime

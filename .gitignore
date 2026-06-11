@@ -1,12 +1,13 @@
 # Rust build artifacts
 /target/
+/**/target/
 /**/*.rs.bk
 
-# Cargo registry and cache (NEVER track - auto-generated, huge)
+# Cargo registry and cache
 .cargo/
 
-# Cargo lock file (optional, usually included for applications)
-# Cargo.lock
+# Cargo lock (library crate — don't track)
+Cargo.lock
 
 # IDE files
 .vscode/
@@ -22,19 +23,18 @@ Thumbs.db
 # Logs
 *.log
 
-# Test artifacts
+# Test/profiling artifacts
 *.profraw
-
-# Benchmark results
-/criterion/
 
 # Coverage reports
 /target/coverage/
 tarpaulin-report.html
-# AI Assistant files
+
+# AI assistant files
 .aider*
 .claude/
 **/.claude/
+
 # Debug tools (local only)
 .gdbinit
 lldbinit
@@ -56,4 +56,11 @@ arena-leak-*
 
 # Slab pool temp (if testing)
 slab-test.*
+
+# Backup/broken files
+*.backup
+*.broken
+
+# Benchmark criterion output
+/criterion/
 

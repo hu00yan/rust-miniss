@@ -8,26 +8,73 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::Instant;
 
-
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_queue::SegQueue;
 
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
-use crate::task::{JoinHandle, Task};
-use crate::timer::TimerWheel;
+use crate::task::{JoinHandle, JoinTaskFuture, Task};
+use crate::timer::{TimerId, TimerWheel};
 use crate::waker::{MinissWaker, TaskId};
 
-use metrics::{gauge, counter as metric_counter};
+use metrics::{counter as metric_counter, gauge};
 
 // --- New I/O State Management ---
+
+type IoBackend = dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>;
+
+fn create_default_io_backend() -> Arc<IoBackend> {
+    #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
+    {
+        Arc::new(
+            crate::io::uring::UringBackend::new(32)
+                .unwrap_or_else(|e| panic!("Failed to create io_uring backend: {e}")),
+        )
+    }
+
+    #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
+    {
+        Arc::new(
+            crate::io::kqueue::KqueueBackend::new()
+                .unwrap_or_else(|e| panic!("Failed to create kqueue backend: {e}")),
+        )
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            io_backend = "epoll",
+            all(not(target_os = "linux"), not(target_os = "macos"))
+        )
+    ))]
+    {
+        Arc::new(
+            crate::io::epoll::EpollBackend::new()
+                .unwrap_or_else(|e| panic!("Failed to create epoll backend: {e}")),
+        )
+    }
+
+    #[cfg(not(any(
+        all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"),
+        all(target_os = "macos", io_backend = "kqueue"),
+        all(
+            unix,
+            any(
+                io_backend = "epoll",
+                all(not(target_os = "linux"), not(target_os = "macos"))
+            )
+        )
+    )))]
+    {
+        panic!("No I/O backend enabled. Please enable io_uring, epoll, or kqueue support.");
+    }
+}
 
 /// Holds the state related to pending and completed I/O operations for a CPU.
 /// This is shared between the `Cpu` and any `IoFuture`s running on it.
 #[repr(align(64))] // Cache line alignment to avoid false sharing
 pub struct CpuIoState {
     /// The I/O backend for submitting operations.
-    pub io_backend:
-        Arc<dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>>,
+    pub io_backend: Arc<IoBackend>,
     /// Padding to avoid false sharing
     _pad1: [u8; 56],
     /// Wakers for tasks that are waiting for an I/O operation to complete.
@@ -42,7 +89,7 @@ impl Default for CpuIoState {
     fn default() -> Self {
         let map = HashMap::new();
         Self {
-            io_backend: Arc::new(crate::io::EpollBackend::new().unwrap_or_else(|_| panic!("Failed to create I/O backend"))),
+            io_backend: create_default_io_backend(),
             _pad1: [0u8; 56],
             io_wakers: std::sync::Mutex::new(HashMap::new()),
             _pad2: [0u8; 56],
@@ -55,19 +102,19 @@ impl std::fmt::Debug for CpuIoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuIoState")
             .field("io_backend", &"<IoBackend>")
-            .field("io_wakers", &format!("HashMap<IoToken, Waker>[{}]", self.io_wakers.lock().unwrap().len()))
+            .field(
+                "io_wakers",
+                &format!(
+                    "HashMap<IoToken, Waker>[{}]",
+                    self.io_wakers.lock().unwrap().len()
+                ),
+            )
             .field("completed_io", &"<Mutex>")
             .finish()
     }
 }
 
 impl CpuIoState {
-    /// Allocates a slot in the waker slab and returns the token.
-    /// Returns None if the slab is full.
-    pub fn alloc_waker_slot(&self) -> Option<IoToken> {
-        Some(IoToken::new().with_slab_index(0))
-    }
-
     /// Stores a waker in the slab at the given token's slab index.
     pub fn store_waker(&self, token: IoToken, waker: Waker) {
         self.io_wakers.lock().unwrap().insert(token, waker);
@@ -91,6 +138,7 @@ thread_local! {
     /// A thread-local reference to the current CPU's `IoState`.
     /// This allows an `IoFuture` to get access to the I/O context of the `Cpu` it's running on.
     pub static CURRENT_CPU_IO_STATE: RefCell<Option<Arc<CpuIoState>>> = const { RefCell::new(None) };
+    static CURRENT_TIMER_WHEEL: RefCell<Option<*mut TimerWheel>> = const { RefCell::new(None) };
 }
 
 /// Provides access to the I/O state of the current CPU thread.
@@ -119,6 +167,39 @@ pub fn clear_current_io_state() {
     CURRENT_CPU_IO_STATE.with(|cell| {
         *cell.borrow_mut() = None;
     });
+}
+
+fn with_current_timer<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut TimerWheel) -> R,
+{
+    CURRENT_TIMER_WHEEL.with(|cell| {
+        (*cell.borrow()).map(|ptr| {
+            // SAFETY: The pointer is only set while the owning runtime thread is active
+            // and no other mutable references exist. Access is confined to that thread.
+            unsafe { f(&mut *ptr) }
+        })
+    })
+}
+
+pub(crate) fn set_current_timer(timer: &mut TimerWheel) {
+    CURRENT_TIMER_WHEEL.with(|cell| {
+        *cell.borrow_mut() = Some(timer as *mut _);
+    });
+}
+
+pub(crate) fn clear_current_timer() {
+    CURRENT_TIMER_WHEEL.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+pub(crate) fn register_timer_waker(at: Instant, waker: Waker) -> Option<TimerId> {
+    with_current_timer(|wheel| wheel.schedule(at, waker))
+}
+
+pub(crate) fn cancel_timer_waker(id: TimerId) -> bool {
+    with_current_timer(|wheel| wheel.cancel(id)).unwrap_or(false)
 }
 
 // --- End New I/O State Management ---
@@ -218,15 +299,12 @@ impl Cpu {
         T: Send + 'static,
     {
         let task_id = self.next_task_id();
-        let (sender, receiver) = crossbeam_channel::bounded(1);
-        let wrapped_future = async move {
-            let result = future.await;
-            let _ = sender.send(Ok(result));
-        };
+        let (handle, completer) = JoinHandle::new(task_id);
+        let wrapped_future = JoinTaskFuture::new(future, completer);
         let task = Task::new(task_id, wrapped_future);
         self.task_queue.insert(task_id, task);
         self.ready_queue.push(task_id);
-        JoinHandle::new(task_id, receiver)
+        handle
     }
 
     fn process_messages(&mut self) {
@@ -286,69 +364,70 @@ impl Cpu {
     }
 
     pub fn tick(&mut self) -> bool {
-    let mut made_progress = false;
-    self.process_messages();
+        let mut made_progress = false;
+        self.process_messages();
 
-    let now = Instant::now();
-    let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
-    self.timer.expire(now, &mut ready_wakers);
-    if !ready_wakers.is_empty() {
-        made_progress = true;
-        let count = ready_wakers.len() as u64;
-        for waker in ready_wakers {
-            waker.wake();
-        }
-        metric_counter!("timer.expirations_total").increment(count);
-    }
-
-    while let Some(task_id) = self.ready_queue.pop() {
-        // Check if the task has been cancelled
-        let is_cancelled = if let Ok(cancelled) = self.cancelled_tasks.lock() {
-            cancelled.contains_key(&task_id)
-        } else {
-            false
-        };
-
-        if is_cancelled {
-            // Clean up the cancelled task
-            if let Ok(mut cancelled) = self.cancelled_tasks.lock() {
-                cancelled.remove(&task_id);
-            }
-            // Remove from task queue if it exists
-            self.task_queue.remove(&task_id);
+        let now = Instant::now();
+        let mut ready_wakers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+        self.timer.expire(now, &mut ready_wakers);
+        if !ready_wakers.is_empty() {
             made_progress = true;
-            metric_counter!("tasks.cancelled_total").increment(1);
-            continue;
+            let count = ready_wakers.len() as u64;
+            for waker in ready_wakers {
+                waker.wake();
+            }
+            metric_counter!("timer.expirations_total").increment(count);
         }
 
-        if let Some(mut task) = self.task_queue.remove(&task_id) {
-            made_progress = true;
-            let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
-            let mut context = Context::from_waker(&waker);
+        while let Some(task_id) = self.ready_queue.pop() {
+            // Check if the task has been cancelled
+            let is_cancelled = if let Ok(cancelled) = self.cancelled_tasks.lock() {
+                cancelled.contains_key(&task_id)
+            } else {
+                false
+            };
 
-            match task.poll(&mut context) {
-                Poll::Ready(()) => {
-                    metric_counter!("tasks.completed_total").increment(1);
+            if is_cancelled {
+                // Clean up the cancelled task
+                if let Ok(mut cancelled) = self.cancelled_tasks.lock() {
+                    cancelled.remove(&task_id);
                 }
-                Poll::Pending => {
-                    self.task_queue.insert(task_id, task);
+                // Remove from task queue if it exists
+                self.task_queue.remove(&task_id);
+                made_progress = true;
+                metric_counter!("tasks.cancelled_total").increment(1);
+                continue;
+            }
+
+            if let Some(mut task) = self.task_queue.remove(&task_id) {
+                made_progress = true;
+                let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
+                let mut context = Context::from_waker(&waker);
+
+                match task.poll(&mut context) {
+                    Poll::Ready(()) => {
+                        metric_counter!("tasks.completed_total").increment(1);
+                    }
+                    Poll::Pending => {
+                        self.task_queue.insert(task_id, task);
+                    }
                 }
             }
         }
+
+        let io_progress = self.poll_io_completions();
+        if io_progress {
+            made_progress = true;
+            metric_counter!("io.completions_total").increment(1); // Per batch
+        }
+
+        // CPU utilization gauge
+        gauge!("cpu.utilization")
+            .set(self.task_queue.len() as f64 / crate::config::MAX_TASKS as f64);
+        metric_counter!("cpu.tick_total").increment(1);
+
+        made_progress
     }
-
-    let io_progress = self.poll_io_completions();
-    if io_progress {
-        made_progress = true;
-        metric_counter!("io.completions_total").increment(1);  // Per batch
-    }
-
-    // CPU utilization gauge
-    gauge!("cpu.utilization").set(self.task_queue.len() as f64 / crate::config::MAX_TASKS as f64);
-    metric_counter!("cpu.tick_total").increment(1);
-
-    made_progress
-}
 
     pub fn schedule_timer(&mut self, at: Instant, task_id: TaskId) {
         let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
@@ -360,6 +439,14 @@ impl Cpu {
         CURRENT_CPU_IO_STATE.with(|cell| {
             *cell.borrow_mut() = Some(self.io_state.clone());
         });
+        set_current_timer(&mut self.timer);
+        struct TimerGuard;
+        impl Drop for TimerGuard {
+            fn drop(&mut self) {
+                clear_current_timer();
+            }
+        }
+        let _timer_guard = TimerGuard;
         self.set_cpu_affinity();
 
         while self.running {

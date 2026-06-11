@@ -1,5 +1,4 @@
-use loom::thread;
-use rust_miniss::{Runtime, timer};
+use rust_miniss::{timer, Runtime};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

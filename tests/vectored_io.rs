@@ -1,44 +1,77 @@
-#[cfg(test)]
-mod vectored_tests {
-    use super::super::net::AsyncTcpStream;
-    use std::io::{IoSlice, IoSliceMut};
-    use std::net::TcpListener;
+#![cfg(test)]
 
-    #[tokio::test]
-    async fn test_vectored_tcp_read() {
-        let rt = Runtime::new();
-        rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let mut server = listener.accept().unwrap().0;
-            server.set_nonblocking(true).unwrap();
-            let mut server_stream = AsyncTcpStream::from(server);
+use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
+use rust_miniss::Runtime;
 
-            let client = std::net::TcpStream::connect(addr).unwrap();
-            client.write_all(b"multi part data").unwrap();
+#[test]
+fn test_tcp_read_vectored_returns_pending() {
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
 
-            let mut bufs = vec![IoSliceMut::new(&mut [0u8; 5]), IoSliceMut::new(&mut [0u8; 9])];
-            let n = server_stream.read_vectored(&mut bufs).await.unwrap();
-            assert_eq!(n, 14);
-            assert_eq!(&bufs[0][..5], b"multi");
-            assert_eq!(&bufs[1][..9], b" part data");
+        let mut stream = AsyncTcpStream::connect(addr).await.unwrap();
+        let mut buf1 = [0u8; 64];
+        let mut buf2 = [0u8; 64];
+        let mut bufs = [
+            std::io::IoSliceMut::new(&mut buf1),
+            std::io::IoSliceMut::new(&mut buf2),
+        ];
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
 
-            // Partial (simulate)
-            let partial_bufs = vec![IoSliceMut::new(&mut [0u8; 3])];
-            let partial_n = server_stream.read_vectored(&mut partial_bufs).await.unwrap();
-            assert_eq!(partial_n, 0);  // No more
-        });
-    }
+        use rust_miniss::AsyncRead;
+        let result = std::pin::Pin::new(&mut stream).poll_read_vectored(&mut cx, &mut bufs);
+        assert!(
+            matches!(result, std::task::Poll::Pending),
+            "expected Pending on first poll, got {result:?}"
+        );
+    });
+}
 
-    #[tokio::test]
-    async fn test_vectored_udp() {
-        let rt = Runtime::new();
-        rt.block_on(async {
-            let socket = AsyncUdpSocket::bind("127.0.0.1:0").unwrap();
-            let peer = "127.0.0.1:9090".parse().unwrap();
-            let slices = vec![IoSlice::new(b"batched"), IoSlice::new(b" datagram")];
-            let n = socket.send_to_vectored(&slices, peer).await.unwrap();  // Assume added method
-            assert_eq!(n, 16);
-        });
-    }
+#[test]
+fn test_tcp_write_vectored_returns_pending() {
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut stream = AsyncTcpStream::connect(addr).await.unwrap();
+        let bufs = [std::io::IoSlice::new(b"hello"), std::io::IoSlice::new(b"world")];
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        use rust_miniss::AsyncWrite;
+        let result = std::pin::Pin::new(&mut stream).poll_write_vectored(&mut cx, &bufs);
+        assert!(
+            matches!(result, std::task::Poll::Pending),
+            "expected Pending on first poll, got {result:?}"
+        );
+    });
+}
+
+#[test]
+fn test_tcp_vectored_write_read_roundtrip() {
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut writer = AsyncTcpStream::connect(addr).await.unwrap();
+        let (mut reader, _) = listener.accept().await.unwrap();
+
+        let bufs = [std::io::IoSlice::new(b"hello "), std::io::IoSlice::new(b"world")];
+        let n = writer.write_vectored(&bufs).await.unwrap();
+        assert_eq!(n, 11);
+
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(&buf[..11], b"hello world");
+    });
 }

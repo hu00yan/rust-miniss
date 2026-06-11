@@ -17,7 +17,7 @@ mod arena_tests {
 
         // Reset arena (no leak)
         arena.reset();
-        assert_eq!(arena.chunk_capacity(), 0);  // Cleared
+        assert_eq!(arena.chunk_capacity(), 0); // Cleared
     }
 
     #[test]
@@ -27,7 +27,7 @@ mod arena_tests {
         let mut ctx = HttpRequestContext::new(&arena);
         ctx.parse_header("Test", "value");
         arena.reset();
-        ctx.parse_header("Leak", "test");  // Panic on alloc post-reset
+        ctx.parse_header("Leak", "test"); // Panic on alloc post-reset
     }
 }
 

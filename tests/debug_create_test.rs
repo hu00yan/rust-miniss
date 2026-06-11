@@ -11,7 +11,7 @@ fn main() -> std::io::Result<()> {
         // Create a temporary file path
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let temp_path = temp_dir.path().join("test_file.txt");
-        println!("Creating file at: {:?}", temp_path);
+        println!("Creating file at: {temp_path:?}");
 
         // Create the file asynchronously
         let async_file = AsyncFile::create(&temp_path).expect("Failed to create file");
@@ -19,12 +19,12 @@ fn main() -> std::io::Result<()> {
 
         // Write a simple string
         let test_data = b"test";
-        println!("Writing {} bytes: {:?}", test_data.len(), test_data);
+        println!("Writing {} bytes: {test_data:?}", test_data.len());
         let bytes_written = async_file
             .write_at(0, test_data)
             .await
             .expect("Failed to write file");
-        println!("Wrote {} bytes", bytes_written);
+        println!("Wrote {bytes_written} bytes");
 
         assert_eq!(bytes_written, test_data.len());
 
@@ -49,7 +49,7 @@ fn main() -> std::io::Result<()> {
         let bytes_read = file
             .read_to_end(&mut contents)
             .expect("Failed to read file contents");
-        println!("Read {} bytes: {:?}", bytes_read, contents);
+        println!("Read {bytes_read} bytes: {contents:?}");
         assert_eq!(contents, test_data);
 
         println!("Test passed!");

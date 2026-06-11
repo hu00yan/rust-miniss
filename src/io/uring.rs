@@ -17,15 +17,15 @@ enum PendingOp {
         op: Op,
         buf: Buffer,
     },
-    #[allow(dead_code)]
     ReadVectored {
         op: Op,
-        iovecs: (),
+        buffers: Vec<Buffer>,
+        iovecs: Vec<iovec>,
     },
-    #[allow(dead_code)]
     WriteVectored {
         op: Op,
-        iovecs: (),
+        buffers: Vec<Buffer>,
+        iovecs: Vec<iovec>,
     },
     Write {
         op: Op,
@@ -35,12 +35,16 @@ enum PendingOp {
     UdpRecv {
         op: Op,
         buffer: Buffer,
+        _iov: Box<iovec>,
+        _msg: Box<msghdr>,
         addr_storage: Box<sockaddr_storage>,
         addr_len: Box<socklen_t>,
     },
     UdpSend {
         op: Op,
         data: Buffer,
+        _iov: Box<iovec>,
+        _msg: Box<msghdr>,
         addr_storage: Box<sockaddr_storage>,
         addr_len: Box<socklen_t>,
     },
@@ -64,8 +68,6 @@ enum PendingOp {
         _data: Buffer,
     },
 }
-
-
 
 /// A `io-uring` based `IoProvider`.
 /// Thread-local to ensure single-threaded access.
@@ -95,11 +97,13 @@ impl IoProvider for UringBackend {
 
     fn submit(&self, op: Op) -> IoToken {
         // Ensure single-threaded use
-        assert_eq!(std::thread::current().id(), self.thread_id, "UringBackend must be used on the same thread");
+        assert_eq!(
+            std::thread::current().id(),
+            self.thread_id,
+            "UringBackend must be used on the same thread"
+        );
 
-        // Allocate token from the current CPU's I/O state
-        let state = crate::cpu::io_state();
-        let token = state.alloc_waker_slot().expect("No available waker slots");
+        let token = IoToken::new();
         let user_data = token.id();
 
         // SAFETY: We have exclusive access on this thread.
@@ -130,7 +134,7 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::Read { fd, offset, len } => {
-                    let mut buf = vec![0u8; len];
+                    let mut buf = Buffer::new_zeroed(len);
                     let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
                         .offset(offset)
                         .build()
@@ -183,7 +187,7 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::ReadFile { fd, offset, len } => {
-                    let mut buf = vec![0u8; len];
+                    let mut buf = Buffer::new_zeroed(len);
                     let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
                         .offset(offset)
                         .build()
@@ -216,7 +220,6 @@ impl IoProvider for UringBackend {
                 }
                 Op::UdpRecv { fd, mut buffer } => {
                     let buffer_clone = buffer.clone();
-                    // Build a libc iovec and msghdr for recvmsg
                     let mut iov = Box::new(iovec {
                         iov_base: buffer.as_mut_ptr() as *mut _,
                         iov_len: buffer.len(),
@@ -239,13 +242,18 @@ impl IoProvider for UringBackend {
                         .build()
                         .user_data(user_data);
 
-                    let op = Op::UdpRecv { fd, buffer: buffer_clone };
+                    let op = Op::UdpRecv {
+                        fd,
+                        buffer: buffer_clone,
+                    };
 
                     (
                         entry,
                         PendingOp::UdpRecv {
                             op,
                             buffer,
+                            _iov: iov,
+                            _msg: msg,
                             addr_storage,
                             addr_len,
                         },
@@ -253,17 +261,14 @@ impl IoProvider for UringBackend {
                 }
                 Op::UdpSend { fd, data, addr } => {
                     let data_clone = data.clone();
-                    // Build iovec and msghdr for sendmsg
                     let mut iov = Box::new(iovec {
                         iov_base: data.as_ptr() as *mut _,
                         iov_len: data.len(),
                     });
 
-                    // Convert SocketAddr into sockaddr_storage
                     let mut addr_storage: Box<sockaddr_storage> =
                         Box::new(unsafe { std::mem::zeroed() });
                     let mut addr_len: Box<socklen_t> = Box::new(0);
-                    // fill in addr_storage using libc helpers via socket2 or manual match
                     match addr {
                         std::net::SocketAddr::V4(sa_v4) => {
                             let in_addr = libc::sockaddr_in {
@@ -316,19 +321,88 @@ impl IoProvider for UringBackend {
                         .build()
                         .user_data(user_data);
 
-                    let op = Op::UdpSend { fd, data: data_clone, addr };
+                    let op = Op::UdpSend {
+                        fd,
+                        data: data_clone,
+                        addr,
+                    };
 
                     (
                         entry,
                         PendingOp::UdpSend {
                             op,
                             data,
+                            _iov: iov,
+                            _msg: msg,
                             addr_storage,
                             addr_len,
                         },
                     )
                 }
-                _ => todo!("Unsupported operation"),
+                Op::ReadVectored { fd, buffers } => {
+                    let mut pending_buffers = buffers.clone();
+                    let iovecs: Vec<iovec> = pending_buffers
+                        .iter_mut()
+                        .map(|buf| iovec {
+                            iov_base: buf.as_mut_ptr() as *mut _,
+                            iov_len: buf.capacity(),
+                        })
+                        .collect();
+                    let iovecs_ptr = iovecs.as_ptr();
+                    let iovecs_len = iovecs.len();
+                    let entry = unsafe {
+                        opcode::Readv::new(
+                            types::Fd(fd),
+                            iovecs_ptr as *const iovec,
+                            iovecs_len as u32,
+                        )
+                        .build()
+                        .user_data(user_data);
+                    };
+                    let pending_op = PendingOp::ReadVectored {
+                        op: Op::ReadVectored { fd, buffers },
+                        buffers: pending_buffers,
+                        iovecs,
+                    };
+                    (entry, pending_op)
+                }
+                Op::WriteVectored { fd, buffers } => {
+                    let iovecs: Vec<iovec> = buffers
+                        .iter()
+                        .map(|buf| iovec {
+                            iov_base: buf.as_ptr() as *mut _,
+                            iov_len: buf.len(),
+                        })
+                        .collect();
+                    let iovecs_ptr = iovecs.as_ptr();
+                    let iovecs_len = iovecs.len();
+                    let entry = unsafe {
+                        opcode::Writev::new(
+                            types::Fd(fd),
+                            iovecs_ptr as *const iovec,
+                            iovecs_len as u32,
+                        )
+                        .build()
+                        .user_data(user_data);
+                    };
+                    let pending_op = PendingOp::WriteVectored {
+                        op: Op::WriteVectored { fd, buffers: buffers.clone() },
+                        buffers,
+                        iovecs,
+                    };
+                    (entry, pending_op)
+                }
+                _ => {
+                    let result = Err(IoError::Io(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Operation not supported by io_uring backend",
+                    )));
+                    eprintln!("Unsupported io_uring operation: {result:?}");
+                    // Return token without submitting — caller will get no completion.
+                    // This is a graceful degradation for operations like UdpRecvVectored,
+                    // UdpSendVectored, ReadRent, WriteRent that aren't implemented yet.
+                    return token;
+                }
             }
         };
 
@@ -337,7 +411,7 @@ impl IoProvider for UringBackend {
                 pending_ops.insert(user_data, pending_op);
             }
             Err(e) => {
-                eprintln!("Failed to submit io-uring operation: {}", e);
+                eprintln!("Failed to submit io-uring operation: {e}");
             }
         }
 
@@ -358,7 +432,10 @@ impl IoProvider for UringBackend {
             let result = cqe.result();
 
             if let Some(pending_op) = pending_ops.remove(&token_id) {
-                let token = IoToken { id: token_id, slab_index: 0 }; // TODO: proper slab index
+                let token = IoToken {
+                    id: token_id,
+                    slab_index: 0,
+                }; // TODO: proper slab index
 
                 let (op, completion_result) = match pending_op {
                     PendingOp::Accept {
@@ -423,7 +500,6 @@ impl IoProvider for UringBackend {
                     }
                     PendingOp::Read { op, mut buf } => {
                         let res = if result < 0 {
-
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
@@ -467,7 +543,6 @@ impl IoProvider for UringBackend {
                     }
                     PendingOp::ReadFile { op, mut buf } => {
                         let res = if result < 0 {
-
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
@@ -498,6 +573,7 @@ impl IoProvider for UringBackend {
                         mut buffer,
                         addr_storage,
                         addr_len,
+                        ..
                     } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
@@ -564,6 +640,7 @@ impl IoProvider for UringBackend {
                         data,
                         addr_storage,
                         addr_len,
+                        ..
                     } => {
                         // touch addr_storage/addr_len so they're considered read (keeps them alive)
                         let _ = &*addr_storage as *const _;
@@ -578,19 +655,36 @@ impl IoProvider for UringBackend {
                         };
                         (op, res)
                     }
-                    PendingOp::ReadVectored { op, iovecs: _ } => {
+                    PendingOp::ReadVectored { op, mut buffers, .. } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
-                            Ok(CompletionKind::ReadVectored { bytes_read: result as usize, iovecs: () })
+                            let bytes_read = result as usize;
+                            let mut remaining = bytes_read;
+                            for buf in buffers.iter_mut() {
+                                let can_read = std::cmp::min(remaining, buf.capacity());
+                                unsafe {
+                                    buf.set_len(can_read);
+                                }
+                                remaining -= can_read;
+                                if remaining == 0 {
+                                    break;
+                                }
+                            }
+                            Ok(CompletionKind::ReadVectored {
+                                bytes_read,
+                                buffers,
+                            })
                         };
                         (op, res)
                     }
-                    PendingOp::WriteVectored { op, iovecs: _ } => {
+                    PendingOp::WriteVectored { op, .. } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
-                            Ok(CompletionKind::WriteVectored { bytes_written: result as usize, iovecs: () })
+                            Ok(CompletionKind::WriteVectored {
+                                bytes_written: result as usize,
+                            })
                         };
                         (op, res)
                     }

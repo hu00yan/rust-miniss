@@ -22,7 +22,6 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-
 use crate::buffer::Buffer;
 
 /// A trait for I/O resources that can be represented by a raw file descriptor.
@@ -103,6 +102,14 @@ pub enum Op {
         iovecs: Vec<Buffer>,
         addr: SocketAddr,
     },
+    ReadVectored {
+        fd: i32,
+        buffers: Vec<Buffer>,
+    },
+    WriteVectored {
+        fd: i32,
+        buffers: Vec<Buffer>,
+    },
     ReadRent {
         fd: i32,
         buffer: Buffer,
@@ -133,20 +140,10 @@ impl IoToken {
     /// Creates a new, unique `IoToken`.
     pub fn new() -> Self {
         Self {
-            id: TOKEN_COUNTER.fetch_add(1, Ordering::Release),
+            id: TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed),
             slab_index: 0, // Will be set by CpuIoState
         }
     }
-
-    /// Creates an IoToken with a specific slab index.
-    pub(crate) fn with_slab_index(mut self, index: usize) -> Self {
-        self.slab_index = index;
-        self
-    }
-
-
-
-
 
     /// Returns the underlying `u64` ID of the token.
     pub fn id(&self) -> u64 {
@@ -172,11 +169,10 @@ pub enum CompletionKind {
     },
     ReadVectored {
         bytes_read: usize,
-        iovecs: (),
+        buffers: Vec<Buffer>,
     },
     WriteVectored {
         bytes_written: usize,
-        iovecs: (),
     },
     Fsync,
     Close,
@@ -248,18 +244,19 @@ impl From<IoError> for std::io::Error {
 pub mod kqueue;
 
 #[cfg(any(
-    all(unix, not(target_os = "macos")),
-    all(target_os = "linux", io_backend = "epoll")
+    all(unix, not(target_os = "linux")),
+    all(target_os = "linux", any(feature = "epoll", io_backend = "epoll"))
 ))]
 pub mod epoll;
 
-#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+#[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
 pub mod uring;
 
 pub mod future;
 
 // Re-export backends for use in other modules
-#[cfg(all(target_os = "linux", feature = "epoll"))]
+#[cfg(any(
+    all(unix, not(target_os = "linux")),
+    all(target_os = "linux", any(feature = "epoll", io_backend = "epoll"))
+))]
 pub use epoll::EpollBackend;
-
-

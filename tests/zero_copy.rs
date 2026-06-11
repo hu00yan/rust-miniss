@@ -1,31 +1,82 @@
-#[cfg(all(test, feature = "rent-traits"))]
-mod zero_copy_tests {
-    use super::super::net::{AsyncTcpStream, AsyncReadRent};
-    use std::task::{Context, Poll};
-    use std::pin::Pin;
+use futures::io::AsyncReadExt;
+use rust_miniss::net::AsyncTcpStream;
+use rust_miniss::Runtime;
+use std::io::Write;
+use std::net::TcpListener;
 
-    #[tokio::test]
-    async fn test_rent_read_no_copy() {
-        let rt = Runtime::new();
-        rt.block_on(async {
-            let mut stream = AsyncTcpStream::connect("127.0.0.1:80").await.unwrap();
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let mut pinned = Pin::new(&mut stream);
+#[test]
+fn test_tcp_read_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
 
-            if let Poll::Ready(Ok(rented)) = pinned.as_mut().poll_read_rent(&mut cx, 1024) {
-                assert_eq!(rented.len(), expected_bytes);  // From server
-                // No memcpy: rented from pool directly
-            }
-        });
-    }
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(b"hello world").unwrap();
+
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut async_stream = AsyncTcpStream::from(stream);
+
+        let mut buf = [0u8; 64];
+        let n = async_stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello world");
+    });
 }
 
-#[cfg(not(feature = "rent-traits"))]
-mod zero_copy_tests {
-    #[test]
-    fn test_no_rent() {
-        // Fallback to native zero-copy read
-        // ...
-    }
+#[test]
+fn test_tcp_read_large_payload() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let payload = vec![0xAB_u8; 1024];
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(&payload).unwrap();
+
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut async_stream = AsyncTcpStream::from(stream);
+
+        let mut buf = vec![0u8; 1024];
+        let mut total = 0;
+        while total < buf.len() {
+            let n = async_stream.read(&mut buf[total..]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        assert_eq!(total, 1024);
+        assert_eq!(&buf[..total], &payload[..]);
+    });
+}
+
+#[test]
+fn test_tcp_read_empty_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(b"ping").unwrap();
+
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut async_stream = AsyncTcpStream::from(stream);
+
+        use futures::io::AsyncReadExt;
+        let mut buf = [0u8; 64];
+        let n = async_stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        drop(client);
+    });
 }

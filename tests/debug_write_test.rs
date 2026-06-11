@@ -15,12 +15,12 @@ fn main() -> std::io::Result<()> {
 
         // Write to the file
         let test_data = b"Hello, async file creation!";
-        println!("Writing {} bytes: {:?}", test_data.len(), test_data);
+        println!("Writing {} bytes: {test_data:?}", test_data.len());
         let bytes_written = async_file
             .write_at(0, test_data)
             .await
             .expect("Failed to write file");
-        println!("Wrote {} bytes", bytes_written);
+        println!("Wrote {bytes_written} bytes");
 
         assert_eq!(bytes_written, test_data.len());
 
@@ -34,7 +34,7 @@ fn main() -> std::io::Result<()> {
         use std::io::Read;
         file.read_to_end(&mut contents)
             .expect("Failed to read file contents");
-        println!("Read {} bytes: {:?}", contents.len(), contents);
+        println!("Read {} bytes: {contents:?}", contents.len());
         assert_eq!(contents, test_data);
 
         println!("Test passed!");

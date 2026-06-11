@@ -28,26 +28,40 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_io_uring)");
 
     if cfg!(target_os = "linux") {
+        let io_uring_feature_enabled = std::env::var_os("CARGO_FEATURE_IO_URING").is_some();
         match get_kernel_version() {
             Ok(version) => {
-                eprintln!("Detected kernel version: {:?}", version);
+                eprintln!("Detected kernel version: {version:?}");
                 let io_uring_eligible =
                     version >= (5, 10, 0) && is_io_uring_actually_supported_on_linux();
 
                 // If kernel supports io_uring (5.10+), use io_uring. Otherwise fall back to epoll.
-                if io_uring_eligible {
-                    eprintln!("Kernel supports io_uring: Selecting io_uring backend.");
+                if io_uring_feature_enabled && io_uring_eligible {
+                    eprintln!(
+                        "Kernel supports io_uring and feature enabled: selecting io_uring backend."
+                    );
                     println!("cargo:rustc-cfg=has_io_uring");
                     println!("cargo:rustc-cfg=io_backend=\"io_uring\"");
                 } else {
-                    eprintln!("Kernel doesn't support io_uring (< 5.10): Falling back to epoll.");
+                    if io_uring_feature_enabled && !io_uring_eligible {
+                        eprintln!(
+                            "io_uring feature enabled but kernel < 5.10; falling back to epoll.",
+                        );
+                    } else if !io_uring_feature_enabled && io_uring_eligible {
+                        eprintln!(
+                            "Kernel supports io_uring but feature disabled; using epoll backend.",
+                        );
+                    } else {
+                        eprintln!(
+                            "Kernel doesn't support io_uring (< 5.10): falling back to epoll."
+                        );
+                    }
                     println!("cargo:rustc-cfg=io_backend=\"epoll\"");
                 }
             }
             Err(e) => {
                 eprintln!(
-                    "Failed to determine kernel version: {}, falling back to epoll for Linux",
-                    e
+                    "Failed to determine kernel version: {e}, falling back to epoll for Linux"
                 );
                 println!("cargo:rustc-cfg=io_backend=\"epoll\"");
             }

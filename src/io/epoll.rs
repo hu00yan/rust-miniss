@@ -1,6 +1,6 @@
 #![cfg(any(
     all(unix, not(target_os = "linux")),
-    all(target_os = "linux", feature = "epoll")
+    all(target_os = "linux", any(feature = "epoll", io_backend = "epoll"))
 ))]
 
 //! An `epoll` (or `kqueue` via `mio`) backend for the I/O subsystem.
@@ -13,15 +13,19 @@
 //! to manage thread-local state within the `IoBackend` trait's `&self` methods.
 
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+use crate::Buffer;
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::Arc;
 use std::task::{Context, Poll as TaskPoll};
 use std::time::Duration;
 use threadpool::ThreadPool;
+
+type IoCompletion = (IoToken, Op, Result<CompletionKind, IoError>);
+type CompletionQueue = Arc<std::sync::Mutex<Vec<IoCompletion>>>;
 
 /// Safe file descriptor wrapper that ensures RAII compliance
 #[derive(Debug)]
@@ -33,12 +37,17 @@ struct SafeFdFile {
 
 impl SafeFdFile {
     /// Create a new SafeFdFile from a raw fd
-    fn new(fd: RawFd) -> Self {
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        Self {
-            file: Some(file),
-            fd,
+    fn new(fd: RawFd) -> io::Result<Self> {
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+        Ok(Self {
+            file: Some(file),
+            fd: dup_fd,
+        })
     }
 
     /// Get mutable reference to the file
@@ -73,7 +82,7 @@ pub struct EpollBackend {
     /// Thread pool for blocking file I/O operations
     thread_pool: Arc<ThreadPool>,
     /// Completed operations from the thread pool
-    completed_ops: Arc<std::sync::Mutex<Vec<(IoToken, Op, Result<CompletionKind, IoError>)>>>,
+    completed_ops: CompletionQueue,
 }
 
 // SAFETY: The `EpollBackend` is designed to be thread-local. It is created within a
@@ -106,9 +115,7 @@ impl IoProvider for EpollBackend {
     type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
 
     fn submit(&self, op: Op) -> IoToken {
-        // Allocate token from the current CPU's I/O state
-        let state = crate::cpu::io_state();
-        let io_token = state.alloc_waker_slot().expect("No available waker slots");
+        let io_token = IoToken::new();
 
         // SAFETY: We have exclusive, single-threaded access.
         let next_token = unsafe { &mut *self.next_token.get() };
@@ -125,7 +132,7 @@ impl IoProvider for EpollBackend {
                     .registry()
                     .register(&mut source, mio_token, Interest::READABLE)
                 {
-                    eprintln!("Failed to register fd with mio: {}", e);
+                    eprintln!("Failed to register fd with mio: {e}");
                 } else {
                     pending_ops.insert(mio_token, (io_token, op));
                 }
@@ -136,7 +143,7 @@ impl IoProvider for EpollBackend {
                     .registry()
                     .register(&mut source, mio_token, Interest::READABLE)
                 {
-                    eprintln!("Failed to register fd with mio: {}", e);
+                    eprintln!("Failed to register fd with mio: {e}");
                 } else {
                     pending_ops.insert(mio_token, (io_token, op));
                 }
@@ -147,7 +154,29 @@ impl IoProvider for EpollBackend {
                     .registry()
                     .register(&mut source, mio_token, Interest::WRITABLE)
                 {
-                    eprintln!("Failed to register fd with mio: {}", e);
+                    eprintln!("Failed to register fd with mio: {e}");
+                } else {
+                    pending_ops.insert(mio_token, (io_token, op));
+                }
+            }
+            Op::ReadVectored { fd, .. } => {
+                let mut source = mio::unix::SourceFd(fd);
+                if let Err(e) = poll
+                    .registry()
+                    .register(&mut source, mio_token, Interest::READABLE)
+                {
+                    eprintln!("Failed to register fd with mio: {e}");
+                } else {
+                    pending_ops.insert(mio_token, (io_token, op));
+                }
+            }
+            Op::WriteVectored { fd, .. } => {
+                let mut source = mio::unix::SourceFd(fd);
+                if let Err(e) = poll
+                    .registry()
+                    .register(&mut source, mio_token, Interest::WRITABLE)
+                {
+                    eprintln!("Failed to register fd with mio: {e}");
                 } else {
                     pending_ops.insert(mio_token, (io_token, op));
                 }
@@ -163,21 +192,24 @@ impl IoProvider for EpollBackend {
                 let len_copy = *len;
 
                 thread_pool.execute(move || {
-                    let result = {
-                        // Use SafeFdFile to ensure RAII compliance
-                        let mut safe_file = SafeFdFile::new(fd_copy);
-                        let res = safe_file
+                    let result = match SafeFdFile::new(fd_copy) {
+                        Ok(mut safe_file) => safe_file
                             .as_mut()
                             .seek(SeekFrom::Start(offset_copy))
                             .and_then(|_| {
-                                let mut buf = vec![0u8; len_copy];
-                                safe_file.as_mut().read(&mut buf).map(|bytes_read| {
-                                    unsafe { buf.set_len(bytes_read); }
-                                    CompletionKind::ReadFile { bytes_read, data: buf }
+                                let mut buf = Buffer::new_zeroed(len_copy);
+                                safe_file.as_mut().read(buf.as_mut()).map(|bytes_read| {
+                                    unsafe {
+                                        buf.set_len(bytes_read);
+                                    }
+                                    CompletionKind::ReadFile {
+                                        bytes_read,
+                                        data: buf,
+                                    }
                                 })
-                            });
-                        // SafeFdFile will be automatically dropped here, ensuring fd is closed
-                        res.map_err(IoError::Io)
+                            })
+                            .map_err(IoError::Io),
+                        Err(err) => Err(IoError::Io(err)),
                     };
 
                     let mut completed_ops = completed_ops.lock().unwrap();
@@ -194,20 +226,19 @@ impl IoProvider for EpollBackend {
                 let data_clone = data.clone();
 
                 thread_pool.execute(move || {
-                    let result = {
-
-                        let mut safe_file = SafeFdFile::new(fd_copy);
-                        let res = safe_file
-                            .as_mut()
-                            .seek(SeekFrom::Start(offset_copy))
-                            .and_then(|_| {
-                                safe_file.as_mut().write(data_clone.as_ref()).map(|bytes_written| {
-                                    CompletionKind::WriteFile { bytes_written }
+                    let result =
+                        match SafeFdFile::new(fd_copy) {
+                            Ok(mut safe_file) => safe_file
+                                .as_mut()
+                                .seek(SeekFrom::Start(offset_copy))
+                                .and_then(|_| {
+                                    safe_file.as_mut().write(data_clone.as_ref()).map(
+                                        |bytes_written| CompletionKind::WriteFile { bytes_written },
+                                    )
                                 })
-                            });
-                        // SafeFdFile will be automatically dropped here
-                        res.map_err(IoError::Io)
-                    };
+                                .map_err(IoError::Io),
+                            Err(err) => Err(IoError::Io(err)),
+                        };
 
                     let mut completed_ops = completed_ops.lock().unwrap();
                     completed_ops.push((io_token_copy, op_clone, result));
@@ -220,7 +251,7 @@ impl IoProvider for EpollBackend {
                     poll.registry()
                         .register(&mut source, mio_token, mio::Interest::READABLE)
                 {
-                    eprintln!("Failed to register UDP socket with epoll: {}", e);
+                    eprintln!("Failed to register UDP socket with epoll: {e}");
                 }
                 // Store the buffer for use in poll_complete
                 let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
@@ -238,25 +269,25 @@ impl IoProvider for EpollBackend {
                     poll.registry()
                         .register(&mut source, mio_token, mio::Interest::WRITABLE)
                 {
-                    eprintln!("Failed to register UDP socket with epoll for send: {}", e);
+                    eprintln!("Failed to register UDP socket with epoll for send: {e}");
                 }
                 // Store the data buffer and address with the op. The op contains the Buffer.
                 pending_ops.insert(mio_token, (io_token, op));
             }
             Op::Fsync { fd } => {
-                // Fsync remains synchronous.
-                let _result = {
-
-                    let mut safe_file = SafeFdFile::new(*fd);
-                    let res = safe_file.as_mut().metadata().map(|_| CompletionKind::Fsync);
-                    // SafeFdFile will be automatically dropped here
-                    res.map(|_| CompletionKind::Fsync).map_err(IoError::Io)
+                let result = match SafeFdFile::new(*fd) {
+                    Ok(mut safe_file) => safe_file
+                        .as_mut()
+                        .sync_all()
+                        .map(|_| CompletionKind::Fsync)
+                        .map_err(IoError::Io),
+                    Err(err) => Err(IoError::Io(err)),
                 };
-                pending_ops.insert(mio_token, (io_token, op));
+                let mut completed_ops = self.completed_ops.lock().unwrap();
+                completed_ops.push((io_token, op.clone(), result));
             }
             Op::Close { fd } => {
-                // Close remains synchronous.
-                let _result = {
+                let result = {
                     let res = unsafe { libc::close(*fd) };
                     if res == -1 {
                         Err(IoError::Io(io::Error::last_os_error()))
@@ -264,7 +295,8 @@ impl IoProvider for EpollBackend {
                         Ok(CompletionKind::Close)
                     }
                 };
-                pending_ops.insert(mio_token, (io_token, op));
+                let mut completed_ops = self.completed_ops.lock().unwrap();
+                completed_ops.push((io_token, op.clone(), result));
             }
             _ => {
                 // For unsupported operations, return an error immediately
@@ -295,7 +327,7 @@ impl IoProvider for EpollBackend {
         // Poll for events non-blockingly to avoid delays.
         if let Err(e) = poll.poll(events, Some(Duration::from_millis(0))) {
             // An error from poll is serious, but we'll just log it for now.
-            eprintln!("mio poll error: {}", e);
+            eprintln!("mio poll error: {e}");
             return if completions.is_empty() {
                 TaskPoll::Ready(Vec::new())
             } else {
@@ -307,7 +339,8 @@ impl IoProvider for EpollBackend {
         for event in events.iter() {
             let mio_token = event.token();
             if let Some((io_token, op)) = pending_ops.remove(&mio_token) {
-                let mut source = SourceFd(&op.as_raw_fd());
+                let raw_fd = op.as_raw_fd();
+                let mut source = SourceFd(&raw_fd);
                 let _ = poll.registry().deregister(&mut source);
 
                 let result = match &op {
@@ -321,41 +354,122 @@ impl IoProvider for EpollBackend {
                             Err(e) => Err(IoError::Io(e)),
                         }
                     }
-                    Op::Read { fd, offset, len } => {
-                        let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
-                        let res = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = vec![0u8; *len];
-                            file.read(&mut buf).map(|bytes_read| {
+                    Op::Read { fd, len, .. } => {
+                        let mut buffer = Buffer::with_capacity(*len);
+                        let mut requeue = false;
+                        let result = loop {
+                            let ret = unsafe {
+                                libc::read(*fd, buffer.as_mut_ptr() as *mut libc::c_void, *len)
+                            };
+                            if ret < 0 {
+                                let err = io::Error::last_os_error();
+                                if err.kind() == io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                if err.kind() == io::ErrorKind::WouldBlock {
+                                    requeue = true;
+                                }
+                                break Err(IoError::Io(err));
+                            } else {
+                                let bytes_read = ret as usize;
                                 unsafe {
-                                    buf.set_len(bytes_read);
+                                    buffer.set_len(bytes_read);
                                 }
-                                CompletionKind::Read {
+                                break Ok(CompletionKind::Read {
                                     bytes_read,
-                                    data: buf,
-                                }
-                            })
-                        });
-                        // Explicitly close the file to avoid fd conflicts
-                        drop(file);
-                        res.map_err(IoError::Io)
+                                    data: buffer,
+                                });
+                            }
+                        };
+
+                        if requeue {
+                            let mut source = SourceFd(fd);
+                            if let Err(reg_err) =
+                                poll.registry()
+                                    .register(&mut source, mio_token, Interest::READABLE)
+                            {
+                                eprintln!(
+                                    "Failed to re-register fd for read after WouldBlock: {reg_err}"
+                                );
+                            }
+                            pending_ops.insert(mio_token, (io_token, op.clone()));
+                            continue;
+                        }
+
+                        result
                     }
-                    Op::Write { fd, offset, data } => {
-                        let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
-                        let res = file
-                            .seek(SeekFrom::Start(*offset))
-                            .and_then(|_| file.write(data.as_ref())) // Write from Buffer
-                            .map(|bytes_written| CompletionKind::Write { bytes_written });
-                        // Explicitly close the file to avoid fd conflicts
-                        drop(file);
-                        res.map_err(IoError::Io)
+                    Op::Write { fd, data, .. } => {
+                        let mut written = 0usize;
+                        let mut requeue = false;
+                        let result = loop {
+                            let remaining = &data[written..];
+                            if remaining.is_empty() {
+                                break Ok(CompletionKind::Write {
+                                    bytes_written: written,
+                                });
+                            }
+                            let ret = unsafe {
+                                libc::write(
+                                    *fd,
+                                    remaining.as_ptr() as *const libc::c_void,
+                                    remaining.len(),
+                                )
+                            };
+                            if ret < 0 {
+                                let err = io::Error::last_os_error();
+                                if err.kind() == io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                if err.kind() == io::ErrorKind::WouldBlock {
+                                    if written == 0 {
+                                        requeue = true;
+                                        break Err(IoError::Io(err));
+                                    } else {
+                                        break Ok(CompletionKind::Write {
+                                            bytes_written: written,
+                                        });
+                                    }
+                                }
+                                break if written > 0 {
+                                    Ok(CompletionKind::Write {
+                                        bytes_written: written,
+                                    })
+                                } else {
+                                    Err(IoError::Io(err))
+                                };
+                            } else {
+                                written += ret as usize;
+                                if written == data.len() {
+                                    break Ok(CompletionKind::Write {
+                                        bytes_written: written,
+                                    });
+                                }
+                            }
+                        };
+
+                        if requeue {
+                            let mut source = SourceFd(fd);
+                            if let Err(reg_err) =
+                                poll.registry()
+                                    .register(&mut source, mio_token, Interest::WRITABLE)
+                            {
+                                eprintln!(
+                                    "Failed to re-register fd for write after WouldBlock: {reg_err}"
+                                );
+                            }
+                            pending_ops.insert(mio_token, (io_token, op.clone()));
+                            continue;
+                        }
+
+                        result
                     }
                     Op::ReadFile { fd, offset, len } => {
                         // This path should ideally not be hit as these are handled sync in submit
                         // but included for completeness if event-driven file I/O were enabled.
                         let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
-                        let res = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = vec![0u8; *len];
-                            file.read(&mut buf).map(|bytes_read| {
+                        let result = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
+                            let mut buf = Buffer::new_zeroed(*len);
+                            file.read(buf.as_mut()).map(|bytes_read| {
                                 unsafe {
                                     buf.set_len(bytes_read);
                                 }
@@ -365,32 +479,30 @@ impl IoProvider for EpollBackend {
                                 }
                             })
                         });
-                        // Explicitly close the file to avoid fd conflicts
-                        drop(file);
-                        res.map_err(IoError::Io)
+                        let _ = file.into_raw_fd();
+                        result.map_err(IoError::Io)
                     }
                     Op::WriteFile { fd, offset, data } => {
                         // This path should ideally not be hit.
                         let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
-                        let res = file
+                        let result = file
                             .seek(SeekFrom::Start(*offset))
                             .and_then(|_| file.write(data.as_ref()))
                             .map(|bytes_written| CompletionKind::WriteFile { bytes_written });
-                        // Explicitly drop the file to ensure fd is properly closed
-                        drop(file);
-                        res.map_err(IoError::Io)
+                        let _ = file.into_raw_fd();
+                        result.map_err(IoError::Io)
                     }
                     Op::UdpRecv { fd, .. } => {
                         // Matched by `event.token()`
                         let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                         if let Some(mut buffer) = udp_recv_buffers.remove(&mio_token) {
-    
                             let socket = unsafe { std::net::UdpSocket::from_raw_fd(*fd) };
-                            let res = match socket.recv_from(buffer.as_mut()) {
+                            let mut retry = false;
+                            let result = match socket.recv_from(buffer.as_mut()) {
                                 Ok((bytes_read, addr)) => {
                                     unsafe {
                                         buffer.set_len(bytes_read);
-                                    } // Safety: bytes_read <= buffer.capacity()
+                                    }
                                     Ok(CompletionKind::UdpRecv {
                                         bytes_read,
                                         buffer,
@@ -405,19 +517,21 @@ impl IoProvider for EpollBackend {
                                         mio::Interest::READABLE,
                                     ) {
                                         eprintln!(
-                                            "Failed to re-register UDP socket with epoll: {}",
-                                            reg_err
+                                            "Failed to re-register UDP socket with epoll: {reg_err}"
                                         );
                                     }
-                                    udp_recv_buffers.insert(mio_token, buffer); // Re-insert the buffer
-                                    pending_ops.insert(mio_token, (io_token, op.clone())); // Re-insert the original op
-                                    continue; // Don't add to completions if WouldBlock
+                                    udp_recv_buffers.insert(mio_token, buffer);
+                                    pending_ops.insert(mio_token, (io_token, op.clone()));
+                                    retry = true;
+                                    Err(IoError::Io(e))
                                 }
-                                Err(e) => Err(e),
+                                Err(e) => Err(IoError::Io(e)),
+                            };
+                            let _ = socket.into_raw_fd();
+                            if retry {
+                                continue;
                             }
-                            .map_err(IoError::Io);
-                            // Socket will be automatically dropped here
-                            res
+                            result
                         } else {
                             Err(IoError::Other(
                                 "UDP receive buffer not found for event".to_string(),
@@ -428,15 +542,171 @@ impl IoProvider for EpollBackend {
                         // Perform UDP send operation
 
                         let socket = unsafe { std::net::UdpSocket::from_raw_fd(*fd) };
-                        let res = socket.send_to(data.as_ref(), *addr).map(|bytes_written| {
+                        let result = socket.send_to(data.as_ref(), *addr).map(|bytes_written| {
                             CompletionKind::UdpSend {
                                 bytes_written,
                                 data: data.clone(),
                             }
                         });
-                        // Explicitly drop the socket to ensure fd is properly closed
-                        drop(socket);
-                        res.map_err(IoError::Io)
+                        let _ = socket.into_raw_fd();
+                        result.map_err(IoError::Io)
+                    }
+                    Op::ReadVectored { fd, buffers } => {
+                        let mut buffers = buffers.clone();
+                        let iovecs: Vec<libc::iovec> = buffers
+                            .iter_mut()
+                            .map(|buf| libc::iovec {
+                                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                                iov_len: buf.capacity(),
+                            })
+                            .collect();
+                        let mut requeue = false;
+                        let result = loop {
+                            let ret = unsafe {
+                                libc::readv(
+                                    *fd,
+                                    iovecs.as_ptr(),
+                                    iovecs.len() as i32,
+                                )
+                            };
+                            if ret < 0 {
+                                let err = io::Error::last_os_error();
+                                if err.kind() == io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                if err.kind() == io::ErrorKind::WouldBlock {
+                                    requeue = true;
+                                    break Err(IoError::Io(err));
+                                }
+                                break Err(IoError::Io(err));
+                            } else if ret == 0 {
+                                break Ok(CompletionKind::ReadVectored {
+                                    bytes_read: 0,
+                                    buffers,
+                                });
+                            } else {
+                                let bytes_read = ret as usize;
+                                let mut remaining = bytes_read;
+                                for buf in buffers.iter_mut() {
+                                    let can_read = std::cmp::min(remaining, buf.capacity());
+                                    unsafe {
+                                        buf.set_len(can_read);
+                                    }
+                                    remaining -= can_read;
+                                    if remaining == 0 {
+                                        break;
+                                    }
+                                }
+                                break Ok(CompletionKind::ReadVectored {
+                                    bytes_read,
+                                    buffers,
+                                });
+                            }
+                        };
+
+                        if requeue {
+                            let mut source = SourceFd(fd);
+                            if let Err(reg_err) =
+                                poll.registry()
+                                    .register(&mut source, mio_token, Interest::READABLE)
+                            {
+                                eprintln!(
+                                    "Failed to re-register fd for readv after WouldBlock: {reg_err}"
+                                );
+                            }
+                            pending_ops.insert(mio_token, (io_token, op.clone()));
+                            continue;
+                        }
+
+                        result
+                    }
+                    Op::WriteVectored { fd, buffers } => {
+                        let total_len: usize = buffers.iter().map(|b| b.len()).sum();
+                        if total_len == 0 {
+                            Ok(CompletionKind::WriteVectored {
+                                bytes_written: 0,
+                            })
+                        } else {
+                            let mut written = 0usize;
+                            let mut requeue = false;
+                            let result = loop {
+                                let iovecs: Vec<libc::iovec> = buffers
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, buf)| {
+                                        let buf_start: usize = buffers[..i].iter().map(|b| b.len()).sum();
+                                        if written >= buf_start + buf.len() {
+                                            return None;
+                                        }
+                                        let offset = written.saturating_sub(buf_start);
+                                        let remaining = buf.len() - offset;
+                                        Some(libc::iovec {
+                                            iov_base: unsafe {
+                                                buf.as_ref().as_ptr().add(offset) as *mut libc::c_void
+                                            },
+                                            iov_len: remaining,
+                                        })
+                                    })
+                                    .collect();
+                                if iovecs.is_empty() {
+                                    break Ok(CompletionKind::WriteVectored {
+                                        bytes_written: written,
+                                    });
+                                }
+                                let ret = unsafe {
+                                    libc::writev(
+                                        *fd,
+                                        iovecs.as_ptr(),
+                                        iovecs.len() as i32,
+                                    )
+                                };
+                                if ret < 0 {
+                                    let err = io::Error::last_os_error();
+                                    if err.kind() == io::ErrorKind::Interrupted {
+                                        continue;
+                                    }
+                                    if err.kind() == io::ErrorKind::WouldBlock {
+                                        if written > 0 {
+                                            break Ok(CompletionKind::WriteVectored {
+                                                bytes_written: written,
+                                            });
+                                        }
+                                        requeue = true;
+                                        break Err(IoError::Io(err));
+                                    }
+                                    break if written > 0 {
+                                        Ok(CompletionKind::WriteVectored {
+                                            bytes_written: written,
+                                        })
+                                    } else {
+                                        Err(IoError::Io(err))
+                                    };
+                                } else {
+                                    written += ret as usize;
+                                    if written >= total_len {
+                                        break Ok(CompletionKind::WriteVectored {
+                                            bytes_written: written,
+                                        });
+                                    }
+                                }
+                            };
+
+                            if requeue {
+                                let mut source = SourceFd(fd);
+                                if let Err(reg_err) =
+                                    poll.registry()
+                                        .register(&mut source, mio_token, Interest::WRITABLE)
+                                {
+                                    eprintln!(
+                                        "Failed to re-register fd for writev after WouldBlock: {reg_err}"
+                                    );
+                                }
+                                pending_ops.insert(mio_token, (io_token, op.clone()));
+                                continue;
+                            }
+
+                            result
+                        }
                     }
                     // Fsync and Close are not handled in this path currently.
                     _ => continue,
@@ -455,11 +725,9 @@ impl IoProvider for EpollBackend {
                     Op::Fsync { fd } => {
                         // Perform fsync synchronously
                         let result = {
-    
                             let file = unsafe { std::fs::File::from_raw_fd(*fd) };
                             let res = file.sync_all();
-                            // Explicitly close the file to avoid fd conflicts
-                            drop(file); // Prevent drop from closing the fd
+                            let _ = file.into_raw_fd();
                             res.map(|_| CompletionKind::Fsync).map_err(IoError::Io)
                         };
                         // Remove from pending ops and add to completions
@@ -496,7 +764,8 @@ impl IoProvider for EpollBackend {
 }
 
 fn syscall_accept(fd: RawFd) -> io::Result<(RawFd, std::net::SocketAddr)> {
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+    let mut storage: libc::sockaddr_storage =
+        unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
     let mut len = std::mem::size_of_val(&storage) as libc::socklen_t;
     let new_fd = unsafe { libc::accept(fd, &mut storage as *mut _ as *mut _, &mut len) };
 
@@ -550,6 +819,8 @@ impl AsRawFd for Op {
             Op::UdpSend { fd, .. } => fd,
             Op::UdpRecvVectored { fd, .. } => fd,
             Op::UdpSendVectored { fd, .. } => fd,
+            Op::ReadVectored { fd, .. } => fd,
+            Op::WriteVectored { fd, .. } => fd,
             Op::ReadRent { fd, .. } => fd,
             Op::WriteRent { fd, .. } => fd,
         }

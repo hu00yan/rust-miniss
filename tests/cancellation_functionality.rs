@@ -12,7 +12,7 @@ fn test_task_cancellation_works() {
     // Test 1: Spawn a task
     let task_id = runtime.spawn(async {}).unwrap();
     // Note: Task cancellation is not fully implemented yet
-    println!("Spawned task with ID: {:?}", task_id);
+    println!("Spawned task with ID: {task_id:?}");
 
     // Clean shutdown
     runtime.shutdown().unwrap();
@@ -34,7 +34,7 @@ fn test_cancel_before_execution() {
         .unwrap();
 
     // Note: Task cancellation is not fully implemented yet
-    println!("Spawned task with ID: {:?}", task_id);
+    println!("Spawned task with ID: {task_id:?}");
 
     // Give some time for processing
     std::thread::yield_now();

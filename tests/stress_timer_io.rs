@@ -32,7 +32,7 @@ fn stress_timer_io() {
             while start.elapsed() < Duration::from_secs(RUN_SECS) {
                 {
                     let mut f = file.lock().unwrap();
-                    writeln!(f, "counter {}", counter).unwrap();
+                    writeln!(f, "counter {counter}").unwrap();
                 }
                 counter += 1;
                 // Use yield instead of sleep for stress testing

@@ -29,7 +29,7 @@ mio = { version = "0.8", features = ["os-poll", "net", "os-ext"] }
 socket2 = "0.5"
 
 # I/O backends
-io-uring = "0.7"  # Available on Linux, used when kernel supports it
+io-uring = { version = "0.7", optional = true }  # Available on Linux, used when kernel supports it
 
 # Buffer management
 bytes = "1"
@@ -71,25 +71,8 @@ tracing-test = "0.2.5"
 name = "hello_world"
 
 [[example]]
-name = "task_builder_demo"
-
-[[example]]
 name = "http_echo"
 path = "examples/http_echo.rs"
-
-[[example]]
-name = "http2_server"
-path = "examples/http2_server.rs"
-
-[[example]]
-name = "hyper_integration"
-path = "examples/hyper_integration.rs"
-
-[[example]]
-name = "simple_hyper_server"
-path = "examples/simple_hyper_server.rs"
-
-
 
 [[example]]
 name = "udp_buffered"
@@ -124,14 +107,25 @@ name = "scheduling_throughput"
 path = "bench/internal/scheduling_throughput.rs"
 harness = false
 
+[[bench]]
+name = "perf_benchmark"
+path = "bench/criterion/perf_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "memory_perf"
+path = "bench/criterion/memory_perf.rs"
+harness = false
+
 [features]
-default = ["io_uring", "epoll"]
+default = ["epoll"]
 arena = ["dep:bumpalo"]
 rent-traits = []  # Enable AsyncReadRent/WriteRent
 advanced = ["dep:bumpalo", "rent-traits"]  # Zero-copy Rent + arena
 debug = []  # Tracing spans, backtraces
-io_uring = []
+io_uring = ["dep:io-uring"]
 epoll = []
+hyper_integration = []
 
 [profile.release]
 lto = true
