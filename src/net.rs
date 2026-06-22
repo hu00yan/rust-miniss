@@ -123,7 +123,9 @@ impl AsyncTcpStream {
 
         let err = io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINPROGRESS) {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(err);
         }
 
@@ -176,14 +178,16 @@ impl IntoRawFd for AsyncTcpStream {
 
 impl Drop for AsyncTcpStream {
     fn drop(&mut self) {
-        let state = io_state();
-        if let Some(token) = self.read_token {
-            state.io_wakers.lock().unwrap().remove(&token);
-            state.completed_io.lock().unwrap().remove(&token);
-        }
-        if let Some(token) = self.write_token {
-            state.io_wakers.lock().unwrap().remove(&token);
-            state.completed_io.lock().unwrap().remove(&token);
+        // Try to access I/O state - may fail if dropped outside miniss runtime
+        if let Some(state) = crate::cpu::try_io_state() {
+            if let Some(token) = self.read_token {
+                state.io_wakers.lock().unwrap().remove(&token);
+                state.completed_io.lock().unwrap().remove(&token);
+            }
+            if let Some(token) = self.write_token {
+                state.io_wakers.lock().unwrap().remove(&token);
+                state.completed_io.lock().unwrap().remove(&token);
+            }
         }
     }
 }
@@ -247,11 +251,16 @@ impl AsyncRead for AsyncTcpStream {
             if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
                 this.read_token = None;
                 match result {
-                    Ok(crate::io::CompletionKind::ReadVectored { bytes_read, buffers }) => {
+                    Ok(crate::io::CompletionKind::ReadVectored {
+                        bytes_read,
+                        buffers,
+                    }) => {
                         let mut remaining = bytes_read;
                         for (owned_buf, caller_buf) in buffers.iter().zip(bufs.iter_mut()) {
-                            let copy_len =
-                                std::cmp::min(remaining, std::cmp::min(owned_buf.len(), caller_buf.len()));
+                            let copy_len = std::cmp::min(
+                                remaining,
+                                std::cmp::min(owned_buf.len(), caller_buf.len()),
+                            );
                             caller_buf[..copy_len].copy_from_slice(&owned_buf[..copy_len]);
                             remaining -= copy_len;
                             if remaining == 0 {
@@ -370,10 +379,8 @@ impl AsyncWrite for AsyncTcpStream {
                 Poll::Pending
             }
         } else {
-            let buffers: Vec<crate::Buffer> = bufs
-                .iter()
-                .map(|b| crate::Buffer::from_slice(b))
-                .collect();
+            let buffers: Vec<crate::Buffer> =
+                bufs.iter().map(|b| crate::Buffer::from_slice(b)).collect();
             let op = crate::io::Op::WriteVectored {
                 fd: this.inner.as_raw_fd(),
                 buffers,
@@ -473,10 +480,7 @@ fn socket_addr_to_storage(addr: &SocketAddr) -> libc::sockaddr_storage {
                 sin_zero: [0; 8],
             };
             unsafe {
-                std::ptr::write(
-                    &mut storage as *mut _ as *mut libc::sockaddr_in,
-                    sin,
-                );
+                std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in, sin);
             }
         }
         SocketAddr::V6(a) => {
@@ -492,10 +496,7 @@ fn socket_addr_to_storage(addr: &SocketAddr) -> libc::sockaddr_storage {
                 sin6_scope_id: a.scope_id(),
             };
             unsafe {
-                std::ptr::write(
-                    &mut storage as *mut _ as *mut libc::sockaddr_in6,
-                    sin6,
-                );
+                std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, sin6);
             }
         }
     }

@@ -1,28 +1,51 @@
-use rust_miniss::Runtime;
+//! UDP buffered echo server example.
+//!
+//! Run with:
+//! ```
+//! cargo run --example udp_buffered
+//! ```
+//!
+//! Test with:
+//! ```
+//! echo "Hello UDP" | nc -u 127.0.0.1 8081
+//! ```
 
-#[tokio::main]
-async fn main() {
-    let rt = Runtime::new();
-    rt.block_on(async {
-        println!("BufferedUdpSocket example not implemented yet.");
-        // let local = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        // let socket = AsyncUdpSocket::bind(local).unwrap();
-        // let mut buffered = BufferedUdpSocket::new(socket); // Not implemented
-        // let peer = "127.0.0.1:9090".parse().unwrap();
-        // buffered.peer_addr = Some(peer);
+use rust_miniss::net::AsyncUdpSocket;
+use rust_miniss::MultiCoreRuntime;
+use std::net::SocketAddr;
 
-        // // Simulate recv (assume sender)
-        // buffered.recv_buffered(1024).await.unwrap();  // Queue data
+fn main() {
+    let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+    println!("Starting UDP buffered server on {addr}");
+    println!("Test with: echo \"Hello UDP\" | nc -u {addr}");
 
-        // // Stream read
-        // let mut reader = BufReader::new(buffered);  // Wrap for buffered
-        // let mut line = String::new();
-        // if reader.read_line(&mut line).await.is_ok() {
-        //     println!("Received line: {}", line.trim());
-        // }
+    let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
 
-        // // Buffered write
-        // buffered.write_all(b"echo response").await.unwrap();
-        // buffered.flush().await.unwrap();
+    runtime.block_on(async {
+        let socket = AsyncUdpSocket::bind(addr).unwrap();
+        println!("Listening on {addr}");
+
+        let mut buf = vec![0u8; 1024];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((len, peer)) => {
+                    let msg = String::from_utf8_lossy(&buf[..len]);
+                    println!("Received {len} bytes from {peer}: {msg}");
+
+                    // Echo back
+                    if let Err(e) = socket.send_to(&buf[..len], peer).await {
+                        eprintln!("Failed to send response: {e}");
+                    } else {
+                        println!("Echoed {len} bytes to {peer}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Receive error: {e}");
+                    break;
+                }
+            }
+        }
     });
+
+    runtime.shutdown().unwrap();
 }

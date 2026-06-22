@@ -25,11 +25,10 @@ dashmap = "5.5"
 # System programming
 nix = { version = "0.27", features = ["signal", "time", "sched", "fs"] }
 libc = "0.2"
-mio = { version = "0.8", features = ["os-poll", "net", "os-ext"] }
+mio = { version = "1.0", features = ["os-poll", "net", "os-ext"] }
 socket2 = "0.5"
 
-# I/O backends
-io-uring = { version = "0.7", optional = true }  # Available on Linux, used when kernel supports it
+# I/O backends (io-uring is Linux-only)
 
 # Buffer management
 bytes = "1"
@@ -38,6 +37,22 @@ slab = "0.4.9"
 # HTTP parsing and types
 http = "1.0"
 httparse = "1.8"
+
+# HTTP framework (hyper)
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# QUIC transport (quinn)
+quinn = { version = "0.11", features = ["rustls-ring"] }
+quinn-udp = "0.5.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+# HTTP/3
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 # Utilities
 thiserror = "1.0"
@@ -53,10 +68,7 @@ metrics = { version = "0.24", default-features = false }
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 bumpalo = { version = "3.16.0", optional = true }
 tracing-test = "0.2.5"
-tokio-rustls = { version = "0.26", optional = true }
-rustls-pemfile = { version = "2", optional = true }
-rustls = { version = "0.23", optional = true }
-webpki-roots = { version = "0.26", optional = true }
+tokio-rustls = { version = "0.26" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -70,6 +82,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 loom = "0.7"
 hyper = { version = "1", features = ["full"] }
 tracing-test = "0.2.5"
+rcgen = "0.13"
 
 [[example]]
 name = "hello_world"
@@ -77,6 +90,10 @@ name = "hello_world"
 [[example]]
 name = "http_echo"
 path = "examples/http_echo.rs"
+
+[[example]]
+name = "http_server"
+path = "examples/http_server.rs"
 
 [[example]]
 name = "udp_buffered"
@@ -130,7 +147,10 @@ debug = []  # Tracing spans, backtraces
 io_uring = ["dep:io-uring"]
 epoll = []
 hyper_integration = []
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls", "dep:webpki-roots"]
+tls = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
 
 [profile.release]
 lto = true

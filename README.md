@@ -20,6 +20,8 @@ rust-miniss is a minimal async runtime that demonstrates high-performance server
 - **Multi-backend I/O**: io-uring (Linux 5.10+), epoll (Linux/Unix), kqueue (macOS)
 - **futures::io compatibility**: Implements `AsyncRead`/`AsyncWrite` traits for ecosystem integration
 - **Panic isolation**: Task panics don't affect other tasks
+- **HTTP/1.1 + HTTP/2**: Integration with hyper ecosystem
+- **QUIC + HTTP/3**: Integration with quinn and h3 ecosystems
 
 ## Quick Start
 
@@ -86,6 +88,75 @@ fn main() {
     });
 }
 ```
+
+## HTTP and QUIC Support
+
+### HTTP/1.1 + HTTP/2
+
+rust-miniss integrates with the [hyper](https://hyper.rs) ecosystem for HTTP support:
+
+```rust
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use rust_miniss::net::AsyncTcpListener;
+use rust_miniss::hyper_compat::{HyperExecutor, MinissIo};
+
+async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    Ok(Response::new(Full::new(Bytes::from("Hello from rust-miniss!"))))
+}
+
+fn main() {
+    let runtime = rust_miniss::MultiCoreRuntime::new(Some(1)).unwrap();
+    
+    runtime.block_on(async {
+        let listener = AsyncTcpListener::bind("0.0.0.0:8080").unwrap();
+        
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            HyperExecutor::spawn(async move {
+                let io = MinissIo::new(stream);
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service_fn(handle))
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+}
+```
+
+### QUIC + HTTP/3
+
+For QUIC and HTTP/3 support, rust-miniss integrates with [quinn](https://github.com/quinn-rs/quinn) and [h3](https://github.com/hyperium/h3):
+
+```rust
+use rust_miniss::quinn_compat::MinissQuinnRuntime;
+use std::sync::Arc;
+
+fn main() {
+    let runtime = rust_miniss::MultiCoreRuntime::new(Some(1)).unwrap();
+    
+    runtime.block_on(async {
+        // Setup QUIC endpoint
+        let endpoint = setup_quic_endpoint().unwrap();
+        
+        while let Some(conn) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let conn = conn.await.unwrap();
+                // Handle QUIC connection
+            });
+        }
+    });
+}
+```
+
+For detailed examples, see:
+- `examples/http1_server.rs` - HTTP/1.1 server
+- `examples/http2_server.rs` - HTTP/2 server
+- `examples/http3_server.rs` - HTTP/3 server with QUIC
 
 ## Architecture
 
@@ -347,7 +418,7 @@ fn main() {
 Spawn tasks that run at regular intervals:
 
 ```rust
-use rust_miniss::{task, timer, Runtime};
+use rust_miniss::{timer, Runtime};
 use std::time::Duration;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
@@ -357,20 +428,18 @@ fn main() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
         
-        // Spawn a periodic task
-        let handle = task::spawn_periodic(Duration::from_millis(100), move || {
-            let counter = counter_clone.clone();
-            async move {
-                let count = counter.fetch_add(1, Ordering::SeqCst);
+        // Spawn a periodic task using a timer loop
+        let handle = runtime.spawn(async move {
+            for _ in 0..5 {
+                timer::sleep(Duration::from_millis(100)).await;
+                let count = counter_clone.fetch_add(1, Ordering::SeqCst);
                 println!("Periodic task executed: {}", count + 1);
             }
-        }).unwrap();
+        });
         
         // Let it run for a while
         timer::sleep(Duration::from_millis(550)).await;
         
-        // Cancel the periodic task
-        handle.cancel().unwrap();
         println!("Final count: {}", counter.load(Ordering::SeqCst));
     });
 }

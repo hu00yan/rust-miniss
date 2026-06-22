@@ -1,93 +1,42 @@
 //! rust-miniss: A minimal async runtime inspired by Seastar
 //!
 //! This crate provides a high-performance async runtime with:
-//! - Shared-nothing architecture (one thread per CPU core)
+//! - Thread-per-core architecture (one thread per CPU core)
 //! - Lock-free cross-CPU communication
-//! - Automatic IO backend selection for optimal performance
-//! - Channel-based task communication for reliability
+//! - Automatic IO backend selection (io_uring/kqueue/epoll)
+//! - Cooperative signal handling for graceful shutdown
 //!
-//! ## IO Backend Selection
-//!
-//! The runtime automatically selects the most appropriate IO backend at runtime:
-//!
-//! - **Linux with kernel 5.10+ and io_uring support**: Uses `io_uring` for optimal performance
-//! - **macOS**: Uses `kqueue`
-//! - **Other Unix systems**: Uses `epoll`
-//!
-//! This selection happens at runtime by checking kernel version and io_uring availability.
-//!
-//! # Timer Utilities
-//!
-//! The runtime provides several timer utilities for async timing operations:
-//!
-//! - [`timer::sleep()`] - Asynchronously wait for a duration
-//! - [`timer::timeout()`] - Apply a timeout to any future
-//! - [`timer::Interval`] - Create repeating timers for periodic tasks
-//!
-//! ## Examples
+//! # Quick Start
 //!
 //! ```rust,no_run
-//! use rust_miniss::timer;
-//! use std::time::Duration;
+//! use rust_miniss::MultiCoreRuntime;
 //!
-//! # async fn example() {
-//! // Sleep for 1 second
-//! timer::sleep(Duration::from_secs(1)).await;
+//! let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
 //!
-//! // Apply a timeout to an operation
-//! let result = timer::timeout(Duration::from_secs(5), async {
-//!     // Some long-running operation
-//!     timer::sleep(Duration::from_secs(2)).await;
-//!     "completed"
-//! }).await;
+//! // Spawn tasks on core threads
+//! runtime.spawn(async {
+//!     println!("Running on a core thread");
+//! }).unwrap();
 //!
-//! // Create a periodic interval
-//! let mut interval = timer::Interval::new(Duration::from_millis(100));
-//! for _ in 0..5 {
-//!     interval.tick().await;
-//!     println!("tick");
-//! }
-//! # }
+//! // Block on a future on the current thread
+//! let result = runtime.block_on(async { 42 });
+//! assert_eq!(result, 42);
+//!
+//! // Graceful shutdown
+//! runtime.shutdown().unwrap();
 //! ```
 //!
-//! # Graceful Shutdown via Signals
+//! # Signal Handling
 //!
-//! The runtime supports graceful shutdown through signal handling. When enabled
-//! with the `signal` feature, the runtime can listen for termination signals
-//! (SIGTERM, SIGINT) and initiate a graceful shutdown sequence.
+//! ```rust,no_run
+//! use rust_miniss::MultiCoreRuntime;
 //!
-//! ## Signal Handling Example
+//! let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
+//! runtime.install_signal_handler();
 //!
-//! ```rust,ignore
-//! use rust_miniss::{Runtime, timer, signal::SignalHandler};
-//! use std::sync::atomic::{AtomicBool, Ordering};
-//! use std::sync::Arc;
-//! use std::time::Duration;
-//!
-//! let runtime = Runtime::new();
-//! let shutdown_flag = Arc::new(AtomicBool::new(false));
-//!
-//! // Set up signal handling for graceful shutdown
-//!
-//! {
-//!     let handler = SignalHandler::new(shutdown_flag.clone());
-//!     handler.start();
-//! }
-//!
+//! // Runtime will shut down gracefully on SIGINT/SIGTERM
 //! runtime.block_on(async {
-//!     // Your main application logic
-//!     loop {
-//!         if shutdown_flag.load(Ordering::SeqCst) {
-//!             println!("Received shutdown signal, exiting gracefully...");
-//!             // Perform cleanup operations here
-//!             timer::sleep(Duration::from_millis(100)).await;
-//!             break;
-//!         }
-//!         
-//!         // Do some work
-//!         timer::sleep(Duration::from_millis(100)).await;
-//!         println!("Working...");
-//!     }
+//!     // Your application logic here
 //! });
 //! ```
 
@@ -101,20 +50,20 @@ pub mod cpu;
 pub mod executor;
 pub mod fs;
 pub mod http;
+pub mod hyper_compat;
 pub mod io;
 pub mod multicore;
 pub mod net;
+pub mod quinn_compat;
 pub mod signal;
 pub mod task;
 pub mod timer;
-pub mod waker;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod waker;
 
-// Re-export core types
 pub use buffer::Buffer;
-pub use cpu::Cpu;
-pub use executor::{Executor, Runtime};
+pub use executor::Executor;
 pub use fs::AsyncFile;
 pub use http::{
     EchoHandler, HttpConnection, HttpHandler, Method, Request, Response, StaticHandler, StatusCode,
@@ -122,14 +71,15 @@ pub use http::{
 pub use io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 pub use multicore::MultiCoreRuntime;
 pub use net::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket};
-pub use task::{spawn, Task, TaskBuilder, TaskError, TaskResult};
+pub use task::{Task, TaskError, TaskResult};
 pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWheel};
 
-// Re-export futures::io traits for convenience
 pub use futures::io::{AsyncRead, AsyncWrite};
 
-// Re-export tokio compat adapter for convenience
 pub use compat::{Compat, FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+
+pub use hyper_compat::{HyperExecutor, MinissTimer, TcpIo};
+pub use quinn_compat::MinissQuinnRuntime;
 
 /// Error types for the runtime
 pub mod error {
@@ -150,11 +100,11 @@ pub mod error {
     pub type Result<T> = std::result::Result<T, RuntimeError>;
 }
 
-/// Convenience function to create a new runtime and run a future
+/// Convenience function to create a runtime and run a future
 pub fn block_on<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {
-    let runtime = Runtime::new();
+    let runtime = MultiCoreRuntime::new(Some(1)).expect("Failed to create runtime");
     runtime.block_on(future)
 }
