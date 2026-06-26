@@ -1,46 +1,125 @@
-use crossbeam_queue::ArrayQueue;
-use once_cell::sync::Lazy;
+use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 
-const POOL_CAPACITY: usize = 1024;
 const MAX_RECYCLED_CAPACITY: usize = 64 * 1024;
 
-static BUFFER_POOL: Lazy<ArrayQueue<Vec<u8>>> = Lazy::new(|| ArrayQueue::new(POOL_CAPACITY));
+// Thread-local buffer pool — eliminates cross-core cache contention.
+thread_local! {
+    static BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+const POOL_CAPACITY: usize = 256;
 
 /// Pooled byte buffer used across the runtime to reduce heap allocations.
+///
+/// Automatically recycles the inner `Vec<u8>` to a thread-local pool on drop,
+/// so subsequent allocations can reuse the memory without heap syscalls.
+/// The `ManuallyDrop` wrapper allows us to move the Vec out in `Drop`.
 #[derive(Debug, Default)]
 pub struct Buffer {
-    inner: Vec<u8>,
+    inner: ManuallyDrop<Vec<u8>>,
 }
 
 impl Buffer {
+    fn recycle_vec(vec: Vec<u8>) {
+        if vec.capacity() > MAX_RECYCLED_CAPACITY {
+            return;
+        }
+        BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < POOL_CAPACITY {
+                pool.push(vec);
+            }
+        });
+    }
+
+    fn acquire_vec(capacity: usize) -> Option<Vec<u8>> {
+        BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            // Take the most recently recycled buffer (hot in cache).
+            // If it's not large enough, just skip — heap alloc is fine.
+            let buf = pool.pop()?;
+            if buf.capacity() >= capacity {
+                Some(buf)
+            } else {
+                // Return smaller buffer for reuse at its own capacity.
+                if buf.capacity() >= 64 && pool.len() < POOL_CAPACITY {
+                    pool.push(buf);
+                }
+                None
+            }
+        })
+    }
+
     /// Creates a buffer with zeroed contents of the requested length.
     pub fn new_zeroed(len: usize) -> Self {
+        if let Some(mut vec) = Self::acquire_vec(len) {
+            vec.clear();
+            vec.resize(len, 0);
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
+        }
         Self {
-            inner: vec![0u8; len],
+            inner: ManuallyDrop::new(vec![0u8; len]),
+        }
+    }
+
+    /// Creates a buffer without zeroing (for kernel read destinations).
+    /// SAFETY: All bytes are uninitialized; caller must ensure they are
+    /// written before reading (io_uring CQE sets the length on completion).
+    pub fn new_uninitialized(len: usize) -> Self {
+        if let Some(mut vec) = Self::acquire_vec(len) {
+            vec.clear();
+            unsafe {
+                vec.set_len(len);
+            }
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
+        }
+        let mut vec = Vec::with_capacity(len);
+        unsafe {
+            vec.set_len(len);
+        }
+        Self {
+            inner: ManuallyDrop::new(vec),
+        }
+    }
+
+    /// Creates a zero-cost empty buffer (no heap allocation).
+    pub fn empty() -> Self {
+        Self {
+            inner: ManuallyDrop::new(Vec::new()),
         }
     }
 
     /// Creates an empty buffer with at least the provided capacity.
     pub fn with_capacity(capacity: usize) -> Self {
-        if capacity <= MAX_RECYCLED_CAPACITY {
-            if let Some(mut vec) = BUFFER_POOL.pop() {
-                if vec.capacity() >= capacity {
-                    vec.clear();
-                    return Self { inner: vec };
-                }
-            }
+        if let Some(mut vec) = Self::acquire_vec(capacity) {
+            vec.clear();
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
         }
-
         Self {
-            inner: Vec::with_capacity(capacity),
+            inner: ManuallyDrop::new(Vec::with_capacity(capacity)),
         }
     }
 
     /// Creates a buffer and copies the provided slice into it.
     pub fn from_slice(data: &[u8]) -> Self {
+        let len = data.len();
+        if let Some(mut vec) = Self::acquire_vec(len) {
+            vec.clear();
+            vec.extend_from_slice(data);
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
+        }
         Self {
-            inner: data.to_vec(),
+            inner: ManuallyDrop::new(data.to_vec()),
         }
     }
 
@@ -80,32 +159,115 @@ impl Buffer {
     }
 
     /// Consumes the buffer and recycles its storage back into the pool if possible.
-    pub fn recycle(self) {
-        if self.inner.capacity() <= MAX_RECYCLED_CAPACITY {
-            let mut vec = self.inner;
+    /// Consumes the buffer and recycles its storage. Drop also recycles,
+    /// so this is redundant — kept for compatibility with BufferPool.
+    pub fn recycle(mut self) {
+        // SAFETY: ManuallyDrop allows taking the value without dropping it.
+        // We forget(self) to prevent Drop from running on the already-moved value.
+        let vec = unsafe { ManuallyDrop::take(&mut self.inner) };
+        Self::recycle_vec(vec);
+        std::mem::forget(self);
+    }
+
+    #[cfg(feature = "arena")]
+    pub fn new_zeroed_arena(len: usize) -> Self {
+        if let Some(mut vec) = Self::acquire_vec(len) {
             vec.clear();
-            let _ = BUFFER_POOL.push(vec);
+            vec.resize(len, 0);
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
+        }
+        Self {
+            inner: ManuallyDrop::new(vec![0u8; len]),
+        }
+    }
+
+    #[cfg(feature = "arena")]
+    /// Creates a buffer without zeroing (for kernel read destinations).
+    /// SAFETY: All bytes are uninitialized; caller must ensure they are
+    /// written before reading (io_uring CQE sets the length on completion).
+    pub unsafe fn new_uninitialized_arena(len: usize) -> Self {
+        if let Some(mut vec) = Self::acquire_vec(len) {
+            vec.clear();
+            vec.set_len(len);
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
+        }
+        let mut vec = Vec::with_capacity(len);
+        vec.set_len(len);
+        Self {
+            inner: ManuallyDrop::new(vec),
+        }
+    }
+
+    #[cfg(feature = "arena")]
+    pub fn with_capacity_arena(capacity: usize) -> Self {
+        if let Some(mut vec) = Self::acquire_vec(capacity) {
+            vec.clear();
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
+        }
+        Self {
+            inner: ManuallyDrop::new(Vec::with_capacity(capacity)),
+        }
+    }
+
+    #[cfg(feature = "arena")]
+    pub fn from_slice_arena(data: &[u8]) -> Self {
+        let len = data.len();
+        if let Some(mut vec) = Self::acquire_vec(len) {
+            vec.clear();
+            vec.extend_from_slice(data);
+            return Self {
+                inner: ManuallyDrop::new(vec),
+            };
+        }
+        Self {
+            inner: ManuallyDrop::new(data.to_vec()),
+        }
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        // Take ownership of the Vec and recycle it to the thread-local pool.
+        // Without this, the buffer pool is never populated and every
+        // Buffer::new_zeroed() allocates fresh memory.
+        // SAFETY: ManuallyDrop lets us take the inner Vec even though
+        // we have Drop. After taking, self.inner is an empty Vec.
+        let vec = unsafe { ManuallyDrop::take(&mut self.inner) };
+        if vec.capacity() > 0 {
+            Self::recycle_vec(vec);
         }
     }
 }
 
 impl Clone for Buffer {
     fn clone(&self) -> Self {
+        // ManuallyDrop doesn't impl Clone, but Vec does, so deref first.
         Self {
-            inner: self.inner.clone(),
+            inner: ManuallyDrop::new((*self.inner).clone()),
         }
     }
 }
 
 impl From<Vec<u8>> for Buffer {
     fn from(inner: Vec<u8>) -> Self {
-        Self { inner }
+        Self {
+            inner: ManuallyDrop::new(inner),
+        }
     }
 }
 
 impl From<Buffer> for Vec<u8> {
-    fn from(buffer: Buffer) -> Self {
-        buffer.inner
+    fn from(mut buffer: Buffer) -> Self {
+        // SAFETY: ManuallyDrop allows taking the value without running Drop.
+        let vec = unsafe { ManuallyDrop::take(&mut buffer.inner) };
+        std::mem::forget(buffer);
+        vec
     }
 }
 

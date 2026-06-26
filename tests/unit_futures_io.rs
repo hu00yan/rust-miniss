@@ -31,7 +31,9 @@ fn test_tcp_read_from_server() {
         };
 
         let client = async move {
-            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr).await.unwrap();
+            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
+                .await
+                .unwrap();
             let mut buf = [0u8; 64];
             let n = stream.read(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], b"data from server");
@@ -57,7 +59,9 @@ fn test_tcp_write_from_client() {
         };
 
         let client = async move {
-            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr).await.unwrap();
+            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
+                .await
+                .unwrap();
             stream.write_all(b"client data").await.unwrap();
             stream.flush().await.unwrap();
         };
@@ -75,7 +79,9 @@ fn test_poll_flush_returns_ok() {
         let addr = listener.local_addr().unwrap();
 
         let client = async move {
-            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr).await.unwrap();
+            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
+                .await
+                .unwrap();
             stream.write_all(b"test").await.unwrap();
             stream.flush().await.unwrap();
         };
@@ -97,7 +103,9 @@ fn test_poll_close_returns_ok() {
         let addr = listener.local_addr().unwrap();
 
         let client = async move {
-            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr).await.unwrap();
+            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
+                .await
+                .unwrap();
             stream.write_all(b"test").await.unwrap();
             stream.close().await.unwrap();
         };

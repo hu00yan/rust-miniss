@@ -19,7 +19,9 @@ fn test_futures_io_compat_read_write() {
         };
 
         let client = async move {
-            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr).await.unwrap();
+            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
+                .await
+                .unwrap();
             let mut buf = [0u8; 64];
             let n = stream.read(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], b"compat reply");
@@ -47,7 +49,9 @@ fn test_futures_io_compat_ping_pong() {
         };
 
         let client = async move {
-            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr).await.unwrap();
+            let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
+                .await
+                .unwrap();
             stream.write_all(b"ping").await.unwrap();
             stream.flush().await.unwrap();
 

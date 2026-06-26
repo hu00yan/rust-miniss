@@ -28,8 +28,10 @@ use crate::waker::TaskId;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+
+use crossbeam_queue::SegQueue;
 
 /// Error returned from a failed task.
 #[derive(Debug)]
@@ -61,12 +63,12 @@ impl<T> JoinState<T> {
 
 /// Completes a [`JoinHandle`] from the task execution side.
 pub(crate) struct JoinCompleter<T> {
-    state: Arc<Mutex<JoinState<T>>>,
+    state: Arc<parking_lot::Mutex<JoinState<T>>>,
 }
 
 impl<T> JoinCompleter<T> {
     fn complete(&self, result: TaskResult<T>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.completed {
             return;
         }
@@ -141,6 +143,9 @@ where
 pub struct Task {
     id: TaskId,
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Cached waker — created once and reused across polls.
+    /// Eliminates per-poll `Rc<MinissWaker>` heap allocation.
+    waker: Option<Waker>,
 }
 
 impl Task {
@@ -149,35 +154,62 @@ impl Task {
         Self {
             id,
             future: Box::pin(future),
+            waker: None,
         }
     }
 
     /// Create a new task from a pinned boxed future
     pub fn from_pinned(id: TaskId, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> Self {
-        Self { id, future }
+        Self {
+            id,
+            future,
+            waker: None,
+        }
     }
 
     /// Get the task ID
+    #[inline(always)]
     pub fn id(&self) -> TaskId {
         self.id
     }
 
     /// Poll the task's future
+    #[inline(always)]
     pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         self.future.as_mut().poll(cx)
+    }
+
+    /// Get or create the cached waker for this task.
+    /// The waker is created lazily on first access, then reused for all
+    /// subsequent polls — avoids per-poll Rc heap allocation.
+    ///
+    /// Returns a cloned Waker (cheap: Rc refcount bump, no heap alloc)
+    /// so that the borrow on `self` is released before the caller's
+    /// closure captures `task` for `task.poll()`.
+    #[inline(always)]
+    pub fn get_or_create_waker(&mut self, queue: &Arc<SegQueue<TaskId>>) -> Waker {
+        self.waker
+            .get_or_insert_with(|| crate::waker::MinissWaker::create_waker(self.id, queue))
+            .clone()
+    }
+
+    /// Take the cached waker (called on task completion to free memory).
+    #[inline(always)]
+    pub fn take_waker(&mut self) -> Option<Waker> {
+        self.waker.take()
     }
 }
 
 /// A spawned task handle that can be awaited
 pub struct JoinHandle<T> {
     task_id: TaskId,
-    state: Arc<Mutex<JoinState<T>>>,
+    state: Arc<parking_lot::Mutex<JoinState<T>>>,
 }
 
 impl<T> JoinHandle<T> {
     /// Create a new join handle
     pub(crate) fn new(task_id: TaskId) -> (Self, JoinCompleter<T>) {
-        let state = Arc::new(Mutex::new(JoinState::pending()));
+        let state = Arc::new(parking_lot::Mutex::new(JoinState::pending()));
         let handle = Self {
             task_id,
             state: state.clone(),
@@ -193,7 +225,7 @@ impl<T> JoinHandle<T> {
 
     /// Check if the task has completed
     pub fn is_finished(&self) -> bool {
-        self.state.lock().unwrap().completed
+        self.state.lock().completed
     }
 
     /// Cancel the task
@@ -211,7 +243,7 @@ impl<T> JoinHandle<T> {
             self.task_id
         );
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if !state.completed {
             state.result = Some(Err(TaskError::Cancelled));
             state.completed = true;
@@ -229,7 +261,7 @@ impl<T: Send> Future for JoinHandle<T> {
     type Output = TaskResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(result) = state.result.take() {
             return Poll::Ready(result);
         }
@@ -341,9 +373,7 @@ where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    panic!(
-        "spawn_periodic() requires an active Runtime — use Runtime::spawn() instead"
-    )
+    panic!("spawn_periodic() requires an active Runtime — use Runtime::spawn() instead")
 }
 
 #[cfg(test)]

@@ -39,7 +39,10 @@ fn test_tcp_write_vectored_returns_pending() {
         let addr = listener.local_addr().unwrap();
 
         let mut stream = AsyncTcpStream::connect(addr).await.unwrap();
-        let bufs = [std::io::IoSlice::new(b"hello"), std::io::IoSlice::new(b"world")];
+        let bufs = [
+            std::io::IoSlice::new(b"hello"),
+            std::io::IoSlice::new(b"world"),
+        ];
         let waker = futures::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
 
@@ -65,7 +68,10 @@ fn test_tcp_vectored_write_read_roundtrip() {
         let mut writer = AsyncTcpStream::connect(addr).await.unwrap();
         let (mut reader, _) = listener.accept().await.unwrap();
 
-        let bufs = [std::io::IoSlice::new(b"hello "), std::io::IoSlice::new(b"world")];
+        let bufs = [
+            std::io::IoSlice::new(b"hello "),
+            std::io::IoSlice::new(b"world"),
+        ];
         let n = writer.write_vectored(&bufs).await.unwrap();
         assert_eq!(n, 11);
 

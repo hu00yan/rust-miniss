@@ -2,8 +2,20 @@
 //!
 //! This module provides a custom Waker that integrates with our executor
 //! to schedule tasks when they become ready.
+//!
+//! # Safety
+//!
+//! In the thread-per-core model, all Waker operations (clone/wake/drop)
+//! happen on the same thread that created the Waker. Therefore we use:
+//! - `Rc` (non-atomic refcount) instead of `Arc` for the outer wrapper
+//! - Raw `*const SegQueue` pointer instead of `Arc<SegQueue>` to avoid
+//!   atomic refcount bumps on every wake operation
+//!
+//! The SegQueue is owned by CpuCore or Executor and lives for the entire
+//! runtime — strictly longer than any Waker — so the raw pointer is safe.
 
 use crossbeam_queue::SegQueue;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
@@ -18,39 +30,60 @@ impl TaskId {
 }
 
 /// Waker implementation that can reschedule tasks
+///
+/// Uses a raw pointer to the SegQueue to avoid atomic refcount operations.
+/// The queue outlives all Wakers because it is owned by the runtime thread.
 pub struct MinissWaker {
     task_id: TaskId,
-    queue: Arc<SegQueue<TaskId>>,
+    queue: *const SegQueue<TaskId>,
 }
+
+// SAFETY: MinissWaker is only accessed from the owning CPU thread.
+// The raw pointer is valid for the lifetime of the runtime.
+unsafe impl Send for MinissWaker {}
+unsafe impl Sync for MinissWaker {}
 
 impl MinissWaker {
     /// Create a new waker for the given task
-    pub fn create_waker(task_id: TaskId, queue: Arc<SegQueue<TaskId>>) -> Waker {
-        let waker = Arc::new(MinissWaker { task_id, queue });
-        let raw_waker = RawWaker::new(Arc::into_raw(waker) as *const (), &VTABLE);
+    ///
+    /// Takes `&Arc<SegQueue>` for ergonomic calling — callers pass
+    /// `&self.ready_queue` without cloning the Arc. Internally we
+    /// extract the raw pointer for zero-overhead access.
+    pub fn create_waker(task_id: TaskId, queue: &Arc<SegQueue<TaskId>>) -> Waker {
+        let waker = Rc::new(MinissWaker {
+            task_id,
+            queue: Arc::as_ptr(queue),
+        });
+        let raw_waker = RawWaker::new(Rc::into_raw(waker) as *const (), &VTABLE);
         unsafe { Waker::from_raw(raw_waker) }
     }
 
     /// Wake the task by adding it to the run queue
+    #[inline(always)]
     fn wake_impl(&self) {
-        self.queue.push(self.task_id);
+        // SAFETY: The raw pointer is valid for the lifetime of this Waker.
+        // The SegQueue is owned by the runtime thread and outlives all Wakers.
+        let queue = unsafe { &*self.queue };
+        queue.push(self.task_id);
     }
 }
 
-// Raw waker implementation
+// Raw waker implementation — non-atomic Rc operations since all
+// clone/wake/drop happen on the same thread.
 static VTABLE: RawWakerVTable =
     RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
 
 unsafe fn waker_clone(data: *const ()) -> RawWaker {
-    let waker = Arc::from_raw(data as *const MinissWaker);
-    let cloned = waker.clone();
+    let waker = Rc::from_raw(data as *const MinissWaker);
+    let cloned = waker.clone(); // non-atomic: Cell<usize> increment
     std::mem::forget(waker); // Don't drop the original
-    RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
+    RawWaker::new(Rc::into_raw(cloned) as *const (), &VTABLE)
 }
 
 unsafe fn waker_wake(data: *const ()) {
-    let waker = Arc::from_raw(data as *const MinissWaker);
+    let waker = Rc::from_raw(data as *const MinissWaker);
     waker.wake_impl();
+    // Rc dropped here — non-atomic refcount decrement
 }
 
 unsafe fn waker_wake_by_ref(data: *const ()) {
@@ -59,7 +92,8 @@ unsafe fn waker_wake_by_ref(data: *const ()) {
 }
 
 unsafe fn waker_drop(data: *const ()) {
-    Arc::from_raw(data as *const MinissWaker);
+    let _ = Rc::from_raw(data as *const MinissWaker);
+    // Rc dropped here — non-atomic refcount decrement, may free MinissWaker
 }
 
 /// Create a dummy waker for simple polling scenarios
@@ -87,14 +121,13 @@ pub fn dummy_waker() -> Waker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_waker_creation() {
         let queue = Arc::new(SegQueue::new());
         let task_id = TaskId(42);
 
-        let waker = MinissWaker::create_waker(task_id, queue.clone());
+        let waker = MinissWaker::create_waker(task_id, &queue);
 
         // Wake the task
         waker.wake();
@@ -108,7 +141,7 @@ mod tests {
         let queue = Arc::new(SegQueue::new());
         let task_id = TaskId(99);
 
-        let waker1 = MinissWaker::create_waker(task_id, queue.clone());
+        let waker1 = MinissWaker::create_waker(task_id, &queue);
         let waker2 = waker1.clone();
 
         // Both wakers should work
@@ -126,7 +159,7 @@ mod tests {
         let queue = Arc::new(SegQueue::new());
         let task_id = TaskId(123);
 
-        let waker = MinissWaker::create_waker(task_id, queue.clone());
+        let waker = MinissWaker::create_waker(task_id, &queue);
 
         // Wake by reference
         waker.wake_by_ref();
@@ -137,5 +170,25 @@ mod tests {
         // Waker should still be usable
         waker.wake();
         assert_eq!(queue.pop(), Some(task_id));
+    }
+
+    /// Verify that Rc refcount is managed correctly — no leaks, no double-frees.
+    #[test]
+    fn test_waker_drop_after_clone() {
+        let queue = Arc::new(SegQueue::new());
+        let task_id = TaskId(77);
+
+        let waker = MinissWaker::create_waker(task_id, &queue);
+        let cloned = waker.clone();
+
+        // Drop the original
+        drop(waker);
+
+        // The clone should still work (wake_by_ref doesn't consume)
+        cloned.wake_by_ref();
+        assert_eq!(queue.pop(), Some(task_id));
+
+        // Drop the clone (both should drop cleanly)
+        drop(cloned);
     }
 }

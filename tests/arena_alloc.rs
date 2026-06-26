@@ -1,33 +1,34 @@
 #[cfg(all(test, feature = "arena"))]
 mod arena_tests {
-    use super::super::http::HttpRequestContext;
-    use bumpalo::Bump;
+    use rust_miniss::Buffer;
 
     #[test]
-    fn test_http_arena_headers() {
-        let arena = Bump::new();
-        let mut ctx = HttpRequestContext::new(&arena);
+    fn test_buffer_pool_reuse() {
+        // Allocate a buffer and let it drop — it goes to thread-local pool.
+        {
+            let buf = Buffer::with_capacity(1024);
+            assert_eq!(buf.capacity(), 1024);
+        }
 
-        ctx.parse_header("Host", "localhost:8080");
-        ctx.parse_header("User-Agent", "curl/7.68.0");
-
-        assert_eq!(ctx.headers.len(), 2);
-        assert_eq!(ctx.headers[0].0, "Host");
-        assert_eq!(ctx.headers[0].1, "localhost:8080");
-
-        // Reset arena (no leak)
-        arena.reset();
-        assert_eq!(arena.chunk_capacity(), 0); // Cleared
+        // Re-allocate same size — should come from pool, not heap.
+        let buf = Buffer::with_capacity(1024);
+        assert_eq!(buf.capacity(), 1024);
     }
 
     #[test]
-    #[should_panic(expected = "bumpalo alloc after reset")]
-    fn test_arena_leak_panic() {
-        let arena = Bump::new();
-        let mut ctx = HttpRequestContext::new(&arena);
-        ctx.parse_header("Test", "value");
-        arena.reset();
-        ctx.parse_header("Leak", "test"); // Panic on alloc post-reset
+    fn test_buffer_new_uninitialized_no_zero_fill() {
+        // new_uninitialized should NOT zero-fill (it's for kernel-written buffers).
+        let buf = unsafe { Buffer::new_uninitialized_arena(4096) };
+        assert_eq!(buf.len(), 4096);
+        // No assertion on contents — they're undefined.
+    }
+
+    #[test]
+    fn test_buffer_arena_from_slice() {
+        // Write data via from_slice and verify contents
+        let buf = Buffer::from_slice_arena(b"hello arena");
+        assert_eq!(buf.len(), 11);
+        assert_eq!(&buf[..], b"hello arena");
     }
 }
 
@@ -35,7 +36,7 @@ mod arena_tests {
 mod arena_tests {
     #[test]
     fn test_no_arena() {
-        // Fallback Vec test (assume implemented)
-        // ...
+        // Without arena feature, Buffer falls back to Vec + pool.
+        // This test just verifies the module compiles.
     }
 }

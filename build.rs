@@ -5,15 +5,15 @@
 //!
 //! ## Platform-specific IO Backend Selection
 //!
-//! - **Linux with kernel 5.10+**: Enables `io_uring` backend for optimal performance
-//! - **Linux with older kernels**: Falls back to `epoll` backend  
-//! - **macOS**: Enables `kqueue` backend
-//! - **Other Unix systems**: Enables `epoll` backend
+//! - **Linux with kernel 6.12+**: Enables `io_uring` backend
+//! - **Linux with older kernels**: **Error** — kernel must be 6.12+
+//! - **macOS**: Enables `kqueue` backend (development only, not optimized)
+//! - **Other Unix systems**: Enables `epoll` backend (development only, not optimized)
 //!
 //! ## Assumptions
 //!
 //! - The compilation machine and runtime machine are the same (reasonable for most use cases)
-//! - Kernel version 5.10+ is considered stable and feature-complete for io_uring
+//! - Kernel version 6.12+ is required for io_uring
 //!
 //! ## Configuration Flags
 //!
@@ -28,53 +28,35 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_io_uring)");
 
     if cfg!(target_os = "linux") {
-        let io_uring_feature_enabled = std::env::var_os("CARGO_FEATURE_IO_URING").is_some();
         match get_kernel_version() {
             Ok(version) => {
                 eprintln!("Detected kernel version: {version:?}");
-                let io_uring_eligible =
-                    version >= (5, 10, 0) && is_io_uring_actually_supported_on_linux();
-
-                // If kernel supports io_uring (5.10+), use io_uring. Otherwise fall back to epoll.
-                if io_uring_feature_enabled && io_uring_eligible {
-                    eprintln!(
-                        "Kernel supports io_uring and feature enabled: selecting io_uring backend."
-                    );
+                if version >= (6, 12, 0) {
+                    eprintln!("Kernel 6.12+ detected: selecting io_uring backend.");
                     println!("cargo:rustc-cfg=has_io_uring");
                     println!("cargo:rustc-cfg=io_backend=\"io_uring\"");
                 } else {
-                    if io_uring_feature_enabled && !io_uring_eligible {
-                        eprintln!(
-                            "io_uring feature enabled but kernel < 5.10; falling back to epoll.",
-                        );
-                    } else if !io_uring_feature_enabled && io_uring_eligible {
-                        eprintln!(
-                            "Kernel supports io_uring but feature disabled; using epoll backend.",
-                        );
-                    } else {
-                        eprintln!(
-                            "Kernel doesn't support io_uring (< 5.10): falling back to epoll."
-                        );
-                    }
-                    println!("cargo:rustc-cfg=io_backend=\"epoll\"");
+                    panic!(
+                        "Linux kernel {}.{}.{} is too old. rust-miniss requires kernel 6.12+ for io_uring support.",
+                        version.0, version.1, version.2
+                    );
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "Failed to determine kernel version: {e}, falling back to epoll for Linux"
+                panic!(
+                    "Failed to determine kernel version: {e}. rust-miniss requires Linux kernel 6.12+."
                 );
-                println!("cargo:rustc-cfg=io_backend=\"epoll\"");
             }
         }
     } else if cfg!(target_os = "macos") {
-        eprintln!("Enabling kqueue backend (macOS)");
+        eprintln!("Enabling kqueue backend (macOS development only)");
         println!("cargo:rustc-cfg=io_backend=\"kqueue\"");
     } else if cfg!(all(
         unix,
         not(target_os = "linux"),
         not(target_os = "macos")
     )) {
-        eprintln!("Enabling epoll backend (other Unix)");
+        eprintln!("Enabling epoll backend (other Unix, development only)");
         println!("cargo:rustc-cfg=io_backend=\"epoll\"");
     }
 }
@@ -101,10 +83,4 @@ fn parse_kernel_version(version_str: &str) -> Result<(u32, u32, u32), Box<dyn st
     } else {
         Err("Invalid version format".into())
     }
-}
-
-/// Checks if io_uring is actually supported on this system.
-/// A more robust implementation might try to create an io_uring instance.
-fn is_io_uring_actually_supported_on_linux() -> bool {
-    true
 }

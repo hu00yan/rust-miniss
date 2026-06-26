@@ -21,6 +21,7 @@
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::buffer::Buffer;
 
@@ -50,6 +51,25 @@ pub trait IoProvider: Send + Sync + 'static {
     /// This method is non-blocking. If no completions are ready, it may
     /// register the waker to be notified when completions are available.
     fn poll_complete(&self, cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>>;
+
+    /// Flush any pending submissions to the kernel.
+    /// Called at event loop boundaries to batch-submit SQEs.
+    fn flush(&self) {}
+
+    /// Park the thread, blocking for completions or timeout.
+    /// Returns the number of available completions.
+    fn park(&self, _timeout: Duration) -> usize {
+        0
+    }
+
+    /// Pop a multi-shot accept result for the given token.
+    /// Returns None for non-accept ops or when no result is available.
+    fn pop_accept_result(
+        &self,
+        _token: IoToken,
+    ) -> Option<(IoToken, Op, Result<CompletionKind, IoError>)> {
+        None
+    }
 }
 
 /// Represents a specific I/O operation to be performed.
@@ -114,6 +134,13 @@ pub enum Op {
         fd: i32,
         addr: SocketAddr,
     },
+    PollAdd {
+        fd: i32,
+        events: u32,
+        multishot: bool,
+    },
+    /// No-op operation for io_uring throughput benchmarking.
+    Nop,
     ReadRent {
         fd: i32,
         buffer: Buffer,
@@ -139,7 +166,7 @@ impl Default for IoToken {
 }
 
 impl IoToken {
-    /// Creates a new, unique `IoToken`.
+    /// Creates a new, unique `IoToken` from a global atomic counter.
     pub fn new() -> Self {
         Self {
             id: TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -149,6 +176,15 @@ impl IoToken {
     /// Returns the underlying `u64` ID of the token.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Creates an `IoToken` from a raw `u64` ID.
+    ///
+    /// Used in `io_uring` backend to reconstruct the token from CQE `user_data`.
+    /// This is the inverse of `id()`, allowing us to match completions back
+    /// to their original submission without any lookup table.
+    pub fn from_id(id: u64) -> Self {
+        Self { id }
     }
 }
 
@@ -207,7 +243,21 @@ pub enum CompletionKind {
     },
     WriteRent {
         bytes_written: usize,
+        data: Buffer,
     },
+    PollAdd {
+        events: u32,
+    },
+    /// A Write on a socket returned -EAGAIN. The io_uring backend has
+    /// submitted POLLOUT on the fd and will re-submit the write when
+    /// the socket becomes writable. The caller should transfer the waker
+    /// and pending_task from the current `token` to `new_token`.
+    WriteRetryWaiting {
+        new_token: IoToken,
+        fd: i32,
+    },
+    /// No-op completion — used for io_uring NOP benchmarking.
+    Nop,
 }
 
 /// Represents an error that can occur during an I/O operation.

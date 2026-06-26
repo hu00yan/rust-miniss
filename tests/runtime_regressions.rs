@@ -122,7 +122,7 @@ fn multicore_spawned_async_file_future_completes() {
 
 #[cfg(any(
     all(unix, not(target_os = "linux")),
-    all(target_os = "linux", any(feature = "epoll", io_backend = "epoll"))
+    all(target_os = "linux", io_backend = "epoll")
 ))]
 #[test]
 fn mio_backend_close_completes_successfully_once() {
@@ -139,9 +139,13 @@ fn mio_backend_close_completes_successfully_once() {
     }
 
     let backend = Arc::new(EpollBackend::new().expect("backend"));
-    let mut state = CpuIoState::default();
-    state.io_backend = backend.clone();
-    set_current_io_state(Arc::new(state));
+    let state = Arc::new(CpuIoState {
+        io_backend: backend.clone(),
+        io_wakers: Default::default(),
+        completed_io: Default::default(),
+        pending_tasks: Default::default(),
+    });
+    set_current_io_state(&state);
     let _guard = IoStateGuard;
 
     let fd = tempfile::tempfile().expect("temp file").into_raw_fd();

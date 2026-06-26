@@ -10,7 +10,7 @@
 //! 4. **Independent IO**: Each core has its own io_uring/epoll instance
 
 use crossbeam_queue::SegQueue;
-use std::collections::HashMap;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -20,14 +20,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cpu::{
-    clear_current_io_state, clear_current_timer, set_current_io_state, set_current_timer,
-    CpuIoState,
+    clear_current_io_state, clear_current_timer, set_current_io_state, set_current_task_id,
+    set_current_timer, CpuIoState,
 };
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 use crate::task::Task;
 use crate::timer::TimerWheel;
-use crate::waker::{MinissWaker, TaskId};
+use crate::waker::TaskId;
 
 /// Type alias for the IO backend completion type
 type IoCompletion = (IoToken, Op, std::result::Result<CompletionKind, IoError>);
@@ -77,16 +77,14 @@ pub struct CpuCore {
     /// Core ID (matches physical CPU)
     id: usize,
     /// Local task queue keyed by task ID. Readiness is tracked separately.
-    task_queue: HashMap<TaskId, Task>,
+    task_queue: rustc_hash::FxHashMap<TaskId, Task>,
     /// Local ready queue populated by task wakers.
     ready_queue: Arc<SegQueue<TaskId>>,
     /// Message inbox from other cores
-    message_inbox: Arc<SegQueue<CoreMessage>>,
+    message_inbox: Arc<crossbeam_queue::SegQueue<CoreMessage>>,
     /// Local timer wheel
     timer_wheel: TimerWheel,
-    /// IO backend (io_uring/epoll/kqueue)
-    io_backend: Arc<dyn IoProvider<Completion = IoCompletion>>,
-    /// Per-core I/O state exposed to `IoFuture`s running on this core.
+    /// Per-core I/O state — also holds the io_backend via `io_state.io_backend`.
     io_state: Arc<CpuIoState>,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
@@ -102,16 +100,15 @@ impl CpuCore {
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         let mut default_state = CpuIoState::default();
-        default_state.io_backend = io_backend.clone();
+        default_state.io_backend = io_backend;
         let io_state = Arc::new(default_state);
 
         Self {
             id,
-            task_queue: HashMap::new(),
+            task_queue: rustc_hash::FxHashMap::default(),
             ready_queue: Arc::new(SegQueue::new()),
             message_inbox: Arc::new(SegQueue::new()),
             timer_wheel: TimerWheel::new(1024, 1),
-            io_backend,
             io_state,
             shutdown,
             local_task_count: 0,
@@ -122,7 +119,7 @@ impl CpuCore {
     fn run(&mut self) -> Result<()> {
         // Bind to CPU core for optimal cache locality
         self.bind_to_cpu()?;
-        set_current_io_state(self.io_state.clone());
+        set_current_io_state(&self.io_state);
         set_current_timer(&mut self.timer_wheel);
 
         struct RuntimeContextGuard;
@@ -142,22 +139,51 @@ impl CpuCore {
             // 1. Process inter-core messages
             work_done |= self.process_messages();
 
-            // 2. Execute local tasks
+            // 2. Poll I/O completions (NO flush — tasks may submit more SQEs)
+            work_done |= self.poll_io();
+
+            // 3. Execute local tasks — may submit new SQEs
             work_done |= self.execute_tasks();
 
-            // 3. Process IO completions
-            work_done |= self.process_io();
+            // 4. Flush SQEs submitted by tasks in step 3.
+            //    This lets the kernel start working on I/O immediately
+            //    instead of waiting for the next iteration.
+            if work_done {
+                self.io_state.io_backend.flush();
+            }
 
-            // 4. Process timers
+            // 5. Process timers
             work_done |= self.process_timers();
 
             // Use proper waiting mechanism instead of busy-waiting with yield
             if !work_done {
-                // Consider using condition variable or park/unpark for better CPU efficiency
-                std::thread::park_timeout(Duration::from_millis(1));
+                // Block on io_uring until at least one I/O completion is ready.
+                // For uring: submit_and_wait(1) — one syscall, no 1ms wasted sleep.
+                // For epoll: fallback to flush + non-blocking poll.
+                // This returns the number of CQEs available.
+                let n_completions = self.io_state.io_backend.park(Duration::from_millis(1));
+
+                if n_completions > 0 {
+                    // park() already synced the CQ — just iterate directly.
+                    // Use poll_complete() which will sync (idempotent double-sync
+                    // is cheap on io_uring, but on epoll it may re-read events).
+                    let waker = futures::task::noop_waker();
+                    let mut context = Context::from_waker(&waker);
+                    if let Poll::Ready(completions) =
+                        self.io_state.io_backend.poll_complete(&mut context)
+                    {
+                        for (token, _op, result) in completions {
+                            unsafe { self.io_state.insert_completed(token, result) };
+                            if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
+                                waker.wake();
+                            }
+                        }
+                    }
+                }
+                // Execute tasks that were just woken by the park+drain
+                self.execute_tasks();
             }
         }
-
         tracing::info!("CPU core {} shutting down", self.id);
         Ok(())
     }
@@ -233,30 +259,31 @@ impl CpuCore {
     fn execute_tasks(&mut self) -> bool {
         let mut executed = 0;
 
-        // Execute up to 16 tasks per iteration
-        while executed < 16 {
+        // Execute all ready tasks per iteration — no artificial cap.
+        loop {
             let Some(task_id) = self.ready_queue.pop() else {
                 break;
             };
 
             if let Some(mut task) = self.task_queue.remove(&task_id) {
-                let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
+                let waker = task.get_or_create_waker(&self.ready_queue);
                 let mut context = Context::from_waker(&waker);
+                // Set current task_id for IoFuture inline completion registration.
+                set_current_task_id(Some(task_id));
                 let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     task.poll(&mut context)
                 }));
+                set_current_task_id(None);
 
                 match poll_result {
                     Ok(Poll::Ready(())) => {
                         self.local_task_count = self.local_task_count.saturating_sub(1);
-                        tracing::trace!("Task {:?} completed on core {}", task_id, self.id);
                     }
                     Ok(Poll::Pending) => {
                         self.task_queue.insert(task_id, task);
                     }
                     Err(payload) => {
                         self.local_task_count = self.local_task_count.saturating_sub(1);
-                        tracing::error!("Task {:?} panicked on core {}", task_id, self.id);
                         drop(payload);
                     }
                 }
@@ -272,22 +299,98 @@ impl CpuCore {
         executed > 0
     }
 
-    /// Process IO completions
-    fn process_io(&mut self) -> bool {
+    /// Poll I/O completions — tries inline poll when the waiting task is known.
+    /// Returns `true` if any progress was made.
+    fn poll_io(&mut self) -> bool {
         let waker = futures::task::noop_waker();
         let mut context = Context::from_waker(&waker);
-        match self.io_backend.poll_complete(&mut context) {
+        match self.io_state.io_backend.poll_complete(&mut context) {
             Poll::Ready(completions) => {
                 if completions.is_empty() {
                     return false;
                 }
 
-                let mut completed = self.io_state.completed_io.lock().unwrap();
+                let mut needs_flush = false;
                 for (token, _op, result) in completions {
-                    completed.insert(token, result);
-                    if let Some(waker) = self.io_state.take_waker(token) {
+                    // ---- WriteRetryWaiting handling ----
+                    // The io_uring backend got EAGAIN on a Write (socket buffer
+                    // full) and has submitted POLLOUT. It will re-submit the
+                    // write when the socket becomes writable. We transfer the
+                    // waker and pending_task to the new token so the retried
+                    // write's completion wakes the correct task.
+                    if let Ok(crate::io::CompletionKind::WriteRetryWaiting { new_token, .. }) =
+                        &result
+                    {
+                        if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
+                            unsafe { self.io_state.store_waker(*new_token, waker) };
+                        }
+                        if let Some(tid) = unsafe { self.io_state.take_pending_task(token) } {
+                            unsafe { self.io_state.store_pending_task(*new_token, tid) };
+                        }
+                        needs_flush = true;
+                        continue;
+                    }
+                    // Try inline completion: if we know which task is waiting,
+                    // insert completion and poll it immediately.
+                    let task_id = unsafe { self.io_state.take_pending_task(token) };
+                    if let Some(tid) = task_id {
+                        if let Some(mut task) = self.task_queue.remove(&tid) {
+                            // Task found — inline poll. Remove the waker that
+                            // IoFuture::poll stored (it will be re-created from
+                            // our cached waker if poll returns Pending).
+                            unsafe { self.io_state.take_waker(token) };
+                            unsafe { self.io_state.insert_completed(token, result) };
+
+                            let waker = task.get_or_create_waker(&self.ready_queue);
+                            let mut ctx = Context::from_waker(&waker);
+                            set_current_task_id(Some(tid));
+                            let poll_result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    task.poll(&mut ctx)
+                                }));
+                            set_current_task_id(None);
+
+                            match poll_result {
+                                Ok(Poll::Ready(())) => {
+                                    self.local_task_count = self.local_task_count.saturating_sub(1);
+                                    needs_flush = true;
+                                }
+                                Ok(Poll::Pending) => {
+                                    self.task_queue.insert(tid, task);
+                                    needs_flush = true;
+                                }
+                                Err(payload) => {
+                                    self.local_task_count = self.local_task_count.saturating_sub(1);
+                                    tracing::error!(
+                                        "Task {:?} panicked inline on core {}",
+                                        tid,
+                                        self.id
+                                    );
+                                    drop(payload);
+                                }
+                            }
+                            continue;
+                        }
+                        // Task was already removed (completed/cleaned up) —
+                        // fall through to the waker path below.
+                        // DO NOT take_waker() here; the caller's waker in
+                        // io_wakers[] is still live and will be used below.
+                    }
+
+                    // No task_id, or task not found: store completion in the
+                    // completed_io map and wake the waiting task via its waker.
+                    unsafe { self.io_state.insert_completed(token, result) };
+                    if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
                         waker.wake();
                     }
+                }
+
+                // Flush any SQEs that inline-polled tasks may have submitted.
+                // Without this, those SQEs sit in the submission queue until
+                // the next event-loop iteration's explicit flush(), adding
+                // one full iteration of latency to every I/O chain.
+                if needs_flush {
+                    self.io_state.io_backend.flush();
                 }
 
                 true
@@ -418,7 +521,7 @@ impl MultiCoreRuntime {
     fn create_io_backend(core_id: usize) -> Result<Arc<dyn IoProvider<Completion = IoCompletion>>> {
         #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
         {
-            match crate::io::uring::UringBackend::new(1024) {
+            match crate::io::uring::UringBackend::new(4096) {
                 Ok(uring) => {
                     tracing::debug!("Core {} using io_uring backend", core_id);
                     return Ok(Arc::new(uring));
@@ -529,6 +632,16 @@ impl MultiCoreRuntime {
 
         tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
         Ok(task_id)
+    }
+
+    /// Install a signal handler that sends shutdown to all cores on SIGINT/SIGTERM.
+    /// The handler runs in a dedicated thread and sends CoreMessage::Shutdown
+    /// to every core's message inbox.  The second signal forces an immediate exit.
+    pub fn install_signal_handler(&self) {
+        use crate::signal::SignalHandler;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handler = SignalHandler::with_cpu_handles(shutdown, self.core_senders.clone());
+        handler.start();
     }
 
     /// Initiate graceful shutdown
@@ -642,7 +755,7 @@ impl MultiCoreRuntime {
     where
         F: Future,
     {
-        crate::Runtime::new().block_on(future)
+        crate::executor::Runtime::new().block_on(future)
     }
 
     /// Block on a future on a specific CPU core

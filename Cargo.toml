@@ -21,6 +21,7 @@ crossbeam-queue = "0.3"
 once_cell = "1.19"
 crossbeam-channel = "0.5"
 dashmap = "5.5"
+parking_lot = "0.12"
 
 # System programming
 nix = { version = "0.27", features = ["signal", "time", "sched", "fs"] }
@@ -30,8 +31,8 @@ socket2 = "0.5"
 
 # I/O backends (io-uring is Linux-only)
 
-# Buffer management
-bytes = "1"
+# Fast hashing for integer-keyed HashMaps
+rustc-hash = "2"
 slab = "0.4.9"
 
 # HTTP parsing and types
@@ -60,7 +61,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 num_cpus = "1.16"
 rand = "0.8"
-signal-hook = "0.3"
+signal-hook = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "signal", "io-util"] }
 threadpool = "1.8"
 tokio-util = { version = "0.7", features = ["compat"] }
@@ -92,8 +93,8 @@ name = "http_echo"
 path = "examples/http_echo.rs"
 
 [[example]]
-name = "http_server"
-path = "examples/http_server.rs"
+name = "http_echo_onecore"
+path = "examples/http_echo_onecore.rs"
 
 [[example]]
 name = "udp_buffered"
@@ -102,6 +103,14 @@ path = "examples/udp_buffered.rs"
 [[example]]
 name = "metrics_server"
 path = "examples/metrics_server.rs"
+
+[[example]]
+name = "bench_single"
+path = "examples/bench_single.rs"
+
+[[example]]
+name = "spawn_micro"
+path = "examples/spawn_micro.rs"
 
 [[bench]]
 name = "http_echo_tokio"
@@ -139,15 +148,14 @@ path = "bench/criterion/memory_perf.rs"
 harness = false
 
 [features]
-default = ["epoll"]
+default = ["arena"]
 arena = ["dep:bumpalo"]
 rent-traits = []  # Enable AsyncReadRent/WriteRent
 advanced = ["dep:bumpalo", "rent-traits"]  # Zero-copy Rent + arena
 debug = []  # Tracing spans, backtraces
 io_uring = ["dep:io-uring"]
-epoll = []
-hyper_integration = []
 tls = []
+signal = ["dep:signal-hook"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }

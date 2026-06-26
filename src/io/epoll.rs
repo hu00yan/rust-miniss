@@ -39,9 +39,7 @@ impl SafeFdFile {
         }
 
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
-        Ok(Self {
-            file: Some(file),
-        })
+        Ok(Self { file: Some(file) })
     }
 
     /// Get mutable reference to the file
@@ -177,11 +175,10 @@ impl IoProvider for EpollBackend {
             }
             Op::Connect { fd, addr: _ } => {
                 let mut source = mio::unix::SourceFd(fd);
-                if let Err(e) = poll.registry().register(
-                    &mut source,
-                    mio_token,
-                    Interest::WRITABLE,
-                ) {
+                if let Err(e) = poll
+                    .registry()
+                    .register(&mut source, mio_token, Interest::WRITABLE)
+                {
                     eprintln!("Failed to register fd for connect: {e}");
                 } else {
                     pending_ops.insert(mio_token, (io_token, op));
@@ -303,6 +300,27 @@ impl IoProvider for EpollBackend {
                 };
                 let mut completed_ops = self.completed_ops.lock().unwrap();
                 completed_ops.push((io_token, op.clone(), result));
+            }
+            Op::PollAdd {
+                fd,
+                events,
+                multishot: _,
+            } => {
+                // Register fd with mio for epoll-based polling
+                let mut source = mio::unix::SourceFd(fd);
+                let events_u32 = *events;
+                let interest = if events_u32 & libc::POLLIN as u32 != 0 {
+                    Interest::READABLE
+                } else if events_u32 & libc::POLLOUT as u32 != 0 {
+                    Interest::WRITABLE
+                } else {
+                    Interest::READABLE | Interest::WRITABLE
+                };
+                if let Err(e) = poll.registry().register(&mut source, mio_token, interest) {
+                    eprintln!("Failed to register fd with mio for poll: {e}");
+                } else {
+                    pending_ops.insert(mio_token, (io_token, op));
+                }
             }
             _ => {
                 // For unsupported operations, return an error immediately
@@ -579,13 +597,8 @@ impl IoProvider for EpollBackend {
                             .collect();
                         let mut requeue = false;
                         let result = loop {
-                            let ret = unsafe {
-                                libc::readv(
-                                    *fd,
-                                    iovecs.as_ptr(),
-                                    iovecs.len() as i32,
-                                )
-                            };
+                            let ret =
+                                unsafe { libc::readv(*fd, iovecs.as_ptr(), iovecs.len() as i32) };
                             if ret < 0 {
                                 let err = io::Error::last_os_error();
                                 if err.kind() == io::ErrorKind::Interrupted {
@@ -640,9 +653,7 @@ impl IoProvider for EpollBackend {
                     Op::WriteVectored { fd, buffers } => {
                         let total_len: usize = buffers.iter().map(|b| b.len()).sum();
                         if total_len == 0 {
-                            Ok(CompletionKind::WriteVectored {
-                                bytes_written: 0,
-                            })
+                            Ok(CompletionKind::WriteVectored { bytes_written: 0 })
                         } else {
                             let mut written = 0usize;
                             let mut requeue = false;
@@ -651,7 +662,8 @@ impl IoProvider for EpollBackend {
                                     .iter()
                                     .enumerate()
                                     .filter_map(|(i, buf)| {
-                                        let buf_start: usize = buffers[..i].iter().map(|b| b.len()).sum();
+                                        let buf_start: usize =
+                                            buffers[..i].iter().map(|b| b.len()).sum();
                                         if written >= buf_start + buf.len() {
                                             return None;
                                         }
@@ -659,7 +671,8 @@ impl IoProvider for EpollBackend {
                                         let remaining = buf.len() - offset;
                                         Some(libc::iovec {
                                             iov_base: unsafe {
-                                                buf.as_ref().as_ptr().add(offset) as *mut libc::c_void
+                                                buf.as_ref().as_ptr().add(offset)
+                                                    as *mut libc::c_void
                                             },
                                             iov_len: remaining,
                                         })
@@ -671,11 +684,7 @@ impl IoProvider for EpollBackend {
                                     });
                                 }
                                 let ret = unsafe {
-                                    libc::writev(
-                                        *fd,
-                                        iovecs.as_ptr(),
-                                        iovecs.len() as i32,
-                                    )
+                                    libc::writev(*fd, iovecs.as_ptr(), iovecs.len() as i32)
                                 };
                                 if ret < 0 {
                                     let err = io::Error::last_os_error();
@@ -710,10 +719,11 @@ impl IoProvider for EpollBackend {
 
                             if requeue {
                                 let mut source = SourceFd(fd);
-                                if let Err(reg_err) =
-                                    poll.registry()
-                                        .register(&mut source, mio_token, Interest::WRITABLE)
-                                {
+                                if let Err(reg_err) = poll.registry().register(
+                                    &mut source,
+                                    mio_token,
+                                    Interest::WRITABLE,
+                                ) {
                                     eprintln!(
                                         "Failed to re-register fd for writev after WouldBlock: {reg_err}"
                                     );
@@ -841,6 +851,7 @@ impl AsRawFd for Op {
             Op::Connect { fd, .. } => fd,
             Op::ReadRent { fd, .. } => fd,
             Op::WriteRent { fd, .. } => fd,
+            Op::PollAdd { fd, .. } => fd,
         }
     }
 }

@@ -1,56 +1,49 @@
 //! Signal handling module
 //!
-//! This module provides signal handling for graceful shutdown using the signal-hook crate.
-//! It spawns a dedicated thread that listens for SIGINT, SIGTERM, and SIGHUP signals.
-//! On the first signal:
-//! - The shutdown flag is set to true
-//! - CrossCpuMessage::Shutdown is broadcast to all CPUs
-//! - User-defined signal callbacks are executed
+//! This module provides signal handling for graceful shutdown.
+//! It uses nix for signal handling (already a dependency).
+//!
+//! Sends `CoreMessage::Shutdown` to each CPU core's message inbox.
 
-use crossbeam_channel::Sender;
-use signal_hook::{consts::signal::*, iterator::Signals};
+use crossbeam_queue::SegQueue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use crate::cpu::{CpuHandle, CrossCpuMessage};
+use nix::sys::signal::Signal;
 
-/// Type for user-defined signal callbacks
+use crate::multicore::CoreMessage;
+
 pub type SignalCallback = Arc<dyn Fn(i32) + Send + Sync>;
 
 /// Signal handler that manages graceful shutdown on signals
 pub struct SignalHandler {
     shutdown_flag: Arc<AtomicBool>,
-    cpu_handles: Option<Vec<Sender<CrossCpuMessage>>>,
+    cpu_senders: Vec<Arc<SegQueue<CoreMessage>>>,
     callbacks: HashMap<i32, Vec<SignalCallback>>,
 }
 
 impl SignalHandler {
-    /// Create a new SignalHandler with just a shutdown flag
     pub fn new(shutdown_flag: Arc<AtomicBool>) -> Self {
         Self {
             shutdown_flag,
-            cpu_handles: None,
+            cpu_senders: Vec::new(),
             callbacks: HashMap::new(),
         }
     }
 
-    /// Create a new SignalHandler with CPU handles for broadcasting shutdown
-    pub fn with_cpu_handles(shutdown_flag: Arc<AtomicBool>, cpu_handles: &[CpuHandle]) -> Self {
-        let senders: Vec<Sender<CrossCpuMessage>> = cpu_handles
-            .iter()
-            .map(|handle| handle.sender().clone())
-            .collect();
-
+    pub fn with_cpu_handles(
+        shutdown_flag: Arc<AtomicBool>,
+        cpu_senders: Vec<Arc<SegQueue<CoreMessage>>>,
+    ) -> Self {
         Self {
             shutdown_flag,
-            cpu_handles: Some(senders),
+            cpu_senders,
             callbacks: HashMap::new(),
         }
     }
 
-    /// Register a callback for a specific signal
     pub fn register_callback<F>(&mut self, signal: i32, callback: F)
     where
         F: Fn(i32) + Send + Sync + 'static,
@@ -61,51 +54,47 @@ impl SignalHandler {
             .push(Arc::new(callback));
     }
 
-    /// Start listening for shutdown signals in a dedicated thread
     pub fn start(&self) {
         let shutdown_flag = self.shutdown_flag.clone();
-        let cpu_handles = self.cpu_handles.clone();
+        let cpu_senders = self.cpu_senders.clone();
         let callbacks = self.callbacks.clone();
 
         thread::spawn(move || {
-            let mut signals =
-                Signals::new([SIGINT, SIGTERM, SIGHUP]).expect("Failed to setup signal handler");
+            let mut signals = nix::sys::signal::SigSet::empty();
+            signals.add(Signal::SIGINT);
+            signals.add(Signal::SIGTERM);
+            signals.add(Signal::SIGHUP);
+            signals.thread_block().unwrap();
 
-            for signal in signals.forever() {
-                match signal {
-                    SIGINT | SIGTERM | SIGHUP => {
-                        tracing::info!("Received signal {} for graceful shutdown", signal);
+            loop {
+                match signals.wait() {
+                    Ok(signal) => {
+                        let sig = signal as i32;
+                        tracing::info!("Received signal {} for graceful shutdown", sig);
 
-                        // On first signal, initiate shutdown
-                        if !shutdown_flag.load(Ordering::SeqCst) {
-                            // Set shutdown flag
-                            shutdown_flag.store(true, Ordering::SeqCst);
+                        if !shutdown_flag.load(Ordering::Acquire) {
+                            shutdown_flag.store(true, Ordering::Release);
 
-                            // Broadcast CrossCpuMessage::Shutdown to all CPUs
-                            if let Some(ref handles) = cpu_handles {
-                                for (cpu_id, sender) in handles.iter().enumerate() {
-                                    if let Err(e) = sender.send(CrossCpuMessage::Shutdown) {
-                                        tracing::warn!(
-                                            "Failed to send shutdown signal to CPU {cpu_id}: {e}"
-                                        );
-                                    }
-                                }
+                            for sender in &cpu_senders {
+                                sender.push(CoreMessage::Shutdown);
                             }
 
-                            // Invoke user-defined callbacks for this signal
-                            if let Some(signal_callbacks) = callbacks.get(&signal) {
+                            if let Some(signal_callbacks) = callbacks.get(&sig) {
                                 for callback in signal_callbacks {
-                                    callback(signal);
+                                    callback(sig);
                                 }
                             }
 
                             tracing::info!("Graceful shutdown initiated");
                         } else {
-                            tracing::warn!("Received second signal {signal}, forcing exit");
+                            tracing::warn!("Received second signal, forcing exit");
                             std::process::exit(1);
                         }
                     }
-                    _ => unreachable!(),
+                    Err(e) => {
+                        tracing::error!("Signal wait error: {:?}", e);
+                        break;
+                    }
                 }
             }
         });

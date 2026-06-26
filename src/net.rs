@@ -1,4 +1,4 @@
-use crate::cpu::io_state;
+use crate::cpu::{current_task_id, io_state};
 use crate::io::IoToken;
 use crate::Buffer;
 use futures::io::{AsyncRead, AsyncWrite};
@@ -67,6 +67,7 @@ impl AsyncTcpStream {
     /// Creates a new AsyncTcpStream from a TcpStream.
     pub fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
         Ok(Self {
             inner: stream,
             read_token: None,
@@ -74,22 +75,60 @@ impl AsyncTcpStream {
         })
     }
 
+    /// Read into a user-provided buffer (owned-buffer pattern).
+    /// Returns the buffer back with data filled in.
+    /// This avoids the internal copy of the standard AsyncRead path.
+    pub async fn read_rent(&self, buffer: Buffer) -> io::Result<(usize, Buffer)> {
+        let state = io_state();
+        let op = crate::io::Op::ReadRent {
+            fd: self.inner.as_raw_fd(),
+            buffer,
+        };
+        let token = state.io_backend.submit(op);
+        let future = crate::io::future::IoFuture::new(token);
+        match future.await? {
+            crate::io::CompletionKind::ReadRent { buffer } => {
+                let n = buffer.len();
+                Ok((n, buffer))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
+        }
+    }
+
+    /// Write from a user-provided buffer (owned-buffer pattern).
+    /// Returns the buffer back so it can be reused for the next read/write.
+    pub async fn write_rent(&self, data: Buffer) -> io::Result<(usize, Buffer)> {
+        let state = io_state();
+        let op = crate::io::Op::WriteRent {
+            fd: self.inner.as_raw_fd(),
+            data,
+        };
+        let token = state.io_backend.submit(op);
+        let future = crate::io::future::IoFuture::new(token);
+        match future.await? {
+            crate::io::CompletionKind::WriteRent {
+                bytes_written,
+                data,
+            } => Ok((bytes_written, data)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
+        }
+    }
+
     /// Connects to the specified address.
-    ///
-    /// DNS resolution is performed synchronously (blocking), but the TCP
-    /// handshake is fully async via `Op::Connect`.
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         use std::net::ToSocketAddrs;
 
         let addr = addr.into();
-
-        // Resolve DNS synchronously (blocking, but only for lookup).
-        // For raw IPs this is instant; for hostnames it blocks briefly.
         let resolved = addr.to_socket_addrs()?.next().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "could not resolve address")
         })?;
 
-        // Create a non-blocking TCP socket.
         let domain = if resolved.is_ipv4() {
             libc::AF_INET
         } else {
@@ -99,13 +138,11 @@ impl AsyncTcpStream {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        // Set non-blocking via fcntl (SOCK_NONBLOCK is not available on macOS).
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
 
-        // Attempt non-blocking connect.
         let storage = socket_addr_to_storage(&resolved);
         let ret = unsafe {
             libc::connect(
@@ -116,7 +153,6 @@ impl AsyncTcpStream {
         };
 
         if ret == 0 {
-            // Connected immediately.
             let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
             return Self::new(std_stream);
         }
@@ -129,7 +165,6 @@ impl AsyncTcpStream {
             return Err(err);
         }
 
-        // Submit Op::Connect to the I/O backend; wait for writable event.
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let stream = Self::new(std_stream)?;
 
@@ -163,13 +198,16 @@ impl IntoRawFd for AsyncTcpStream {
     fn into_raw_fd(self) -> RawFd {
         let fd = self.inner.as_raw_fd();
         let state = crate::cpu::io_state();
-        if let Some(token) = self.read_token {
-            state.io_wakers.lock().unwrap().remove(&token);
-            state.completed_io.lock().unwrap().remove(&token);
-        }
-        if let Some(token) = self.write_token {
-            state.io_wakers.lock().unwrap().remove(&token);
-            state.completed_io.lock().unwrap().remove(&token);
+        // SAFETY: Single-threaded access.
+        unsafe {
+            if let Some(token) = self.read_token {
+                state.take_waker(token);
+                state.take_completed(token);
+            }
+            if let Some(token) = self.write_token {
+                state.take_waker(token);
+                state.take_completed(token);
+            }
         }
         std::mem::forget(self);
         fd
@@ -178,21 +216,26 @@ impl IntoRawFd for AsyncTcpStream {
 
 impl Drop for AsyncTcpStream {
     fn drop(&mut self) {
-        // Try to access I/O state - may fail if dropped outside miniss runtime
         if let Some(state) = crate::cpu::try_io_state() {
-            if let Some(token) = self.read_token {
-                state.io_wakers.lock().unwrap().remove(&token);
-                state.completed_io.lock().unwrap().remove(&token);
-            }
-            if let Some(token) = self.write_token {
-                state.io_wakers.lock().unwrap().remove(&token);
-                state.completed_io.lock().unwrap().remove(&token);
+            // SAFETY: Single-threaded access.
+            unsafe {
+                if let Some(token) = self.read_token {
+                    state.take_waker(token);
+                    state.take_completed(token);
+                    state.take_pending_task(token);
+                }
+                if let Some(token) = self.write_token {
+                    state.take_waker(token);
+                    state.take_completed(token);
+                    state.take_pending_task(token);
+                }
             }
         }
     }
 }
 
 impl AsyncRead for AsyncTcpStream {
+    #[inline]
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -200,10 +243,11 @@ impl AsyncRead for AsyncTcpStream {
     ) -> Poll<io::Result<usize>> {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        if let Some(token) = this.read_token {
-            if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
+        let token = if let Some(token) = this.read_token {
+            // SAFETY: Single-threaded access.
+            if let Some(result) = unsafe { state.take_completed(token) } {
                 this.read_token = None;
-                match result {
+                return match result {
                     Ok(crate::io::CompletionKind::Read { bytes_read, data }) => {
                         let copy_len = std::cmp::min(bytes_read, buf.len());
                         buf[..copy_len].copy_from_slice(&data[..copy_len]);
@@ -214,15 +258,9 @@ impl AsyncRead for AsyncTcpStream {
                         "Unexpected completion",
                     ))),
                     Err(e) => Poll::Ready(Err(e.into())),
-                }
-            } else {
-                state
-                    .io_wakers
-                    .lock()
-                    .unwrap()
-                    .insert(token, cx.waker().clone());
-                Poll::Pending
+                };
             }
+            token
         } else {
             let op = crate::io::Op::Read {
                 fd: this.inner.as_raw_fd(),
@@ -231,13 +269,17 @@ impl AsyncRead for AsyncTcpStream {
             };
             let token = state.io_backend.submit(op);
             this.read_token = Some(token);
-            state
-                .io_wakers
-                .lock()
-                .unwrap()
-                .insert(token, cx.waker().clone());
-            Poll::Pending
+            token
+        };
+        // Register waker AND pending_task for inline completion.
+        // SAFETY: Single-threaded access.
+        unsafe {
+            state.store_waker(token, cx.waker().clone());
+            if let Some(task_id) = current_task_id() {
+                state.store_pending_task(token, task_id);
+            }
         }
+        Poll::Pending
     }
 
     fn poll_read_vectored(
@@ -247,10 +289,11 @@ impl AsyncRead for AsyncTcpStream {
     ) -> Poll<io::Result<usize>> {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        if let Some(token) = this.read_token {
-            if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
+        let token = if let Some(token) = this.read_token {
+            // SAFETY: Single-threaded access.
+            if let Some(result) = unsafe { state.take_completed(token) } {
                 this.read_token = None;
-                match result {
+                return match result {
                     Ok(crate::io::CompletionKind::ReadVectored {
                         bytes_read,
                         buffers,
@@ -274,15 +317,9 @@ impl AsyncRead for AsyncTcpStream {
                         "Unexpected completion",
                     ))),
                     Err(e) => Poll::Ready(Err(e.into())),
-                }
-            } else {
-                state
-                    .io_wakers
-                    .lock()
-                    .unwrap()
-                    .insert(token, cx.waker().clone());
-                Poll::Pending
+                };
             }
+            token
         } else {
             let buffers: Vec<crate::Buffer> = bufs
                 .iter()
@@ -294,17 +331,21 @@ impl AsyncRead for AsyncTcpStream {
             };
             let token = state.io_backend.submit(op);
             this.read_token = Some(token);
-            state
-                .io_wakers
-                .lock()
-                .unwrap()
-                .insert(token, cx.waker().clone());
-            Poll::Pending
+            token
+        };
+        // SAFETY: Single-threaded access.
+        unsafe {
+            state.store_waker(token, cx.waker().clone());
+            if let Some(task_id) = current_task_id() {
+                state.store_pending_task(token, task_id);
+            }
         }
+        Poll::Pending
     }
 }
 
 impl AsyncWrite for AsyncTcpStream {
+    #[inline]
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -312,10 +353,11 @@ impl AsyncWrite for AsyncTcpStream {
     ) -> Poll<io::Result<usize>> {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        if let Some(token) = this.write_token {
-            if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
+        let token = if let Some(token) = this.write_token {
+            // SAFETY: Single-threaded access.
+            if let Some(result) = unsafe { state.take_completed(token) } {
                 this.write_token = None;
-                match result {
+                return match result {
                     Ok(crate::io::CompletionKind::Write { bytes_written }) => {
                         Poll::Ready(Ok(bytes_written))
                     }
@@ -324,15 +366,9 @@ impl AsyncWrite for AsyncTcpStream {
                         "Unexpected completion",
                     ))),
                     Err(e) => Poll::Ready(Err(e.into())),
-                }
-            } else {
-                state
-                    .io_wakers
-                    .lock()
-                    .unwrap()
-                    .insert(token, cx.waker().clone());
-                Poll::Pending
+                };
             }
+            token
         } else {
             let op = crate::io::Op::Write {
                 fd: this.inner.as_raw_fd(),
@@ -341,13 +377,16 @@ impl AsyncWrite for AsyncTcpStream {
             };
             let token = state.io_backend.submit(op);
             this.write_token = Some(token);
-            state
-                .io_wakers
-                .lock()
-                .unwrap()
-                .insert(token, cx.waker().clone());
-            Poll::Pending
+            token
+        };
+        // SAFETY: Single-threaded access.
+        unsafe {
+            state.store_waker(token, cx.waker().clone());
+            if let Some(task_id) = current_task_id() {
+                state.store_pending_task(token, task_id);
+            }
         }
+        Poll::Pending
     }
 
     fn poll_write_vectored(
@@ -357,10 +396,11 @@ impl AsyncWrite for AsyncTcpStream {
     ) -> Poll<io::Result<usize>> {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        if let Some(token) = this.write_token {
-            if let Some(result) = state.completed_io.lock().unwrap().remove(&token) {
+        let token = if let Some(token) = this.write_token {
+            // SAFETY: Single-threaded access.
+            if let Some(result) = unsafe { state.take_completed(token) } {
                 this.write_token = None;
-                match result {
+                return match result {
                     Ok(crate::io::CompletionKind::WriteVectored { bytes_written }) => {
                         Poll::Ready(Ok(bytes_written))
                     }
@@ -369,15 +409,9 @@ impl AsyncWrite for AsyncTcpStream {
                         "Unexpected completion",
                     ))),
                     Err(e) => Poll::Ready(Err(e.into())),
-                }
-            } else {
-                state
-                    .io_wakers
-                    .lock()
-                    .unwrap()
-                    .insert(token, cx.waker().clone());
-                Poll::Pending
+                };
             }
+            token
         } else {
             let buffers: Vec<crate::Buffer> =
                 bufs.iter().map(|b| crate::Buffer::from_slice(b)).collect();
@@ -387,13 +421,16 @@ impl AsyncWrite for AsyncTcpStream {
             };
             let token = state.io_backend.submit(op);
             this.write_token = Some(token);
-            state
-                .io_wakers
-                .lock()
-                .unwrap()
-                .insert(token, cx.waker().clone());
-            Poll::Pending
+            token
+        };
+        // SAFETY: Single-threaded access.
+        unsafe {
+            state.store_waker(token, cx.waker().clone());
+            if let Some(task_id) = current_task_id() {
+                state.store_pending_task(token, task_id);
+            }
         }
+        Poll::Pending
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -416,7 +453,6 @@ impl AsyncUdpSocket {
         Ok(Self { inner: socket })
     }
 
-    /// Returns the local socket address of this socket.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
@@ -425,7 +461,7 @@ impl AsyncUdpSocket {
         let state = io_state();
         let op = crate::io::Op::UdpRecv {
             fd: self.inner.as_raw_fd(),
-            buffer: Buffer::new_zeroed(buf.len()),
+            buffer: Buffer::new_uninitialized(buf.len()),
         };
         let token = state.io_backend.submit(op);
         let future = crate::io::future::IoFuture::new(token);

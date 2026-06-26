@@ -105,14 +105,21 @@ impl TimerWheel {
         }
     }
 
-    /// Schedules a timer to expire at the specified time
+    /// Schedules a timer to expire at the specified time.
     ///
-    /// Returns a TimerId that can be used to cancel the timer
+    /// Uses ceiling division for tick computation so that the timer never fires
+    /// before `at`. This prevents a subtle bug where a timer fires at tick N
+    /// due to floor division, but `Instant::now()` is still before the deadline.
+    ///
+    /// Returns a TimerId that can be used to cancel the timer.
     pub fn schedule(&mut self, at: Instant, waker: Waker) -> TimerId {
         let timer_id = TimerId::new();
         debug_assert!(self.resolution_ms > 0, "Timer resolution must be non-zero");
 
-        let deadline_tick = self.instant_to_tick(at).max(self.current_tick);
+        // Use ceiling division: ensures the deadline tick is strictly at or after `at`.
+        // Without this, a timer scheduled at 7.5ms would be placed at tick 7 (floor),
+        // fire at real time 7.0ms — 0.5ms before the user's deadline.
+        let deadline_tick = self.instant_to_tick_ceil(at).max(self.current_tick);
         let distance = deadline_tick.saturating_sub(self.current_tick);
         let rounds = distance / self.num_slots as u64;
         let slot_index = ((self.current_tick + distance) % self.num_slots as u64) as usize;
@@ -183,10 +190,22 @@ impl TimerWheel {
         }
     }
 
+    /// Convert Instant to tick number (floor division) using nanosecond precision.
+    /// Used in expire() to determine which ticks have passed.
     fn instant_to_tick(&self, at: Instant) -> u64 {
-        let elapsed_ms = at.saturating_duration_since(self.start_time).as_millis();
-        let resolution = self.resolution_ms as u128;
-        (elapsed_ms / resolution) as u64
+        let elapsed_ns = at.saturating_duration_since(self.start_time).as_nanos();
+        let resolution_ns = (self.resolution_ms as u128) * 1_000_000;
+        (elapsed_ns / resolution_ns) as u64
+    }
+
+    /// Convert Instant to tick number (ceiling division) using nanosecond precision.
+    /// Used in schedule() to ensure the deadline tick strictly covers the target instant.
+    /// Using `as_nanos()` instead of `as_millis()` prevents precision loss that would
+    /// cause the timer to fire up to 1ms before the actual deadline.
+    fn instant_to_tick_ceil(&self, at: Instant) -> u64 {
+        let elapsed_ns = at.saturating_duration_since(self.start_time).as_nanos();
+        let resolution_ns = (self.resolution_ms as u128) * 1_000_000;
+        ((elapsed_ns + resolution_ns - 1) / resolution_ns) as u64
     }
 
     /// Returns the number of pending timers across all slots

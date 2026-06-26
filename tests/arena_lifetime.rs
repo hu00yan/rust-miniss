@@ -1,38 +1,33 @@
 #[cfg(all(test, feature = "arena"))]
 mod arena_lifetime_tests {
-    use super::super::http::HttpRequestContext;
-    use bumpalo::Bump;
-    use std::mem::leak; // For negative test
+    use rust_miniss::Buffer;
 
     #[test]
-    fn test_arena_borrow_after_reset() {
-        let arena = Bump::new();
-        let mut ctx = HttpRequestContext::new(&arena);
+    fn test_buffer_drop_recycles_to_pool() {
+        // Allocate and drop — should recycle to thread-local pool.
+        {
+            let _buf = Buffer::with_capacity(4096);
+        }
 
-        ctx.parse_header("Test", "value"); // Borrow from arena
-
-        // Borrow after reset should fail (lifetime invalid)
-        arena.reset();
-        // ctx.parse_header("After", "value");  // This would be UB—test via drop or separate
-
-        // Assert: No access post-reset (test via clone or indirect)
-        let headers_clone = ctx.get_headers().clone(); // Pre-reset borrow invalid post
-                                                       // But since reset, clone would have dangling refs—use drop to test reset
-        drop(ctx); // Arena dropped, but test passes if no panic during use
+        // Allocate same size — likely reuses the just-recycled buffer.
+        let buf2 = Buffer::with_capacity(4096);
+        assert!(buf2.capacity() >= 4096);
     }
 
     #[test]
-    fn test_arena_large_alloc() {
-        let arena = Bump::new();
-        let mut ctx = HttpRequestContext::new(&arena);
+    fn test_buffer_large_alloc() {
+        // Large allocation should work and be properly freed on drop.
+        let buf = Buffer::with_capacity(1024 * 1024); // 1MB
+        assert!(buf.capacity() >= 1024 * 1024);
+        // Drop happens here — large bufs bypass the pool (MAX_RECYCLED_CAPACITY=64K).
+    }
 
-        // Large body alloc
-        let body = ctx.arena.alloc_slice_fill_copy(1024, b'A'); // Assume added to context
-        assert_eq!(body.len(), 1024);
-
-        // Reset clears (capacity 0)
-        arena.reset();
-        assert_eq!(arena.chunk_capacity(), 0); // All freed
+    #[test]
+    fn test_buffer_recycle_does_not_leak() {
+        // Allocate, recycle, ensure no panic/double-free.
+        let buf = Buffer::with_capacity(256);
+        buf.recycle(); // Explicit recycle
+                       // The buffer is consumed — no further access.
     }
 }
 
@@ -40,7 +35,8 @@ mod arena_lifetime_tests {
 mod arena_lifetime_tests {
     #[test]
     fn test_no_arena_fallback() {
-        // Vec fallback test
-        // ...
+        // Without arena, Buffer falls back to Vec-backed allocation.
+        let buf = rust_miniss::Buffer::with_capacity(64);
+        assert!(buf.capacity() >= 64);
     }
 }

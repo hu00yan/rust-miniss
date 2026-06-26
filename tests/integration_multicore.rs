@@ -15,11 +15,13 @@ fn multicore_task_distribution() {
     runtime.block_on(async {
         for i in 0..4 {
             let counters = counters.clone();
-            runtime.spawn(async move {
-                for _j in 0..250 {
-                    counters[i].fetch_add(1, Ordering::Relaxed);
-                }
-            }).expect("spawn task");
+            runtime
+                .spawn(async move {
+                    for _j in 0..250 {
+                        counters[i].fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+                .expect("spawn task");
         }
 
         rust_miniss::timer::sleep(std::time::Duration::from_millis(200)).await;
@@ -27,5 +29,8 @@ fn multicore_task_distribution() {
 
     let counts: Vec<_> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let total: usize = counts.iter().sum();
-    assert_eq!(total, 1000, "expected 1000 total tasks, got {total} with counts {counts:?}");
+    assert_eq!(
+        total, 1000,
+        "expected 1000 total tasks, got {total} with counts {counts:?}"
+    );
 }

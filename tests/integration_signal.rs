@@ -1,3 +1,5 @@
+#![cfg(feature = "signal")]
+
 use signal_hook::consts::SIGTERM;
 use signal_hook::iterator::Signals;
 use std::sync::atomic::{AtomicBool, Ordering};

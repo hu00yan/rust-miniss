@@ -4,14 +4,16 @@
 
 use crate::buffer::Buffer;
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
-use io_uring::{opcode, types, IoUring}; // Import opcode, types and IoUring directly
+use io_uring::{cqueue, opcode, types, IoUring};
 use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
+use slab::Slab;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::io;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 /// A struct to hold a pending operation and any associated data, like buffers.
+#[derive(Clone)]
 enum PendingOp {
     Read {
         op: Op,
@@ -29,7 +31,7 @@ enum PendingOp {
     },
     Write {
         op: Op,
-        _data: Buffer,
+        data: Buffer,
     },
     // ... existing UdpRecv/UdpSend extended for multi
     UdpRecv {
@@ -69,7 +71,19 @@ enum PendingOp {
     },
     WriteFile {
         op: Op,
-        _data: Buffer,
+        data: Buffer,
+    },
+    PollAdd {
+        op: Op,
+    },
+    /// Write got EAGAIN — waiting for POLLOUT before retry.
+    WriteEagain {
+        fd: i32,
+        data: Buffer,
+        orig_token: u64,
+    },
+    Nop {
+        op: Op,
     },
 }
 
@@ -77,7 +91,7 @@ enum PendingOp {
 /// Thread-local to ensure single-threaded access.
 pub struct UringBackend {
     ring: UnsafeCell<IoUring>,
-    pending_ops: UnsafeCell<HashMap<u64, PendingOp>>,
+    pending_ops: UnsafeCell<Slab<PendingOp>>,
     completed_ops: UnsafeCell<Vec<(IoToken, Op, Result<CompletionKind, IoError>)>>,
     thread_id: std::thread::ThreadId,
 }
@@ -88,10 +102,15 @@ unsafe impl Sync for UringBackend {}
 
 impl UringBackend {
     pub fn new(entries: u32) -> io::Result<Self> {
-        let ring = IoUring::new(entries)?;
+        let ring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_coop_taskrun()
+            .build(entries)?;
         Ok(Self {
             ring: UnsafeCell::new(ring),
-            pending_ops: UnsafeCell::new(HashMap::new()),
+            // Use at least 64 entries for slab capacity
+            pending_ops: UnsafeCell::new(Slab::with_capacity(std::cmp::max(entries, 64) as usize)),
             completed_ops: UnsafeCell::new(Vec::new()),
             thread_id: std::thread::current().id(),
         })
@@ -109,13 +128,12 @@ impl IoProvider for UringBackend {
             "UringBackend must be used on the same thread"
         );
 
-        let token = IoToken::new();
-        let user_data = token.id();
-
         // SAFETY: We have exclusive access on this thread.
         let ring = unsafe { &mut *self.ring.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
 
+        // Build the SQE entry and PendingOp WITHOUT user_data — we set it after
+        // inserting into the slab to get the index.
         let (entry, pending_op) = {
             match op {
                 Op::Accept { fd } => {
@@ -128,8 +146,7 @@ impl IoProvider for UringBackend {
                         addr_storage.as_mut() as *mut _ as *mut _,
                         &mut *addr_len as *mut _,
                     )
-                    .build()
-                    .user_data(user_data);
+                    .build();
                     (
                         entry,
                         PendingOp::Accept {
@@ -143,8 +160,7 @@ impl IoProvider for UringBackend {
                     let mut buf = Buffer::new_zeroed(len);
                     let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
                         .offset(offset)
-                        .build()
-                        .user_data(user_data);
+                        .build();
                     (
                         entry,
                         PendingOp::Read {
@@ -156,24 +172,37 @@ impl IoProvider for UringBackend {
                 Op::Write { fd, offset, data } => {
                     let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
                         .offset(offset)
-                        .build()
-                        .user_data(user_data);
+                        .build();
                     (
                         entry,
                         PendingOp::Write {
                             op: Op::Write {
                                 fd,
                                 offset,
-                                data: data.clone(), // Clone data for op, move original into PendingOp
+                                data: Buffer::empty(),
                             },
-                            _data: data, // Store the original Buffer here
+                            data,
+                        },
+                    )
+                }
+                Op::WriteFile { fd, offset, data } => {
+                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
+                        .offset(offset)
+                        .build();
+                    (
+                        entry,
+                        PendingOp::WriteFile {
+                            op: Op::WriteFile {
+                                fd,
+                                offset,
+                                data: Buffer::empty(),
+                            },
+                            data,
                         },
                     )
                 }
                 Op::Fsync { fd } => {
-                    let entry = opcode::Fsync::new(types::Fd(fd))
-                        .build()
-                        .user_data(user_data);
+                    let entry = opcode::Fsync::new(types::Fd(fd)).build();
                     (
                         entry,
                         PendingOp::Fsync {
@@ -182,9 +211,7 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::Close { fd } => {
-                    let entry = opcode::Close::new(types::Fd(fd))
-                        .build()
-                        .user_data(user_data);
+                    let entry = opcode::Close::new(types::Fd(fd)).build();
                     (
                         entry,
                         PendingOp::Close {
@@ -196,8 +223,7 @@ impl IoProvider for UringBackend {
                     let mut buf = Buffer::new_zeroed(len);
                     let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
                         .offset(offset)
-                        .build()
-                        .user_data(user_data);
+                        .build();
                     (
                         entry,
                         PendingOp::ReadFile {
@@ -206,26 +232,7 @@ impl IoProvider for UringBackend {
                         },
                     )
                 }
-                Op::WriteFile { fd, offset, data } => {
-                    // The data Buffer is moved into PendingOp to ensure it lives until completion.
-                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
-                        .offset(offset)
-                        .build()
-                        .user_data(user_data);
-                    (
-                        entry,
-                        PendingOp::WriteFile {
-                            op: Op::WriteFile {
-                                fd,
-                                offset,
-                                data: data.clone(), // Clone data for op, move original into PendingOp
-                            },
-                            _data: data, // Store the original Buffer here
-                        },
-                    )
-                }
                 Op::UdpRecv { fd, mut buffer } => {
-                    let buffer_clone = buffer.clone();
                     let mut iov = Box::new(iovec {
                         iov_base: buffer.as_mut_ptr() as *mut _,
                         iov_len: buffer.len(),
@@ -244,13 +251,12 @@ impl IoProvider for UringBackend {
                         msg_flags: 0,
                     });
 
-                    let entry = opcode::RecvMsg::new(types::Fd(fd), msg.as_mut() as *mut _)
-                        .build()
-                        .user_data(user_data);
+                    let entry = opcode::RecvMsg::new(types::Fd(fd), msg.as_mut() as *mut _).build();
 
+                    // Op buffer is a placeholder — real buffer in PendingOp
                     let op = Op::UdpRecv {
                         fd,
-                        buffer: buffer_clone,
+                        buffer: Buffer::empty(),
                     };
 
                     (
@@ -266,7 +272,6 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::UdpSend { fd, data, addr } => {
-                    let data_clone = data.clone();
                     let mut iov = Box::new(iovec {
                         iov_base: data.as_ptr() as *mut _,
                         iov_len: data.len(),
@@ -323,13 +328,11 @@ impl IoProvider for UringBackend {
                         msg_flags: 0,
                     });
 
-                    let entry = opcode::SendMsg::new(types::Fd(fd), msg.as_mut() as *mut _)
-                        .build()
-                        .user_data(user_data);
+                    let entry = opcode::SendMsg::new(types::Fd(fd), msg.as_mut() as *mut _).build();
 
                     let op = Op::UdpSend {
                         fd,
-                        data: data_clone,
+                        data: Buffer::empty(),
                         addr,
                     };
 
@@ -345,8 +348,9 @@ impl IoProvider for UringBackend {
                         },
                     )
                 }
-                Op::ReadVectored { fd, buffers } => {
-                    let mut pending_buffers = buffers.clone();
+                Op::ReadVectored { fd, mut buffers } => {
+                    // Take ownership of buffers for PendingOp; Op gets empty placeholder
+                    let mut pending_buffers = std::mem::take(&mut buffers);
                     let iovecs: Vec<iovec> = pending_buffers
                         .iter_mut()
                         .map(|buf| iovec {
@@ -354,19 +358,17 @@ impl IoProvider for UringBackend {
                             iov_len: buf.capacity(),
                         })
                         .collect();
-                    let iovecs_ptr = iovecs.as_ptr();
-                    let iovecs_len = iovecs.len();
-                    let entry = unsafe {
-                        opcode::Readv::new(
-                            types::Fd(fd),
-                            iovecs_ptr as *const iovec,
-                            iovecs_len as u32,
-                        )
-                        .build()
-                        .user_data(user_data);
-                    };
+                    let entry = opcode::Readv::new(
+                        types::Fd(fd),
+                        iovecs.as_ptr() as *const iovec,
+                        iovecs.len() as u32,
+                    )
+                    .build();
                     let pending_op = PendingOp::ReadVectored {
-                        op: Op::ReadVectored { fd, buffers },
+                        op: Op::ReadVectored {
+                            fd,
+                            buffers: Vec::new(),
+                        },
                         buffers: pending_buffers,
                         iovecs,
                     };
@@ -380,19 +382,17 @@ impl IoProvider for UringBackend {
                             iov_len: buf.len(),
                         })
                         .collect();
-                    let iovecs_ptr = iovecs.as_ptr();
-                    let iovecs_len = iovecs.len();
-                    let entry = unsafe {
-                        opcode::Writev::new(
-                            types::Fd(fd),
-                            iovecs_ptr as *const iovec,
-                            iovecs_len as u32,
-                        )
-                        .build()
-                        .user_data(user_data);
-                    };
+                    let entry = opcode::Writev::new(
+                        types::Fd(fd),
+                        iovecs.as_ptr() as *const iovec,
+                        iovecs.len() as u32,
+                    )
+                    .build();
                     let pending_op = PendingOp::WriteVectored {
-                        op: Op::WriteVectored { fd, buffers: buffers.clone() },
+                        op: Op::WriteVectored {
+                            fd,
+                            buffers: Vec::new(),
+                        },
                         buffers,
                         iovecs,
                     };
@@ -449,8 +449,7 @@ impl IoProvider for UringBackend {
                         addr_storage.as_ref() as *const _ as *const libc::sockaddr,
                         addr_len,
                     )
-                    .build()
-                    .user_data(user_data);
+                    .build();
                     (
                         entry,
                         PendingOp::Connect {
@@ -459,29 +458,130 @@ impl IoProvider for UringBackend {
                         },
                     )
                 }
+                Op::ReadRent { fd, buffer } => {
+                    let mut buf = buffer;
+                    let entry =
+                        opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+                            .offset(0)
+                            .build();
+                    (
+                        entry,
+                        PendingOp::Read {
+                            // Op::ReadRent.buffer is a placeholder — the real
+                            // buffer lives in PendingOp::Read.buf and is returned
+                            // on completion.
+                            op: Op::ReadRent {
+                                fd,
+                                buffer: Buffer::empty(),
+                            },
+                            buf,
+                        },
+                    )
+                }
+                Op::WriteRent { fd, data } => {
+                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
+                        .offset(0)
+                        .build();
+                    (
+                        entry,
+                        PendingOp::Write {
+                            // Op::WriteRent's data field is just a placeholder —
+                            // the real buffer lives in PendingOp::Write.data and
+                            // is returned to the caller on completion.
+                            op: Op::WriteRent {
+                                fd,
+                                data: Buffer::empty(),
+                            },
+                            data,
+                        },
+                    )
+                }
+                Op::PollAdd {
+                    fd,
+                    events,
+                    multishot,
+                } => {
+                    let mut entry = opcode::PollAdd::new(types::Fd(fd), events);
+                    if multishot {
+                        entry = entry.multi(true);
+                    }
+                    let entry = entry.build();
+                    (
+                        entry,
+                        PendingOp::PollAdd {
+                            op: Op::PollAdd {
+                                fd,
+                                events,
+                                multishot,
+                            },
+                        },
+                    )
+                }
+                Op::Nop => {
+                    let entry = opcode::Nop::new().build();
+                    (entry, PendingOp::Nop { op: Op::Nop })
+                }
                 _ => {
                     let result = Err(IoError::Io(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "Operation not supported by io_uring backend",
                     )));
                     let completed_ops = unsafe { &mut *self.completed_ops.get() };
-                    completed_ops.push((token, op, result));
-                    return token;
+                    // Use a dummy token that will never match any waker — these
+                    // unsupported ops will be returned directly.
+                    let dummy_token = IoToken::from_id(u64::MAX);
+                    completed_ops.push((dummy_token, op, result));
+                    return dummy_token;
                 }
             }
         };
 
-        match unsafe { ring.submission().push(&entry) } {
-            Ok(_) => {
-                pending_ops.insert(user_data, pending_op);
-            }
-            Err(e) => {
-                eprintln!("Failed to submit io-uring operation: {e}");
-            }
+        // Insert into slab to get index, use index as user_data (zero-alloc O(1) lookup)
+        let idx = pending_ops.insert(pending_op);
+        let token = IoToken::from_id(idx as u64);
+        let entry = entry.user_data(idx as u64);
+
+        // Proactive flush when SQ is filling up — avoids emergency flushes
+        // that would break batch semantics. Thresholds: >75% capacity or >128 entries.
+        let should_flush = {
+            // submission() borrows ring mutably; scope it so submit() can borrow later
+            let sq = ring.submission();
+            sq.len() > (sq.capacity() * 3 / 4) || sq.len() > 128
+        };
+        if should_flush {
+            let _ = ring.submit();
         }
 
-        let _ = ring.submit();
+        // Push to submission queue. Single push, no retry — proactive flush above
+        // should keep SQ from ever being completely full.
+        if unsafe { ring.submission().push(&entry) }.is_err() {
+            pending_ops.try_remove(idx);
+            eprintln!("SQ full, dropping op (ring too small?)");
+        }
+
+        // NO ring.submit() here — batch submission happens in flush() at event loop boundary
         token
+    }
+
+    fn flush(&self) {
+        let ring = unsafe { &mut *self.ring.get() };
+        // submit() returns io::Result<u32> with the number of submitted SQEs.
+        // If SQ is empty, this is a fast no-op syscall.
+        let _ = ring.submit();
+    }
+
+    fn park(&self, _timeout: Duration) -> usize {
+        let ring = unsafe { &mut *self.ring.get() };
+        // submit_and_wait(1) submits all pending SQEs and blocks until
+        // at least 1 CQE is available. One syscall instead of submit + poll.
+        match ring.submit_and_wait(1) {
+            Ok(_) => {
+                // Return number of available CQEs for the caller
+                let cq = ring.completion();
+                cq.len()
+            }
+            Err(_) => 0,
+        }
     }
 
     fn poll_complete(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
@@ -490,15 +590,147 @@ impl IoProvider for UringBackend {
         let completed_ops = unsafe { &mut *self.completed_ops.get() };
 
         let mut completions: Vec<Self::Completion> = completed_ops.drain(..).collect();
+
+        // Collect CQEs first to avoid borrow conflicts with ring.submission()
+        // in the EAGAIN retry path below.
         let mut cq = ring.completion();
         cq.sync();
+        let cqes: Vec<_> = cq.into_iter().collect();
 
-        for cqe in cq {
+        for cqe in &cqes {
             let token_id = cqe.user_data();
             let result = cqe.result();
+            let flags = cqe.flags();
+            let has_more = cqueue::more(flags);
 
-            if let Some(pending_op) = pending_ops.remove(&token_id) {
-                let token = IoToken::new();
+            // ---- EAGAIN handling for Write ops ----
+            // When a Write on a TCP socket returns -EAGAIN, the send buffer is
+            // full. We keep the PendingOp alive, submit POLLOUT on the fd.
+            // When POLLOUT fires, we re-submit the write. Throughout this
+            // process, we return WriteRetryWaiting completions that tell poll_io
+            // to transfer the waker/pending_task from the old token to the new,
+            // ensuring the task is woken when the retried write completes.
+            if !has_more
+                && token_id != u64::MAX
+                && result == -libc::EAGAIN
+                && pending_ops
+                    .get(token_id as usize)
+                    .is_some_and(|op| matches!(op, PendingOp::Write { .. }))
+            {
+                let (fd, data) = {
+                    let entry = pending_ops.try_remove(token_id as usize).unwrap();
+                    match entry {
+                        PendingOp::Write { op, data } => {
+                            let fd = match op {
+                                Op::Write { fd, .. } | Op::WriteRent { fd, .. } => fd,
+                                _ => unreachable!(),
+                            };
+                            (fd, data)
+                        }
+                        _ => unreachable!(),
+                    }
+                }; // pending_ops mutable borrow ends here
+
+                // Replace with WriteEagain state — holds the buffer alive
+                let eagain_idx = pending_ops.insert(PendingOp::WriteEagain {
+                    fd,
+                    data,
+                    orig_token: token_id,
+                });
+
+                // Submit POLLOUT on the fd
+                let poll_entry = opcode::PollAdd::new(types::Fd(fd), libc::POLLOUT as u32)
+                    .build()
+                    .user_data(eagain_idx as u64);
+                if unsafe { ring.submission().push(&poll_entry) }.is_err() {
+                    // SQ full — will retry when next CQE arrives
+                }
+
+                // Return WriteRetryWaiting so poll_io transfers waker
+                completions.push((
+                    IoToken::from_id(token_id),
+                    Op::PollAdd {
+                        fd,
+                        events: libc::POLLOUT as u32,
+                        multishot: false,
+                    },
+                    Ok(CompletionKind::WriteRetryWaiting {
+                        new_token: IoToken::from_id(eagain_idx as u64),
+                        fd,
+                    }),
+                ));
+                continue;
+            }
+
+            // ---- POLLOUT firing for a WriteEagain retry ----
+            // The PendingOp at this slot is WriteEagain, meaning POLLOUT
+            // has fired and the socket is writable. Re-submit the write.
+            if !has_more
+                && token_id != u64::MAX
+                && result >= 0
+                && pending_ops
+                    .get(token_id as usize)
+                    .is_some_and(|op| matches!(op, PendingOp::WriteEagain { .. }))
+            {
+                let (fd, data, _orig_token) = {
+                    let entry = pending_ops.try_remove(token_id as usize).unwrap();
+                    match entry {
+                        PendingOp::WriteEagain {
+                            fd,
+                            data,
+                            orig_token,
+                        } => (fd, data, orig_token),
+                        _ => unreachable!(),
+                    }
+                };
+
+                // Capture buffer info before slab insert
+                let ptr = data.as_ptr();
+                let len = data.len();
+
+                // Re-submit the write — PendingOp owns the buffer
+                let write_idx = pending_ops.insert(PendingOp::Write {
+                    op: Op::Write {
+                        fd,
+                        offset: 0,
+                        data: Buffer::empty(),
+                    },
+                    data,
+                });
+                let entry = opcode::Write::new(types::Fd(fd), ptr as *mut _, len as u32)
+                    .offset(0)
+                    .build()
+                    .user_data(write_idx as u64);
+                if unsafe { ring.submission().push(&entry) }.is_err() {
+                    // SQ full — will retry
+                }
+
+                // Tell poll_io to transfer waker from POLLOUT token to new write token
+                completions.push((
+                    IoToken::from_id(token_id),
+                    Op::PollAdd {
+                        fd,
+                        events: libc::POLLOUT as u32,
+                        multishot: false,
+                    },
+                    Ok(CompletionKind::WriteRetryWaiting {
+                        new_token: IoToken::from_id(write_idx as u64),
+                        fd,
+                    }),
+                ));
+                continue;
+            }
+
+            // Normal completion processing
+            let pending_op = if has_more && token_id != u64::MAX {
+                pending_ops.get(token_id as usize).cloned()
+            } else {
+                pending_ops.try_remove(token_id as usize)
+            };
+
+            if let Some(pending_op) = pending_op {
+                // Reconstruct original token from CQE user_data
+                let token = IoToken::from_id(token_id);
 
                 let (op, completion_result) = match pending_op {
                     PendingOp::Accept {
@@ -569,21 +801,38 @@ impl IoProvider for UringBackend {
                             unsafe {
                                 buf.set_len(bytes_read);
                             }
-                            Ok(CompletionKind::Read {
-                                bytes_read,
-                                data: buf,
-                            })
+                            match &op {
+                                Op::ReadRent { .. } => Ok(CompletionKind::ReadRent { buffer: buf }),
+                                _ => Ok(CompletionKind::Read {
+                                    bytes_read,
+                                    data: buf,
+                                }),
+                            }
                         };
                         (op, res)
                     }
-                    PendingOp::Write { op, _data: _ } => {
+                    PendingOp::Write { op, data } => {
                         let res = {
                             if result < 0 {
+                                // Error: data is dropped and recycled to pool
                                 Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                             } else {
-                                Ok(CompletionKind::Write {
-                                    bytes_written: result as usize,
-                                })
+                                match &op {
+                                    Op::WriteRent { .. } => {
+                                        // Return the buffer to the caller for reuse
+                                        Ok(CompletionKind::WriteRent {
+                                            bytes_written: result as usize,
+                                            data,
+                                        })
+                                    }
+                                    _ => {
+                                        // Non-rent write: data is recycled via Buffer::Drop
+                                        let _ = data;
+                                        Ok(CompletionKind::Write {
+                                            bytes_written: result as usize,
+                                        })
+                                    }
+                                }
                             }
                         };
                         (op, res)
@@ -619,7 +868,10 @@ impl IoProvider for UringBackend {
                         };
                         (op, res)
                     }
-                    PendingOp::WriteFile { op, _data: _ } => {
+                    PendingOp::WriteFile { op, data } => {
+                        // Drop data (recycles to pool) — kept alive until
+                        // completion so the kernel can read/write it.
+                        let _ = data;
                         let res = {
                             if result < 0 {
                                 Err(IoError::Io(io::Error::from_raw_os_error(-result)))
@@ -727,7 +979,13 @@ impl IoProvider for UringBackend {
                         };
                         (op, res)
                     }
-                    PendingOp::ReadVectored { op, mut buffers, .. } => {
+                    PendingOp::ReadVectored {
+                        op,
+                        mut buffers,
+                        iovecs,
+                    } => {
+                        // Keep iovecs alive until buffers are no longer needed
+                        let _ = iovecs;
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
@@ -750,7 +1008,14 @@ impl IoProvider for UringBackend {
                         };
                         (op, res)
                     }
-                    PendingOp::WriteVectored { op, .. } => {
+                    PendingOp::WriteVectored {
+                        op,
+                        buffers,
+                        iovecs,
+                    } => {
+                        // Keep buffers and iovecs alive until completion
+                        let _ = buffers;
+                        let _ = iovecs;
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
@@ -759,6 +1024,30 @@ impl IoProvider for UringBackend {
                             })
                         };
                         (op, res)
+                    }
+                    PendingOp::PollAdd { op } => {
+                        let res = if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::PollAdd {
+                                events: result as u32,
+                            })
+                        };
+                        (op, res)
+                    }
+                    // WriteEagain entries are caught before the main match
+                    // in the EAGAIN/POLLOUT retry handling above, but the
+                    // compiler needs this arm for exhaustiveness.
+                    PendingOp::Nop { op } => {
+                        let res = if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::Nop)
+                        };
+                        (op, res)
+                    }
+                    PendingOp::WriteEagain { .. } => {
+                        unreachable!("WriteEagain should be handled before the main match")
                     }
                 };
                 completions.push((token, op, completion_result));

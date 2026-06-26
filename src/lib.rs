@@ -42,6 +42,8 @@
 
 #![deny(warnings)]
 
+#[cfg(feature = "arena")]
+pub mod arena;
 pub mod buffer;
 pub mod cancellation;
 pub mod compat;
@@ -50,11 +52,9 @@ pub mod cpu;
 pub mod executor;
 pub mod fs;
 pub mod http;
-pub mod hyper_compat;
 pub mod io;
 pub mod multicore;
 pub mod net;
-pub mod quinn_compat;
 pub mod signal;
 pub mod task;
 pub mod timer;
@@ -63,7 +63,7 @@ pub mod tls;
 pub mod waker;
 
 pub use buffer::Buffer;
-pub use executor::Executor;
+pub use executor::{Executor, Runtime};
 pub use fs::AsyncFile;
 pub use http::{
     EchoHandler, HttpConnection, HttpHandler, Method, Request, Response, StaticHandler, StatusCode,
@@ -77,9 +77,6 @@ pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWhe
 pub use futures::io::{AsyncRead, AsyncWrite};
 
 pub use compat::{Compat, FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
-
-pub use hyper_compat::{HyperExecutor, MinissTimer, TcpIo};
-pub use quinn_compat::MinissQuinnRuntime;
 
 /// Error types for the runtime
 pub mod error {

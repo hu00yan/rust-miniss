@@ -1,6 +1,9 @@
 //! A future that resolves when an I/O operation completes.
+//!
+//! Also checks the multi-shot accept result queue for the token,
+//! enabling zero-syscall multi-shot accept handling.
 
-use crate::cpu::io_state;
+use crate::cpu::{current_task_id, io_state};
 use crate::io::{CompletionKind, IoError, IoToken};
 use std::future::Future;
 use std::pin::Pin;
@@ -10,12 +13,11 @@ use std::task::{Context, Poll};
 #[derive(Debug)]
 pub struct IoFuture {
     token: IoToken,
-    // We don't need a reference to the backend, just the token.
-    // The result will be delivered to the CpuIoState by the runtime.
 }
 
 impl IoFuture {
     /// Creates a new `IoFuture` for a given `IoToken`.
+    #[inline(always)]
     pub fn new(token: IoToken) -> Self {
         Self { token }
     }
@@ -24,34 +26,43 @@ impl IoFuture {
 impl Future for IoFuture {
     type Output = Result<CompletionKind, IoError>;
 
+    #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Get the I/O state for the current CPU thread.
         let state = io_state();
 
-        // Check if the completion for our token is already available.
-        if let Some(result) = state.completed_io.lock().unwrap().remove(&self.token) {
-            // The operation is complete, return the result.
+        // Check if the completion is already available in the standard map.
+        // SAFETY: Single-threaded access.
+        if let Some(result) = unsafe { state.take_completed(self.token) } {
             return Poll::Ready(result);
         }
 
-        // The operation is not yet complete. Store the waker in the slab
-        // so the runtime can wake us up when the completion arrives.
-        state.store_waker(self.token, cx.waker().clone());
+        // Check the multi-shot accept result queue (fast None for non-accept ops).
+        if let Some((_token, _op, result)) = state.io_backend.pop_accept_result(self.token) {
+            return Poll::Ready(result);
+        }
 
-        // Return Pending to indicate that we are still waiting.
+        // Store the waker so the runtime can wake us when completion arrives.
+        // SAFETY: Single-threaded access.
+        unsafe { state.store_waker(self.token, cx.waker().clone()) };
+
+        // Register the current task_id for inline completion processing.
+        if let Some(task_id) = current_task_id() {
+            unsafe { state.store_pending_task(self.token, task_id) };
+        }
+
         Poll::Pending
     }
 }
 
 impl Drop for IoFuture {
     fn drop(&mut self) {
-        // When the future is dropped, we need to clean up any associated state.
-        // The most important thing is to remove the waker from the slab, if it exists,
-        // to prevent a memory leak. A more advanced implementation would also attempt to
-        // cancel the underlying I/O operation.
-        let state = io_state();
-        state.take_waker(self.token); // This removes the waker from the slab
-                                      // We also remove any potential completion that might have arrived just now.
-        state.completed_io.lock().unwrap().remove(&self.token);
+        if let Some(state) = crate::cpu::try_io_state() {
+            // SAFETY: Single-threaded access.
+            unsafe {
+                state.take_waker(self.token);
+                state.take_completed(self.token);
+                state.take_pending_task(self.token);
+            }
+        }
     }
 }

@@ -2,12 +2,12 @@
 //!
 //! This example demonstrates the basic usage of our custom async runtime.
 
-use rust_miniss::Runtime;
+use rust_miniss::MultiCoreRuntime;
 
 fn main() {
     println!("rust-miniss Hello World Example");
 
-    let runtime = Runtime::new();
+    let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
 
     // Example 1: Simple async block
     println!("\n--- Example 1: Simple async block ---");
@@ -39,16 +39,15 @@ fn main() {
 
     // Example 3: Using task spawning (modern approach)
     println!("\n--- Example 3: Task Spawning ---");
-    let result = runtime.block_on(async {
+    runtime.block_on(async {
         // Spawn a task and await its result
         let handle = runtime.spawn(async {
             println!("Task is running...");
-            "Hello from spawned task!"
         });
 
-        handle.await.unwrap()
+        handle.unwrap();
     });
-    println!("Task result: {result}");
 
     println!("\nAll examples completed successfully!");
+    runtime.shutdown().unwrap();
 }

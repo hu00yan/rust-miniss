@@ -19,8 +19,8 @@
 //! `TaskError::Panic` contains the panic payload for analysis.
 
 use crossbeam_queue::SegQueue;
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,7 +63,7 @@ impl Runtime {
         > = {
             #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
             {
-                match crate::io::uring::UringBackend::new(32) {
+                match crate::io::uring::UringBackend::new(4096) {
                     Ok(uring) => Arc::new(uring),
                     Err(e) => panic!("Failed to create io_uring backend: {e}"),
                 }
@@ -115,7 +115,7 @@ impl Runtime {
         let io_state = Arc::new(default_state);
 
         // Set the current I/O state
-        set_current_io_state(io_state.clone());
+        set_current_io_state(&io_state);
 
         // Pin the future to the stack
         let mut future = Box::pin(future);
@@ -144,29 +144,39 @@ impl Runtime {
 
         // Poll the future until it completes, parking the thread when pending
         loop {
+            // Set current_task_id so IoFuture can register for inline completion.
+            // In `Runtime::block_on()`, there's no CpuCore event loop doing inline
+            // completion processing — completions are handled in the Pending branch
+            // below. But setting it here is still correct: IoFuture::poll() will
+            // store_pending_task which we don't use in this path, and it'll also
+            // store_waker which IS used. The task_id is cleared after poll returns.
+            crate::cpu::set_current_task_id(Some(crate::waker::TaskId(0)));
             match future.as_mut().poll(&mut context) {
                 Poll::Ready(output) => {
+                    crate::cpu::set_current_task_id(None);
                     clear_current_io_state();
                     return output;
                 }
                 Poll::Pending => {
+                    crate::cpu::set_current_task_id(None);
                     let mut made_progress = false;
 
                     // Check for I/O completions
                     let noop_waker = futures::task::noop_waker();
                     let mut io_context = Context::from_waker(&noop_waker);
 
+                    // Flush all queued SQEs before polling for completions
+                    io_state.io_backend.flush();
+
                     // Poll the I/O backend for completions
                     if let Poll::Ready(completions) =
                         io_state.io_backend.poll_complete(&mut io_context)
                     {
                         if !completions.is_empty() {
-                            // Process completions
-                            let mut completed = io_state.completed_io.lock().unwrap();
+                            // SAFETY: Single-threaded access.
                             for (token, _op, result) in completions {
-                                completed.insert(token, result);
-                                // Take and wake the waker from the slab
-                                if let Some(waker) = io_state.take_waker(token) {
+                                unsafe { io_state.insert_completed(token, result) };
+                                if let Some(waker) = unsafe { io_state.take_waker(token) } {
                                     waker.wake();
                                 }
                             }
@@ -211,7 +221,7 @@ impl Default for Runtime {
 
 /// The core executor that manages task scheduling
 pub struct Executor {
-    tasks: HashMap<TaskId, Task>,
+    tasks: FxHashMap<TaskId, Task>,
     ready_queue: Arc<SegQueue<TaskId>>,
     next_task_id: AtomicU64,
 }
@@ -220,7 +230,7 @@ impl Executor {
     /// Create a new executor
     pub fn new() -> Self {
         Self {
-            tasks: HashMap::new(),
+            tasks: FxHashMap::default(),
             ready_queue: Arc::new(SegQueue::new()),
             next_task_id: AtomicU64::new(1),
         }
@@ -264,7 +274,7 @@ impl Executor {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::SeqCst));
+        let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
 
         let (handle, completer) = JoinHandle::new(task_id);
         let wrapped_future = JoinTaskFuture::new(future, completer);
@@ -286,7 +296,7 @@ impl Executor {
         while let Some(task_id) = self.ready_queue.pop() {
             if let Some(mut task) = self.tasks.remove(&task_id) {
                 // Create a waker for this task
-                let waker = MinissWaker::create_waker(task_id, self.ready_queue.clone());
+                let waker = MinissWaker::create_waker(task_id, &self.ready_queue);
                 let mut context = Context::from_waker(&waker);
 
                 // Poll the task, catching any panics
@@ -648,5 +658,4 @@ mod tests {
             "Runtime spawn should complete successfully"
         );
     }
-
 }

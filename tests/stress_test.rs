@@ -7,10 +7,12 @@ use std::time::Duration;
 fn test_udp_stress() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let recv_socket = AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let recv_socket =
+            AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
         let recv_addr = recv_socket.local_addr().unwrap();
 
-        let send_socket = AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let send_socket =
+            AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
 
         let count = 1000;
         for i in 0..count {
@@ -41,11 +43,14 @@ fn test_long_running() {
 fn test_udp_stress_multiple_senders() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let recv_socket = AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let recv_socket =
+            AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
         let recv_addr = recv_socket.local_addr().unwrap();
 
-        let sender_a = AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
-        let sender_b = AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let sender_a =
+            AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let sender_b =
+            AsyncUdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
 
         let n = 500;
         for i in 0..n {
