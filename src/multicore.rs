@@ -141,62 +141,78 @@ impl CpuCore {
 
         tracing::info!("CPU core {} started", self.id);
 
+        /// Maximum inner-loop iterations before yielding to I/O (prevents
+        /// starvation of completions and timers during a busy-task storm).
+        const MAX_BUSY_ROUNDS: u32 = 64;
+
         while !self.shutdown.load(Ordering::Acquire) {
-            let mut work_done = false;
+            // --- INNER LOOP: process all available work, submit I/O, don't wait ---
+            let mut busy_rounds: u32 = 0;
+            loop {
+                let mut work_done = false;
 
-            // 1. Process inter-core messages. Avoid touching the cross-core
-            // channel on every hot-loop tick while local work is flowing.
-            if self.ready_queue.is_empty() || self.message_poll_ticks == 0 {
-                work_done |= self.process_messages();
-                self.message_poll_ticks = 63;
-            } else {
-                self.message_poll_ticks -= 1;
+                // 1. Process inter-core messages.
+                //    Only check the cross-core channel when the ready queue is
+                //    empty (starving for work) or every 64th tick — avoids
+                //    touching the shared channel on every hot-loop iteration.
+                if self.ready_queue.is_empty() || self.message_poll_ticks == 0 {
+                    work_done |= self.process_messages();
+                    self.message_poll_ticks = 63;
+                } else {
+                    self.message_poll_ticks -= 1;
+                }
+
+                // 2. Process I/O completions — may wake tasks into ready_queue.
+                work_done |= self.process_io_completions();
+
+                // 3. Execute ready tasks — may submit new SQEs.
+                work_done |= self.execute_tasks();
+
+                // 4. Submit pending SQEs to kernel (no wait).
+                //    During busy periods this lets the kernel start working on
+                //    I/O immediately instead of deferring it to park().
+                if work_done {
+                    self.io_state.io_backend.flush();
+                }
+
+                // 5. Process expired timers — they also put tasks into ready_queue.
+                work_done |= self.process_timers();
+
+                // 6. Nothing left to do — exit inner loop, go park (wait for I/O).
+                if !work_done {
+                    break;
+                }
+
+                // 7. Bounding: prevent I/O starvation.  If we've been busy for
+                //    MAX_BUSY_ROUNDS without a break, force a park to let the
+                //    kernel push completions and timers fire.
+                busy_rounds += 1;
+                if busy_rounds >= MAX_BUSY_ROUNDS {
+                    break;
+                }
             }
 
-            // 2. Process I/O completions (NO flush — tasks may submit more SQEs)
-            work_done |= self.process_io_completions();
+            // --- OUTER: park (submit_and_wait, blocks for I/O) ---
+            // We've exhausted local work; block until at least one completion
+            // arrives or the 1ms timeout fires.
+            let n_completions = self.io_state.io_backend.park(Duration::from_millis(1));
 
-            // 3. Execute local tasks — may submit new SQEs
-            work_done |= self.execute_tasks();
-
-            // 4. Flush SQEs submitted by tasks in step 3.
-            //    This lets the kernel start working on I/O immediately
-            //    instead of waiting for the next iteration.
-            if work_done {
-                self.io_state.io_backend.flush();
-            }
-
-            // 5. Process timers
-            work_done |= self.process_timers();
-
-            // Use proper waiting mechanism instead of busy-waiting with yield
-            if !work_done {
-                // Block on io_uring until at least one I/O completion is ready.
-                // For uring: submit_and_wait(1) — one syscall, no 1ms wasted sleep.
-                // For epoll: fallback to flush + non-blocking poll.
-                // This returns the number of CQEs available.
-                let n_completions = self.io_state.io_backend.park(Duration::from_millis(1));
-
-                if n_completions > 0 {
-                    // park() already synced the CQ — just iterate directly.
-                    // drain_completions syncs again (idempotent double-sync
-                    // is cheap on io_uring, but on epoll it may re-read events).
-                    let waker = futures::task::noop_waker();
-                    let mut context = Context::from_waker(&waker);
-                    if let Poll::Ready(completions) =
-                        self.io_state.io_backend.drain_completions(&mut context)
-                    {
-                        for (token, _op, result) in completions {
-                            unsafe { self.io_state.insert_completed(token, result) };
-                            if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
-                                waker.wake();
-                            }
+            if n_completions > 0 {
+                let waker = futures::task::noop_waker();
+                let mut context = Context::from_waker(&waker);
+                if let Poll::Ready(completions) =
+                    self.io_state.io_backend.drain_completions(&mut context)
+                {
+                    for (token, _op, result) in completions {
+                        unsafe { self.io_state.insert_completed(token, result) };
+                        if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
+                            waker.wake();
                         }
                     }
                 }
-                // Execute tasks that were just woken by the park+drain
-                self.execute_tasks();
             }
+            // Execute tasks that were just woken by the park+drain
+            self.execute_tasks();
         }
         tracing::info!("CPU core {} shutting down", self.id);
         Ok(())

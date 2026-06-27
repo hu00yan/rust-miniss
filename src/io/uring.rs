@@ -114,7 +114,9 @@ unsafe impl Sync for UringBackend {}
 
 /// Minimum pending SQEs before flush() calls io_uring_enter submit.
 /// Deferring small batches reduces syscall rate.
-const FLUSH_BATCH_SIZE: usize = 16;
+/// Matches MAX_BUSY_ROUNDS in multicore.rs so the inner loop typically
+/// submits once (via park) rather than multiple times via flush().
+const FLUSH_BATCH_SIZE: usize = 64;
 
 impl UringBackend {
     pub fn new(entries: u32) -> io::Result<Self> {
