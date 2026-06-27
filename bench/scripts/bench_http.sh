@@ -152,15 +152,15 @@ run_benchmark() {
     parse_wrk "$name" "$port" "$raw_log" "$server_log" | tee -a "$csv"
 }
 
-run_benchmark "miniss-onecore" "$ROOT/target/release/examples/http_echo_onecore" "$BASE_PORT"
-run_benchmark "miniss-multicore" "$ROOT/target/release/examples/http_echo" "$((BASE_PORT + 1))" --cores "$HTTP_CORES"
-run_benchmark "monoio" "$ROOT/bench/runtime_comparison/target/release/monoio_echo" "$((BASE_PORT + 2))"
-run_benchmark "compio" "$ROOT/bench/runtime_comparison/target/release/compio_echo" "$((BASE_PORT + 3))"
-run_benchmark "tokio-current-thread" "$ROOT/bench/runtime_comparison/target/release/tokio_echo" "$((BASE_PORT + 4))"
+	run_benchmark "miniss-onecore" "$ROOT/target/release/examples/http_echo_onecore" "$BASE_PORT"
+	run_benchmark "miniss-multicore" "$ROOT/target/release/examples/http_echo" "$((BASE_PORT + 1))" --cores "$HTTP_CORES"
+	run_benchmark "monoio" "$ROOT/bench/runtime_comparison/target/release/monoio_echo" "$((BASE_PORT + 2))" --cores "$HTTP_CORES"
+	run_benchmark "compio" "$ROOT/bench/runtime_comparison/target/release/compio_echo" "$((BASE_PORT + 3))" --cores "$HTTP_CORES"
+	run_benchmark "tokio" "$ROOT/bench/runtime_comparison/target/release/tokio_echo" "$((BASE_PORT + 4))" --cores "$HTTP_CORES"
 
-if [[ -x "$ROOT/bench/runtime_comparison/target/release/glommio_echo" ]]; then
-    run_benchmark "glommio" "$ROOT/bench/runtime_comparison/target/release/glommio_echo" "$((BASE_PORT + 5))"
-fi
+	if [[ -x "$ROOT/bench/runtime_comparison/target/release/glommio_echo" ]]; then
+	    run_benchmark "glommio" "$ROOT/bench/runtime_comparison/target/release/glommio_echo" "$((BASE_PORT + 5))" --cores "$HTTP_CORES"
+	fi
 
 cleanup
 echo "summary=$csv"

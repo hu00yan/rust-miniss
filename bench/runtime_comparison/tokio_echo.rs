@@ -1,7 +1,25 @@
 //! tokio HTTP echo server for runtime comparison.
+//! Supports --cores N for multi-threaded worker pool.
 
+use std::thread::available_parallelism;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+fn parse_cores() -> usize {
+    let mut cores = available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--cores" | "-c" => {
+                if let Some(v) = args.next() {
+                    cores = v.parse().unwrap_or(cores);
+                }
+            }
+            _ => {}
+        }
+    }
+    cores
+}
 
 async fn handle_client(mut stream: TcpStream) {
     let _ = stream.set_nodelay(true);
@@ -25,25 +43,49 @@ async fn handle_client(mut stream: TcpStream) {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
+    let cores = parse_cores();
     let mut addr = String::from("0.0.0.0:8080");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--addr" || arg == "-a" {
-            if let Some(v) = args.next() {
-                addr = v;
+        match arg.as_str() {
+            "--addr" | "-a" => {
+                if let Some(v) = args.next() {
+                    addr = v;
+                }
             }
+            _ => {}
         }
     }
 
-    let listener = TcpListener::bind(&addr).await?;
-    println!("tokio http_echo listening on {addr}");
-
-    loop {
-        let (stream, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            handle_client(stream).await;
-        });
+    if cores == 1 {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()?;
+        rt.block_on(async move {
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            println!("tokio http_echo listening on {addr} (single-thread)");
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    handle_client(stream).await;
+                });
+            }
+        })
+    } else {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(cores)
+            .enable_io()
+            .build()?;
+        rt.block_on(async move {
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            println!("tokio http_echo listening on {addr} with {cores} workers");
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    handle_client(stream).await;
+                });
+            }
+        })
     }
 }

@@ -112,6 +112,10 @@ pub struct UringBackend {
 unsafe impl Send for UringBackend {}
 unsafe impl Sync for UringBackend {}
 
+/// Minimum pending SQEs before flush() calls io_uring_enter submit.
+/// Deferring small batches reduces syscall rate.
+const FLUSH_BATCH_SIZE: usize = 16;
+
 impl UringBackend {
     pub fn new(entries: u32) -> io::Result<Self> {
         fn base_builder() -> io_uring::Builder {
@@ -147,6 +151,18 @@ impl UringBackend {
             pending_sqes: Cell::new(0),
             thread_id: std::thread::current().id(),
         })
+    }
+
+    /// Submit all pending SQEs unconditionally.
+    /// Used by flush() for batch threshold, park() before sleep, and submit() SQ-full.
+    fn do_flush(&self) {
+        if self.pending_sqes.get() == 0 {
+            return;
+        }
+        let ring = unsafe { &mut *self.ring.get() };
+        if ring.submit().is_ok() {
+            self.pending_sqes.set(0);
+        }
     }
 }
 
@@ -591,9 +607,8 @@ impl IoProvider for UringBackend {
         // Push to submission queue. If SQ is full, flush and retry.
         // NO proactive flush here — batch submission happens in flush() at event loop boundary.
         if unsafe { ring.submission().push(&entry) }.is_err() {
-            // SQ full: do an emergency flush, then retry the push.
-            let _ = ring.submit();
-            self.pending_sqes.set(0);
+            // SQ full: flush_all submits everything pending, freeing SQ slots.
+            self.do_flush();
             if unsafe { ring.submission().push(&entry) }.is_err() {
                 // Still full after flush — ring is too small, drop the op.
                 token_to_idx.remove(&token_id);
@@ -613,12 +628,14 @@ impl IoProvider for UringBackend {
         if self.pending_sqes.get() == 0 {
             return;
         }
-        let ring = unsafe { &mut *self.ring.get() };
-        // submit() flushes all pending SQEs to the kernel in one syscall.
-        if ring.submit().is_ok() {
-            self.pending_sqes.set(0);
+        // Batch: defer the syscall until we have enough SQEs queued.
+        // SQEs stay in the submission ring and will be submitted by:
+        // - a later flush() when the threshold is reached, or
+        // - park() via submit_and_wait when the thread goes idle.
+        if self.pending_sqes.get() < FLUSH_BATCH_SIZE {
+            return;
         }
-        // On error: leave pending_sqes > 0 so the next flush() retries.
+        self.do_flush();
     }
 
     fn park(&self, timeout: Duration) -> usize {
@@ -629,6 +646,11 @@ impl IoProvider for UringBackend {
         if !ring.completion().is_empty() {
             return ring.completion().len();
         }
+
+        // Flush any batched-but-not-submitted SQEs before sleeping.
+        // Without this, deferred SQEs sit in the submission ring while
+        // we block, adding their latency on top of the timeout.
+        self.do_flush();
 
         // Use a timeout SQE so we never deadlock even when no operations are in flight.
         // The timeout CQE (user_data = u64::MAX) will be safely ignored by drain_completions

@@ -31,6 +31,7 @@ monoio = { version = "0.2", default-features = true, features = ["sync", "macros
 # Use minimal features for echo server benchmark.
 compio = { version = "0.12", features = ["event", "runtime", "io"] }
 compio-io = "0.4"
-tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "rt-multi-thread"] }
 futures-lite = "1"
 futures-util = "0.3"
+socket2 = "0.5"

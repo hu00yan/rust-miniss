@@ -1,7 +1,26 @@
 //! glommio HTTP echo server for runtime comparison.
+//! Supports --cores N via glommio's LocalExecutorPoolBuilder.
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use glommio::net::{TcpListener, TcpStream};
+use glommio::PoolPlacement;
+use std::thread::available_parallelism;
+
+fn parse_cores() -> usize {
+    let mut cores = available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--cores" | "-c" => {
+                if let Some(v) = args.next() {
+                    cores = v.parse().unwrap_or(cores);
+                }
+            }
+            _ => {}
+        }
+    }
+    cores
+}
 
 async fn handle_client(mut stream: TcpStream) {
     let _ = stream.set_nodelay(true);
@@ -27,30 +46,66 @@ async fn handle_client(mut stream: TcpStream) {
 }
 
 fn main() -> std::io::Result<()> {
+    let cores = parse_cores();
     let mut addr = String::from("0.0.0.0:8080");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--addr" || arg == "-a" {
-            if let Some(v) = args.next() {
-                addr = v;
+        match arg.as_str() {
+            "--addr" | "-a" => {
+                if let Some(v) = args.next() {
+                    addr = v;
+                }
             }
+            _ => {}
         }
     }
 
-    glommio::LocalExecutorBuilder::default()
-        .spawn(move || async move {
-            let listener = TcpListener::bind(&addr)?;
-            println!("glommio http_echo listening on {addr}");
+    println!("glommio http_echo listening on {addr} with {cores} workers");
 
-            loop {
-                let stream = listener.accept().await?;
-                glommio::spawn_local(async move {
-                    handle_client(stream).await;
-                })
-                .detach();
-            }
-        })
-        .unwrap()
-        .join()
-        .unwrap()
+    if cores == 1 {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let listener = TcpListener::bind(&addr).expect("bind");
+                loop {
+                    match listener.accept().await {
+                        Ok(stream) => {
+                            glommio::spawn_local(async move {
+                                handle_client(stream).await;
+                            })
+                            .detach();
+                        }
+                        Err(e) => {
+                            eprintln!("glommio accept error: {e}");
+                            break;
+                        }
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        Ok(())
+    } else {
+        glommio::LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(cores, None))
+            .on_all_shards(move || async move {
+                let listener = TcpListener::bind(&addr).expect("bind");
+                loop {
+                    match listener.accept().await {
+                        Ok(stream) => {
+                            glommio::spawn_local(async move {
+                                handle_client(stream).await;
+                            })
+                            .detach();
+                        }
+                        Err(e) => {
+                            eprintln!("glommio accept error: {e}");
+                            break;
+                        }
+                    }
+                }
+            })
+            .unwrap()
+            .join_all();
+        Ok(())
+    }
 }
