@@ -72,6 +72,7 @@ pub struct TimerWheel {
     start_time: Instant,
     /// Maps TimerId to slot index for cancellation
     timer_locations: HashMap<TimerId, usize>,
+    pending_timers: usize,
 }
 
 impl Default for TimerWheel {
@@ -102,6 +103,7 @@ impl TimerWheel {
             current_tick: 0,
             start_time: Instant::now(),
             timer_locations: HashMap::new(),
+            pending_timers: 0,
         }
     }
 
@@ -136,6 +138,7 @@ impl TimerWheel {
             .push_back(entry);
 
         self.timer_locations.insert(timer_id, slot_index);
+        self.pending_timers += 1;
         timer_id
     }
 
@@ -148,6 +151,7 @@ impl TimerWheel {
                 for idx in 0..slot.len() {
                     if slot[idx].id == id {
                         slot.remove(idx);
+                        self.pending_timers = self.pending_timers.saturating_sub(1);
                         return true;
                     }
                 }
@@ -176,6 +180,7 @@ impl TimerWheel {
                     if let Some(mut entry) = slot.pop_front() {
                         if entry.remaining_rounds == 0 {
                             self.timer_locations.remove(&entry.id);
+                            self.pending_timers = self.pending_timers.saturating_sub(1);
                             ready.push(entry.waker);
                         } else {
                             entry.remaining_rounds -= 1;
@@ -205,30 +210,28 @@ impl TimerWheel {
     fn instant_to_tick_ceil(&self, at: Instant) -> u64 {
         let elapsed_ns = at.saturating_duration_since(self.start_time).as_nanos();
         let resolution_ns = (self.resolution_ms as u128) * 1_000_000;
-        ((elapsed_ns + resolution_ns - 1) / resolution_ns) as u64
+        elapsed_ns.div_ceil(resolution_ns) as u64
     }
 
     /// Returns the number of pending timers across all slots
     pub fn pending_count(&self) -> usize {
-        self.slots.iter().map(|slot| slot.len()).sum()
+        self.pending_timers
+    }
+
+    /// Returns whether any timers are pending.
+    pub fn has_pending(&self) -> bool {
+        self.pending_timers != 0
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::task::Wake;
+    use std::task::Waker;
     use std::time::Duration;
 
-    struct TestWaker;
-
-    impl Wake for TestWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn create_test_waker() -> Waker {
-        Arc::new(TestWaker).into()
+        Waker::noop().clone()
     }
 
     #[test]

@@ -1,23 +1,20 @@
-#![cfg(feature = "arena")]
-
 use bumpalo::Bump;
 use std::cell::RefCell;
 
 // Thread-local arena with periodic reset
 thread_local! {
     static THREAD_ARENA: RefCell<Bump> = RefCell::new(Bump::new());
-    static ALLOCATION_COUNT: RefCell<usize> = RefCell::new(0);
+    static ALLOCATION_COUNT: RefCell<usize> = const { RefCell::new(0) };
 }
 
 // Reset arena after N allocations to prevent unbounded growth
 const RESET_THRESHOLD: usize = 1000;
 
-/// Allocate bytes from the thread-local arena.
+/// Allocate bytes from the thread-local arena and use them within a scoped callback.
 ///
-/// NOTE: The arena may be reset on the next allocation, so the returned
-/// reference is only valid until the next call to `alloc_bytes` or `reset_arena`.
-/// The caller MUST consume or copy the data before the next allocation.
-pub fn alloc_bytes(len: usize) -> &'static mut [u8] {
+/// The slice must not escape the callback. This keeps arena reset boundaries visible
+/// and avoids handing out references that can be invalidated by the next allocation.
+pub fn with_bytes<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     THREAD_ARENA.with(|arena| {
         let mut arena = arena.borrow_mut();
 
@@ -33,11 +30,7 @@ pub fn alloc_bytes(len: usize) -> &'static mut [u8] {
         }
 
         let slice = arena.alloc_slice_fill_default(len);
-
-        // SAFETY: The arena lives for the thread duration, so the reference is valid
-        // as long as no reset happens. We reset only at allocation boundaries (above),
-        // and the caller must consume the data before the next allocation.
-        unsafe { &mut *(slice as *mut [u8]) }
+        f(slice)
     })
 }
 

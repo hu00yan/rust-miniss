@@ -36,19 +36,14 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let runtime = MultiCoreRuntime::new(Some(num_cores))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let runtime =
+        MultiCoreRuntime::new(Some(num_cores)).map_err(|e| io::Error::other(e.to_string()))?;
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
     runtime.block_on(async {
         let listener = AsyncTcpListener::bind(addr).expect("Failed to bind");
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    runtime.spawn(handle_client(stream)).ok();
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            runtime.spawn(handle_client(stream)).ok();
         }
     });
     Ok(())

@@ -92,9 +92,11 @@ impl Default for CpuIoState {
     fn default() -> Self {
         Self {
             io_backend: create_default_io_backend(),
-            io_wakers: UnsafeCell::new(Vec::new()),
-            completed_io: UnsafeCell::new(Vec::new()),
-            pending_tasks: UnsafeCell::new(Vec::new()),
+            // Pre-allocate to full ring size (4096) to eliminate repeated
+            // ensure_capacity() → heap-alloc resizes on every new I/O token.
+            io_wakers: UnsafeCell::new(Vec::with_capacity(4096)),
+            completed_io: UnsafeCell::new(Vec::with_capacity(4096)),
+            pending_tasks: UnsafeCell::new(Vec::with_capacity(4096)),
         }
     }
 }
@@ -123,6 +125,12 @@ impl CpuIoState {
     /// Stores a waker in the vec for the given token.
     /// SAFETY: Must be called from the owning CPU thread.
     #[inline(always)]
+    /// Stores the waker for a pending I/O token.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// callers must ensure slot reuse cannot race with this store.
     pub unsafe fn store_waker(&self, token: IoToken, waker: Waker) {
         let idx = token.id() as usize;
         let wakers = &mut *self.io_wakers.get();
@@ -133,6 +141,12 @@ impl CpuIoState {
     /// Takes a waker from the vec for the given token.
     /// SAFETY: Must be called from the owning CPU thread.
     #[inline(always)]
+    /// Removes and returns the waker for a pending I/O token.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// callers must ensure the slot has not been released for reuse.
     pub unsafe fn take_waker(&self, token: IoToken) -> Option<Waker> {
         let idx = token.id() as usize;
         let wakers = &mut *self.io_wakers.get();
@@ -142,6 +156,12 @@ impl CpuIoState {
     /// Insert a completed IO result.
     /// SAFETY: Must be called from the owning CPU thread.
     #[inline(always)]
+    /// Stores the completion result for a token.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// only one completion may be stored for a token before it is consumed.
     pub unsafe fn insert_completed(&self, token: IoToken, result: Result<CompletionKind, IoError>) {
         let idx = token.id() as usize;
         let completed = &mut *self.completed_io.get();
@@ -152,6 +172,12 @@ impl CpuIoState {
     /// Remove and return a completed IO result.
     /// SAFETY: Must be called from the owning CPU thread.
     #[inline(always)]
+    /// Removes and returns the completion result for a token.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// callers must ensure the token has not been recycled.
     pub unsafe fn take_completed(&self, token: IoToken) -> Option<Result<CompletionKind, IoError>> {
         let idx = token.id() as usize;
         let completed = &mut *self.completed_io.get();
@@ -161,6 +187,12 @@ impl CpuIoState {
     /// Check if a completed IO result exists without removing it.
     /// SAFETY: Must be called from the owning CPU thread.
     #[inline(always)]
+    /// Returns whether a token has a stored completion.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// callers must ensure the token has not been recycled.
     pub unsafe fn has_completed(&self, token: IoToken) -> bool {
         let idx = token.id() as usize;
         let completed = &*self.completed_io.get();
@@ -170,6 +202,13 @@ impl CpuIoState {
     /// Store the task_id that is waiting for this token.
     /// SAFETY: Must be called from the owning CPU thread.
     #[inline(always)]
+    /// Stores the task waiting on a pending I/O token.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// the task id must remain valid until the operation completes or is
+    /// cancelled.
     pub unsafe fn store_pending_task(&self, token: IoToken, task_id: crate::waker::TaskId) {
         let idx = token.id() as usize;
         let tasks = &mut *self.pending_tasks.get();
@@ -180,6 +219,12 @@ impl CpuIoState {
     /// Remove and return the task_id for a token.
     /// SAFETY: Must be called from the owning CPU thread.
     #[inline(always)]
+    /// Removes and returns the task waiting on a pending I/O token.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// callers must ensure the token has not been recycled.
     pub unsafe fn take_pending_task(&self, token: IoToken) -> Option<crate::waker::TaskId> {
         let idx = token.id() as usize;
         let tasks = &mut *self.pending_tasks.get();
@@ -202,12 +247,12 @@ impl Drop for CpuIoState {
 thread_local! {
     /// Thread-local raw pointer to the current CPU's IoState.
     /// Zero-cost access — no Arc clone, no Mutex, no atomic.
-    static CURRENT_IO_STATE: std::cell::Cell<*const CpuIoState> = std::cell::Cell::new(ptr::null());
-    static CURRENT_TIMER_WHEEL: std::cell::Cell<*mut TimerWheel> = std::cell::Cell::new(ptr::null_mut());
+    static CURRENT_IO_STATE: std::cell::Cell<*const CpuIoState> = const { std::cell::Cell::new(ptr::null()) };
+    static CURRENT_TIMER_WHEEL: std::cell::Cell<*mut TimerWheel> = const { std::cell::Cell::new(ptr::null_mut()) };
     /// Thread-local current TaskId, set before polling each task.
     /// Used by IoFuture to register for inline completion.
     static CURRENT_TASK_ID: std::cell::Cell<Option<crate::waker::TaskId>> =
-        std::cell::Cell::new(None);
+        const { std::cell::Cell::new(None) };
 }
 
 /// Provides access to the I/O state of the current CPU thread.

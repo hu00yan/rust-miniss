@@ -2,18 +2,11 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use futures::executor::block_on;
 use rust_miniss::multicore::MultiCoreRuntime;
 use rust_miniss::timer::{Interval, SleepFuture, TimerWheel};
-use std::sync::Arc;
-use std::task::{Wake, Waker};
+use std::task::Waker;
 use std::time::{Duration, Instant};
 
-struct BenchWaker;
-
-impl Wake for BenchWaker {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn create_bench_waker() -> Waker {
-    Arc::new(BenchWaker).into()
+    Waker::noop().clone()
 }
 
 fn timer_insertion_benchmark(c: &mut Criterion) {

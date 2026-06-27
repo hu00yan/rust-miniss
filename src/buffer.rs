@@ -72,19 +72,13 @@ impl Buffer {
     pub fn new_uninitialized(len: usize) -> Self {
         if let Some(mut vec) = Self::acquire_vec(len) {
             vec.clear();
-            unsafe {
-                vec.set_len(len);
-            }
+            vec.resize(len, 0);
             return Self {
                 inner: ManuallyDrop::new(vec),
             };
         }
-        let mut vec = Vec::with_capacity(len);
-        unsafe {
-            vec.set_len(len);
-        }
         Self {
-            inner: ManuallyDrop::new(vec),
+            inner: ManuallyDrop::new(vec![0u8; len]),
         }
     }
 
@@ -154,6 +148,12 @@ impl Buffer {
     ///
     /// The caller must ensure `len <= capacity()` and that every byte in the
     /// new initialized range has been written before it is read.
+    /// Sets the logical length of the buffer without initializing new bytes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that all bytes in the range from the old length
+    /// to `len` have been initialized before they are read.
     pub unsafe fn set_len(&mut self, len: usize) {
         self.inner.set_len(len);
     }
@@ -187,18 +187,22 @@ impl Buffer {
     /// Creates a buffer without zeroing (for kernel read destinations).
     /// SAFETY: All bytes are uninitialized; caller must ensure they are
     /// written before reading (io_uring CQE sets the length on completion).
+    /// Creates a buffer intended for kernel-written data.
+    ///
+    /// # Safety
+    ///
+    /// Callers must not read from the returned buffer until the bytes have
+    /// been initialized by an I/O operation or another write.
     pub unsafe fn new_uninitialized_arena(len: usize) -> Self {
         if let Some(mut vec) = Self::acquire_vec(len) {
             vec.clear();
-            vec.set_len(len);
+            vec.resize(len, 0);
             return Self {
                 inner: ManuallyDrop::new(vec),
             };
         }
-        let mut vec = Vec::with_capacity(len);
-        vec.set_len(len);
         Self {
-            inner: ManuallyDrop::new(vec),
+            inner: ManuallyDrop::new(vec![0u8; len]),
         }
     }
 

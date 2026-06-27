@@ -18,9 +18,9 @@
 //! JoinHandles return `TaskResult<T>` which is `Result<T, TaskError>` where
 //! `TaskError::Panic` contains the panic payload for analysis.
 
-use crossbeam_queue::SegQueue;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,74 +47,16 @@ impl Runtime {
 
     /// Run a future to completion
     pub fn block_on<F>(&self, future: F) -> F::Output
+    // arch-audit: allow control-plane runtime API
     where
         F: Future,
     {
-        // For single-threaded execution, we need to set up the I/O state
+        // CpuIoState::default() auto-selects the right backend (io_uring/kqueue/epoll)
+        // based on compile-time cfg, removing duplicated cfg logic here.
+        // No Arc needed — io_state is a stack local that lives for block_on's duration.
         use crate::cpu::{clear_current_io_state, set_current_io_state, CpuIoState};
-        use crate::{CompletionKind, IoError, IoProvider, IoToken, Op};
-        use std::sync::Arc;
 
-        // Create an appropriate I/O backend for single-threaded execution based on compile-time features
-        let io_backend: Arc<
-            dyn IoProvider<
-                Completion = (IoToken, Op, std::result::Result<CompletionKind, IoError>),
-            >,
-        > = {
-            #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
-            {
-                match crate::io::uring::UringBackend::new(4096) {
-                    Ok(uring) => Arc::new(uring),
-                    Err(e) => panic!("Failed to create io_uring backend: {e}"),
-                }
-            }
-            #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
-            {
-                match crate::io::kqueue::KqueueBackend::new() {
-                    Ok(kqueue) => Arc::new(kqueue)
-                        as Arc<
-                            dyn IoProvider<
-                                Completion = (
-                                    IoToken,
-                                    Op,
-                                    std::result::Result<CompletionKind, IoError>,
-                                ),
-                            >,
-                        >,
-                    Err(e) => panic!("Failed to create kqueue backend: {e}"),
-                }
-            }
-            #[cfg(all(target_os = "linux", io_backend = "epoll"))]
-            {
-                match crate::io::epoll::EpollBackend::new() {
-                    Ok(epoll) => Arc::new(epoll)
-                        as Arc<
-                            dyn IoProvider<
-                                Completion = (
-                                    IoToken,
-                                    Op,
-                                    std::result::Result<CompletionKind, IoError>,
-                                ),
-                            >,
-                        >,
-                    Err(e) => panic!("Failed to create epoll backend: {e}"),
-                }
-            }
-            #[cfg(not(any(
-                all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"),
-                all(target_os = "linux", io_backend = "epoll"),
-                all(target_os = "macos", io_backend = "kqueue")
-            )))]
-            {
-                panic!("No I/O backend enabled. Please enable 'io_uring', 'epoll', or 'kqueue' feature.");
-            }
-        };
-
-        let mut default_state = CpuIoState::default();
-        default_state.io_backend = io_backend;
-        let io_state = Arc::new(default_state);
-
-        // Set the current I/O state
+        let io_state = CpuIoState::default();
         set_current_io_state(&io_state);
 
         // Pin the future to the stack
@@ -168,9 +110,9 @@ impl Runtime {
                     // Flush all queued SQEs before polling for completions
                     io_state.io_backend.flush();
 
-                    // Poll the I/O backend for completions
+                    // Drain I/O completions
                     if let Poll::Ready(completions) =
-                        io_state.io_backend.poll_complete(&mut io_context)
+                        io_state.io_backend.drain_completions(&mut io_context)
                     {
                         if !completions.is_empty() {
                             // SAFETY: Single-threaded access.
@@ -184,11 +126,13 @@ impl Runtime {
                         }
                     }
 
-                    timer_wheel.expire(std::time::Instant::now(), &mut ready_timers);
-                    if !ready_timers.is_empty() {
-                        made_progress = true;
-                        for waker in ready_timers.drain(..) {
-                            waker.wake();
+                    if timer_wheel.has_pending() {
+                        timer_wheel.expire(std::time::Instant::now(), &mut ready_timers);
+                        if !ready_timers.is_empty() {
+                            made_progress = true;
+                            for waker in ready_timers.drain(..) {
+                                waker.wake();
+                            }
                         }
                     }
 
@@ -196,8 +140,29 @@ impl Runtime {
                         continue;
                     }
 
-                    // Park the thread until it is woken
-                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    // Park using the I/O backend. With DEFER_TASKRUN, completions are
+                    // only posted to the CQ ring when we enter the kernel via
+                    // submit_and_wait. park() handles this correctly.
+                    io_state
+                        .io_backend
+                        .park(std::time::Duration::from_millis(1));
+
+                    // Drain any completions that arrived during park.
+                    let noop_waker = futures::task::noop_waker();
+                    let mut io_context = Context::from_waker(&noop_waker);
+                    if let Poll::Ready(completions) =
+                        io_state.io_backend.drain_completions(&mut io_context)
+                    {
+                        if !completions.is_empty() {
+                            for (token, _op, result) in completions {
+                                unsafe { io_state.insert_completed(token, result) };
+                                if let Some(waker) = unsafe { io_state.take_waker(token) } {
+                                    waker.wake();
+                                }
+                            }
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -222,7 +187,7 @@ impl Default for Runtime {
 /// The core executor that manages task scheduling
 pub struct Executor {
     tasks: FxHashMap<TaskId, Task>,
-    ready_queue: Arc<SegQueue<TaskId>>,
+    ready_queue: VecDeque<TaskId>,
     next_task_id: AtomicU64,
 }
 
@@ -231,13 +196,14 @@ impl Executor {
     pub fn new() -> Self {
         Self {
             tasks: FxHashMap::default(),
-            ready_queue: Arc::new(SegQueue::new()),
+            ready_queue: VecDeque::with_capacity(256),
             next_task_id: AtomicU64::new(1),
         }
     }
 
     /// Run a future to completion
     pub fn block_on<F>(&self, future: F) -> F::Output
+    // arch-audit: allow control-plane runtime API
     where
         F: Future,
     {
@@ -284,7 +250,7 @@ impl Executor {
 
         // Add to our task list and ready queue
         self.tasks.insert(task_id, task);
-        self.ready_queue.push(task_id);
+        self.ready_queue.push_back(task_id);
 
         handle
     }
@@ -293,10 +259,11 @@ impl Executor {
     pub fn tick(&mut self) -> bool {
         let mut made_progress = false;
 
-        while let Some(task_id) = self.ready_queue.pop() {
+        while let Some(task_id) = self.ready_queue.pop_front() {
             if let Some(mut task) = self.tasks.remove(&task_id) {
                 // Create a waker for this task
-                let waker = MinissWaker::create_waker(task_id, &self.ready_queue);
+                let waker =
+                    MinissWaker::create_waker(task_id, &self.ready_queue as *const VecDeque<_>);
                 let mut context = Context::from_waker(&waker);
 
                 // Poll the task, catching any panics
@@ -359,8 +326,8 @@ mod tests {
 
     #[test]
     fn test_runtime_creation() {
-        let _runtime = Runtime::new();
-        // Runtime should be created successfully
+        let _runtime = Runtime::new(); // arch-audit: allow unit test runtime creation
+                                       // Runtime should be created successfully
     }
 
     #[test]
@@ -448,19 +415,20 @@ mod tests {
     #[test]
     fn test_multiple_tasks() {
         let mut executor = Executor::new();
-        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
 
         // Spawn tasks that complete in different "rounds"
         for i in 0..3 {
-            let results = results.clone();
+            let tx = tx.clone();
             executor.spawn(async move {
-                results.lock().unwrap().push(i);
+                tx.send(i).unwrap();
             });
         }
+        drop(tx);
 
         executor.run();
 
-        let final_results = results.lock().unwrap();
+        let final_results: Vec<_> = rx.try_iter().collect();
         assert_eq!(final_results.len(), 3);
         // Results might be in any order due to task scheduling
         assert!(final_results.contains(&0));
@@ -564,19 +532,20 @@ mod tests {
     fn test_vector_contains_operations() {
         // Specifically test the vector contains operations that were fixed
         let mut executor = Executor::new();
-        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
 
         // Spawn tasks with specific values
         for i in [42, 100, 255] {
-            let results = results.clone();
+            let tx = tx.clone();
             executor.spawn(async move {
-                results.lock().unwrap().push(i);
+                tx.send(i).unwrap();
             });
         }
+        drop(tx);
 
         executor.run();
 
-        let final_results = results.lock().unwrap();
+        let final_results: Vec<_> = rx.try_iter().collect();
         assert_eq!(final_results.len(), 3);
 
         // Test all the contains operations that were previously broken
@@ -635,14 +604,10 @@ mod tests {
         // Note: In this single-threaded executor, we need to use the Executor directly
         // to run spawned tasks, as Runtime's block_on doesn't execute the task queue
         let mut executor = Executor::new();
-        let result = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let result_clone = result.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
         let handle = executor.spawn(async move {
-            result_clone
-                .lock()
-                .unwrap()
-                .push("task completed".to_string());
+            tx.send("task completed".to_string()).unwrap();
             "done"
         });
 
@@ -652,7 +617,7 @@ mod tests {
         // Check that the task completed
         assert!(handle.is_finished());
 
-        let final_result = result.lock().unwrap();
+        let final_result: Vec<_> = rx.try_iter().collect();
         assert!(
             final_result.contains(&"task completed".to_string()),
             "Runtime spawn should complete successfully"

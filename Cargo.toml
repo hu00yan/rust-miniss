@@ -6,6 +6,9 @@ authors = ["Your Name"]
 description = "A Rust implementation of miniss - a toy Seastar-like async runtime"
 license = "MIT OR Apache-2.0"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("hyper_integration"))'] }
+
 
 
 [dependencies]

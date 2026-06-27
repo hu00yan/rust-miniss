@@ -18,8 +18,8 @@
 //! target platform and kernel version, and sets the appropriate `io_backend`
 //! configuration flag.
 
+use std::cell::Cell;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -46,11 +46,12 @@ pub trait IoProvider: Send + Sync + 'static {
     /// the operation.
     fn submit(&self, op: Op) -> IoToken;
 
-    /// Polls for completed I/O operations.
+    /// Drain completed I/O operations from the backend.
     ///
-    /// This method is non-blocking. If no completions are ready, it may
-    /// register the waker to be notified when completions are available.
-    fn poll_complete(&self, cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>>;
+    /// This method is non-blocking. Returns `Poll::Ready` with completed
+    /// operations, or `Poll::Pending` if none are available.
+    /// Note: completion-based (io_uring/IOCP), not poll-based (epoll).
+    fn drain_completions(&self, cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>>;
 
     /// Flush any pending submissions to the kernel.
     /// Called at event loop boundaries to batch-submit SQEs.
@@ -87,6 +88,10 @@ pub enum Op {
         fd: i32,
         offset: u64,
         data: Buffer,
+    },
+    WriteStatic {
+        fd: i32,
+        data: &'static [u8],
     },
     Fsync {
         fd: i32,
@@ -157,7 +162,9 @@ pub struct IoToken {
     id: u64,
 }
 
-static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static TOKEN_COUNTER: Cell<u64> = const { Cell::new(1) };
+}
 
 impl Default for IoToken {
     fn default() -> Self {
@@ -166,11 +173,17 @@ impl Default for IoToken {
 }
 
 impl IoToken {
-    /// Creates a new, unique `IoToken` from a global atomic counter.
+    /// Creates a new `IoToken` from a thread-local counter.
+    ///
+    /// Tokens only need to be unique within the owning I/O backend. Keeping
+    /// this counter thread-local avoids a cross-core atomic fetch_add on every
+    /// I/O submission.
     pub fn new() -> Self {
-        Self {
-            id: TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed),
-        }
+        TOKEN_COUNTER.with(|counter| {
+            let id = counter.get();
+            counter.set(id.wrapping_add(1).max(1));
+            Self { id }
+        })
     }
 
     /// Returns the underlying `u64` ID of the token.
@@ -210,6 +223,7 @@ pub enum CompletionKind {
     },
     WriteVectored {
         bytes_written: usize,
+        buffers: Vec<Buffer>,
     },
     Fsync,
     Close,
@@ -247,14 +261,6 @@ pub enum CompletionKind {
     },
     PollAdd {
         events: u32,
-    },
-    /// A Write on a socket returned -EAGAIN. The io_uring backend has
-    /// submitted POLLOUT on the fd and will re-submit the write when
-    /// the socket becomes writable. The caller should transfer the waker
-    /// and pending_task from the current `token` to `new_token`.
-    WriteRetryWaiting {
-        new_token: IoToken,
-        fd: i32,
     },
     /// No-op completion — used for io_uring NOP benchmarking.
     Nop,

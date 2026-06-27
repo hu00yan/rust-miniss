@@ -58,7 +58,7 @@ impl TlsStream {
         let tls_stream = connector
             .connect(domain_name, compat_stream)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok(Self {
             inner: tls_stream.compat(),

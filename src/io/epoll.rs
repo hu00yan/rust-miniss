@@ -15,14 +15,16 @@ use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::task::{Context, Poll as TaskPoll};
 use std::time::Duration;
 use threadpool::ThreadPool;
 
 type IoCompletion = (IoToken, Op, Result<CompletionKind, IoError>);
-type CompletionQueue = Arc<std::sync::Mutex<Vec<IoCompletion>>>;
+const COMPLETION_QUEUE_CAPACITY: usize = 4096;
 
 /// Safe file descriptor wrapper that ensures RAII compliance
 #[derive(Debug)]
@@ -73,8 +75,11 @@ pub struct EpollBackend {
     next_token: UnsafeCell<usize>,
     /// Thread pool for blocking file I/O operations
     thread_pool: Arc<ThreadPool>,
-    /// Completed operations from the thread pool
-    completed_ops: CompletionQueue,
+    /// Same-thread completed operations.
+    completed_local: UnsafeCell<Vec<IoCompletion>>,
+    /// Completed operations from the file I/O thread pool.
+    completed_tx: SyncSender<IoCompletion>,
+    completed_rx: UnsafeCell<Receiver<IoCompletion>>,
 }
 
 // SAFETY: The `EpollBackend` is designed to be thread-local. It is created within a
@@ -90,6 +95,7 @@ impl EpollBackend {
         // Create a small thread pool for blocking I/O operations
         let pool_size = std::cmp::max(2, num_cpus::get() / 4);
         let thread_pool = Arc::new(ThreadPool::new(pool_size));
+        let (completed_tx, completed_rx) = sync_channel(COMPLETION_QUEUE_CAPACITY);
 
         Ok(Self {
             poll: UnsafeCell::new(Poll::new()?),
@@ -98,8 +104,15 @@ impl EpollBackend {
             udp_recv_buffers: UnsafeCell::new(HashMap::new()),
             next_token: UnsafeCell::new(0),
             thread_pool,
-            completed_ops: Arc::new(std::sync::Mutex::new(Vec::new())),
+            completed_local: UnsafeCell::new(Vec::new()),
+            completed_tx,
+            completed_rx: UnsafeCell::new(completed_rx),
         })
+    }
+
+    fn complete_local(&self, completion: IoCompletion) {
+        let completed_local = unsafe { &mut *self.completed_local.get() };
+        completed_local.push(completion);
     }
 }
 
@@ -140,7 +153,7 @@ impl IoProvider for EpollBackend {
                     pending_ops.insert(mio_token, (io_token, op));
                 }
             }
-            Op::Write { fd, .. } => {
+            Op::Write { fd, .. } | Op::WriteStatic { fd, .. } => {
                 let mut source = mio::unix::SourceFd(fd);
                 if let Err(e) = poll
                     .registry()
@@ -186,7 +199,7 @@ impl IoProvider for EpollBackend {
             }
             // File operations are handled asynchronously in thread pool
             Op::ReadFile { fd, offset, len } => {
-                let completed_ops = self.completed_ops.clone();
+                let completed_tx = self.completed_tx.clone();
                 let thread_pool = self.thread_pool.clone();
                 let op_clone = op.clone();
                 let io_token_copy = io_token;
@@ -215,12 +228,11 @@ impl IoProvider for EpollBackend {
                         Err(err) => Err(IoError::Io(err)),
                     };
 
-                    let mut completed_ops = completed_ops.lock().unwrap();
-                    completed_ops.push((io_token_copy, op_clone, result));
+                    let _ = completed_tx.send((io_token_copy, op_clone, result));
                 });
             }
             Op::WriteFile { fd, offset, data } => {
-                let completed_ops = self.completed_ops.clone();
+                let completed_tx = self.completed_tx.clone();
                 let thread_pool = self.thread_pool.clone();
                 let op_clone = op.clone();
                 let io_token_copy = io_token;
@@ -243,8 +255,7 @@ impl IoProvider for EpollBackend {
                             Err(err) => Err(IoError::Io(err)),
                         };
 
-                    let mut completed_ops = completed_ops.lock().unwrap();
-                    completed_ops.push((io_token_copy, op_clone, result));
+                    let _ = completed_tx.send((io_token_copy, op_clone, result));
                 });
             }
             Op::UdpRecv { fd, buffer } => {
@@ -256,7 +267,7 @@ impl IoProvider for EpollBackend {
                 {
                     eprintln!("Failed to register UDP socket with epoll: {e}");
                 }
-                // Store the buffer for use in poll_complete
+                // Store the buffer for use in drain_completions
                 let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                 udp_recv_buffers.insert(mio_token, buffer.clone());
                 pending_ops.insert(mio_token, (io_token, op));
@@ -286,8 +297,7 @@ impl IoProvider for EpollBackend {
                         .map_err(IoError::Io),
                     Err(err) => Err(IoError::Io(err)),
                 };
-                let mut completed_ops = self.completed_ops.lock().unwrap();
-                completed_ops.push((io_token, op.clone(), result));
+                self.complete_local((io_token, op.clone(), result));
             }
             Op::Close { fd } => {
                 let result = {
@@ -298,8 +308,7 @@ impl IoProvider for EpollBackend {
                         Ok(CompletionKind::Close)
                     }
                 };
-                let mut completed_ops = self.completed_ops.lock().unwrap();
-                completed_ops.push((io_token, op.clone(), result));
+                self.complete_local((io_token, op.clone(), result));
             }
             Op::PollAdd {
                 fd,
@@ -328,25 +337,31 @@ impl IoProvider for EpollBackend {
                     io::ErrorKind::Unsupported,
                     "Operation not supported by epoll backend",
                 )));
-                let mut completed_ops = self.completed_ops.lock().unwrap();
-                completed_ops.push((io_token, op, result));
+                self.complete_local((io_token, op, result));
             }
         };
 
         io_token
     }
 
-    fn poll_complete(&self, _cx: &mut Context<'_>) -> TaskPoll<Vec<Self::Completion>> {
+    fn drain_completions(&self, _cx: &mut Context<'_>) -> TaskPoll<Vec<Self::Completion>> {
         // SAFETY: We have exclusive, single-threaded access.
         let poll = unsafe { &mut *self.poll.get() };
         let events = unsafe { &mut *self.events.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
-        let mut completed_ops = self.completed_ops.lock().unwrap();
+        let completed_local = unsafe { &mut *self.completed_local.get() };
+        let completed_rx = unsafe { &mut *self.completed_rx.get() };
 
-        let mut completions = Vec::new();
+        let mut completions = mem::take(completed_local);
 
         // First, collect any completed operations from the thread pool
-        completions.extend(completed_ops.drain(..));
+        loop {
+            match completed_rx.try_recv() {
+                Ok(completion) => completions.push(completion),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
 
         // Poll for events non-blockingly to avoid delays.
         if let Err(e) = poll.poll(events, Some(Duration::from_millis(0))) {
@@ -479,6 +494,71 @@ impl IoProvider for EpollBackend {
                             {
                                 eprintln!(
                                     "Failed to re-register fd for write after WouldBlock: {reg_err}"
+                                );
+                            }
+                            pending_ops.insert(mio_token, (io_token, op.clone()));
+                            continue;
+                        }
+
+                        result
+                    }
+                    Op::WriteStatic { fd, data } => {
+                        let mut written = 0usize;
+                        let mut requeue = false;
+                        let result = loop {
+                            let remaining = &data[written..];
+                            if remaining.is_empty() {
+                                break Ok(CompletionKind::Write {
+                                    bytes_written: written,
+                                });
+                            }
+                            let ret = unsafe {
+                                libc::write(
+                                    *fd,
+                                    remaining.as_ptr() as *const libc::c_void,
+                                    remaining.len(),
+                                )
+                            };
+                            if ret < 0 {
+                                let err = io::Error::last_os_error();
+                                if err.kind() == io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                if err.kind() == io::ErrorKind::WouldBlock {
+                                    if written == 0 {
+                                        requeue = true;
+                                        break Err(IoError::Io(err));
+                                    } else {
+                                        break Ok(CompletionKind::Write {
+                                            bytes_written: written,
+                                        });
+                                    }
+                                }
+                                break if written > 0 {
+                                    Ok(CompletionKind::Write {
+                                        bytes_written: written,
+                                    })
+                                } else {
+                                    Err(IoError::Io(err))
+                                };
+                            } else {
+                                written += ret as usize;
+                                if written == data.len() {
+                                    break Ok(CompletionKind::Write {
+                                        bytes_written: written,
+                                    });
+                                }
+                            }
+                        };
+
+                        if requeue {
+                            let mut source = SourceFd(fd);
+                            if let Err(reg_err) =
+                                poll.registry()
+                                    .register(&mut source, mio_token, Interest::WRITABLE)
+                            {
+                                eprintln!(
+                                    "Failed to re-register fd for static write after WouldBlock: {reg_err}"
                                 );
                             }
                             pending_ops.insert(mio_token, (io_token, op.clone()));
@@ -653,7 +733,10 @@ impl IoProvider for EpollBackend {
                     Op::WriteVectored { fd, buffers } => {
                         let total_len: usize = buffers.iter().map(|b| b.len()).sum();
                         if total_len == 0 {
-                            Ok(CompletionKind::WriteVectored { bytes_written: 0 })
+                            Ok(CompletionKind::WriteVectored {
+                                bytes_written: 0,
+                                buffers: buffers.clone(),
+                            })
                         } else {
                             let mut written = 0usize;
                             let mut requeue = false;
@@ -681,6 +764,7 @@ impl IoProvider for EpollBackend {
                                 if iovecs.is_empty() {
                                     break Ok(CompletionKind::WriteVectored {
                                         bytes_written: written,
+                                        buffers: buffers.clone(),
                                     });
                                 }
                                 let ret = unsafe {
@@ -695,6 +779,7 @@ impl IoProvider for EpollBackend {
                                         if written > 0 {
                                             break Ok(CompletionKind::WriteVectored {
                                                 bytes_written: written,
+                                                buffers: buffers.clone(),
                                             });
                                         }
                                         requeue = true;
@@ -703,6 +788,7 @@ impl IoProvider for EpollBackend {
                                     break if written > 0 {
                                         Ok(CompletionKind::WriteVectored {
                                             bytes_written: written,
+                                            buffers: buffers.clone(),
                                         })
                                     } else {
                                         Err(IoError::Io(err))
@@ -712,6 +798,7 @@ impl IoProvider for EpollBackend {
                                     if written >= total_len {
                                         break Ok(CompletionKind::WriteVectored {
                                             bytes_written: written,
+                                            buffers: buffers.clone(),
                                         });
                                     }
                                 }
@@ -838,6 +925,7 @@ impl AsRawFd for Op {
             Op::Accept { fd } => fd,
             Op::Read { fd, .. } => fd,
             Op::Write { fd, .. } => fd,
+            Op::WriteStatic { fd, .. } => fd,
             Op::Fsync { fd, .. } => fd,
             Op::Close { fd, .. } => fd,
             Op::ReadFile { fd, .. } => fd,
@@ -852,6 +940,7 @@ impl AsRawFd for Op {
             Op::ReadRent { fd, .. } => fd,
             Op::WriteRent { fd, .. } => fd,
             Op::PollAdd { fd, .. } => fd,
+            Op::Nop => panic!("Nop has no file descriptor"),
         }
     }
 }

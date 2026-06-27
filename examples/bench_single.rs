@@ -17,10 +17,9 @@ const DURATION_SECS: u64 = 5;
 
 async fn handle_client(mut stream: AsyncTcpStream) {
     let mut buf = vec![0u8; 4096];
+    let mut resp = Vec::with_capacity(8192);
     if let Ok(n) = stream.read(&mut buf).await {
-        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
-        let mut resp = Vec::with_capacity(header.len() + n);
-        resp.extend_from_slice(header.as_bytes());
+        let _ = write!(resp, "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
         resp.extend_from_slice(&buf[..n]);
         let _ = stream.write_all(&resp).await;
     }
@@ -30,7 +29,7 @@ fn main() {
     let rt = Runtime::new();
     let (port_tx, port_rx) = std::sync::mpsc::channel();
 
-    let server = std::thread::spawn(move || {
+    let _server = std::thread::spawn(move || {
         rt.block_on(async {
             let listener =
                 AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();

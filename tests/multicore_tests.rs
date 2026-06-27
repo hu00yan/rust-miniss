@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use rust_miniss::timer::*;
-    use std::sync::Arc;
     use std::{task::*, time::*};
 
     fn init_tracing() {
@@ -10,14 +9,8 @@ mod tests {
             .try_init();
     }
 
-    struct TestWaker;
-
-    impl Wake for TestWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn create_test_waker() -> Waker {
-        Arc::new(TestWaker).into()
+        Waker::noop().clone()
     }
 
     #[test]
@@ -140,30 +133,26 @@ fn test_multicore_basic_functionality() {
 fn test_multicore_cross_cpu_communication() {
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
-    let results = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let (tx, rx) = mpsc::channel();
     for _ in 0..4 {
-        let results_clone = results.clone();
         let tx_clone = tx.clone();
         runtime
             .spawn(async move {
                 // Simulate some work
                 std::thread::yield_now();
-                // Since we can't control which CPU the task runs on, we'll just push a value
-                results_clone.lock().unwrap().push(1);
-                tx_clone.send(()).unwrap();
+                tx_clone.send(1usize).unwrap();
             })
             .unwrap();
     }
 
     // Wait for all tasks to complete
+    let mut results = Vec::new();
     for _ in 0..4 {
-        rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        results.push(rx.recv_timeout(Duration::from_millis(200)).unwrap());
     }
 
-    let final_results = results.lock().unwrap();
-    assert_eq!(final_results.len(), 4);
+    assert_eq!(results.len(), 4);
 
     runtime.shutdown().unwrap();
 }

@@ -8,15 +8,14 @@
 //! In the thread-per-core model, all Waker operations (clone/wake/drop)
 //! happen on the same thread that created the Waker. Therefore we use:
 //! - `Rc` (non-atomic refcount) instead of `Arc` for the outer wrapper
-//! - Raw `*const SegQueue` pointer instead of `Arc<SegQueue>` to avoid
-//!   atomic refcount bumps on every wake operation
+//! - Raw `*const VecDeque` pointer instead of a shared locked queue to avoid
+//!   atomic operations on every wake
 //!
-//! The SegQueue is owned by CpuCore or Executor and lives for the entire
-//! runtime — strictly longer than any Waker — so the raw pointer is safe.
+//! The VecDeque is owned by CpuCore and lives for the entire runtime —
+//! strictly longer than any Waker — so the raw pointer is safe.
 
-use crossbeam_queue::SegQueue;
+use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 /// A task ID that uniquely identifies a task in the executor
@@ -31,11 +30,11 @@ impl TaskId {
 
 /// Waker implementation that can reschedule tasks
 ///
-/// Uses a raw pointer to the SegQueue to avoid atomic refcount operations.
+/// Uses a raw pointer to the VecDeque to avoid atomic refcount operations.
 /// The queue outlives all Wakers because it is owned by the runtime thread.
 pub struct MinissWaker {
     task_id: TaskId,
-    queue: *const SegQueue<TaskId>,
+    queue: *const VecDeque<TaskId>,
 }
 
 // SAFETY: MinissWaker is only accessed from the owning CPU thread.
@@ -46,14 +45,10 @@ unsafe impl Sync for MinissWaker {}
 impl MinissWaker {
     /// Create a new waker for the given task
     ///
-    /// Takes `&Arc<SegQueue>` for ergonomic calling — callers pass
-    /// `&self.ready_queue` without cloning the Arc. Internally we
-    /// extract the raw pointer for zero-overhead access.
-    pub fn create_waker(task_id: TaskId, queue: &Arc<SegQueue<TaskId>>) -> Waker {
-        let waker = Rc::new(MinissWaker {
-            task_id,
-            queue: Arc::as_ptr(queue),
-        });
+    /// Takes a raw `*const VecDeque<TaskId>` pointer for zero-overhead access.
+    /// The VecDeque is owned by the CpuCore and outlives all Wakers.
+    pub fn create_waker(task_id: TaskId, queue: *const VecDeque<TaskId>) -> Waker {
+        let waker = Rc::new(MinissWaker { task_id, queue });
         let raw_waker = RawWaker::new(Rc::into_raw(waker) as *const (), &VTABLE);
         unsafe { Waker::from_raw(raw_waker) }
     }
@@ -62,9 +57,10 @@ impl MinissWaker {
     #[inline(always)]
     fn wake_impl(&self) {
         // SAFETY: The raw pointer is valid for the lifetime of this Waker.
-        // The SegQueue is owned by the runtime thread and outlives all Wakers.
-        let queue = unsafe { &*self.queue };
-        queue.push(self.task_id);
+        // The VecDeque is owned by the runtime thread and outlives all Wakers.
+        // Since this is thread-per-core, the cast to *mut is safe.
+        let queue = unsafe { &mut *self.queue.cast_mut() };
+        queue.push_back(self.task_id);
     }
 }
 
@@ -124,24 +120,24 @@ mod tests {
 
     #[test]
     fn test_waker_creation() {
-        let queue = Arc::new(SegQueue::new());
+        let mut queue = VecDeque::new();
         let task_id = TaskId(42);
 
-        let waker = MinissWaker::create_waker(task_id, &queue);
+        let waker = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
 
         // Wake the task
         waker.wake();
 
         // Check that task was added to queue
-        assert_eq!(queue.pop(), Some(task_id));
+        assert_eq!(queue.pop_front(), Some(task_id));
     }
 
     #[test]
     fn test_waker_clone() {
-        let queue = Arc::new(SegQueue::new());
+        let mut queue = VecDeque::new();
         let task_id = TaskId(99);
 
-        let waker1 = MinissWaker::create_waker(task_id, &queue);
+        let waker1 = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
         let waker2 = waker1.clone();
 
         // Both wakers should work
@@ -149,36 +145,36 @@ mod tests {
         waker2.wake();
 
         // Should have two entries in queue
-        assert_eq!(queue.pop(), Some(task_id));
-        assert_eq!(queue.pop(), Some(task_id));
-        assert_eq!(queue.pop(), None);
+        assert_eq!(queue.pop_front(), Some(task_id));
+        assert_eq!(queue.pop_front(), Some(task_id));
+        assert_eq!(queue.pop_front(), None);
     }
 
     #[test]
     fn test_waker_wake_by_ref() {
-        let queue = Arc::new(SegQueue::new());
+        let mut queue = VecDeque::new();
         let task_id = TaskId(123);
 
-        let waker = MinissWaker::create_waker(task_id, &queue);
+        let waker = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
 
         // Wake by reference
         waker.wake_by_ref();
 
         // Task should be in queue
-        assert_eq!(queue.pop(), Some(task_id));
+        assert_eq!(queue.pop_front(), Some(task_id));
 
         // Waker should still be usable
         waker.wake();
-        assert_eq!(queue.pop(), Some(task_id));
+        assert_eq!(queue.pop_front(), Some(task_id));
     }
 
     /// Verify that Rc refcount is managed correctly — no leaks, no double-frees.
     #[test]
     fn test_waker_drop_after_clone() {
-        let queue = Arc::new(SegQueue::new());
+        let mut queue = VecDeque::new();
         let task_id = TaskId(77);
 
-        let waker = MinissWaker::create_waker(task_id, &queue);
+        let waker = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
         let cloned = waker.clone();
 
         // Drop the original
@@ -186,7 +182,7 @@ mod tests {
 
         // The clone should still work (wake_by_ref doesn't consume)
         cloned.wake_by_ref();
-        assert_eq!(queue.pop(), Some(task_id));
+        assert_eq!(queue.pop_front(), Some(task_id));
 
         // Drop the clone (both should drop cleanly)
         drop(cloned);

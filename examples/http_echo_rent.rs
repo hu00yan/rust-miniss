@@ -1,41 +1,59 @@
-//! True zero-copy HTTP echo using read_rent / write_rent.
+//! Owned-buffer HTTP echo using read_rent and vectored writes.
 //!
 //! The key insight: read data stays in the Buffer the kernel wrote into.
-//! No memcpy of payload at any point:
+//! The response uses one writev submission for header + body:
 //!   1. read_rent → kernel fills user's Buffer directly (zero copy)
-//!   2. write_rent(header) → small header from a separate Buffer
-//!   3. write_rent(body) → the original read Buffer goes straight to kernel (zero copy)
+//!   2. write_vectored_rent(header, body) → one kernel writev operation
 //!
 //! HTTP pipelining over a single TCP connection works because TCP
 //! guarantees ordering: header bytes arrive before body bytes.
 
+use futures::io::AsyncWriteExt;
 use rust_miniss::net::AsyncTcpListener;
 use rust_miniss::{Buffer, MultiCoreRuntime};
 
 use std::io;
+use std::io::Write as _;
 use std::net::SocketAddr;
 
-async fn handle_client(stream: rust_miniss::net::AsyncTcpStream) {
+async fn write_response(
+    stream: &mut rust_miniss::net::AsyncTcpStream,
+    header: Buffer,
+    body: Buffer,
+) -> io::Result<Buffer> {
+    let total_len = header.len() + body.len();
+    let (written, mut buffers) = stream.write_vectored_rent(vec![header, body]).await?;
+
+    let header = buffers.remove(0);
+    let body = buffers.remove(0);
+    if written >= total_len {
+        return Ok(body);
+    }
+
+    if written < header.len() {
+        stream.write_all(&header[written..]).await?;
+        stream.write_all(&body).await?;
+    } else {
+        let body_offset = written - header.len();
+        stream.write_all(&body[body_offset..]).await?;
+    }
+
+    Ok(body)
+}
+
+async fn handle_client(mut stream: rust_miniss::net::AsyncTcpStream) {
     // Single buffer per connection, reused across the entire lifecycle.
     let mut buf = Buffer::with_capacity(8192);
+    let mut header = Vec::with_capacity(64);
 
     loop {
         match stream.read_rent(buf).await {
             Ok((0, _consumed)) => break,
             Ok((n, read_buf)) => {
-                // Build HTTP header (small, unavoidable allocation for text).
-                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
-                let header_buf = Buffer::from_slice(header.as_bytes());
-
-                // Write header. On error, the connection is dead.
-                if stream.write_rent(header_buf).await.is_err() {
-                    break;
-                }
-
-                // Write body directly — zero copy of the payload.
-                // The returned buffer is reused for the next read.
-                match stream.write_rent(read_buf).await {
-                    Ok((_, returned_buf)) => buf = returned_buf,
+                header.clear();
+                let _ = write!(header, "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
+                match write_response(&mut stream, Buffer::from_slice(&header), read_buf).await {
+                    Ok(returned_body) => buf = returned_body,
                     Err(_) => break,
                 }
             }
@@ -55,8 +73,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let runtime = MultiCoreRuntime::new(Some(1))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let runtime = MultiCoreRuntime::new(Some(1)).map_err(|e| io::Error::other(e.to_string()))?;
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
     let rt = runtime.clone();
@@ -82,7 +99,7 @@ fn main() -> io::Result<()> {
                 }
             }
         })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     std::thread::park();
     Ok(())

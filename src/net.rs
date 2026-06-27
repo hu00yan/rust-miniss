@@ -2,6 +2,8 @@ use crate::cpu::{current_task_id, io_state};
 use crate::io::IoToken;
 use crate::Buffer;
 use futures::io::{AsyncRead, AsyncWrite};
+use libc;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -23,6 +25,26 @@ impl AsyncTcpListener {
     }
 
     /// Accepts a new incoming connection from this listener.
+    /// Bind with SO_REUSEPORT so one listener can be created per worker core.
+    pub fn bind_reuse_port<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
+        let addr = addr.into();
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        let listener: TcpListener = socket.into();
+        listener.set_nonblocking(true)?;
+        Ok(Self { inner: listener })
+    }
+
     pub async fn accept(&self) -> io::Result<(AsyncTcpStream, Option<SocketAddr>)> {
         let state = io_state();
         let op = crate::io::Op::Accept {
@@ -30,15 +52,16 @@ impl AsyncTcpListener {
         };
         let token = state.io_backend.submit(op);
         let future = crate::io::future::IoFuture::new(token);
-        match future.await? {
+        let result = future.await;
+        match result? {
             crate::io::CompletionKind::Accept { fd, addr } => {
                 let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
                 let async_stream = AsyncTcpStream::new(stream)?;
                 Ok((async_stream, addr))
             }
-            _ => Err(io::Error::new(
+            other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Unexpected completion",
+                format!("Unexpected completion: {other:?}"),
             )),
         }
     }
@@ -61,6 +84,10 @@ pub struct AsyncTcpStream {
     inner: TcpStream,
     read_token: Option<IoToken>,
     write_token: Option<IoToken>,
+    /// Token for POLLOUT submitted after a Write returned EAGAIN.
+    /// The task is woken when the socket becomes writable, then
+    /// a fresh Write is submitted.
+    pollout_token: Option<IoToken>,
 }
 
 impl AsyncTcpStream {
@@ -68,10 +95,31 @@ impl AsyncTcpStream {
     pub fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
+        // Increase send/recv buffer to reduce EAGAIN frequency under load.
+        // Default 16KB is too small for high-throughput echo benchmarks.
+        let fd = stream.as_raw_fd();
+        unsafe {
+            let size: u32 = 256 * 1024;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
         Ok(Self {
             inner: stream,
             read_token: None,
             write_token: None,
+            pollout_token: None,
         })
     }
 
@@ -113,6 +161,88 @@ impl AsyncTcpStream {
                 bytes_written,
                 data,
             } => Ok((bytes_written, data)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
+        }
+    }
+
+    /// Write multiple owned buffers with one vectored I/O operation.
+    /// Returns the buffers so callers can recycle or reuse them.
+    pub async fn write_vectored_rent(
+        &self,
+        buffers: Vec<Buffer>,
+    ) -> io::Result<(usize, Vec<Buffer>)> {
+        let state = io_state();
+        let op = crate::io::Op::WriteVectored {
+            fd: self.inner.as_raw_fd(),
+            buffers,
+        };
+        let token = state.io_backend.submit(op);
+        let future = crate::io::future::IoFuture::new(token);
+        match future.await? {
+            crate::io::CompletionKind::WriteVectored {
+                bytes_written,
+                buffers,
+            } => Ok((bytes_written, buffers)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion",
+            )),
+        }
+    }
+
+    /// Write a static byte slice without copying it into an owned Buffer.
+    pub async fn write_static_all(&self, mut data: &'static [u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let state = io_state();
+            let op = crate::io::Op::WriteStatic {
+                fd: self.inner.as_raw_fd(),
+                data,
+            };
+            let token = state.io_backend.submit(op);
+            let future = crate::io::future::IoFuture::new(token);
+            match future.await {
+                Ok(crate::io::CompletionKind::Write { bytes_written }) => {
+                    if bytes_written == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write_static_all wrote zero bytes",
+                        ));
+                    }
+                    data = &data[bytes_written..];
+                }
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected completion",
+                    ));
+                }
+                Err(crate::io::IoError::Io(e))
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == Some(libc::EAGAIN) =>
+                {
+                    self.wait_writable().await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn wait_writable(&self) -> io::Result<()> {
+        let state = io_state();
+        let op = crate::io::Op::PollAdd {
+            fd: self.inner.as_raw_fd(),
+            events: libc::POLLOUT as u32,
+            multishot: false,
+        };
+        let token = state.io_backend.submit(op);
+        let future = crate::io::future::IoFuture::new(token);
+        match future.await? {
+            crate::io::CompletionKind::PollAdd { .. } => Ok(()),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Unexpected completion",
@@ -203,10 +333,17 @@ impl IntoRawFd for AsyncTcpStream {
             if let Some(token) = self.read_token {
                 state.take_waker(token);
                 state.take_completed(token);
+                state.take_pending_task(token);
             }
             if let Some(token) = self.write_token {
                 state.take_waker(token);
                 state.take_completed(token);
+                state.take_pending_task(token);
+            }
+            if let Some(token) = self.pollout_token {
+                state.take_waker(token);
+                state.take_completed(token);
+                state.take_pending_task(token);
             }
         }
         std::mem::forget(self);
@@ -225,6 +362,11 @@ impl Drop for AsyncTcpStream {
                     state.take_pending_task(token);
                 }
                 if let Some(token) = self.write_token {
+                    state.take_waker(token);
+                    state.take_completed(token);
+                    state.take_pending_task(token);
+                }
+                if let Some(token) = self.pollout_token {
                     state.take_waker(token);
                     state.take_completed(token);
                     state.take_pending_task(token);
@@ -353,6 +495,19 @@ impl AsyncWrite for AsyncTcpStream {
     ) -> Poll<io::Result<usize>> {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
+
+        // Clear stale POLLOUT completion (fire-and-forget).
+        // POLLOUT just serves as a wakeup mechanism when the socket
+        // becomes writable after an EAGAIN; the completion itself is
+        // discarded, then poll_write submits a fresh Write SQE.
+        if let Some(pollout_tok) = this.pollout_token.take() {
+            unsafe {
+                state.take_waker(pollout_tok);
+                state.take_completed(pollout_tok);
+                state.take_pending_task(pollout_tok);
+            }
+        }
+
         let token = if let Some(token) = this.write_token {
             // SAFETY: Single-threaded access.
             if let Some(result) = unsafe { state.take_completed(token) } {
@@ -365,6 +520,26 @@ impl AsyncWrite for AsyncTcpStream {
                         io::ErrorKind::InvalidData,
                         "Unexpected completion",
                     ))),
+                    Err(ref e) if is_write_wouldblock(e) => {
+                        // Socket send buffer full. Submit POLLOUT to be
+                        // notified when buffer space becomes available.
+                        // Then return Pending; the task will be woken by
+                        // POLLOUT and retry the write with a fresh SQE.
+                        let pollout_op = crate::io::Op::PollAdd {
+                            fd: this.inner.as_raw_fd(),
+                            events: libc::POLLOUT as u32,
+                            multishot: false,
+                        };
+                        let pollout_tok = state.io_backend.submit(pollout_op);
+                        this.pollout_token = Some(pollout_tok);
+                        unsafe {
+                            state.store_waker(pollout_tok, cx.waker().clone());
+                            if let Some(task_id) = current_task_id() {
+                                state.store_pending_task(pollout_tok, task_id);
+                            }
+                        }
+                        return Poll::Pending;
+                    }
                     Err(e) => Poll::Ready(Err(e.into())),
                 };
             }
@@ -396,18 +571,45 @@ impl AsyncWrite for AsyncTcpStream {
     ) -> Poll<io::Result<usize>> {
         let state = io_state();
         let this = unsafe { self.as_mut().get_unchecked_mut() };
+
+        // Clear stale POLLOUT completion (fire-and-forget).
+        if let Some(pollout_tok) = this.pollout_token.take() {
+            unsafe {
+                state.take_waker(pollout_tok);
+                state.take_completed(pollout_tok);
+                state.take_pending_task(pollout_tok);
+            }
+        }
+
         let token = if let Some(token) = this.write_token {
             // SAFETY: Single-threaded access.
             if let Some(result) = unsafe { state.take_completed(token) } {
                 this.write_token = None;
                 return match result {
-                    Ok(crate::io::CompletionKind::WriteVectored { bytes_written }) => {
+                    Ok(crate::io::CompletionKind::WriteVectored { bytes_written, .. }) => {
                         Poll::Ready(Ok(bytes_written))
                     }
                     Ok(_) => Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Unexpected completion",
                     ))),
+                    Err(ref e) if is_write_wouldblock(e) => {
+                        // Same as poll_write: EAGAIN → POLLOUT → retry
+                        let pollout_op = crate::io::Op::PollAdd {
+                            fd: this.inner.as_raw_fd(),
+                            events: libc::POLLOUT as u32,
+                            multishot: false,
+                        };
+                        let pollout_tok = state.io_backend.submit(pollout_op);
+                        this.pollout_token = Some(pollout_tok);
+                        unsafe {
+                            state.store_waker(pollout_tok, cx.waker().clone());
+                            if let Some(task_id) = current_task_id() {
+                                state.store_pending_task(pollout_tok, task_id);
+                            }
+                        }
+                        return Poll::Pending;
+                    }
                     Err(e) => Poll::Ready(Err(e.into())),
                 };
             }
@@ -450,6 +652,24 @@ impl AsyncUdpSocket {
     pub fn bind<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr.into())?;
         socket.set_nonblocking(true)?;
+        let fd = socket.as_raw_fd();
+        unsafe {
+            let size: u32 = 4 * 1024 * 1024;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
         Ok(Self { inner: socket })
     }
 
@@ -543,6 +763,18 @@ fn socket_addr_len(addr: &SocketAddr) -> libc::socklen_t {
     match addr {
         SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
         SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+    }
+}
+
+/// Check if an IoError represents a "write would block" condition (EAGAIN/EWOULDBLOCK).
+/// io_uring returns -EAGAIN when the socket send buffer is full.
+fn is_write_wouldblock(e: &crate::io::IoError) -> bool {
+    match e {
+        crate::io::IoError::Io(io_err) => {
+            io_err.raw_os_error() == Some(libc::EAGAIN)
+                || io_err.raw_os_error() == Some(libc::EWOULDBLOCK)
+        }
+        _ => false,
     }
 }
 

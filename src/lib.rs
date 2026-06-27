@@ -102,6 +102,6 @@ pub fn block_on<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {
-    let runtime = MultiCoreRuntime::new(Some(1)).expect("Failed to create runtime");
-    runtime.block_on(future)
+    let runtime = MultiCoreRuntime::new(Some(1)).expect("Failed to create runtime"); // arch-audit: allow control-plane convenience wrapper
+    runtime.block_on(future) // arch-audit: allow control-plane convenience wrapper
 }

@@ -1,8 +1,5 @@
-use rust_miniss::{
-    AsyncFile, CompletionKind, Executor, IoProvider, MultiCoreRuntime, Op, Runtime, TaskError,
-};
+use rust_miniss::{AsyncFile, Executor, MultiCoreRuntime, Runtime, TaskError};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 #[test]
@@ -48,6 +45,44 @@ fn async_file_sync_all_completes_after_write() {
         file.sync_all().await.expect("sync_all");
 
         assert_eq!(std::fs::read(&temp_path).expect("read back"), data);
+    });
+}
+
+#[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn tcp_read_rent_reads_into_empty_capacity_buffer() {
+    use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
+    use rust_miniss::Buffer;
+    use std::net::SocketAddr;
+
+    let runtime = Runtime::new();
+
+    runtime.block_on(async {
+        let listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let buf = Buffer::with_capacity(64);
+            assert_eq!(buf.len(), 0);
+            assert!(buf.capacity() >= 64);
+
+            let (n, buf) = stream.read_rent(buf).await.unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(buf.len(), 5);
+            assert_eq!(&buf[..], b"hello");
+        };
+
+        let client = async move {
+            let stream = AsyncTcpStream::connect(addr).await.unwrap();
+            stream
+                .write_rent(Buffer::from_slice(b"hello"))
+                .await
+                .unwrap();
+        };
+
+        futures::future::join(server, client).await;
     });
 }
 
@@ -128,7 +163,9 @@ fn multicore_spawned_async_file_future_completes() {
 fn mio_backend_close_completes_successfully_once() {
     use rust_miniss::cpu::{clear_current_io_state, set_current_io_state, CpuIoState};
     use rust_miniss::io::epoll::EpollBackend;
+    use rust_miniss::{CompletionKind, IoProvider, Op};
     use std::os::fd::IntoRawFd;
+    use std::task::{Context, Poll};
 
     struct IoStateGuard;
 
@@ -139,21 +176,22 @@ fn mio_backend_close_completes_successfully_once() {
     }
 
     let backend = Arc::new(EpollBackend::new().expect("backend"));
-    let state = Arc::new(CpuIoState {
+    let state = CpuIoState {
         io_backend: backend.clone(),
         io_wakers: Default::default(),
         completed_io: Default::default(),
         pending_tasks: Default::default(),
-    });
+    };
     set_current_io_state(&state);
     let _guard = IoStateGuard;
 
     let fd = tempfile::tempfile().expect("temp file").into_raw_fd();
     let token = backend.submit(Op::Close { fd });
+    backend.flush();
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
 
-    match backend.poll_complete(&mut cx) {
+    match backend.drain_completions(&mut cx) {
         Poll::Ready(completions) => {
             let (_, _, result) = completions
                 .into_iter()

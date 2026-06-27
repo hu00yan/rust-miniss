@@ -4,9 +4,33 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "glommio_echo" 
+name = "glommio_echo"
 path = "glommio_echo.rs"
+
+[[bin]]
+name = "monoio_echo"
+path = "monoio_echo.rs"
+
+[[bin]]
+name = "compio_echo"
+path = "compio_echo.rs"
+
+[[bin]]
+name = "tokio_echo"
+path = "tokio_echo.rs"
 
 [dependencies]
 glommio = "0.9"
+monoio = { version = "0.2", default-features = true, features = ["sync", "macros"] }
+# compio 0.12 — last version that compiles on stable Rust (1.88+).
+# 0.19+ requires nightly (maybe_uninit_slice / #63569).
+# NOTE: API paths may differ from 0.19. If compilation fails on Linux,
+# consider `rustup install nightly && rustup run nightly cargo build ...`
+# with the 0.19 version.
+# compio 0.12 — last version that compiles on stable Rust (1.88+).
+# Use minimal features for echo server benchmark.
+compio = { version = "0.12", features = ["event", "runtime", "io"] }
+compio-io = "0.4"
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
 futures-lite = "1"
+futures-util = "0.3"

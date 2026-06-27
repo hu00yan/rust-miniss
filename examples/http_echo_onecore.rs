@@ -5,17 +5,21 @@ use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
 use rust_miniss::MultiCoreRuntime;
 
 use std::io;
+use std::io::Write as _;
 use std::net::SocketAddr;
 
 async fn handle_client(mut stream: AsyncTcpStream) {
     let mut buf = vec![0u8; 4096];
+    let mut response = Vec::with_capacity(8192);
     loop {
         match stream.read(&mut buf).await {
             Ok(0) => break,
             Ok(bytes_read) => {
-                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes_read);
-                let mut response = Vec::with_capacity(header.len() + bytes_read);
-                response.extend_from_slice(header.as_bytes());
+                response.clear();
+                let _ = write!(
+                    response,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {bytes_read}\r\n\r\n"
+                );
                 response.extend_from_slice(&buf[..bytes_read]);
                 if stream.write_all(&response).await.is_err() {
                     break;
@@ -37,8 +41,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let runtime = MultiCoreRuntime::new(Some(1))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let runtime = MultiCoreRuntime::new(Some(1)).map_err(|e| io::Error::other(e.to_string()))?;
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
     // Spawn the accept loop as a task on core 0.
@@ -67,7 +70,7 @@ fn main() -> io::Result<()> {
                 }
             }
         })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     // Park main thread — core 0 runs everything.
     std::thread::park();

@@ -6,9 +6,11 @@ use crate::buffer::Buffer;
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 use io_uring::{cqueue, opcode, types, IoUring};
 use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
+use rustc_hash::FxHashMap;
 use slab::Slab;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::io;
+use std::mem;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -32,6 +34,9 @@ enum PendingOp {
     Write {
         op: Op,
         data: Buffer,
+    },
+    WriteStatic {
+        op: Op,
     },
     // ... existing UdpRecv/UdpSend extended for multi
     UdpRecv {
@@ -76,23 +81,30 @@ enum PendingOp {
     PollAdd {
         op: Op,
     },
-    /// Write got EAGAIN — waiting for POLLOUT before retry.
-    WriteEagain {
-        fd: i32,
-        data: Buffer,
-        orig_token: u64,
-    },
     Nop {
         op: Op,
     },
 }
+
+/// The completion type for the io_uring backend.
+pub(super) type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
 
 /// A `io-uring` based `IoProvider`.
 /// Thread-local to ensure single-threaded access.
 pub struct UringBackend {
     ring: UnsafeCell<IoUring>,
     pending_ops: UnsafeCell<Slab<PendingOp>>,
-    completed_ops: UnsafeCell<Vec<(IoToken, Op, Result<CompletionKind, IoError>)>>,
+    /// Mapping from unique token ID -> slab index.
+    /// Prevents CQE misrouting when slab slots are reused.
+    token_to_idx: UnsafeCell<FxHashMap<u64, usize>>,
+    /// Monotonically increasing token ID counter. Never reuses IDs,
+    /// unlike slab indices which are recycled immediately on remove.
+    next_token_id: Cell<u64>,
+    completed_ops: UnsafeCell<Vec<Completion>>,
+    /// Reused buffer for CQE collection — avoids per-call Vec allocation.
+    cqe_buffer: UnsafeCell<Vec<io_uring::cqueue::Entry>>,
+    /// Count of SQEs not yet flushed. Zero means flush() can skip the syscall.
+    pending_sqes: Cell<usize>,
     thread_id: std::thread::ThreadId,
 }
 
@@ -102,16 +114,37 @@ unsafe impl Sync for UringBackend {}
 
 impl UringBackend {
     pub fn new(entries: u32) -> io::Result<Self> {
-        let ring = IoUring::builder()
-            .setup_single_issuer()
-            .setup_defer_taskrun()
-            .setup_coop_taskrun()
-            .build(entries)?;
+        fn base_builder() -> io_uring::Builder {
+            let mut builder = IoUring::builder();
+            builder
+                .setup_single_issuer()
+                .setup_defer_taskrun()
+                .setup_coop_taskrun();
+            builder
+        }
+
+        let ring = if std::env::var_os("MINISS_URING_SQPOLL").is_some() {
+            let mut builder = base_builder();
+            builder.setup_sqpoll(1000);
+            match builder.build(entries) {
+                Ok(ring) => ring,
+                Err(err) => {
+                    tracing::warn!("io_uring SQPOLL unavailable, falling back: {err}");
+                    base_builder().build(entries)?
+                }
+            }
+        } else {
+            base_builder().build(entries)?
+        };
         Ok(Self {
             ring: UnsafeCell::new(ring),
             // Use at least 64 entries for slab capacity
             pending_ops: UnsafeCell::new(Slab::with_capacity(std::cmp::max(entries, 64) as usize)),
+            token_to_idx: UnsafeCell::new(FxHashMap::default()),
+            next_token_id: Cell::new(1),
             completed_ops: UnsafeCell::new(Vec::new()),
+            cqe_buffer: UnsafeCell::new(Vec::with_capacity(entries as usize)),
+            pending_sqes: Cell::new(0),
             thread_id: std::thread::current().id(),
         })
     }
@@ -121,8 +154,8 @@ impl IoProvider for UringBackend {
     type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
 
     fn submit(&self, op: Op) -> IoToken {
-        // Ensure single-threaded use
-        assert_eq!(
+        // Ensure single-threaded use (debug builds only)
+        debug_assert_eq!(
             std::thread::current().id(),
             self.thread_id,
             "UringBackend must be used on the same thread"
@@ -198,6 +231,17 @@ impl IoProvider for UringBackend {
                                 data: Buffer::empty(),
                             },
                             data,
+                        },
+                    )
+                }
+                Op::WriteStatic { fd, data } => {
+                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
+                        .offset(0)
+                        .build();
+                    (
+                        entry,
+                        PendingOp::WriteStatic {
+                            op: Op::WriteStatic { fd, data },
                         },
                     )
                 }
@@ -358,12 +402,9 @@ impl IoProvider for UringBackend {
                             iov_len: buf.capacity(),
                         })
                         .collect();
-                    let entry = opcode::Readv::new(
-                        types::Fd(fd),
-                        iovecs.as_ptr() as *const iovec,
-                        iovecs.len() as u32,
-                    )
-                    .build();
+                    let entry =
+                        opcode::Readv::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
+                            .build();
                     let pending_op = PendingOp::ReadVectored {
                         op: Op::ReadVectored {
                             fd,
@@ -382,12 +423,9 @@ impl IoProvider for UringBackend {
                             iov_len: buf.len(),
                         })
                         .collect();
-                    let entry = opcode::Writev::new(
-                        types::Fd(fd),
-                        iovecs.as_ptr() as *const iovec,
-                        iovecs.len() as u32,
-                    )
-                    .build();
+                    let entry =
+                        opcode::Writev::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
+                            .build();
                     let pending_op = PendingOp::WriteVectored {
                         op: Op::WriteVectored {
                             fd,
@@ -461,7 +499,7 @@ impl IoProvider for UringBackend {
                 Op::ReadRent { fd, buffer } => {
                     let mut buf = buffer;
                     let entry =
-                        opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+                        opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.capacity() as u32)
                             .offset(0)
                             .build();
                     (
@@ -536,196 +574,131 @@ impl IoProvider for UringBackend {
             }
         };
 
-        // Insert into slab to get index, use index as user_data (zero-alloc O(1) lookup)
+        // Insert into slab to get efficient O(1) storage.
         let idx = pending_ops.insert(pending_op);
-        let token = IoToken::from_id(idx as u64);
-        let entry = entry.user_data(idx as u64);
 
-        // Proactive flush when SQ is filling up — avoids emergency flushes
-        // that would break batch semantics. Thresholds: >75% capacity or >128 entries.
-        let should_flush = {
-            // submission() borrows ring mutably; scope it so submit() can borrow later
-            let sq = ring.submission();
-            sq.len() > (sq.capacity() * 3 / 4) || sq.len() > 128
-        };
-        if should_flush {
-            let _ = ring.submit();
-        }
+        // Use a monotonically increasing ID as user_data, NOT the slab index.
+        // Slab indices are immediately recycled on try_remove, which causes CQE
+        // misrouting when a completion arrives after the slot has been reused
+        // by a different operation.
+        let token_id = self.next_token_id.get();
+        self.next_token_id.set(token_id + 1);
+        let token_to_idx = unsafe { &mut *self.token_to_idx.get() };
+        token_to_idx.insert(token_id, idx);
+        let token = IoToken::from_id(token_id);
+        let entry = entry.user_data(token_id);
 
-        // Push to submission queue. Single push, no retry — proactive flush above
-        // should keep SQ from ever being completely full.
+        // Push to submission queue. If SQ is full, flush and retry.
+        // NO proactive flush here — batch submission happens in flush() at event loop boundary.
         if unsafe { ring.submission().push(&entry) }.is_err() {
-            pending_ops.try_remove(idx);
-            eprintln!("SQ full, dropping op (ring too small?)");
+            // SQ full: do an emergency flush, then retry the push.
+            let _ = ring.submit();
+            self.pending_sqes.set(0);
+            if unsafe { ring.submission().push(&entry) }.is_err() {
+                // Still full after flush — ring is too small, drop the op.
+                token_to_idx.remove(&token_id);
+                pending_ops.try_remove(idx);
+                tracing::error!("SQ still full after emergency flush (ring too small?)");
+            }
+        } else {
+            // Successful push — count it so flush() knows there's work.
+            self.pending_sqes.set(self.pending_sqes.get() + 1);
         }
 
-        // NO ring.submit() here — batch submission happens in flush() at event loop boundary
         token
     }
 
     fn flush(&self) {
-        let ring = unsafe { &mut *self.ring.get() };
-        // submit() returns io::Result<u32> with the number of submitted SQEs.
-        // If SQ is empty, this is a fast no-op syscall.
-        let _ = ring.submit();
-    }
-
-    fn park(&self, _timeout: Duration) -> usize {
-        let ring = unsafe { &mut *self.ring.get() };
-        // submit_and_wait(1) submits all pending SQEs and blocks until
-        // at least 1 CQE is available. One syscall instead of submit + poll.
-        match ring.submit_and_wait(1) {
-            Ok(_) => {
-                // Return number of available CQEs for the caller
-                let cq = ring.completion();
-                cq.len()
-            }
-            Err(_) => 0,
+        // Skip syscall entirely when no SQEs are pending — fast path for idle ticks.
+        if self.pending_sqes.get() == 0 {
+            return;
         }
+        let ring = unsafe { &mut *self.ring.get() };
+        // submit() flushes all pending SQEs to the kernel in one syscall.
+        if ring.submit().is_ok() {
+            self.pending_sqes.set(0);
+        }
+        // On error: leave pending_sqes > 0 so the next flush() retries.
     }
 
-    fn poll_complete(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
+    fn park(&self, timeout: Duration) -> usize {
+        let ring = unsafe { &mut *self.ring.get() };
+
+        // Check if completions are already available.
+        // No need to wait if results are ready.
+        if !ring.completion().is_empty() {
+            return ring.completion().len();
+        }
+
+        // Use a timeout SQE so we never deadlock even when no operations are in flight.
+        // The timeout CQE (user_data = u64::MAX) will be safely ignored by drain_completions
+        // since the slab lookup will return None for this out-of-range user_data.
+        let ts = io_uring::types::Timespec::new()
+            .sec(timeout.as_secs())
+            .nsec(timeout.subsec_nanos() as _);
+        let timeout_entry = opcode::Timeout::new(&ts).build().user_data(u64::MAX);
+
+        if unsafe { ring.submission().push(&timeout_entry) }.is_err() {
+            // SQ full — fall back to thread parking.
+            std::thread::park_timeout(timeout);
+            return 0;
+        }
+
+        // submit_and_wait: submits timeout SQE (+ any other pending SQEs),
+        // then waits for at least 1 CQE (real completion OR timeout expiry).
+        // This is the only syscall; drain_completions will process all CQEs.
+        let _ = ring.submit_and_wait(1);
+        self.pending_sqes.set(0);
+        ring.completion().len()
+    }
+
+    fn drain_completions(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
         let ring = unsafe { &mut *self.ring.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
         let completed_ops = unsafe { &mut *self.completed_ops.get() };
 
-        let mut completions: Vec<Self::Completion> = completed_ops.drain(..).collect();
+        // Take ownership of completed_ops (reuses its allocation via swap)
+        let mut completions = mem::take(completed_ops);
 
-        // Collect CQEs first to avoid borrow conflicts with ring.submission()
-        // in the EAGAIN retry path below.
+        // Collect CQEs in the pre-allocated buffer to avoid per-call Vec allocation.
         let mut cq = ring.completion();
         cq.sync();
-        let cqes: Vec<_> = cq.into_iter().collect();
+        let cqe_buf = unsafe { &mut *self.cqe_buffer.get() };
+        cqe_buf.clear();
+        cqe_buf.extend(cq);
 
-        for cqe in &cqes {
+        let token_to_idx = unsafe { &mut *self.token_to_idx.get() };
+
+        for cqe in cqe_buf.iter() {
             let token_id = cqe.user_data();
             let result = cqe.result();
             let flags = cqe.flags();
             let has_more = cqueue::more(flags);
 
-            // ---- EAGAIN handling for Write ops ----
-            // When a Write on a TCP socket returns -EAGAIN, the send buffer is
-            // full. We keep the PendingOp alive, submit POLLOUT on the fd.
-            // When POLLOUT fires, we re-submit the write. Throughout this
-            // process, we return WriteRetryWaiting completions that tell poll_io
-            // to transfer the waker/pending_task from the old token to the new,
-            // ensuring the task is woken when the retried write completes.
-            if !has_more
-                && token_id != u64::MAX
-                && result == -libc::EAGAIN
-                && pending_ops
-                    .get(token_id as usize)
-                    .is_some_and(|op| matches!(op, PendingOp::Write { .. }))
-            {
-                let (fd, data) = {
-                    let entry = pending_ops.try_remove(token_id as usize).unwrap();
-                    match entry {
-                        PendingOp::Write { op, data } => {
-                            let fd = match op {
-                                Op::Write { fd, .. } | Op::WriteRent { fd, .. } => fd,
-                                _ => unreachable!(),
-                            };
-                            (fd, data)
-                        }
-                        _ => unreachable!(),
-                    }
-                }; // pending_ops mutable borrow ends here
-
-                // Replace with WriteEagain state — holds the buffer alive
-                let eagain_idx = pending_ops.insert(PendingOp::WriteEagain {
-                    fd,
-                    data,
-                    orig_token: token_id,
-                });
-
-                // Submit POLLOUT on the fd
-                let poll_entry = opcode::PollAdd::new(types::Fd(fd), libc::POLLOUT as u32)
-                    .build()
-                    .user_data(eagain_idx as u64);
-                if unsafe { ring.submission().push(&poll_entry) }.is_err() {
-                    // SQ full — will retry when next CQE arrives
-                }
-
-                // Return WriteRetryWaiting so poll_io transfers waker
-                completions.push((
-                    IoToken::from_id(token_id),
-                    Op::PollAdd {
-                        fd,
-                        events: libc::POLLOUT as u32,
-                        multishot: false,
-                    },
-                    Ok(CompletionKind::WriteRetryWaiting {
-                        new_token: IoToken::from_id(eagain_idx as u64),
-                        fd,
-                    }),
-                ));
+            // Skip sentinel user_data (timeout CQEs with u64::MAX)
+            if token_id == u64::MAX {
                 continue;
             }
 
-            // ---- POLLOUT firing for a WriteEagain retry ----
-            // The PendingOp at this slot is WriteEagain, meaning POLLOUT
-            // has fired and the socket is writable. Re-submit the write.
-            if !has_more
-                && token_id != u64::MAX
-                && result >= 0
-                && pending_ops
-                    .get(token_id as usize)
-                    .is_some_and(|op| matches!(op, PendingOp::WriteEagain { .. }))
-            {
-                let (fd, data, _orig_token) = {
-                    let entry = pending_ops.try_remove(token_id as usize).unwrap();
-                    match entry {
-                        PendingOp::WriteEagain {
-                            fd,
-                            data,
-                            orig_token,
-                        } => (fd, data, orig_token),
-                        _ => unreachable!(),
-                    }
-                };
-
-                // Capture buffer info before slab insert
-                let ptr = data.as_ptr();
-                let len = data.len();
-
-                // Re-submit the write — PendingOp owns the buffer
-                let write_idx = pending_ops.insert(PendingOp::Write {
-                    op: Op::Write {
-                        fd,
-                        offset: 0,
-                        data: Buffer::empty(),
-                    },
-                    data,
-                });
-                let entry = opcode::Write::new(types::Fd(fd), ptr as *mut _, len as u32)
-                    .offset(0)
-                    .build()
-                    .user_data(write_idx as u64);
-                if unsafe { ring.submission().push(&entry) }.is_err() {
-                    // SQ full — will retry
+            // Look up the slab index via unique token ID.
+            // This prevents misrouting when a slab slot is reused by a new
+            // operation before the previous operation's CQE arrives.
+            let idx = match token_to_idx.remove(&token_id) {
+                Some(idx) => idx,
+                None => {
+                    // Token not found — stale CQE for an already-completed
+                    // operation whose mapping was cleaned up.
+                    continue;
                 }
+            };
 
-                // Tell poll_io to transfer waker from POLLOUT token to new write token
-                completions.push((
-                    IoToken::from_id(token_id),
-                    Op::PollAdd {
-                        fd,
-                        events: libc::POLLOUT as u32,
-                        multishot: false,
-                    },
-                    Ok(CompletionKind::WriteRetryWaiting {
-                        new_token: IoToken::from_id(write_idx as u64),
-                        fd,
-                    }),
-                ));
-                continue;
-            }
-
-            // Normal completion processing
-            let pending_op = if has_more && token_id != u64::MAX {
-                pending_ops.get(token_id as usize).cloned()
+            let pending_op = if has_more {
+                // Multi-shot: keep both the PendingOp and the mapping
+                // for future completions.
+                token_to_idx.insert(token_id, idx);
+                pending_ops.get(idx).cloned()
             } else {
-                pending_ops.try_remove(token_id as usize)
+                pending_ops.try_remove(idx)
             };
 
             if let Some(pending_op) = pending_op {
@@ -834,6 +807,16 @@ impl IoProvider for UringBackend {
                                     }
                                 }
                             }
+                        };
+                        (op, res)
+                    }
+                    PendingOp::WriteStatic { op } => {
+                        let res = if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::Write {
+                                bytes_written: result as usize,
+                            })
                         };
                         (op, res)
                     }
@@ -1014,13 +997,13 @@ impl IoProvider for UringBackend {
                         iovecs,
                     } => {
                         // Keep buffers and iovecs alive until completion
-                        let _ = buffers;
                         let _ = iovecs;
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::WriteVectored {
                                 bytes_written: result as usize,
+                                buffers,
                             })
                         };
                         (op, res)
@@ -1045,9 +1028,6 @@ impl IoProvider for UringBackend {
                             Ok(CompletionKind::Nop)
                         };
                         (op, res)
-                    }
-                    PendingOp::WriteEagain { .. } => {
-                        unreachable!("WriteEagain should be handled before the main match")
                     }
                 };
                 completions.push((token, op, completion_result));

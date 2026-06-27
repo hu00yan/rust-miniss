@@ -1,48 +1,29 @@
-use glommio::net::{TcpListener, TcpStream};
+//! glommio HTTP echo server for runtime comparison.
+
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+use glommio::net::{TcpListener, TcpStream};
 
-async fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String, String)> {
-    let mut data = Vec::with_capacity(4096);
-    let mut buf = vec![0u8; 1024];
-    
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        data.extend_from_slice(&buf[..n]);
-        if data.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if data.len() > 16 * 1024 {
-            break;
-        }
-    }
-    
-    let text = String::from_utf8_lossy(&data);
-    let mut parts = text.split("\r\n").next().unwrap_or("").split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
-    let version = parts.next().unwrap_or("").to_string();
-    Ok((method, path, version))
-}
+async fn handle_client(mut stream: TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let mut buf = vec![0u8; 4096];
 
-async fn write_http_response(stream: &mut TcpStream) -> std::io::Result<()> {
     let body = b"Hello from glommio";
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         body.len()
     );
-    
-    stream.write_all(resp.as_bytes()).await?;
-    stream.write_all(body).await?;
-    Ok(())
-}
+    let response = [header.as_bytes(), body].concat();
 
-async fn handle_client(stream: TcpStream) {
-    let mut stream = stream;
-    let _ = read_http_request(&mut stream).await;
-    let _ = write_http_response(&mut stream).await;
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if stream.write_all(&response).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -57,7 +38,7 @@ fn main() -> std::io::Result<()> {
     }
 
     glommio::LocalExecutorBuilder::default()
-        .spawn(|| async move {
+        .spawn(move || async move {
             let listener = TcpListener::bind(&addr)?;
             println!("glommio http_echo listening on {addr}");
 

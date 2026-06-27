@@ -34,6 +34,9 @@ tarpaulin-report.html
 .aider*
 .claude/
 **/.claude/
+.scratch/
+.serena/
+*.data.old
 
 # Debug tools (local only)
 .gdbinit
@@ -50,6 +53,7 @@ metrics_temp
 # Valgrind/Perf outputs
 vgcore.*
 perf.data
+perf*.data
 
 # Bumpalo arenas (if leaked in tests)
 arena-leak-*
@@ -64,3 +68,5 @@ slab-test.*
 # Benchmark criterion output
 /criterion/
 
+# Performance benchmark results (large binary/text artifacts)
+bench/results/

@@ -5,7 +5,7 @@
 //!
 //! Sends `CoreMessage::Shutdown` to each CPU core's message inbox.
 
-use crossbeam_queue::SegQueue;
+use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ pub type SignalCallback = Arc<dyn Fn(i32) + Send + Sync>;
 /// Signal handler that manages graceful shutdown on signals
 pub struct SignalHandler {
     shutdown_flag: Arc<AtomicBool>,
-    cpu_senders: Vec<Arc<SegQueue<CoreMessage>>>,
+    cpu_senders: Vec<Sender<CoreMessage>>,
     callbacks: HashMap<i32, Vec<SignalCallback>>,
 }
 
@@ -35,7 +35,7 @@ impl SignalHandler {
 
     pub fn with_cpu_handles(
         shutdown_flag: Arc<AtomicBool>,
-        cpu_senders: Vec<Arc<SegQueue<CoreMessage>>>,
+        cpu_senders: Vec<Sender<CoreMessage>>,
     ) -> Self {
         Self {
             shutdown_flag,
@@ -76,7 +76,7 @@ impl SignalHandler {
                             shutdown_flag.store(true, Ordering::Release);
 
                             for sender in &cpu_senders {
-                                sender.push(CoreMessage::Shutdown);
+                                let _ = sender.send(CoreMessage::Shutdown);
                             }
 
                             if let Some(signal_callbacks) = callbacks.get(&sig) {

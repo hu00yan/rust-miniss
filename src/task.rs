@@ -26,12 +26,11 @@
 
 use crate::waker::TaskId;
 use std::any::Any;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-
-use crossbeam_queue::SegQueue;
 
 /// Error returned from a failed task.
 #[derive(Debug)]
@@ -187,7 +186,7 @@ impl Task {
     /// so that the borrow on `self` is released before the caller's
     /// closure captures `task` for `task.poll()`.
     #[inline(always)]
-    pub fn get_or_create_waker(&mut self, queue: &Arc<SegQueue<TaskId>>) -> Waker {
+    pub fn get_or_create_waker(&mut self, queue: *const VecDeque<TaskId>) -> Waker {
         self.waker
             .get_or_insert_with(|| crate::waker::MinissWaker::create_waker(self.id, queue))
             .clone()
