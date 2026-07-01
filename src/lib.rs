@@ -52,9 +52,11 @@ pub mod cpu;
 pub mod executor;
 pub mod fs;
 pub mod http;
+pub mod hyper_rt;
 pub mod io;
 pub mod multicore;
 pub mod net;
+pub mod quic;
 pub mod signal;
 pub mod task;
 pub mod timer;
@@ -62,15 +64,17 @@ pub mod timer;
 pub mod tls;
 pub mod waker;
 
-pub use buffer::Buffer;
+pub use buffer::{Buffer, RentBuffer};
 pub use executor::{Executor, Runtime};
 pub use fs::AsyncFile;
 pub use http::{
     EchoHandler, HttpConnection, HttpHandler, Method, Request, Response, StaticHandler, StatusCode,
 };
+pub use hyper_rt::{MinissHyperExecutor, MinissHyperTimer};
 pub use io::{CompletionKind, IoError, IoProvider, IoToken, Op};
-pub use multicore::MultiCoreRuntime;
+pub use multicore::{CoreMetricsSnapshot, MultiCoreRuntime, RuntimeMetrics};
 pub use net::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket};
+pub use quic::MinissQuicRuntime;
 pub use task::{Task, TaskError, TaskResult};
 pub use timer::{sleep, timeout, Entry, Interval, TimeoutError, TimerId, TimerWheel};
 

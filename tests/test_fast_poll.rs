@@ -1,6 +1,6 @@
 //! Test Fast Poll (IORING_OP_POLL_ADD multishot) functionality
 
-#[cfg(all(test, target_os = "linux", feature = "io_uring"))]
+#[cfg(all(test, target_os = "linux", io_backend = "io_uring"))]
 mod fast_poll_tests {
     use rust_miniss::io::Op;
     use std::net::{TcpListener, TcpStream};
@@ -36,13 +36,12 @@ mod fast_poll_tests {
             state.io_backend.park(Duration::from_millis(10));
 
             // Poll for completion
-            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-            let completions = match state.io_backend.drain_completions(&mut cx) {
+            let completions = match state.io_backend.drain_completions() {
                 std::task::Poll::Ready(comps) => comps,
                 std::task::Poll::Pending => {
                     // Try again after a short delay
                     std::thread::sleep(Duration::from_millis(10));
-                    match state.io_backend.drain_completions(&mut cx) {
+                    match state.io_backend.drain_completions() {
                         std::task::Poll::Ready(comps) => comps,
                         std::task::Poll::Pending => panic!("PollAdd did not complete"),
                     }
@@ -90,11 +89,10 @@ mod fast_poll_tests {
             state.io_backend.park(Duration::from_millis(10));
 
             // Poll for completion - multishot should generate multiple completions
-            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             let mut completion_count = 0;
 
             for _ in 0..3 {
-                match state.io_backend.drain_completions(&mut cx) {
+                match state.io_backend.drain_completions() {
                     std::task::Poll::Ready(comps) => {
                         completion_count += comps.len();
                         if !comps.is_empty() {
@@ -122,11 +120,11 @@ mod fast_poll_tests {
     }
 }
 
-#[cfg(any(not(target_os = "linux"), not(feature = "io_uring")))]
+#[cfg(any(not(target_os = "linux"), not(io_backend = "io_uring")))]
 mod fast_poll_tests {
     #[test]
     fn test_poll_add_unsupported() {
-        // Test is skipped on non-Linux or without io_uring feature
-        println!("Fast Poll test skipped - requires Linux with io_uring feature");
+        // Test is skipped on non-Linux or when the backend is not io_uring.
+        println!("Fast Poll test skipped - requires Linux with io_uring backend");
     }
 }

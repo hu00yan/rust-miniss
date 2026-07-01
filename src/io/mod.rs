@@ -9,8 +9,8 @@
 //! The IO backend is automatically selected at compile time based on the target platform
 //! and kernel version:
 //!
-//! - **Linux with kernel 5.10+ and io_uring feature**: Uses `io_uring` for optimal performance
-//! - **Linux (older kernels or without io_uring feature)**: Uses `epoll` via mio
+//! - **Linux with kernel 6.12+**: Uses `io_uring` for optimal performance
+//! - **Linux (older kernels)**: Uses `epoll` via mio
 //! - **macOS**: Uses `kqueue` via mio (reuses epoll implementation)
 //! - **Other Unix systems**: Uses `epoll` via mio
 //!
@@ -20,10 +20,11 @@
 
 use std::cell::Cell;
 use std::os::unix::io::RawFd;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Duration;
 
 use crate::buffer::Buffer;
+use smallvec::SmallVec;
 
 /// A trait for I/O resources that can be represented by a raw file descriptor.
 pub trait AsRawFd {
@@ -51,11 +52,31 @@ pub trait IoProvider: Send + Sync + 'static {
     /// This method is non-blocking. Returns `Poll::Ready` with completed
     /// operations, or `Poll::Pending` if none are available.
     /// Note: completion-based (io_uring/IOCP), not poll-based (epoll).
-    fn drain_completions(&self, cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>>;
+    fn drain_completions(&self) -> Poll<Vec<Self::Completion>>;
+
+    /// Drain completed operations into a caller-provided buffer.
+    ///
+    /// Backends should prefer this path when the caller can reuse allocation.
+    /// The default implementation falls back to `drain_completions()`.
+    fn drain_completions_into(&self, completions: &mut Vec<Self::Completion>) -> Poll<()> {
+        match self.drain_completions() {
+            Poll::Ready(mut drained) => {
+                completions.append(&mut drained);
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 
     /// Flush any pending submissions to the kernel.
     /// Called at event loop boundaries to batch-submit SQEs.
     fn flush(&self) {}
+
+    /// Number of SQEs currently queued but not yet submitted.
+    /// Used by hot loops to tell whether a poll actually produced new work.
+    fn pending_submission_count(&self) -> usize {
+        0
+    }
 
     /// Park the thread, blocking for completions or timeout.
     /// Returns the number of available completions.
@@ -65,11 +86,18 @@ pub trait IoProvider: Send + Sync + 'static {
 
     /// Pop a multi-shot accept result for the given token.
     /// Returns None for non-accept ops or when no result is available.
-    fn pop_accept_result(
-        &self,
-        _token: IoToken,
-    ) -> Option<(IoToken, Op, Result<CompletionKind, IoError>)> {
+    fn pop_accept_result(&self, _token: IoToken) -> Option<Result<CompletionKind, IoError>> {
         None
+    }
+
+    /// Whether Accept operations stay armed after a completion.
+    fn supports_multishot_accept(&self) -> bool {
+        false
+    }
+
+    /// Whether accepted TCP streams are already created in non-blocking mode.
+    fn accepted_streams_are_nonblocking(&self) -> bool {
+        false
     }
 }
 
@@ -120,20 +148,20 @@ pub enum Op {
     },
     UdpRecvVectored {
         fd: RawFd,
-        iovecs: Vec<Buffer>,
+        iovecs: SmallVec<[Buffer; 4]>,
     },
     UdpSendVectored {
         fd: RawFd,
-        iovecs: Vec<Buffer>,
+        iovecs: SmallVec<[Buffer; 4]>,
         addr: SocketAddr,
     },
     ReadVectored {
         fd: i32,
-        buffers: Vec<Buffer>,
+        buffers: SmallVec<[Buffer; 4]>,
     },
     WriteVectored {
         fd: i32,
-        buffers: Vec<Buffer>,
+        buffers: SmallVec<[Buffer; 4]>,
     },
     Connect {
         fd: i32,
@@ -186,19 +214,36 @@ impl IoToken {
         })
     }
 
+    /// Creates a new `IoToken` from a caller-owned counter.
+    ///
+    /// Backends use this to keep token generation shard-local and avoid a
+    /// thread-local lookup on every submit.
+    #[allow(dead_code)]
+    pub(crate) fn next_from(counter: &Cell<u64>) -> Self {
+        let id = counter.get();
+        counter.set(id.wrapping_add(1).max(1));
+        Self { id }
+    }
+
     /// Returns the underlying `u64` ID of the token.
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// Creates an `IoToken` from a raw `u64` ID.
-    ///
-    /// Used in `io_uring` backend to reconstruct the token from CQE `user_data`.
-    /// This is the inverse of `id()`, allowing us to match completions back
-    /// to their original submission without any lookup table.
-    pub fn from_id(id: u64) -> Self {
+    pub(crate) fn from_id(id: u64) -> Self {
         Self { id }
     }
+
+    /// Returns the shard-local table index encoded in this token.
+    ///
+    /// io_uring tokens pack a generation in the high 32 bits and the backend
+    /// slab slot in the low 32 bits. Other backends currently use small
+    /// monotonic IDs, so this is equivalent to `id()` for them.
+    #[inline(always)]
+    pub(crate) fn slot_index(&self) -> usize {
+        (self.id as u32) as usize
+    }
+
 }
 
 /// Describes the result of a successfully completed I/O operation.
@@ -219,11 +264,11 @@ pub enum CompletionKind {
     },
     ReadVectored {
         bytes_read: usize,
-        buffers: Vec<Buffer>,
+        buffers: SmallVec<[Buffer; 4]>,
     },
     WriteVectored {
         bytes_written: usize,
-        buffers: Vec<Buffer>,
+        buffers: SmallVec<[Buffer; 4]>,
     },
     Fsync,
     Close,
@@ -246,7 +291,7 @@ pub enum CompletionKind {
     UdpRecvVectored {
         bytes_read: usize,
         addr: SocketAddr,
-        iovecs: Vec<Buffer>,
+        iovecs: SmallVec<[Buffer; 4]>,
     },
     UdpSendVectored {
         bytes_written: usize,
@@ -304,7 +349,7 @@ pub mod kqueue;
 #[cfg(any(io_backend = "epoll", all(unix, not(target_os = "linux"))))]
 pub mod epoll;
 
-#[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 pub mod uring;
 
 pub mod future;

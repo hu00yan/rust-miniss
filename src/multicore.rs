@@ -9,14 +9,19 @@
 //! 3. **CPU Affinity**: Each core bound to physical CPU for optimal cache locality
 //! 4. **Independent IO**: Each core has its own io_uring/epoll instance
 
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::mem::size_of;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,21 +30,68 @@ use crate::cpu::{
     set_current_timer, CpuIoState,
 };
 use crate::error::{Result, RuntimeError};
-use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
-use crate::task::Task;
+use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
+use crate::task::{DetachedTaskFuture, Task};
 use crate::timer::TimerWheel;
 use crate::waker::TaskId;
 
 /// Type alias for the IO backend completion type
-type IoCompletion = (IoToken, Op, std::result::Result<CompletionKind, IoError>);
+type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
+type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()> + Send>>);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
+const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Global task ID generator
-static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static CURRENT_CORE_ID: Cell<Option<usize>> = const { Cell::new(None) };
+    static LOCAL_SPAWN_QUEUE: RefCell<Vec<LocalSpawn>> = const { RefCell::new(Vec::new()) };
+    static LOCAL_SPAWN_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
-/// Generate unique task ID
-fn next_task_id() -> TaskId {
-    TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Release))
+fn current_core_id() -> Option<usize> {
+    CURRENT_CORE_ID.with(Cell::get)
+}
+
+fn push_local_spawn(task_id: TaskId, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+    LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().push((task_id, future)));
+    LOCAL_SPAWN_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(target_os = "linux")]
+fn create_wakeup_eventfd() -> Result<OwnedFd> {
+    // SAFETY: eventfd creates a fresh fd owned by this function; we wrap it
+    // immediately in OwnedFd on success and keep it thread-local.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(RuntimeError::TaskFailed(format!(
+            "Failed to create core wakeup eventfd: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `fd` is the owned descriptor returned by eventfd above and has
+    // not been wrapped elsewhere.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn notify_wakeup_eventfd(fd: RawFd) {
+    let value: u64 = 1;
+    let ptr = (&value as *const u64).cast::<libc::c_void>();
+    let len = size_of::<u64>();
+    // SAFETY: best-effort wakeup on a valid non-blocking eventfd.
+    unsafe {
+        let _ = libc::write(fd, ptr, len);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_wakeup_eventfd(fd: RawFd) {
+    let mut value: u64 = 0;
+    let ptr = (&mut value as *mut u64).cast::<libc::c_void>();
+    let len = size_of::<u64>();
+    // SAFETY: best-effort drain on a valid non-blocking eventfd.
+    unsafe {
+        let _ = libc::read(fd, ptr, len);
+    }
 }
 
 /// Message types for inter-core communication
@@ -55,6 +107,10 @@ pub enum CoreMessage {
     Shutdown,
     /// Cancel a task
     CancelTask(TaskId),
+    /// Control-plane metrics snapshot request.
+    CollectMetrics {
+        reply: std::sync::mpsc::Sender<CoreMetricsSnapshot>,
+    },
 }
 
 impl std::fmt::Debug for CoreMessage {
@@ -70,16 +126,89 @@ impl std::fmt::Debug for CoreMessage {
                 .debug_struct("CancelTask")
                 .field("task_id", task_id)
                 .finish(),
+            Self::CollectMetrics { .. } => write!(f, "CollectMetrics"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoreMetricsSnapshot {
+    pub core_id: usize,
+    pub local_task_count: usize,
+    pub ready_queue_len: usize,
+    pub max_ready_queue_len: usize,
+    pub tasks_spawned: u64,
+    pub tasks_completed: u64,
+    pub tasks_polled: u64,
+    pub io_completions: u64,
+    pub messages_processed: u64,
+    pub message_batches: u64,
+    pub max_message_inbox_len: usize,
+    pub busy_rounds: u64,
+    pub flushes: u64,
+    pub flush_total_us: u64,
+    pub max_flush_us: u64,
+    pub io_completion_batches: u64,
+    pub io_completion_total_ns: u64,
+    pub max_io_completion_batch_ns: u64,
+    pub max_io_completion_batch_len: usize,
+    pub inline_poll_total_ns: u64,
+    pub max_inline_poll_ns: u64,
+    pub wake_total_ns: u64,
+    pub max_wake_ns: u64,
+    pub parks: u64,
+    pub park_timeouts: u64,
+    pub park_completions: u64,
+    pub park_total_us: u64,
+    pub max_park_us: u64,
+    pub timer_expirations: u64,
+    pub inline_completion_hits: u64,
+    pub waker_wakeups: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeMetrics {
+    pub cores: Vec<CoreMetricsSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct CoreMetrics {
+    tasks_spawned: u64,
+    tasks_completed: u64,
+    tasks_polled: u64,
+    io_completions: u64,
+    messages_processed: u64,
+    message_batches: u64,
+    max_ready_queue_len: usize,
+    max_message_inbox_len: usize,
+    busy_rounds: u64,
+    flushes: u64,
+    flush_total_us: u64,
+    max_flush_us: u64,
+    io_completion_batches: u64,
+    io_completion_total_ns: u64,
+    max_io_completion_batch_ns: u64,
+    max_io_completion_batch_len: usize,
+    inline_poll_total_ns: u64,
+    max_inline_poll_ns: u64,
+    wake_total_ns: u64,
+    max_wake_ns: u64,
+    parks: u64,
+    park_timeouts: u64,
+    park_completions: u64,
+    park_total_us: u64,
+    max_park_us: u64,
+    timer_expirations: u64,
+    inline_completion_hits: u64,
+    waker_wakeups: u64,
 }
 
 /// Individual CPU core executor - completely independent
 pub struct CpuCore {
     /// Core ID (matches physical CPU)
     id: usize,
-    /// Local task queue keyed by task ID. Readiness is tracked separately.
-    task_queue: rustc_hash::FxHashMap<TaskId, Task>,
+    /// Local task queue keyed by task sequence. Readiness is tracked separately.
+    task_queue: Vec<Option<Task>>,
     /// Local ready queue populated by task wakers.
     /// Box gives stable address for Waker raw pointer.
     ready_queue: VecDeque<TaskId>,
@@ -87,40 +216,139 @@ pub struct CpuCore {
     message_inbox: Receiver<CoreMessage>,
     /// Local timer wheel
     timer_wheel: TimerWheel,
+    /// Idle park timeout, configured at runtime startup.
+    park_timeout: Duration,
+    /// Per-core park wakeup flag, shared with the runtime control plane.
+    #[cfg(target_os = "linux")]
+    sleeping: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    /// Eventfd used to wake the worker when a cross-core message arrives.
+    wakeup_eventfd: RawFd,
+    #[cfg(target_os = "linux")]
+    /// Wake poll armed while the worker is parked.
+    wakeup_poll_armed: bool,
+    #[cfg(target_os = "linux")]
+    /// Token for the armed wake poll, so the completion can be ignored.
+    wakeup_poll_token: Option<IoToken>,
     /// Per-core I/O state — also holds the io_backend via `io_state.io_backend`.
     /// NOT wrapped in Arc: access is exclusively through thread-local raw pointer,
     /// so Arc provides zero benefit and adds atomic refcount overhead.
     io_state: CpuIoState,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
+    /// Graceful drain mode: reject new control-plane spawns at the runtime
+    /// level, but let already queued and running shard-local tasks finish.
+    draining: bool,
     /// Task counter for this core
     local_task_count: usize,
     /// Countdown for polling cross-core messages while the shard is busy.
     message_poll_ticks: usize,
+    /// Shard-local metrics. Aggregated only by explicit control-plane request.
+    metrics: CoreMetrics,
 }
 
 impl CpuCore {
+    #[inline]
+    fn ensure_task_capacity(&mut self, idx: usize) {
+        if idx >= self.task_queue.len() {
+            self.task_queue.resize_with(idx + 1, || None);
+        }
+    }
+
     /// Create new CPU core
     fn new(
         id: usize,
         io_backend: Arc<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
+        #[cfg(target_os = "linux")] sleeping: Arc<AtomicBool>,
         message_inbox: Receiver<CoreMessage>,
+        park_timeout: Duration,
+        #[cfg(target_os = "linux")] wakeup_eventfd: RawFd,
     ) -> Self {
         let mut io_state = CpuIoState::default();
         io_state.io_backend = io_backend;
 
         Self {
             id,
-            task_queue: rustc_hash::FxHashMap::default(),
+            task_queue: Vec::with_capacity(256),
             ready_queue: VecDeque::with_capacity(256),
             message_inbox,
             timer_wheel: TimerWheel::new(1024, 1),
+            park_timeout,
+            #[cfg(target_os = "linux")]
+            sleeping,
+            #[cfg(target_os = "linux")]
+            wakeup_eventfd,
+            #[cfg(target_os = "linux")]
+            wakeup_poll_armed: false,
+            #[cfg(target_os = "linux")]
+            wakeup_poll_token: None,
             io_state,
             shutdown,
+            draining: false,
             local_task_count: 0,
             message_poll_ticks: 0,
+            metrics: CoreMetrics::default(),
         }
+    }
+
+    fn metrics_snapshot(&self) -> CoreMetricsSnapshot {
+        CoreMetricsSnapshot {
+            core_id: self.id,
+            local_task_count: self.local_task_count,
+            ready_queue_len: self.ready_queue.len(),
+            max_ready_queue_len: self.metrics.max_ready_queue_len,
+            tasks_spawned: self.metrics.tasks_spawned,
+            tasks_completed: self.metrics.tasks_completed,
+            tasks_polled: self.metrics.tasks_polled,
+            io_completions: self.metrics.io_completions,
+            messages_processed: self.metrics.messages_processed,
+            message_batches: self.metrics.message_batches,
+            max_message_inbox_len: self.metrics.max_message_inbox_len,
+            busy_rounds: self.metrics.busy_rounds,
+            flushes: self.metrics.flushes,
+            flush_total_us: self.metrics.flush_total_us,
+            max_flush_us: self.metrics.max_flush_us,
+            io_completion_batches: self.metrics.io_completion_batches,
+            io_completion_total_ns: self.metrics.io_completion_total_ns,
+            max_io_completion_batch_ns: self.metrics.max_io_completion_batch_ns,
+            max_io_completion_batch_len: self.metrics.max_io_completion_batch_len,
+            inline_poll_total_ns: self.metrics.inline_poll_total_ns,
+            max_inline_poll_ns: self.metrics.max_inline_poll_ns,
+            wake_total_ns: self.metrics.wake_total_ns,
+            max_wake_ns: self.metrics.max_wake_ns,
+            parks: self.metrics.parks,
+            park_timeouts: self.metrics.park_timeouts,
+            park_completions: self.metrics.park_completions,
+            park_total_us: self.metrics.park_total_us,
+            max_park_us: self.metrics.max_park_us,
+            timer_expirations: self.metrics.timer_expirations,
+            inline_completion_hits: self.metrics.inline_completion_hits,
+            waker_wakeups: self.metrics.waker_wakeups,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn arm_wakeup_poll(&mut self) {
+        if self.wakeup_poll_armed {
+            return;
+        }
+
+        let token = self.io_state.io_backend.submit(crate::io::Op::PollAdd {
+            fd: self.wakeup_eventfd,
+            events: libc::POLLIN as u32,
+            multishot: false,
+        });
+        self.wakeup_poll_token = Some(token);
+        self.wakeup_poll_armed = true;
+        self.io_state.io_backend.flush();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clear_wakeup_poll(&mut self) {
+        self.wakeup_poll_armed = false;
+        self.wakeup_poll_token = None;
+        drain_wakeup_eventfd(self.wakeup_eventfd);
     }
 
     /// Main event loop - shared-nothing execution
@@ -133,37 +361,51 @@ impl CpuCore {
         struct RuntimeContextGuard;
         impl Drop for RuntimeContextGuard {
             fn drop(&mut self) {
+                LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().clear());
+                LOCAL_SPAWN_COUNT.with(|count| count.set(0));
+                CURRENT_CORE_ID.with(|core_id| core_id.set(None));
                 clear_current_timer();
                 clear_current_io_state();
             }
         }
         let _context_guard = RuntimeContextGuard;
+        CURRENT_CORE_ID.with(|core_id| core_id.set(Some(self.id)));
 
         tracing::info!("CPU core {} started", self.id);
 
         /// Maximum inner-loop iterations before yielding to I/O (prevents
         /// starvation of completions and timers during a busy-task storm).
         const MAX_BUSY_ROUNDS: u32 = 64;
+        const MESSAGE_POLL_TICKS_LIGHT: usize = 3;
+        const MESSAGE_POLL_TICKS_BUSY: usize = 15;
+        let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+        let mut io_completions = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT * 4);
 
-        while !self.shutdown.load(Ordering::Acquire) {
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                self.draining = true;
+            }
+
             // --- INNER LOOP: process all available work, submit I/O, don't wait ---
             let mut busy_rounds: u32 = 0;
             loop {
                 let mut work_done = false;
-
                 // 1. Process inter-core messages.
-                //    Only check the cross-core channel when the ready queue is
-                //    empty (starving for work) or every 64th tick — avoids
-                //    touching the shared channel on every hot-loop iteration.
-                if self.ready_queue.is_empty() || self.message_poll_ticks == 0 {
+                //    Check immediately when messages are waiting, when the
+                //    ready queue is empty, or every Nth tick under load.
+                if self.draining || self.ready_queue.is_empty() || self.message_poll_ticks == 0 {
                     work_done |= self.process_messages();
-                    self.message_poll_ticks = 63;
+                    self.message_poll_ticks = if self.ready_queue.len() < 8 {
+                        MESSAGE_POLL_TICKS_LIGHT
+                    } else {
+                        MESSAGE_POLL_TICKS_BUSY
+                    };
                 } else {
                     self.message_poll_ticks -= 1;
                 }
 
                 // 2. Process I/O completions — may wake tasks into ready_queue.
-                work_done |= self.process_io_completions();
+                work_done |= self.process_io_completions(&mut io_completions, false);
 
                 // 3. Execute ready tasks — may submit new SQEs.
                 work_done |= self.execute_tasks();
@@ -172,11 +414,19 @@ impl CpuCore {
                 //    During busy periods this lets the kernel start working on
                 //    I/O immediately instead of deferring it to park().
                 if work_done {
+                    self.metrics.flushes += 1;
+                    let flush_started = Instant::now();
                     self.io_state.io_backend.flush();
+                    let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
+                    self.metrics.flush_total_us += flush_elapsed_us;
+                    self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
                 }
 
                 // 5. Process expired timers — they also put tasks into ready_queue.
-                work_done |= self.process_timers();
+                if self.timer_wheel.has_pending() {
+                    let now = Instant::now();
+                    work_done |= self.process_timers(now, &mut ready_timers);
+                }
 
                 // 6. Nothing left to do — exit inner loop, go park (wait for I/O).
                 if !work_done {
@@ -187,32 +437,66 @@ impl CpuCore {
                 //    MAX_BUSY_ROUNDS without a break, force a park to let the
                 //    kernel push completions and timers fire.
                 busy_rounds += 1;
+                self.metrics.busy_rounds += 1;
                 if busy_rounds >= MAX_BUSY_ROUNDS {
                     break;
                 }
             }
 
+            if self.draining
+                && self.local_task_count == 0
+                && self.ready_queue.is_empty()
+                && self.message_inbox.is_empty()
+            {
+                break;
+            }
+
             // --- OUTER: park (submit_and_wait, blocks for I/O) ---
             // We've exhausted local work; block until at least one completion
-            // arrives or the 1ms timeout fires.
-            let n_completions = self.io_state.io_backend.park(Duration::from_millis(1));
+            // arrives, a wake message lands, or the timeout fires.
+            #[cfg(target_os = "linux")]
+            self.sleeping.store(true, Ordering::Release);
+            #[cfg(target_os = "linux")]
+            if self.process_messages() {
+                self.sleeping.store(false, Ordering::Release);
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            self.arm_wakeup_poll();
+            self.metrics.parks += 1;
+            let park_started = Instant::now();
+            let n_completions = self.io_state.io_backend.park(self.park_timeout);
+            let park_elapsed_us = park_started.elapsed().as_micros() as u64;
+            #[cfg(target_os = "linux")]
+            self.sleeping.store(false, Ordering::Release);
+            self.metrics.park_total_us += park_elapsed_us;
+            self.metrics.max_park_us = self.metrics.max_park_us.max(park_elapsed_us);
+            if n_completions == 0 {
+                self.metrics.park_timeouts += 1;
+            } else {
+                self.metrics.park_completions += n_completions as u64;
+            }
 
             if n_completions > 0 {
-                let waker = futures::task::noop_waker();
-                let mut context = Context::from_waker(&waker);
-                if let Poll::Ready(completions) =
-                    self.io_state.io_backend.drain_completions(&mut context)
-                {
-                    for (token, _op, result) in completions {
-                        unsafe { self.io_state.insert_completed(token, result) };
-                        if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
-                            waker.wake();
-                        }
-                    }
-                }
+                let _ = self.process_io_completions(&mut io_completions, true);
             }
             // Execute tasks that were just woken by the park+drain
-            self.execute_tasks();
+            if self.execute_tasks() {
+                self.metrics.flushes += 1;
+                let flush_started = Instant::now();
+                self.io_state.io_backend.flush();
+                let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
+                self.metrics.flush_total_us += flush_elapsed_us;
+                self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
+            }
+
+            if self.draining
+                && self.local_task_count == 0
+                && self.ready_queue.is_empty()
+                && self.message_inbox.is_empty()
+            {
+                break;
+            }
         }
         tracing::info!("CPU core {} shutting down", self.id);
         Ok(())
@@ -224,6 +508,8 @@ impl CpuCore {
         use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
         use std::mem;
 
+        // SAFETY: The cpu_set_t is zero-initialized before CPU_SET, and
+        // sched_setaffinity receives a pointer valid for the call duration.
         unsafe {
             let mut cpuset: cpu_set_t = mem::zeroed();
             CPU_ZERO(&mut cpuset);
@@ -250,9 +536,21 @@ impl CpuCore {
     /// Process messages from other cores
     fn process_messages(&mut self) -> bool {
         let mut processed = 0;
+        self.metrics.max_message_inbox_len = self
+            .metrics
+            .max_message_inbox_len
+            .max(self.message_inbox.len());
+        let ready_len = self.ready_queue.len();
+        let max_messages = if self.draining || ready_len == 0 {
+            256
+        } else if ready_len < 8 {
+            32
+        } else {
+            16
+        };
 
-        // Process up to 32 messages per iteration to avoid starvation
-        while processed < 32 {
+        // Process more messages when the shard is idle; back off when it is busy.
+        while processed < max_messages {
             match self.message_inbox.try_recv() {
                 Ok(CoreMessage::Task { id, future }) => {
                     tracing::debug!(
@@ -261,10 +559,16 @@ impl CpuCore {
                         id,
                         self.ready_queue.len()
                     );
-                    let task = Task::from_pinned(id, future);
-                    self.task_queue.insert(id, task);
+                    let mut task = Task::from_pinned(id, future);
+                    let idx = id.sequence() as usize;
+                    self.ensure_task_capacity(idx);
+                    task.ensure_waker(&self.ready_queue as *const VecDeque<TaskId>);
+                    self.task_queue[idx] = Some(task);
                     self.ready_queue.push_back(id);
+                    self.metrics.max_ready_queue_len =
+                        self.metrics.max_ready_queue_len.max(self.ready_queue.len());
                     self.local_task_count += 1;
+                    self.metrics.tasks_spawned += 1;
                     processed += 1;
                 }
                 Ok(CoreMessage::Ping { from_core }) => {
@@ -273,15 +577,23 @@ impl CpuCore {
                 }
                 Ok(CoreMessage::Shutdown) => {
                     self.shutdown.store(true, Ordering::Release);
+                    self.draining = true;
                     processed += 1;
-                    break;
                 }
                 Ok(CoreMessage::CancelTask(task_id)) => {
                     // Remove task from queue if it exists
-                    if self.task_queue.remove(&task_id).is_some() {
-                        self.local_task_count = self.local_task_count.saturating_sub(1);
+                    let idx = task_id.sequence() as usize;
+                    if let Some(slot) = self.task_queue.get_mut(idx) {
+                        if slot.take().is_some() {
+                            self.local_task_count = self.local_task_count.saturating_sub(1);
+                            self.metrics.tasks_completed += 1;
+                        }
                     }
                     tracing::trace!("Cancelled task {:?}", task_id);
+                    processed += 1;
+                }
+                Ok(CoreMessage::CollectMetrics { reply }) => {
+                    let _ = reply.send(self.metrics_snapshot());
                     processed += 1;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -289,6 +601,10 @@ impl CpuCore {
             }
         }
 
+        self.metrics.messages_processed += processed as u64;
+        if processed > 0 {
+            self.metrics.message_batches += 1;
+        }
         processed > 0
     }
 
@@ -300,148 +616,199 @@ impl CpuCore {
             let removed = {
                 // In-place poll: borrow task mutably from task_queue.
                 // Scope ensures the mutable borrow is released before remove().
-                let task = match self.task_queue.get_mut(&task_id) {
+                let idx = task_id.sequence() as usize;
+                let task = match self.task_queue.get_mut(idx).and_then(Option::as_mut) {
                     Some(t) => t,
                     None => continue, // stale wake after cancellation
                 };
 
-                let waker = task.get_or_create_waker(&self.ready_queue as *const VecDeque<TaskId>);
-                let mut context = Context::from_waker(&waker);
                 set_current_task_id(Some(task_id));
                 let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    task.poll(&mut context)
+                    task.poll_with_cached_waker()
                 }));
                 set_current_task_id(None);
-
                 executed += 1;
+                self.metrics.tasks_polled += 1;
                 match poll_result {
-                    Ok(Poll::Ready(())) | Err(_) => {
+                    Ok(Poll::Ready(())) => {
                         self.local_task_count = self.local_task_count.saturating_sub(1);
+                        self.metrics.tasks_completed += 1;
                         true // remove from task_queue
                     }
                     Ok(Poll::Pending) => {
                         false // stays in task_queue
                     }
+                    Err(payload) => {
+                        self.local_task_count = self.local_task_count.saturating_sub(1);
+                        self.metrics.tasks_completed += 1;
+                        tracing::error!("Task {:?} panicked on core {}", task_id, self.id);
+                        drop(payload);
+                        true
+                    }
                 }
             };
 
             if removed {
-                self.task_queue.remove(&task_id);
+                let idx = task_id.sequence() as usize;
+                if let Some(slot) = self.task_queue.get_mut(idx) {
+                    *slot = None;
+                }
             }
         }
 
-        executed > 0
+        let spawned_local = self.drain_local_spawns();
+        executed > 0 || spawned_local
+    }
+
+    fn drain_local_spawns(&mut self) -> bool {
+        if LOCAL_SPAWN_COUNT.with(Cell::get) == 0 {
+            return false;
+        }
+
+        LOCAL_SPAWN_QUEUE.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            if queue.is_empty() {
+                LOCAL_SPAWN_COUNT.with(|count| count.set(0));
+                return false;
+            }
+
+            for (id, future) in queue.drain(..) {
+                let mut task = Task::from_pinned(id, future);
+                let idx = id.sequence() as usize;
+                self.ensure_task_capacity(idx);
+                task.ensure_waker(&self.ready_queue as *const VecDeque<TaskId>);
+                self.task_queue[idx] = Some(task);
+                self.ready_queue.push_back(id);
+                self.metrics.max_ready_queue_len =
+                    self.metrics.max_ready_queue_len.max(self.ready_queue.len());
+                self.local_task_count += 1;
+                self.metrics.tasks_spawned += 1;
+            }
+            LOCAL_SPAWN_COUNT.with(|count| count.set(0));
+
+            true
+        })
     }
 
     /// Process I/O completions — tries inline poll when the waiting task is known.
     /// Completion-based: io_uring returns completed operations, this processes them.
     /// Returns `true` if any progress was made.
-    fn process_io_completions(&mut self) -> bool {
-        let waker = futures::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        match self.io_state.io_backend.drain_completions(&mut context) {
-            Poll::Ready(completions) => {
-                if completions.is_empty() {
-                    return false;
+    fn process_io_completions(
+        &mut self,
+        completions: &mut Vec<IoCompletion>,
+        drain_all: bool,
+    ) -> bool {
+        let mut made_progress = false;
+
+        loop {
+            if completions.is_empty() {
+                match self.io_state.io_backend.drain_completions_into(completions) {
+                    Poll::Ready(()) => {}
+                    Poll::Pending => return made_progress,
+                }
+            }
+
+            if completions.is_empty() {
+                return made_progress;
+            }
+
+            made_progress = true;
+            self.metrics.io_completion_batches += 1;
+            self.metrics.max_io_completion_batch_len = self
+                .metrics
+                .max_io_completion_batch_len
+                .max(completions.len());
+            let io_batch_started = Instant::now();
+            let mut io_completion_count = 0u64;
+            for (token, result) in completions.drain(..) {
+                #[cfg(target_os = "linux")]
+                if self.wakeup_poll_armed
+                    && self.wakeup_poll_token == Some(token)
+                    && matches!(result, Ok(CompletionKind::PollAdd { .. }))
+                {
+                    self.clear_wakeup_poll();
+                    continue;
                 }
 
-                let mut needs_flush = false;
-                for (token, _op, result) in completions {
-                    // Try inline completion: if we know which task is waiting,
-                    // insert completion and poll it immediately.
-                    let task_id = unsafe { self.io_state.take_pending_task(token) };
-                    if let Some(tid) = task_id {
-                        // In-place inline poll — no remove/insert.
-                        let removed = {
-                            let task = match self.task_queue.get_mut(&tid) {
-                                Some(t) => t,
-                                None => {
-                                    // Task was already removed (completed/cleaned up)
-                                    // Fall through to waker path below.
-                                    // DO NOT take_waker() here; the caller's waker
-                                    // in io_wakers[] is still live.
-                                    continue;
-                                }
-                            };
+                io_completion_count += 1;
+                let is_multishot_accept = matches!(&result, Ok(CompletionKind::Accept { .. }))
+                    && self.io_state.io_backend.supports_multishot_accept();
+                let should_inline = matches!(
+                    &result,
+                    Ok(CompletionKind::Accept { .. })
+                        | Ok(CompletionKind::Connect)
+                        | Ok(CompletionKind::Read { .. })
+                        | Ok(CompletionKind::ReadFile { .. })
+                        | Ok(CompletionKind::ReadRent { .. })
+                        | Ok(CompletionKind::ReadVectored { .. })
+                        | Ok(CompletionKind::UdpRecv { .. })
+                        | Ok(CompletionKind::UdpRecvVectored { .. })
+                );
 
-                            // Remove the waker that IoFuture::poll stored
-                            // (it will be re-created from our cached waker
-                            // if poll returns Pending).
-                            unsafe { self.io_state.take_waker(token) };
-                            unsafe { self.io_state.insert_completed(token, result) };
-
-                            let waker = task
-                                .get_or_create_waker(&self.ready_queue as *const VecDeque<TaskId>);
-                            let mut ctx = Context::from_waker(&waker);
-                            set_current_task_id(Some(tid));
-                            let poll_result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    task.poll(&mut ctx)
-                                }));
-                            set_current_task_id(None);
-
-                            match poll_result {
-                                Ok(Poll::Ready(())) => {
-                                    self.local_task_count = self.local_task_count.saturating_sub(1);
-                                    true
-                                }
-                                Ok(Poll::Pending) => {
-                                    false // stays in task_queue
-                                }
-                                Err(payload) => {
-                                    self.local_task_count = self.local_task_count.saturating_sub(1);
-                                    tracing::error!(
-                                        "Task {:?} panicked inline on core {}",
-                                        tid,
-                                        self.id
-                                    );
-                                    drop(payload);
-                                    true
-                                }
-                            }
-                        };
-                        if removed {
-                            self.task_queue.remove(&tid);
+                // Try inline completion: if we know which task is waiting,
+                // insert completion and poll it immediately.
+                // SAFETY: Completion handling runs on the owning worker
+                // thread, and the token came from this shard's backend.
+                let task_id = if is_multishot_accept {
+                    unsafe { self.io_state.take_pending_task(token) }
+                } else {
+                    unsafe {
+                        self.io_state
+                            .take_pending_task_and_store_completed(token, result)
+                    }
+                };
+                if let Some(_tid) = task_id {
+                    if should_inline {
+                        // SAFETY: The token is shard-local and the waker
+                        // slot belongs to this worker thread.
+                        if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
+                            self.metrics.waker_wakeups += 1;
+                            waker.wake();
                         }
-                        needs_flush = true;
                         continue;
                     }
-
-                    // No task_id, or task not found: store completion in the
-                    // completed_io map and wake the waiting task via its waker.
-                    unsafe { self.io_state.insert_completed(token, result) };
-                    if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
-                        waker.wake();
-                    }
                 }
 
-                // Flush any SQEs that inline-polled tasks may have submitted.
-                // Without this, those SQEs sit in the submission queue until
-                // the next event-loop iteration's explicit flush(), adding
-                // one full iteration of latency to every I/O chain.
-                if needs_flush {
-                    self.io_state.io_backend.flush();
+                // No task_id, or task not found: the completion has
+                // already been stored in the shard-local slot; just wake
+                // the waiting task via its waker.
+                // SAFETY: Completion handling runs on the owning worker
+                // thread, and this token is consumed once.
+                if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
+                    self.metrics.waker_wakeups += 1;
+                    waker.wake();
                 }
-
-                true
             }
-            Poll::Pending => false,
+
+            self.metrics.io_completions += io_completion_count;
+            let io_batch_elapsed_ns = io_batch_started.elapsed().as_nanos() as u64;
+            self.metrics.io_completion_total_ns += io_batch_elapsed_ns;
+            self.metrics.max_io_completion_batch_ns = self
+                .metrics
+                .max_io_completion_batch_ns
+                .max(io_batch_elapsed_ns);
+
+            if !drain_all {
+                return true;
+            }
         }
     }
 
     /// Process timer events
-    fn process_timers(&mut self) -> bool {
+    fn process_timers(&mut self, now: Instant, ready: &mut Vec<std::task::Waker>) -> bool {
         if !self.timer_wheel.has_pending() {
             return false;
         }
 
-        let mut ready = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
-        self.timer_wheel.expire(Instant::now(), &mut ready);
+        ready.clear();
+        self.timer_wheel.expire(now, ready);
         if ready.is_empty() {
             return false;
         }
 
-        for waker in ready {
+        self.metrics.timer_expirations += ready.len() as u64;
+
+        for waker in ready.drain(..) {
             waker.wake();
         }
         true
@@ -464,8 +831,20 @@ pub struct MultiCoreRuntime {
     num_cores: usize,
     /// Message senders for each core
     core_senders: Vec<Sender<CoreMessage>>,
+    /// Per-core shutdown flags, written directly by the control plane so
+    /// shutdown is not delayed behind ordinary data-plane messages.
+    core_shutdowns: Vec<Arc<AtomicBool>>,
+    /// Per-core sleep flags; senders only write to the wake eventfd when the
+    /// target core is actually parked.
+    #[cfg(target_os = "linux")]
+    core_sleeping: Vec<Arc<AtomicBool>>,
+    #[cfg(target_os = "linux")]
+    /// Per-core eventfds used to wake parked workers when messages arrive.
+    core_wakeup_fds: Vec<OwnedFd>,
     /// Thread join handles
     join_handles: Vec<thread::JoinHandle<Result<()>>>,
+    /// Per-core task sequence counters.
+    task_counters: Vec<AtomicU64>,
     /// Runtime state
     state: AtomicU8,
     /// Next core for round-robin task distribution
@@ -506,13 +885,34 @@ impl MultiCoreRuntime {
         tracing::info!("Creating thread-per-core runtime with {} cores", num_cores);
 
         let mut core_senders = Vec::with_capacity(num_cores);
+        let mut core_shutdowns = Vec::with_capacity(num_cores);
+        #[cfg(target_os = "linux")]
+        let mut core_sleeping = Vec::with_capacity(num_cores);
+        #[cfg(target_os = "linux")]
+        let mut core_wakeup_fds = Vec::with_capacity(num_cores);
         let mut join_handles = Vec::with_capacity(num_cores);
+        let mut ready_receivers = Vec::with_capacity(num_cores);
+        let mut task_counters = Vec::with_capacity(num_cores);
 
         // Create cores and start threads
         for core_id in 0..num_cores {
             let core_shutdown = Arc::new(AtomicBool::new(false));
+            #[cfg(target_os = "linux")]
+            let core_sleeping_flag = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
+            let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
             core_senders.push(sender.clone());
+            core_shutdowns.push(core_shutdown.clone());
+            #[cfg(target_os = "linux")]
+            core_sleeping.push(core_sleeping_flag.clone());
+            ready_receivers.push((core_id, ready_receiver));
+            task_counters.push(AtomicU64::new(1));
+            #[cfg(target_os = "linux")]
+            let wakeup_fd = create_wakeup_eventfd()?;
+            #[cfg(target_os = "linux")]
+            let wakeup_fd_raw = wakeup_fd.as_raw_fd();
+            #[cfg(target_os = "linux")]
+            core_wakeup_fds.push(wakeup_fd);
 
             // Spawn thread for this core
             let handle = thread::Builder::new()
@@ -520,9 +920,35 @@ impl MultiCoreRuntime {
                 .spawn(move || {
                     // io_uring instances are thread-affine; create the backend inside
                     // the worker thread that will submit and poll its operations.
-                    let io_backend = MultiCoreRuntime::create_io_backend(core_id)?;
-                    let mut core =
-                        CpuCore::new(core_id, io_backend, core_shutdown.clone(), receiver);
+                    let io_backend = match MultiCoreRuntime::create_io_backend(core_id) {
+                        Ok(io_backend) => io_backend,
+                        Err(err) => {
+                            let _ = ready_sender.send(Err(format!("{err:?}")));
+                            return Err(err);
+                        }
+                    };
+                    #[cfg(target_os = "linux")]
+                    let mut core = {
+                        let sleeping = core_sleeping_flag.clone();
+                        CpuCore::new(
+                            core_id,
+                            io_backend,
+                            core_shutdown.clone(),
+                            sleeping,
+                            receiver,
+                            crate::config::park_timeout(),
+                            wakeup_fd_raw,
+                        )
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let mut core = CpuCore::new(
+                        core_id,
+                        io_backend,
+                        core_shutdown.clone(),
+                        receiver,
+                        crate::config::park_timeout(),
+                    );
+                    let _ = ready_sender.send(Ok(()));
                     let result = core.run();
                     // Set shutdown flag when core exits
                     core_shutdown.store(true, Ordering::Relaxed);
@@ -535,10 +961,44 @@ impl MultiCoreRuntime {
             join_handles.push(handle);
         }
 
+        for (core_id, ready_receiver) in ready_receivers {
+            match ready_receiver.recv_timeout(Duration::from_secs(2)) {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    for sender in &core_senders {
+                        let _ = sender.send(CoreMessage::Shutdown);
+                    }
+                    for handle in join_handles {
+                        let _ = handle.join();
+                    }
+                    return Err(RuntimeError::TaskFailed(format!(
+                        "Core {core_id} worker failed to start: {err}"
+                    )));
+                }
+                Err(err) => {
+                    for sender in &core_senders {
+                        let _ = sender.send(CoreMessage::Shutdown);
+                    }
+                    for handle in join_handles {
+                        let _ = handle.join();
+                    }
+                    return Err(RuntimeError::TaskFailed(format!(
+                        "Core {core_id} worker did not report startup: {err}"
+                    )));
+                }
+            }
+        }
+
         let runtime = Arc::new(Self {
             num_cores,
             core_senders,
+            core_shutdowns,
+            #[cfg(target_os = "linux")]
+            core_sleeping,
+            #[cfg(target_os = "linux")]
+            core_wakeup_fds,
             join_handles,
+            task_counters,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
             next_core: AtomicUsize::new(0),
         });
@@ -551,9 +1011,21 @@ impl MultiCoreRuntime {
         Ok(runtime)
     }
 
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn notify_core(&self, core_id: usize) {
+        if self.core_sleeping[core_id].load(Ordering::Acquire) {
+            notify_wakeup_eventfd(self.core_wakeup_fds[core_id].as_raw_fd());
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[inline]
+    fn notify_core(&self, _core_id: usize) {}
+
     /// Create IO backend for a specific core
     fn create_io_backend(core_id: usize) -> Result<Arc<dyn IoProvider<Completion = IoCompletion>>> {
-        #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
+        #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
         {
             match crate::io::uring::UringBackend::new(4096) {
                 Ok(uring) => {
@@ -604,6 +1076,10 @@ impl MultiCoreRuntime {
     }
 
     /// Spawn task on optimal core
+    ///
+    /// This is a cross-core-capable API: the future is sent to a worker chosen
+    /// by round-robin. Use `spawn_local` from within a worker task when the new
+    /// task should stay on the same shard as its parent.
     pub fn spawn<F>(&self, future: F) -> Result<TaskId>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -616,16 +1092,14 @@ impl MultiCoreRuntime {
             ));
         }
 
-        // Generate task ID
-        let task_id = next_task_id();
-
-        // Select core using round-robin
-        let core_id = self.next_core.fetch_add(1, Ordering::AcqRel) % self.num_cores;
-
-        self.spawn_on_core(core_id, task_id, future)
+        let start_core = self.select_spawn_core();
+        self.spawn_on_any_core(start_core, Box::pin(future))
     }
 
     /// Spawn task on a specific core
+    ///
+    /// This preserves explicit affinity but may still cross a core boundary if
+    /// called from a different worker or from a control thread.
     pub fn spawn_on<F>(&self, core_id: usize, future: F) -> Result<TaskId>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -645,10 +1119,115 @@ impl MultiCoreRuntime {
             )));
         }
 
-        // Generate task ID
-        let task_id = next_task_id();
-
+        let task_id = self.next_task_id_for_core(core_id);
         self.spawn_on_core(core_id, task_id, future)
+    }
+
+    /// Spawn task on optimal core, waiting for bounded queue capacity.
+    ///
+    /// Unlike `spawn`, this method does not fail immediately when the selected
+    /// shard inbox is full. It retries with timer-based backpressure until the
+    /// message is accepted or `timeout` expires.
+    pub async fn spawn_wait<F>(&self, future: F, timeout: Duration) -> Result<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let state = self.state.load(Ordering::Acquire);
+        if state != RuntimeState::Running as u8 {
+            return Err(RuntimeError::TaskFailed(
+                "Runtime is not running".to_string(),
+            ));
+        }
+
+        let start_core = self.select_spawn_core();
+        self.send_task_with_backpressure_any(start_core, Box::pin(future), timeout)
+            .await
+    }
+
+    /// Spawn task on a specific core, waiting for bounded queue capacity.
+    ///
+    /// This is the backpressure-aware variant of `spawn_on`; it preserves the
+    /// caller's explicit shard choice and never falls back to an unbounded queue.
+    pub async fn spawn_on_wait<F>(
+        &self,
+        core_id: usize,
+        future: F,
+        timeout: Duration,
+    ) -> Result<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let state = self.state.load(Ordering::Acquire);
+        if state != RuntimeState::Running as u8 {
+            return Err(RuntimeError::TaskFailed(
+                "Runtime is not running".to_string(),
+            ));
+        }
+
+        if core_id >= self.num_cores {
+            return Err(RuntimeError::TaskFailed(format!(
+                "Invalid core ID: {core_id}"
+            )));
+        }
+
+        let task_id = self.next_task_id_for_core(core_id);
+        self.send_task_with_backpressure_on_core(core_id, task_id, Box::pin(future), timeout)
+            .await
+    }
+
+    /// Spawn a task on the worker core currently executing this code.
+    ///
+    /// This is the preferred API for connection handlers and child tasks that
+    /// should keep shard affinity. It requires being called from a miniss
+    /// worker thread; outside the runtime use `spawn` or `spawn_on`.
+    pub fn spawn_local<F>(&self, future: F) -> Result<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let state = self.state.load(Ordering::Acquire);
+        if state != RuntimeState::Running as u8 {
+            return Err(RuntimeError::TaskFailed(
+                "Runtime is not running".to_string(),
+            ));
+        }
+
+        let core_id = current_core_id().ok_or_else(|| {
+            RuntimeError::TaskFailed("spawn_local called outside a worker core".to_string())
+        })?;
+        let task_id = self.next_task_id_for_core(core_id);
+        push_local_spawn(task_id, Box::pin(DetachedTaskFuture::new(future)));
+        Ok(task_id)
+    }
+
+    #[inline]
+    fn next_task_id_for_core(&self, core_id: usize) -> TaskId {
+        let sequence = self.task_counters[core_id].fetch_add(1, Ordering::Relaxed) as u32;
+        TaskId::new(core_id, sequence)
+    }
+
+    /// Pick the least-loaded core as the starting point for cross-core spawn.
+    ///
+    /// This is a control-plane decision on the submission side. It only reads
+    /// shard inbox depth and uses round-robin as a tie-breaker to avoid bias.
+    #[inline]
+    fn select_spawn_core(&self) -> usize {
+        let start = self.next_core.fetch_add(1, Ordering::Relaxed) % self.num_cores;
+        let mut best_core = start;
+        let mut best_depth = self.core_senders[start].len();
+
+        for offset in 1..self.num_cores {
+            let core_id = (start + offset) % self.num_cores;
+            let depth = self.core_senders[core_id].len();
+            if depth < best_depth {
+                best_core = core_id;
+                best_depth = depth;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+
+        best_core
     }
 
     /// Internal helper to spawn a task on a specific core
@@ -659,11 +1238,11 @@ impl MultiCoreRuntime {
         // Send task to selected core
         let message = CoreMessage::Task {
             id: task_id,
-            future: Box::pin(future),
+            future: Box::pin(DetachedTaskFuture::new(future)),
         };
 
         match self.core_senders[core_id].try_send(message) {
-            Ok(()) => {}
+            Ok(()) => self.notify_core(core_id),
             Err(TrySendError::Full(_)) => {
                 return Err(RuntimeError::TaskFailed(format!(
                     "Core {core_id} message queue is full"
@@ -678,6 +1257,152 @@ impl MultiCoreRuntime {
 
         tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
         Ok(task_id)
+    }
+
+    fn spawn_on_any_core(
+        &self,
+        start_core: usize,
+        mut future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> Result<TaskId> {
+        let mut disconnected = 0usize;
+
+        for offset in 0..self.num_cores {
+            let core_id = (start_core + offset) % self.num_cores;
+            let task_id = self.next_task_id_for_core(core_id);
+            let message = CoreMessage::Task {
+                id: task_id,
+                future: Box::pin(DetachedTaskFuture::new(future)),
+            };
+            match self.core_senders[core_id].try_send(message) {
+                Ok(()) => {
+                    self.notify_core(core_id);
+                    return Ok(task_id);
+                }
+                Err(TrySendError::Full(CoreMessage::Task {
+                    future: returned_future,
+                    ..
+                })) => {
+                    future = returned_future;
+                }
+                Err(TrySendError::Disconnected(CoreMessage::Task {
+                    future: returned_future,
+                    ..
+                })) => {
+                    future = returned_future;
+                    disconnected += 1;
+                }
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    unreachable!("spawn_on_any_core only sends task messages")
+                }
+            }
+        }
+
+        if disconnected == self.num_cores {
+            Err(RuntimeError::TaskFailed(
+                "All worker cores are disconnected".to_string(),
+            ))
+        } else {
+            Err(RuntimeError::TaskFailed(
+                "All worker cores are busy".to_string(),
+            ))
+        }
+    }
+
+    async fn send_task_with_backpressure_any(
+        &self,
+        start_core: usize,
+        mut future: Pin<Box<dyn Future<Output = ()> + Send>>,
+        timeout: Duration,
+    ) -> Result<TaskId> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            for offset in 0..self.num_cores {
+                let core_id = (start_core + offset) % self.num_cores;
+                let task_id = self.next_task_id_for_core(core_id);
+                let message = CoreMessage::Task {
+                    id: task_id,
+                    future: Box::pin(DetachedTaskFuture::new(future)),
+                };
+                match self.core_senders[core_id].try_send(message) {
+                    Ok(()) => {
+                        self.notify_core(core_id);
+                        tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
+                        return Ok(task_id);
+                    }
+                    Err(TrySendError::Full(CoreMessage::Task {
+                        future: returned_future,
+                        ..
+                    }))
+                    | Err(TrySendError::Disconnected(CoreMessage::Task {
+                        future: returned_future,
+                        ..
+                    })) => {
+                        future = returned_future;
+                    }
+                    Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                        unreachable!("send_task_with_backpressure_any only sends task messages")
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RuntimeError::TaskFailed(
+                    "Timed out waiting for worker core message queue capacity".to_string(),
+                ));
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            crate::timer::sleep(remaining.min(SPAWN_BACKPRESSURE_RETRY_INTERVAL)).await;
+        }
+    }
+
+    async fn send_task_with_backpressure_on_core(
+        &self,
+        core_id: usize,
+        task_id: TaskId,
+        mut future: Pin<Box<dyn Future<Output = ()> + Send>>,
+        timeout: Duration,
+    ) -> Result<TaskId> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let message = CoreMessage::Task {
+                id: task_id,
+                future: Box::pin(DetachedTaskFuture::new(future)),
+            };
+            match self.core_senders[core_id].try_send(message) {
+                Ok(()) => {
+                    self.notify_core(core_id);
+                    tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
+                    return Ok(task_id);
+                }
+                Err(TrySendError::Full(CoreMessage::Task {
+                    future: returned_future,
+                    ..
+                }))
+                | Err(TrySendError::Disconnected(CoreMessage::Task {
+                    future: returned_future,
+                    ..
+                })) => {
+                    future = returned_future;
+                }
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    unreachable!("send_task_with_backpressure_on_core only sends task messages")
+                }
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RuntimeError::TaskFailed(format!(
+                    "Timed out waiting for core {core_id} message queue capacity"
+                )));
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            crate::timer::sleep(remaining.min(SPAWN_BACKPRESSURE_RETRY_INTERVAL)).await;
+        }
     }
 
     /// Install a signal handler that sends shutdown to all cores on SIGINT/SIGTERM.
@@ -726,9 +1451,17 @@ impl MultiCoreRuntime {
             ));
         }
 
-        // Send shutdown message to all cores
-        for sender in &self.core_senders {
-            let _ = sender.send(CoreMessage::Shutdown);
+        // Set per-core shutdown flags directly so shutdown is not starved by
+        // ordinary queued task messages.
+        for shutdown in &self.core_shutdowns {
+            shutdown.store(true, Ordering::Release);
+        }
+
+        // Best-effort wakeup. Do not block if a bounded message queue is full:
+        // the direct shutdown flag above is authoritative.
+        for (core_id, sender) in self.core_senders.iter().enumerate() {
+            let _ = sender.try_send(CoreMessage::Shutdown);
+            self.notify_core(core_id);
         }
 
         tracing::info!("Shutdown signal sent to all cores");
@@ -746,8 +1479,9 @@ impl MultiCoreRuntime {
         }
 
         tracing::info!("Task cancellation requested for task {:?}", task_id);
-        for sender in &self.core_senders {
+        for (core_id, sender) in self.core_senders.iter().enumerate() {
             let _ = sender.try_send(CoreMessage::CancelTask(task_id));
+            self.notify_core(core_id);
         }
         Ok(())
     }
@@ -761,9 +1495,61 @@ impl MultiCoreRuntime {
                     let _ = sender.try_send(CoreMessage::Ping { from_core });
                 }
             }
+            self.notify_core(from_core);
         }
 
         Ok(())
+    }
+
+    /// Collect per-core runtime metrics through control-plane shard messages.
+    ///
+    /// Metrics counters are shard-local; this method aggregates snapshots on
+    /// demand and is not intended for per-request hot-path use.
+    pub fn metrics_snapshot(&self, timeout: Duration) -> Result<RuntimeMetrics> {
+        let state = self.state.load(Ordering::Acquire);
+        if state != RuntimeState::Running as u8 && state != RuntimeState::ShuttingDown as u8 {
+            return Err(RuntimeError::TaskFailed(
+                "Runtime is not running".to_string(),
+            ));
+        }
+
+        let (reply, receiver) = std::sync::mpsc::channel();
+        for (core_id, sender) in self.core_senders.iter().enumerate() {
+            sender
+                .try_send(CoreMessage::CollectMetrics {
+                    reply: reply.clone(),
+                })
+                .map_err(|err| {
+                    RuntimeError::TaskFailed(format!(
+                        "Core {core_id} metrics request failed: {err}"
+                    ))
+                })?;
+            self.notify_core(core_id);
+        }
+        drop(reply);
+
+        let deadline = Instant::now() + timeout;
+        let mut cores = Vec::with_capacity(self.num_cores);
+        while cores.len() < self.num_cores {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RuntimeError::TaskFailed(format!(
+                    "Timed out collecting metrics: got {}/{} cores",
+                    cores.len(),
+                    self.num_cores
+                )));
+            }
+            match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
+                Ok(snapshot) => cores.push(snapshot),
+                Err(err) => {
+                    return Err(RuntimeError::TaskFailed(format!(
+                        "Metrics collection failed: {err}"
+                    )));
+                }
+            }
+        }
+        cores.sort_by_key(|snapshot| snapshot.core_id);
+        Ok(RuntimeMetrics { cores })
     }
 
     /// Wait for all cores to complete

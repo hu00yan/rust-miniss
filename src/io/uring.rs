@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "linux", feature = "io_uring"))] // Only compile when io_uring feature is enabled
+#![cfg(all(target_os = "linux", io_backend = "io_uring"))] // Only compile when io_uring backend is selected
 
 //! A `io-uring` backend for the I/O subsystem.
 
@@ -6,12 +6,12 @@ use crate::buffer::Buffer;
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 use io_uring::{cqueue, opcode, types, IoUring};
 use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
-use rustc_hash::FxHashMap;
 use slab::Slab;
+use smallvec::SmallVec;
 use std::cell::{Cell, UnsafeCell};
+use std::collections::VecDeque;
 use std::io;
-use std::mem;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Duration;
 
 /// A struct to hold a pending operation and any associated data, like buffers.
@@ -23,13 +23,13 @@ enum PendingOp {
     },
     ReadVectored {
         op: Op,
-        buffers: Vec<Buffer>,
-        iovecs: Vec<iovec>,
+        buffers: SmallVec<[Buffer; 4]>,
+        iovecs: SmallVec<[iovec; 4]>,
     },
     WriteVectored {
         op: Op,
-        buffers: Vec<Buffer>,
-        iovecs: Vec<iovec>,
+        buffers: SmallVec<[Buffer; 4]>,
+        iovecs: SmallVec<[iovec; 4]>,
     },
     Write {
         op: Op,
@@ -61,8 +61,8 @@ enum PendingOp {
     },
     Accept {
         op: Op,
-        addr_storage: Box<sockaddr_storage>,
-        addr_len: Box<socklen_t>,
+        addr_storage: Option<Box<sockaddr_storage>>,
+        addr_len: Option<Box<socklen_t>>,
     },
     Fsync {
         op: Op,
@@ -86,25 +86,40 @@ enum PendingOp {
     },
 }
 
+#[derive(Clone, Copy, Default)]
+struct SlotMeta {
+    generation: u32,
+    token_id: u64,
+}
+
 /// The completion type for the io_uring backend.
-pub(super) type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
+pub(super) type Completion = (IoToken, Result<CompletionKind, IoError>);
 
 /// A `io-uring` based `IoProvider`.
 /// Thread-local to ensure single-threaded access.
 pub struct UringBackend {
     ring: UnsafeCell<IoUring>,
     pending_ops: UnsafeCell<Slab<PendingOp>>,
-    /// Mapping from unique token ID -> slab index.
-    /// Prevents CQE misrouting when slab slots are reused.
-    token_to_idx: UnsafeCell<FxHashMap<u64, usize>>,
-    /// Monotonically increasing token ID counter. Never reuses IDs,
-    /// unlike slab indices which are recycled immediately on remove.
+    /// Generation per slab slot. Packed with the slot index into CQE user_data
+    /// so stale completions can be dropped without a hash table lookup.
+    slot_meta: UnsafeCell<Vec<SlotMeta>>,
+    /// Monotonic token counter for unique shard-local IoToken values.
     next_token_id: Cell<u64>,
+    /// Fallback completion queue for unsupported ops and as a capacity hint
+    /// for the reusable completion buffer.
     completed_ops: UnsafeCell<Vec<Completion>>,
-    /// Reused buffer for CQE collection — avoids per-call Vec allocation.
-    cqe_buffer: UnsafeCell<Vec<io_uring::cqueue::Entry>>,
+    /// Multi-shot accept completions indexed by slab slot.
+    accept_results: UnsafeCell<Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>>,
     /// Count of SQEs not yet flushed. Zero means flush() can skip the syscall.
     pending_sqes: Cell<usize>,
+    /// True when the kernel SQPOLL thread owns submission. In that mode flush()
+    /// only publishes the SQ tail; it must not call io_uring_enter.
+    sqpoll_enabled: bool,
+    /// High watermark for proactive submission. When pending SQEs reach this
+    /// point, submit() flushes before the ring gets too full.
+    flush_high_watermark: usize,
+    /// Minimum queued SQEs before flush() submits. Parsed once at backend startup.
+    flush_batch_size: usize,
     thread_id: std::thread::ThreadId,
 }
 
@@ -114,43 +129,66 @@ unsafe impl Sync for UringBackend {}
 
 /// Minimum pending SQEs before flush() calls io_uring_enter submit.
 /// Deferring small batches reduces syscall rate.
-/// Matches MAX_BUSY_ROUNDS in multicore.rs so the inner loop typically
-/// submits once (via park) rather than multiple times via flush().
-const FLUSH_BATCH_SIZE: usize = 64;
+/// Kept below MAX_BUSY_ROUNDS in multicore.rs so busy workers still submit
+/// without waiting for the outer park path.
+const FLUSH_BATCH_SIZE: usize = 61;
+/// Maximum CQEs processed in one drain pass. Keeps one completion burst from
+/// monopolizing a core and pushing tail latency up.
+const MAX_COMPLETIONS_PER_DRAIN: usize = 61;
 
 impl UringBackend {
     pub fn new(entries: u32) -> io::Result<Self> {
+        let flush_batch_size = std::env::var("MINISS_URING_FLUSH_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(FLUSH_BATCH_SIZE);
         fn base_builder() -> io_uring::Builder {
             let mut builder = IoUring::builder();
-            builder
-                .setup_single_issuer()
-                .setup_defer_taskrun()
-                .setup_coop_taskrun();
+            // Match monoio's default posture: leave the builder mostly plain
+            // unless a benchmark explicitly asks for extra flags.
+            if std::env::var_os("MINISS_URING_SINGLE_ISSUER").is_some() {
+                builder.setup_single_issuer();
+            }
+            if std::env::var_os("MINISS_URING_COOP_TASKRUN").is_some() {
+                builder.setup_coop_taskrun();
+            }
+            if std::env::var_os("MINISS_URING_DEFER_TASKRUN").is_some() {
+                builder.setup_defer_taskrun();
+            }
             builder
         }
 
-        let ring = if std::env::var_os("MINISS_URING_SQPOLL").is_some() {
+        let (ring, sqpoll_enabled) = if std::env::var_os("MINISS_URING_SQPOLL").is_some() {
             let mut builder = base_builder();
             builder.setup_sqpoll(1000);
             match builder.build(entries) {
-                Ok(ring) => ring,
+                Ok(ring) => (ring, true),
                 Err(err) => {
                     tracing::warn!("io_uring SQPOLL unavailable, falling back: {err}");
-                    base_builder().build(entries)?
+                    (base_builder().build(entries)?, false)
                 }
             }
         } else {
-            base_builder().build(entries)?
+            (base_builder().build(entries)?, false)
         };
+        let ring_entries = entries as usize;
+        let flush_high_watermark = std::cmp::max(1, ring_entries.saturating_mul(3) / 4);
+        let capacity = std::cmp::max(entries, 64) as usize;
+        let mut accept_results = Vec::with_capacity(capacity);
+        accept_results.resize_with(capacity, || None);
         Ok(Self {
             ring: UnsafeCell::new(ring),
             // Use at least 64 entries for slab capacity
-            pending_ops: UnsafeCell::new(Slab::with_capacity(std::cmp::max(entries, 64) as usize)),
-            token_to_idx: UnsafeCell::new(FxHashMap::default()),
+            pending_ops: UnsafeCell::new(Slab::with_capacity(capacity)),
+            slot_meta: UnsafeCell::new(vec![SlotMeta::default(); capacity]),
             next_token_id: Cell::new(1),
-            completed_ops: UnsafeCell::new(Vec::new()),
-            cqe_buffer: UnsafeCell::new(Vec::with_capacity(entries as usize)),
+            completed_ops: UnsafeCell::new(Vec::with_capacity(capacity)),
+            accept_results: UnsafeCell::new(accept_results),
             pending_sqes: Cell::new(0),
+            sqpoll_enabled,
+            flush_high_watermark,
+            flush_batch_size,
             thread_id: std::thread::current().id(),
         })
     }
@@ -161,15 +199,35 @@ impl UringBackend {
         if self.pending_sqes.get() == 0 {
             return;
         }
+        // SAFETY: UringBackend is thread-affine; the owning runtime thread is
+        // the only code path mutating the ring.
         let ring = unsafe { &mut *self.ring.get() };
+        if self.sqpoll_enabled {
+            ring.submission().sync();
+            self.pending_sqes.set(0);
+            return;
+        }
         if ring.submit().is_ok() {
             self.pending_sqes.set(0);
         }
     }
+
+    #[inline]
+    fn pack_slot(idx: usize, generation: u32) -> u64 {
+        debug_assert!(idx <= u32::MAX as usize);
+        ((generation as u64) << 32) | (idx as u64)
+    }
+
+    #[inline]
+    fn unpack_token(token_id: u64) -> Option<(usize, u32)> {
+        let idx = (token_id & 0xffff_ffff) as usize;
+        let generation = (token_id >> 32) as u32;
+        Some((idx, generation))
+    }
 }
 
 impl IoProvider for UringBackend {
-    type Completion = (IoToken, Op, Result<CompletionKind, IoError>);
+    type Completion = (IoToken, Result<CompletionKind, IoError>);
 
     fn submit(&self, op: Op) -> IoToken {
         // Ensure single-threaded use (debug builds only)
@@ -182,33 +240,25 @@ impl IoProvider for UringBackend {
         // SAFETY: We have exclusive access on this thread.
         let ring = unsafe { &mut *self.ring.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
-
         // Build the SQE entry and PendingOp WITHOUT user_data — we set it after
         // inserting into the slab to get the index.
         let (entry, pending_op) = {
             match op {
                 Op::Accept { fd } => {
-                    let mut addr_storage =
-                        Box::new(unsafe { std::mem::zeroed::<sockaddr_storage>() });
-                    let mut addr_len =
-                        Box::new(std::mem::size_of::<sockaddr_storage>() as socklen_t);
-                    let entry = opcode::Accept::new(
-                        types::Fd(fd),
-                        addr_storage.as_mut() as *mut _ as *mut _,
-                        &mut *addr_len as *mut _,
-                    )
-                    .build();
+                    let entry = opcode::AcceptMulti::new(types::Fd(fd))
+                        .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+                        .build();
                     (
                         entry,
                         PendingOp::Accept {
                             op: Op::Accept { fd },
-                            addr_storage,
-                            addr_len,
+                            addr_storage: None,
+                            addr_len: None,
                         },
                     )
                 }
                 Op::Read { fd, offset, len } => {
-                    let mut buf = Buffer::new_zeroed(len);
+                    let mut buf = Buffer::new_uninitialized(len);
                     let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
                         .offset(offset)
                         .build();
@@ -282,7 +332,7 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::ReadFile { fd, offset, len } => {
-                    let mut buf = Buffer::new_zeroed(len);
+                    let mut buf = Buffer::new_uninitialized(len);
                     let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
                         .offset(offset)
                         .build();
@@ -297,8 +347,10 @@ impl IoProvider for UringBackend {
                 Op::UdpRecv { fd, mut buffer } => {
                     let mut iov = Box::new(iovec {
                         iov_base: buffer.as_mut_ptr() as *mut _,
-                        iov_len: buffer.len(),
+                        iov_len: buffer.capacity(),
                     });
+                    // SAFETY: sockaddr_storage is plain C storage used as an
+                    // output buffer for recvmsg.
                     let mut addr_storage =
                         Box::new(unsafe { std::mem::zeroed::<sockaddr_storage>() });
                     let addr_len = Box::new(std::mem::size_of::<sockaddr_storage>() as socklen_t);
@@ -339,6 +391,8 @@ impl IoProvider for UringBackend {
                         iov_len: data.len(),
                     });
 
+                    // SAFETY: sockaddr_storage is plain C storage and will be
+                    // overwritten with the matching socket address.
                     let mut addr_storage: Box<sockaddr_storage> =
                         Box::new(unsafe { std::mem::zeroed() });
                     let mut addr_len: Box<socklen_t> = Box::new(0);
@@ -352,6 +406,8 @@ impl IoProvider for UringBackend {
                                 },
                                 sin_zero: [0; 8],
                             };
+                            // SAFETY: addr_storage is large/aligned enough for
+                            // sockaddr_in.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in,
@@ -370,6 +426,8 @@ impl IoProvider for UringBackend {
                                 },
                                 sin6_scope_id: sa_v6.scope_id(),
                             };
+                            // SAFETY: addr_storage is large/aligned enough for
+                            // sockaddr_in6.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in6,
@@ -410,23 +468,24 @@ impl IoProvider for UringBackend {
                         },
                     )
                 }
-                Op::ReadVectored { fd, mut buffers } => {
+                Op::ReadVectored { fd, buffers } => {
                     // Take ownership of buffers for PendingOp; Op gets empty placeholder
-                    let mut pending_buffers = std::mem::take(&mut buffers);
-                    let iovecs: Vec<iovec> = pending_buffers
-                        .iter_mut()
-                        .map(|buf| iovec {
+                    let mut pending_buffers = buffers;
+                    let mut iovecs: SmallVec<[iovec; 4]> =
+                        SmallVec::with_capacity(pending_buffers.len());
+                    for buf in pending_buffers.iter_mut() {
+                        iovecs.push(iovec {
                             iov_base: buf.as_mut_ptr() as *mut _,
                             iov_len: buf.capacity(),
-                        })
-                        .collect();
+                        });
+                    }
                     let entry =
                         opcode::Readv::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
                             .build();
                     let pending_op = PendingOp::ReadVectored {
                         op: Op::ReadVectored {
                             fd,
-                            buffers: Vec::new(),
+                            buffers: SmallVec::new(),
                         },
                         buffers: pending_buffers,
                         iovecs,
@@ -434,20 +493,20 @@ impl IoProvider for UringBackend {
                     (entry, pending_op)
                 }
                 Op::WriteVectored { fd, buffers } => {
-                    let iovecs: Vec<iovec> = buffers
-                        .iter()
-                        .map(|buf| iovec {
+                    let mut iovecs: SmallVec<[iovec; 4]> = SmallVec::with_capacity(buffers.len());
+                    for buf in buffers.iter() {
+                        iovecs.push(iovec {
                             iov_base: buf.as_ptr() as *mut _,
                             iov_len: buf.len(),
-                        })
-                        .collect();
+                        });
+                    }
                     let entry =
                         opcode::Writev::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
                             .build();
                     let pending_op = PendingOp::WriteVectored {
                         op: Op::WriteVectored {
                             fd,
-                            buffers: Vec::new(),
+                            buffers: SmallVec::new(),
                         },
                         buffers,
                         iovecs,
@@ -455,6 +514,8 @@ impl IoProvider for UringBackend {
                     (entry, pending_op)
                 }
                 Op::Connect { fd, addr } => {
+                    // SAFETY: sockaddr_storage is plain C storage and will be
+                    // overwritten with the matching socket address.
                     let mut addr_storage: Box<sockaddr_storage> =
                         Box::new(unsafe { std::mem::zeroed() });
                     let addr_len: libc::socklen_t = match &addr {
@@ -475,6 +536,8 @@ impl IoProvider for UringBackend {
                                 },
                                 sin_zero: [0; 8],
                             };
+                            // SAFETY: addr_storage is large/aligned enough for
+                            // sockaddr_in.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in,
@@ -492,6 +555,8 @@ impl IoProvider for UringBackend {
                                 },
                                 sin6_scope_id: sa.scope_id(),
                             };
+                            // SAFETY: addr_storage is large/aligned enough for
+                            // sockaddr_in6.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in6,
@@ -582,44 +647,63 @@ impl IoProvider for UringBackend {
                         io::ErrorKind::Unsupported,
                         "Operation not supported by io_uring backend",
                     )));
+                    // SAFETY: completed_ops is shard-local and mutated only by
+                    // this UringBackend owner thread.
                     let completed_ops = unsafe { &mut *self.completed_ops.get() };
                     // Use a dummy token that will never match any waker — these
                     // unsupported ops will be returned directly.
                     let dummy_token = IoToken::from_id(u64::MAX);
-                    completed_ops.push((dummy_token, op, result));
+                    completed_ops.push((dummy_token, result));
                     return dummy_token;
                 }
             }
         };
+        let is_accept = matches!(&pending_op, PendingOp::Accept { .. });
 
         // Insert into slab to get efficient O(1) storage.
         let idx = pending_ops.insert(pending_op);
 
-        // Use a monotonically increasing ID as user_data, NOT the slab index.
-        // Slab indices are immediately recycled on try_remove, which causes CQE
-        // misrouting when a completion arrives after the slot has been reused
-        // by a different operation.
-        let token_id = self.next_token_id.get();
-        self.next_token_id.set(token_id + 1);
-        let token_to_idx = unsafe { &mut *self.token_to_idx.get() };
-        token_to_idx.insert(token_id, idx);
-        let token = IoToken::from_id(token_id);
-        let entry = entry.user_data(token_id);
+        // SAFETY: slot_meta is shard-local and only
+        // mutated by this backend owner thread while submitting/draining.
+        let slot_meta = unsafe { &mut *self.slot_meta.get() };
+        if idx >= slot_meta.len() {
+            slot_meta.resize_with(idx + 1, SlotMeta::default);
+        }
+        let generation = slot_meta[idx].generation.wrapping_add(1).max(1);
+        slot_meta[idx].generation = generation;
+        let token = IoToken::next_from(&self.next_token_id);
+        slot_meta[idx].token_id = token.id();
+        if is_accept {
+            // SAFETY: accept_results is shard-local and only mutated by this
+            // backend owner thread while submitting/draining operations.
+            let accept_results = unsafe { &mut *self.accept_results.get() };
+            let token_idx = token.slot_index();
+            if token_idx >= accept_results.len() {
+                accept_results.resize_with(token_idx + 1, || None);
+            }
+        }
+        let entry = entry.user_data(Self::pack_slot(idx, generation));
 
         // Push to submission queue. If SQ is full, flush and retry.
         // NO proactive flush here — batch submission happens in flush() at event loop boundary.
+        // SAFETY: `entry` lives until push copies it into the submission queue;
+        // the ring is owned by this thread.
         if unsafe { ring.submission().push(&entry) }.is_err() {
             // SQ full: flush_all submits everything pending, freeing SQ slots.
             self.do_flush();
+            // SAFETY: Same as above; retry after flushing free SQ slots.
             if unsafe { ring.submission().push(&entry) }.is_err() {
                 // Still full after flush — ring is too small, drop the op.
-                token_to_idx.remove(&token_id);
                 pending_ops.try_remove(idx);
                 tracing::error!("SQ still full after emergency flush (ring too small?)");
             }
         } else {
             // Successful push — count it so flush() knows there's work.
-            self.pending_sqes.set(self.pending_sqes.get() + 1);
+            let pending_sqes = self.pending_sqes.get() + 1;
+            self.pending_sqes.set(pending_sqes);
+            if pending_sqes >= self.flush_high_watermark {
+                self.do_flush();
+            }
         }
 
         token
@@ -634,152 +718,217 @@ impl IoProvider for UringBackend {
         // SQEs stay in the submission ring and will be submitted by:
         // - a later flush() when the threshold is reached, or
         // - park() via submit_and_wait when the thread goes idle.
-        if self.pending_sqes.get() < FLUSH_BATCH_SIZE {
+        if self.pending_sqes.get() < self.flush_batch_size {
             return;
         }
         self.do_flush();
     }
 
+    fn pending_submission_count(&self) -> usize {
+        self.pending_sqes.get()
+    }
+
     fn park(&self, timeout: Duration) -> usize {
+        // SAFETY: UringBackend is thread-affine; the owning runtime thread is
+        // the only code path mutating the ring.
         let ring = unsafe { &mut *self.ring.get() };
 
         // Check if completions are already available.
         // No need to wait if results are ready.
-        if !ring.completion().is_empty() {
-            return ring.completion().len();
+        let ready = {
+            let completions = ring.completion();
+            completions.len()
+        };
+        if ready != 0 {
+            return ready;
         }
 
-        // Flush any batched-but-not-submitted SQEs before sleeping.
-        // Without this, deferred SQEs sit in the submission ring while
-        // we block, adding their latency on top of the timeout.
-        self.do_flush();
-
-        // Use a timeout SQE so we never deadlock even when no operations are in flight.
-        // The timeout CQE (user_data = u64::MAX) will be safely ignored by drain_completions
-        // since the slab lookup will return None for this out-of-range user_data.
         let ts = io_uring::types::Timespec::new()
             .sec(timeout.as_secs())
             .nsec(timeout.subsec_nanos() as _);
-        let timeout_entry = opcode::Timeout::new(&ts).build().user_data(u64::MAX);
-
-        if unsafe { ring.submission().push(&timeout_entry) }.is_err() {
-            // SQ full — fall back to thread parking.
-            std::thread::park_timeout(timeout);
-            return 0;
-        }
-
-        // submit_and_wait: submits timeout SQE (+ any other pending SQEs),
-        // then waits for at least 1 CQE (real completion OR timeout expiry).
-        // This is the only syscall; drain_completions will process all CQEs.
-        let _ = ring.submit_and_wait(1);
+        let args = types::SubmitArgs::new().timespec(&ts);
+        let _ = ring.submitter().submit_with_args(1, &args);
         self.pending_sqes.set(0);
         ring.completion().len()
     }
 
-    fn drain_completions(&self, _cx: &mut Context<'_>) -> Poll<Vec<Self::Completion>> {
+    fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+        let mut completions = Vec::new();
+        match self.drain_completions_into(&mut completions) {
+            Poll::Ready(()) => Poll::Ready(completions),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn drain_completions_into(&self, completions: &mut Vec<Self::Completion>) -> Poll<()> {
+        // SAFETY: UringBackend is thread-affine; these UnsafeCell fields are
+        // shard-local and only touched by this owner thread.
         let ring = unsafe { &mut *self.ring.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        let accept_results = unsafe { &mut *self.accept_results.get() };
+        let slot_meta = unsafe { &mut *self.slot_meta.get() };
         let completed_ops = unsafe { &mut *self.completed_ops.get() };
+        completions.clear();
+        let reserve_hint = completed_ops.capacity().max(64);
+        if completions.capacity() < reserve_hint {
+            completions.reserve(reserve_hint - completions.capacity());
+        }
 
-        // Take ownership of completed_ops (reuses its allocation via swap)
-        let mut completions = mem::take(completed_ops);
-
-        // Collect CQEs in the pre-allocated buffer to avoid per-call Vec allocation.
         let mut cq = ring.completion();
         cq.sync();
-        let cqe_buf = unsafe { &mut *self.cqe_buffer.get() };
-        cqe_buf.clear();
-        cqe_buf.extend(cq);
 
-        let token_to_idx = unsafe { &mut *self.token_to_idx.get() };
-
-        for cqe in cqe_buf.iter() {
+        let mut processed = 0usize;
+        for cqe in cq {
             let token_id = cqe.user_data();
             let result = cqe.result();
             let flags = cqe.flags();
             let has_more = cqueue::more(flags);
 
-            // Skip sentinel user_data (timeout CQEs with u64::MAX)
             if token_id == u64::MAX {
                 continue;
             }
 
-            // Look up the slab index via unique token ID.
-            // This prevents misrouting when a slab slot is reused by a new
-            // operation before the previous operation's CQE arrives.
-            let idx = match token_to_idx.remove(&token_id) {
-                Some(idx) => idx,
-                None => {
-                    // Token not found — stale CQE for an already-completed
-                    // operation whose mapping was cleaned up.
-                    continue;
-                }
+            let Some((idx, generation)) = Self::unpack_token(token_id) else {
+                continue;
             };
+            if idx >= slot_meta.len() || slot_meta[idx].generation != generation {
+                continue;
+            }
 
-            let pending_op = if has_more {
-                // Multi-shot: keep both the PendingOp and the mapping
-                // for future completions.
-                token_to_idx.insert(token_id, idx);
-                pending_ops.get(idx).cloned()
-            } else {
-                pending_ops.try_remove(idx)
-            };
+            let token = IoToken::from_id(slot_meta[idx].token_id);
+
+            if has_more {
+                let Some(PendingOp::Accept {
+                    op: _op,
+                    addr_storage,
+                    addr_len,
+                }) = pending_ops.get(idx)
+                else {
+                    continue;
+                };
+
+                let completion_result = {
+                    let res = if result < 0 {
+                        Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                    } else if let (Some(addr_storage), Some(addr_len)) =
+                        (addr_storage.as_ref(), addr_len.as_ref())
+                    {
+                        let storage: *const libc::sockaddr_storage = &**addr_storage as *const _;
+                        // SAFETY: addr_storage points to kernel-filled sockaddr
+                        // bytes for this completion, and the family tag comes
+                        // from the kernel for the same CQE.
+                        let socket_addr = unsafe {
+                            match (*storage).ss_family as libc::c_int {
+                                libc::AF_INET => {
+                                    let sockaddr_in =
+                                        &*(storage as *const _ as *const libc::sockaddr_in);
+                                    let ip = std::net::Ipv4Addr::from(u32::from_be(
+                                        sockaddr_in.sin_addr.s_addr,
+                                    ));
+                                    let port = u16::from_be(sockaddr_in.sin_port);
+                                    Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                                        ip, port,
+                                    )))
+                                }
+                                libc::AF_INET6 => {
+                                    let sockaddr_in6 =
+                                        &*(storage as *const _ as *const libc::sockaddr_in6);
+                                    let ip =
+                                        std::net::Ipv6Addr::from(sockaddr_in6.sin6_addr.s6_addr);
+                                    let port = u16::from_be(sockaddr_in6.sin6_port);
+                                    Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                                        ip,
+                                        port,
+                                        sockaddr_in6.sin6_flowinfo,
+                                        sockaddr_in6.sin6_scope_id,
+                                    )))
+                                }
+                                _ => Err(IoError::Io(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Unsupported address family",
+                                ))),
+                            }
+                        };
+                        let _ = **addr_len;
+                        match socket_addr {
+                            Ok(sa) => Ok(CompletionKind::Accept {
+                                fd: result,
+                                addr: Some(sa),
+                            }),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Ok(CompletionKind::Accept {
+                            fd: result,
+                            addr: None,
+                        })
+                    };
+                    res
+                };
+                let token_idx = token.slot_index();
+                let queue = accept_results[token_idx].get_or_insert_with(VecDeque::new);
+                queue.push_back(completion_result);
+                // SAFETY: token belongs to this shard and the waker slot is
+                // owned by the current io_state.
+                if let Some(waker) = unsafe { crate::cpu::io_state().take_waker(token) } {
+                    waker.wake();
+                }
+                continue;
+            }
+
+            let pending_op = { pending_ops.try_remove(idx) };
 
             if let Some(pending_op) = pending_op {
-                // Reconstruct original token from CQE user_data
-                let token = IoToken::from_id(token_id);
-
-                let (op, completion_result) = match pending_op {
+                let completion_result = match pending_op {
                     PendingOp::Accept {
-                        op,
+                        op: _op,
                         addr_storage,
                         addr_len,
                     } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            // convert sockaddr_storage to SocketAddr
-                            let socket_addr = {
-                                let storage: *const libc::sockaddr_storage =
-                                    &*addr_storage as *const _;
-                                unsafe {
-                                    match (*storage).ss_family as libc::c_int {
-                                        libc::AF_INET => {
-                                            let sockaddr_in =
-                                                &*(storage as *const _ as *const libc::sockaddr_in);
-                                            let ip = std::net::Ipv4Addr::from(u32::from_be(
-                                                sockaddr_in.sin_addr.s_addr,
-                                            ));
-                                            let port = u16::from_be(sockaddr_in.sin_port);
-                                            Ok(std::net::SocketAddr::V4(
-                                                std::net::SocketAddrV4::new(ip, port),
-                                            ))
-                                        }
-                                        libc::AF_INET6 => {
-                                            let sockaddr_in6 = &*(storage as *const _
-                                                as *const libc::sockaddr_in6);
-                                            let ip = std::net::Ipv6Addr::from(
-                                                sockaddr_in6.sin6_addr.s6_addr,
-                                            );
-                                            let port = u16::from_be(sockaddr_in6.sin6_port);
-                                            Ok(std::net::SocketAddr::V6(
-                                                std::net::SocketAddrV6::new(
-                                                    ip,
-                                                    port,
-                                                    sockaddr_in6.sin6_flowinfo,
-                                                    sockaddr_in6.sin6_scope_id,
-                                                ),
-                                            ))
-                                        }
-                                        _ => Err(IoError::Io(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "Unsupported address family",
-                                        ))),
+                        } else if let (Some(addr_storage), Some(addr_len)) =
+                            (addr_storage.as_ref(), addr_len.as_ref())
+                        {
+                            let storage: *const libc::sockaddr_storage =
+                                &**addr_storage as *const _;
+                            // SAFETY: addr_storage points to kernel-filled sockaddr
+                            // bytes for this completion, and the family tag comes
+                            // from the kernel for the same CQE.
+                            let socket_addr = unsafe {
+                                match (*storage).ss_family as libc::c_int {
+                                    libc::AF_INET => {
+                                        let sockaddr_in =
+                                            &*(storage as *const _ as *const libc::sockaddr_in);
+                                        let ip = std::net::Ipv4Addr::from(u32::from_be(
+                                            sockaddr_in.sin_addr.s_addr,
+                                        ));
+                                        let port = u16::from_be(sockaddr_in.sin_port);
+                                        Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                                            ip, port,
+                                        )))
                                     }
+                                    libc::AF_INET6 => {
+                                        let sockaddr_in6 =
+                                            &*(storage as *const _ as *const libc::sockaddr_in6);
+                                        let ip = std::net::Ipv6Addr::from(
+                                            sockaddr_in6.sin6_addr.s6_addr,
+                                        );
+                                        let port = u16::from_be(sockaddr_in6.sin6_port);
+                                        Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                                            ip,
+                                            port,
+                                            sockaddr_in6.sin6_flowinfo,
+                                            sockaddr_in6.sin6_scope_id,
+                                        )))
+                                    }
+                                    _ => Err(IoError::Io(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "Unsupported address family",
+                                    ))),
                                 }
                             };
-                            // touch addr_len so it's considered read (we keep it to keep memory alive)
-                            let _ = *addr_len;
+                            let _ = **addr_len;
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::Accept {
                                     fd: result,
@@ -787,14 +936,21 @@ impl IoProvider for UringBackend {
                                 }),
                                 Err(e) => Err(e),
                             }
+                        } else {
+                            Ok(CompletionKind::Accept {
+                                fd: result,
+                                addr: None,
+                            })
                         };
-                        (op, res)
+                        res
                     }
                     PendingOp::Read { op, mut buf } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
+                            // SAFETY: buffer has enough capacity for the kernel
+                            // write, and result bytes were just reported by CQE.
                             unsafe {
                                 buf.set_len(bytes_read);
                             }
@@ -806,24 +962,19 @@ impl IoProvider for UringBackend {
                                 }),
                             }
                         };
-                        (op, res)
+                        res
                     }
                     PendingOp::Write { op, data } => {
                         let res = {
                             if result < 0 {
-                                // Error: data is dropped and recycled to pool
                                 Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                             } else {
                                 match &op {
-                                    Op::WriteRent { .. } => {
-                                        // Return the buffer to the caller for reuse
-                                        Ok(CompletionKind::WriteRent {
-                                            bytes_written: result as usize,
-                                            data,
-                                        })
-                                    }
+                                    Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
+                                        bytes_written: result as usize,
+                                        data,
+                                    }),
                                     _ => {
-                                        // Non-rent write: data is recycled via Buffer::Drop
                                         let _ = data;
                                         Ok(CompletionKind::Write {
                                             bytes_written: result as usize,
@@ -832,9 +983,9 @@ impl IoProvider for UringBackend {
                                 }
                             }
                         };
-                        (op, res)
+                        res
                     }
-                    PendingOp::WriteStatic { op } => {
+                    PendingOp::WriteStatic { op: _op } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
@@ -842,29 +993,31 @@ impl IoProvider for UringBackend {
                                 bytes_written: result as usize,
                             })
                         };
-                        (op, res)
+                        res
                     }
-                    PendingOp::Fsync { op } => {
+                    PendingOp::Fsync { op: _op } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::Fsync)
                         };
-                        (op, res)
+                        res
                     }
-                    PendingOp::Close { op } => {
+                    PendingOp::Close { op: _op } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::Close)
                         };
-                        (op, res)
+                        res
                     }
-                    PendingOp::ReadFile { op, mut buf } => {
+                    PendingOp::ReadFile { op: _op, mut buf } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
+                            // SAFETY: buffer has enough capacity for the kernel
+                            // write, and result bytes were just reported by CQE.
                             unsafe {
                                 buf.set_len(bytes_read);
                             }
@@ -873,25 +1026,21 @@ impl IoProvider for UringBackend {
                                 data: buf,
                             })
                         };
-                        (op, res)
+                        res
                     }
-                    PendingOp::WriteFile { op, data } => {
-                        // Drop data (recycles to pool) — kept alive until
-                        // completion so the kernel can read/write it.
+                    PendingOp::WriteFile { op: _op, data } => {
                         let _ = data;
-                        let res = {
-                            if result < 0 {
-                                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                            } else {
-                                Ok(CompletionKind::WriteFile {
-                                    bytes_written: result as usize,
-                                })
-                            }
+                        let res = if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::WriteFile {
+                                bytes_written: result as usize,
+                            })
                         };
-                        (op, res)
+                        res
                     }
                     PendingOp::UdpRecv {
-                        op,
+                        op: _op,
                         mut buffer,
                         addr_storage,
                         addr_len,
@@ -901,13 +1050,16 @@ impl IoProvider for UringBackend {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
+                            // SAFETY: buffer has enough capacity for the kernel
+                            // write, and result bytes were just reported by CQE.
                             unsafe {
                                 buffer.set_len(bytes_read);
                             }
-                            // convert sockaddr_storage to SocketAddr
                             let socket_addr = {
                                 let storage: *const libc::sockaddr_storage =
                                     &*addr_storage as *const _;
+                                // SAFETY: storage points at the sockaddr bytes
+                                // just filled by the kernel for this recv.
                                 unsafe {
                                     match (*storage).ss_family as libc::c_int {
                                         libc::AF_INET => {
@@ -944,7 +1096,6 @@ impl IoProvider for UringBackend {
                                     }
                                 }
                             };
-                            // read addr_len to avoid unused-field warning
                             let _ = *addr_len;
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::UdpRecv {
@@ -955,16 +1106,15 @@ impl IoProvider for UringBackend {
                                 Err(e) => Err(e),
                             }
                         };
-                        (op, res)
+                        res
                     }
                     PendingOp::UdpSend {
-                        op,
+                        op: _op,
                         data,
                         addr_storage,
                         addr_len,
                         ..
                     } => {
-                        // touch addr_storage/addr_len so they're considered read (keeps them alive)
                         let _ = &*addr_storage as *const _;
                         let _ = *addr_len;
                         let res = if result < 0 {
@@ -975,23 +1125,25 @@ impl IoProvider for UringBackend {
                                 data,
                             })
                         };
-                        (op, res)
+                        res
                     }
-                    PendingOp::Connect { op, addr_storage } => {
+                    PendingOp::Connect {
+                        op: _op,
+                        addr_storage,
+                    } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let _ = &*addr_storage;
                             Ok(CompletionKind::Connect)
                         };
-                        (op, res)
+                        res
                     }
                     PendingOp::ReadVectored {
-                        op,
+                        op: _op,
                         mut buffers,
                         iovecs,
                     } => {
-                        // Keep iovecs alive until buffers are no longer needed
                         let _ = iovecs;
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
@@ -1000,6 +1152,8 @@ impl IoProvider for UringBackend {
                             let mut remaining = bytes_read;
                             for buf in buffers.iter_mut() {
                                 let can_read = std::cmp::min(remaining, buf.capacity());
+                                // SAFETY: buffer slots are bounded by the
+                                // kernel-reported read length.
                                 unsafe {
                                     buf.set_len(can_read);
                                 }
@@ -1013,14 +1167,13 @@ impl IoProvider for UringBackend {
                                 buffers,
                             })
                         };
-                        (op, res)
+                        res
                     }
                     PendingOp::WriteVectored {
-                        op,
+                        op: _op,
                         buffers,
                         iovecs,
                     } => {
-                        // Keep buffers and iovecs alive until completion
                         let _ = iovecs;
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
@@ -1030,9 +1183,9 @@ impl IoProvider for UringBackend {
                                 buffers,
                             })
                         };
-                        (op, res)
+                        res
                     }
-                    PendingOp::PollAdd { op } => {
+                    PendingOp::PollAdd { op: _op } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
@@ -1040,28 +1193,51 @@ impl IoProvider for UringBackend {
                                 events: result as u32,
                             })
                         };
-                        (op, res)
+                        res
                     }
-                    // WriteEagain entries are caught before the main match
-                    // in the EAGAIN/POLLOUT retry handling above, but the
-                    // compiler needs this arm for exhaustiveness.
-                    PendingOp::Nop { op } => {
+                    PendingOp::Nop { op: _op } => {
                         let res = if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::Nop)
                         };
-                        (op, res)
+                        res
                     }
                 };
-                completions.push((token, op, completion_result));
+                completions.push((token, completion_result));
+            }
+
+            processed += 1;
+            if processed >= MAX_COMPLETIONS_PER_DRAIN {
+                break;
             }
         }
 
         if completions.is_empty() {
             Poll::Pending
         } else {
-            Poll::Ready(completions)
+            Poll::Ready(())
         }
+    }
+
+    fn pop_accept_result(&self, token: IoToken) -> Option<Result<CompletionKind, IoError>> {
+        // SAFETY: accept_results is shard-local and only accessed by this
+        // UringBackend owner thread.
+        let accept_results = unsafe { &mut *self.accept_results.get() };
+        let idx = token.slot_index();
+        let queue = accept_results.get_mut(idx)?.as_mut()?;
+        let result = queue.pop_front()?;
+        if queue.is_empty() {
+            accept_results[idx] = None;
+        }
+        Some(result)
+    }
+
+    fn supports_multishot_accept(&self) -> bool {
+        true
+    }
+
+    fn accepted_streams_are_nonblocking(&self) -> bool {
+        true
     }
 }

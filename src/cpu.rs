@@ -4,15 +4,15 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
-use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
 use crate::timer::{TimerId, TimerWheel};
 
 // --- I/O State Management ---
 
-type IoBackend = dyn IoProvider<Completion = (IoToken, Op, Result<CompletionKind, IoError>)>;
+type IoBackend = dyn IoProvider<Completion = (IoToken, Result<CompletionKind, IoError>)>;
 
 pub(crate) fn create_default_io_backend() -> Arc<IoBackend> {
-    #[cfg(all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"))]
+    #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
     {
         Arc::new(
             crate::io::uring::UringBackend::new(4096)
@@ -43,7 +43,7 @@ pub(crate) fn create_default_io_backend() -> Arc<IoBackend> {
     }
 
     #[cfg(not(any(
-        all(target_os = "linux", io_backend = "io_uring", feature = "io_uring"),
+        all(target_os = "linux", io_backend = "io_uring"),
         all(target_os = "macos", io_backend = "kqueue"),
         all(
             unix,
@@ -64,24 +64,24 @@ pub(crate) fn create_default_io_backend() -> Arc<IoBackend> {
 /// SAFETY: All fields are accessed only from the owning CPU thread.
 /// The UnsafeCell is safe because thread-per-core guarantees single-threaded access.
 ///
-/// I/O tokens are sequential slab indices, so we use `Vec<Option<T>>` instead of
-/// HashMap for O(1) direct-indexed access with zero hashing overhead.
+/// I/O tokens are sequential slab indices, so we use a flat `Vec` of slots
+/// instead of HashMap for O(1) direct-indexed access with zero hashing overhead.
 /// The vec grows lazily as needed; resizes are amortized O(1).
 #[repr(C)]
 pub struct CpuIoState {
     /// The I/O backend for submitting operations.
     pub io_backend: Arc<IoBackend>,
-    /// Wakers for tasks waiting for I/O completions.
-    /// Indexed by IoToken::id() as usize. O(1) no hash.
+    /// Per-token state packed into a single slot to avoid three separate table lookups.
     /// SAFETY: Single-threaded access only.
-    pub io_wakers: UnsafeCell<Vec<Option<Waker>>>,
-    /// Results of completed I/O operations.
-    /// Indexed by IoToken::id() as usize. O(1) no hash.
-    /// SAFETY: Single-threaded access only.
-    pub completed_io: UnsafeCell<Vec<Option<Result<CompletionKind, IoError>>>>,
-    /// Mapping from IoToken to TaskId for inline completion processing.
-    /// Indexed by IoToken::id() as usize. O(1) no hash.
-    pub pending_tasks: UnsafeCell<Vec<Option<crate::waker::TaskId>>>,
+    pub io_slots: UnsafeCell<Vec<IoSlot>>,
+}
+
+#[derive(Default)]
+pub struct IoSlot {
+    token_id: u64,
+    waker: Option<Waker>,
+    completed: Option<Result<CompletionKind, IoError>>,
+    pending_task: Option<crate::waker::TaskId>,
 }
 
 // SAFETY: CpuIoState is only accessed from the owning CPU thread.
@@ -90,13 +90,13 @@ unsafe impl Sync for CpuIoState {}
 
 impl Default for CpuIoState {
     fn default() -> Self {
+        let mut io_slots = Vec::with_capacity(4096);
+        io_slots.resize_with(4096, IoSlot::default);
         Self {
             io_backend: create_default_io_backend(),
-            // Pre-allocate to full ring size (4096) to eliminate repeated
-            // ensure_capacity() → heap-alloc resizes on every new I/O token.
-            io_wakers: UnsafeCell::new(Vec::with_capacity(4096)),
-            completed_io: UnsafeCell::new(Vec::with_capacity(4096)),
-            pending_tasks: UnsafeCell::new(Vec::with_capacity(4096)),
+            // Pre-fill to the default ring size so the common path can write
+            // slots directly without growing the vector first.
+            io_slots: UnsafeCell::new(io_slots),
         }
     }
 }
@@ -105,20 +105,58 @@ impl std::fmt::Debug for CpuIoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuIoState")
             .field("io_backend", &"<IoBackend>")
-            .field("io_wakers", &"<UnsafeCell>")
-            .field("completed_io", &"<UnsafeCell>")
+            .field("io_slots", &"<UnsafeCell>")
             .finish()
     }
 }
 
 impl CpuIoState {
     /// Ensure vec is large enough for the given index (grows by 64-slot chunks).
+    ///
+    /// # Safety
+    ///
+    /// The caller must have exclusive access to the shard-local vector through
+    /// the owning CPU thread.
     #[inline(always)]
-    unsafe fn ensure_capacity<T>(vec: &mut Vec<Option<T>>, idx: usize) {
+    unsafe fn ensure_capacity<T: Default>(vec: &mut Vec<T>, idx: usize) {
         if idx >= vec.len() {
             // Round up to next multiple of 64 for amortized O(1) growth
             let new_len = (idx + 64) & !(64 - 1);
-            vec.resize_with(new_len, || None);
+            vec.resize_with(new_len, T::default);
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Callers must be running on the owning CPU thread with exclusive
+    /// shard-local access to `slots`.
+    #[inline(always)]
+    unsafe fn prepare_slot(slots: &mut Vec<IoSlot>, token: IoToken) -> &mut IoSlot {
+        let idx = token.slot_index();
+        Self::ensure_capacity(slots, idx);
+        // SAFETY: ensure_capacity guarantees idx is in-bounds.
+        let slot = unsafe { slots.get_unchecked_mut(idx) };
+        if slot.token_id != token.id() {
+            slot.token_id = token.id();
+            slot.waker = None;
+            slot.completed = None;
+            slot.pending_task = None;
+        }
+        slot
+    }
+
+    /// # Safety
+    ///
+    /// Callers must be running on the owning CPU thread with exclusive
+    /// shard-local access to `slots`.
+    #[inline(always)]
+    unsafe fn live_slot(slots: &mut [IoSlot], token: IoToken) -> Option<&mut IoSlot> {
+        let idx = token.slot_index();
+        let slot = slots.get_mut(idx)?;
+        if slot.token_id == token.id() {
+            Some(slot)
+        } else {
+            None
         }
     }
 
@@ -131,11 +169,41 @@ impl CpuIoState {
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure slot reuse cannot race with this store.
-    pub unsafe fn store_waker(&self, token: IoToken, waker: Waker) {
-        let idx = token.id() as usize;
-        let wakers = &mut *self.io_wakers.get();
-        Self::ensure_capacity(wakers, idx);
-        wakers[idx] = Some(waker);
+    pub unsafe fn store_waker(&self, token: IoToken, waker: &Waker) {
+        let slots = &mut *self.io_slots.get();
+        // SAFETY: This method is only called by the owning CPU thread.
+        let slot = unsafe { Self::prepare_slot(slots, token) };
+        match &mut slot.waker {
+            Some(existing) if existing.will_wake(waker) => {}
+            slot => *slot = Some(waker.clone()),
+        }
+    }
+
+    /// Store the waker and pending task for a token with one slot lookup.
+    ///
+    /// # Safety
+    ///
+    /// `token` must refer to a live operation owned by this `CpuIoState`, and
+    /// callers must ensure slot reuse cannot race with this store.
+    #[inline(always)]
+    pub unsafe fn store_waker_and_pending_task(
+        &self,
+        token: IoToken,
+        waker: &Waker,
+        task_id: Option<crate::waker::TaskId>,
+    ) {
+        let slots = &mut *self.io_slots.get();
+        // SAFETY: This method is only called by the owning CPU thread.
+        let slot = unsafe { Self::prepare_slot(slots, token) };
+        match &mut slot.waker {
+            Some(existing) if existing.will_wake(waker) => {}
+            entry => *entry = Some(waker.clone()),
+        }
+        if let Some(task_id) = task_id {
+            if slot.pending_task != Some(task_id) {
+                slot.pending_task = Some(task_id);
+            }
+        }
     }
 
     /// Takes a waker from the vec for the given token.
@@ -148,9 +216,8 @@ impl CpuIoState {
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the slot has not been released for reuse.
     pub unsafe fn take_waker(&self, token: IoToken) -> Option<Waker> {
-        let idx = token.id() as usize;
-        let wakers = &mut *self.io_wakers.get();
-        wakers.get_mut(idx)?.take()
+        let slots = &mut *self.io_slots.get();
+        unsafe { Self::live_slot(slots, token) }?.waker.take()
     }
 
     /// Insert a completed IO result.
@@ -163,10 +230,9 @@ impl CpuIoState {
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// only one completion may be stored for a token before it is consumed.
     pub unsafe fn insert_completed(&self, token: IoToken, result: Result<CompletionKind, IoError>) {
-        let idx = token.id() as usize;
-        let completed = &mut *self.completed_io.get();
-        Self::ensure_capacity(completed, idx);
-        completed[idx] = Some(result);
+        let slots = &mut *self.io_slots.get();
+        let slot = unsafe { Self::prepare_slot(slots, token) };
+        slot.completed = Some(result);
     }
 
     /// Remove and return a completed IO result.
@@ -179,9 +245,8 @@ impl CpuIoState {
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the token has not been recycled.
     pub unsafe fn take_completed(&self, token: IoToken) -> Option<Result<CompletionKind, IoError>> {
-        let idx = token.id() as usize;
-        let completed = &mut *self.completed_io.get();
-        completed.get_mut(idx)?.take()
+        let slots = &mut *self.io_slots.get();
+        unsafe { Self::live_slot(slots, token) }?.completed.take()
     }
 
     /// Check if a completed IO result exists without removing it.
@@ -194,9 +259,10 @@ impl CpuIoState {
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the token has not been recycled.
     pub unsafe fn has_completed(&self, token: IoToken) -> bool {
-        let idx = token.id() as usize;
-        let completed = &*self.completed_io.get();
-        completed.get(idx).and_then(|o| o.as_ref()).is_some()
+        let slots = &mut *self.io_slots.get();
+        unsafe { Self::live_slot(slots, token) }
+            .and_then(|slot| slot.completed.as_ref())
+            .is_some()
     }
 
     /// Store the task_id that is waiting for this token.
@@ -210,10 +276,11 @@ impl CpuIoState {
     /// the task id must remain valid until the operation completes or is
     /// cancelled.
     pub unsafe fn store_pending_task(&self, token: IoToken, task_id: crate::waker::TaskId) {
-        let idx = token.id() as usize;
-        let tasks = &mut *self.pending_tasks.get();
-        Self::ensure_capacity(tasks, idx);
-        tasks[idx] = Some(task_id);
+        let slots = &mut *self.io_slots.get();
+        let slot = unsafe { Self::prepare_slot(slots, token) };
+        if slot.pending_task != Some(task_id) {
+            slot.pending_task = Some(task_id);
+        }
     }
 
     /// Remove and return the task_id for a token.
@@ -226,20 +293,95 @@ impl CpuIoState {
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the token has not been recycled.
     pub unsafe fn take_pending_task(&self, token: IoToken) -> Option<crate::waker::TaskId> {
-        let idx = token.id() as usize;
-        let tasks = &mut *self.pending_tasks.get();
-        tasks.get_mut(idx)?.take()
+        let slots = &mut *self.io_slots.get();
+        unsafe { Self::live_slot(slots, token) }?
+            .pending_task
+            .take()
+    }
+
+    /// Take the pending task and store the completion result with one slot lookup.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from the owning CPU thread. The token must refer to a
+    /// live slot owned by this `CpuIoState`.
+    #[inline(always)]
+    pub unsafe fn take_pending_task_and_store_completed(
+        &self,
+        token: IoToken,
+        result: Result<CompletionKind, IoError>,
+    ) -> Option<crate::waker::TaskId> {
+        let slots = &mut *self.io_slots.get();
+        // SAFETY: This method is only called by the owning CPU thread.
+        let slot = unsafe { Self::live_slot(slots, token) }?;
+        let task_id = slot.pending_task.take()?;
+        slot.completed = Some(result);
+        Some(task_id)
+    }
+
+    /// Take both the pending task and its waker with one slot lookup.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from the owning CPU thread. The token must refer to a
+    /// live slot owned by this `CpuIoState`.
+    #[inline(always)]
+    pub unsafe fn take_pending_task_and_waker(
+        &self,
+        token: IoToken,
+    ) -> Option<(crate::waker::TaskId, Waker)> {
+        let slots = &mut *self.io_slots.get();
+        // SAFETY: This method is only called by the owning CPU thread.
+        let slot = unsafe { Self::live_slot(slots, token) }?;
+        Some((slot.pending_task.take()?, slot.waker.take()?))
+    }
+
+    /// Store a completion result and take the current waker in one slot lookup.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from the owning CPU thread. The token must refer to a
+    /// live slot owned by this `CpuIoState`.
+    #[inline(always)]
+    pub unsafe fn insert_completed_and_take_waker(
+        &self,
+        token: IoToken,
+        result: Result<CompletionKind, IoError>,
+    ) -> Option<Waker> {
+        let slots = &mut *self.io_slots.get();
+        // SAFETY: This method is only called by the owning CPU thread.
+        let slot = unsafe { Self::prepare_slot(slots, token) };
+        slot.completed = Some(result);
+        slot.waker.take()
+    }
+
+    /// Clear the per-token slot in one lookup.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from the owning CPU thread. The token must refer to a
+    /// live slot owned by this `CpuIoState`.
+    #[inline(always)]
+    pub unsafe fn clear_slot(&self, token: IoToken) {
+        let slots = &mut *self.io_slots.get();
+        let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
+            return;
+        };
+        slot.token_id = 0;
+        slot.waker = None;
+        slot.completed = None;
+        slot.pending_task = None;
     }
 }
 
 impl Drop for CpuIoState {
     fn drop(&mut self) {
+        // SAFETY: Drop has exclusive access to CpuIoState; no worker can access
+        // these UnsafeCell-backed vectors after the owner is being dropped.
         unsafe {
             // Vec::clear is O(n) but fast — just sets len to 0,
             // dropping all remaining values.
-            (*self.completed_io.get()).clear();
-            (*self.io_wakers.get()).clear();
-            (*self.pending_tasks.get()).clear();
+            (*self.io_slots.get()).clear();
         }
     }
 }
@@ -281,6 +423,8 @@ pub fn try_io_state() -> Option<&'static CpuIoState> {
         if ptr.is_null() {
             None
         } else {
+            // SAFETY: Non-null pointer was installed by the current runtime
+            // thread and remains valid until `clear_current_io_state`.
             Some(unsafe { &*ptr })
         }
     })
@@ -344,7 +488,7 @@ pub(crate) fn clear_current_timer() {
     });
 }
 
-pub(crate) fn register_timer_waker(at: Instant, waker: Waker) -> Option<TimerId> {
+pub(crate) fn register_timer_waker(at: Instant, waker: &Waker) -> Option<TimerId> {
     with_current_timer(|wheel| wheel.schedule(at, waker))
 }
 

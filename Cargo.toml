@@ -7,9 +7,7 @@ description = "A Rust implementation of miniss - a toy Seastar-like async runtim
 license = "MIT OR Apache-2.0"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("hyper_integration"))'] }
-
-
+unexpected_cfgs = { level = "warn" }
 
 [dependencies]
 # Core async primitives
@@ -30,7 +28,7 @@ parking_lot = "0.12"
 nix = { version = "0.27", features = ["signal", "time", "sched", "fs"] }
 libc = "0.2"
 mio = { version = "1.0", features = ["os-poll", "net", "os-ext"] }
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 # I/O backends (io-uring is Linux-only)
 
@@ -41,28 +39,19 @@ slab = "0.4.9"
 # HTTP parsing and types
 http = "1.0"
 httparse = "1.8"
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2", "server"] }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 
-# HTTP framework (hyper)
-hyper = { version = "1", features = ["http1", "http2", "server"] }
-http-body-util = "0.1"
-hyper-util = { version = "0.1", features = ["tokio"] }
-
-# QUIC transport (quinn)
-quinn = { version = "0.11", features = ["rustls-ring"] }
-quinn-udp = "0.5.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
-
-# HTTP/3
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
 
 # Utilities
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 num_cpus = "1.16"
+itoa = "1.0"
 rand = "0.8"
 signal-hook = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "signal", "io-util"] }
@@ -73,6 +62,7 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 bumpalo = { version = "3.16.0", optional = true }
 tracing-test = "0.2.5"
 tokio-rustls = { version = "0.26" }
+smallvec = "1.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -84,9 +74,12 @@ tracing = "0.1"
 reqwest = { version = "0.11", features = ["blocking"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 loom = "0.7"
-hyper = { version = "1", features = ["full"] }
 tracing-test = "0.2.5"
 rcgen = "0.13"
+bytes = "1"
+http-body-util = "0.1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 [[example]]
 name = "hello_world"
@@ -102,10 +95,6 @@ path = "examples/http_echo_onecore.rs"
 [[example]]
 name = "udp_buffered"
 path = "examples/udp_buffered.rs"
-
-[[example]]
-name = "metrics_server"
-path = "examples/metrics_server.rs"
 
 [[example]]
 name = "bench_single"
@@ -156,12 +145,11 @@ arena = ["dep:bumpalo"]
 rent-traits = []  # Enable AsyncReadRent/WriteRent
 advanced = ["dep:bumpalo", "rent-traits"]  # Zero-copy Rent + arena
 debug = []  # Tracing spans, backtraces
-io_uring = ["dep:io-uring"]
 tls = []
 signal = ["dep:signal-hook"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.7", optional = true }
+io-uring = { version = "0.7" }
 
 [profile.release]
 lto = true
