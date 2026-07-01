@@ -1,6 +1,6 @@
 //! Tests for async UDP functionality.
 
-use rust_miniss::{net::AsyncUdpSocket, Runtime};
+use rust_miniss::{net::AsyncUdpSocket, Buffer, Runtime};
 use std::net::SocketAddr;
 
 #[test]
@@ -31,9 +31,9 @@ fn test_async_udp_send_recv() {
             .expect("Async UDP send failed");
         assert_eq!(bytes_sent, test_data.len());
 
-        let mut buf = [0u8; 1024];
-        let (bytes_received, _sender) = receiver_socket
-            .recv_from(&mut buf)
+        let buf = Buffer::with_capacity(1024);
+        let (bytes_received, _sender, buf) = receiver_socket
+            .recv_from_rent(buf)
             .await
             .expect("Async UDP receive failed");
         assert_eq!(bytes_received, test_data.len());

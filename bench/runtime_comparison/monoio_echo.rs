@@ -6,7 +6,10 @@ use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::available_parallelism;
+use std::time::Duration;
 
 fn parse_cores() -> usize {
     let mut cores = available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -24,7 +27,7 @@ fn parse_cores() -> usize {
     cores
 }
 
-async fn handle_client(stream: TcpStream) {
+async fn handle_client(stream: TcpStream, requests: Option<Arc<AtomicU64>>) {
     let mut stream = stream;
     let _ = stream.set_nodelay(true);
     let mut buf = vec![0u8; 4096];
@@ -42,6 +45,9 @@ async fn handle_client(stream: TcpStream) {
         match result {
             Ok(0) | Err(_) => break,
             Ok(_) => {
+                if let Some(counter) = &requests {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
                 if stream.write_all(response.clone()).await.0.is_err() {
                     break;
                 }
@@ -50,7 +56,7 @@ async fn handle_client(stream: TcpStream) {
     }
 }
 
-fn run_worker(addr: SocketAddr, core_id: usize) {
+fn run_worker(addr: SocketAddr, core_id: usize, requests: Option<Arc<AtomicU64>>) {
     // Create socket with SO_REUSEPORT so all workers share the same port
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
         .expect("socket creation failed");
@@ -75,8 +81,9 @@ fn run_worker(addr: SocketAddr, core_id: usize) {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let requests = requests.clone();
                     monoio::spawn(async move {
-                        handle_client(stream).await;
+                        handle_client(stream, requests).await;
                     });
                 }
                 Err(e) => {
@@ -86,6 +93,32 @@ fn run_worker(addr: SocketAddr, core_id: usize) {
             }
         }
     });
+}
+
+fn spawn_metrics_reporter(label: &'static str, requests: Vec<Arc<AtomicU64>>) {
+    if let Some(interval_ms) = std::env::var("MINISS_METRICS_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|interval_ms| *interval_ms > 0)
+    {
+        std::thread::spawn(move || {
+            let interval = Duration::from_millis(interval_ms);
+            loop {
+                std::thread::sleep(interval);
+                let mut total = 0u64;
+                let mut per_worker = Vec::with_capacity(requests.len());
+                for counter in &requests {
+                    let value = counter.load(Ordering::Relaxed);
+                    total += value;
+                    per_worker.push(value);
+                }
+                eprintln!(
+                    "{label}.metrics requests={} per_worker={per_worker:?}",
+                    total
+                );
+            }
+        });
+    }
 }
 
 fn main() {
@@ -107,8 +140,28 @@ fn main() {
 
     println!("monoio http_echo listening on {addr} with {cores} workers");
 
+    let request_metrics_enabled = std::env::var("MINISS_REQUEST_METRICS")
+        .ok()
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let requests: Vec<_> = if request_metrics_enabled {
+        (0..cores).map(|_| Arc::new(AtomicU64::new(0))).collect()
+    } else {
+        Vec::new()
+    };
+    if request_metrics_enabled {
+        spawn_metrics_reporter("monoio", requests.clone());
+    }
+
     let handles: Vec<_> = (0..cores)
-        .map(|i| std::thread::spawn(move || run_worker(addr, i)))
+        .map(|i| {
+            let requests = if request_metrics_enabled {
+                Some(Arc::clone(&requests[i]))
+            } else {
+                None
+            };
+            std::thread::spawn(move || run_worker(addr, i, requests))
+        })
         .collect();
 
     for h in handles {

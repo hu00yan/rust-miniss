@@ -26,6 +26,14 @@ impl TaskId {
     pub fn cpu_id(&self) -> usize {
         (self.0 >> 32) as usize
     }
+
+    pub fn sequence(&self) -> u32 {
+        self.0 as u32
+    }
+
+    pub fn new(core_id: usize, sequence: u32) -> Self {
+        Self(((core_id as u64) << 32) | sequence as u64)
+    }
 }
 
 /// Waker implementation that can reschedule tasks
@@ -50,6 +58,8 @@ impl MinissWaker {
     pub fn create_waker(task_id: TaskId, queue: *const VecDeque<TaskId>) -> Waker {
         let waker = Rc::new(MinissWaker { task_id, queue });
         let raw_waker = RawWaker::new(Rc::into_raw(waker) as *const (), &VTABLE);
+        // SAFETY: The RawWaker vtable reconstructs the same Rc allocation and
+        // follows RawWaker ownership rules for clone/wake/drop.
         unsafe { Waker::from_raw(raw_waker) }
     }
 
@@ -70,6 +80,8 @@ static VTABLE: RawWakerVTable =
     RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
 
 unsafe fn waker_clone(data: *const ()) -> RawWaker {
+    // SAFETY: `data` was produced by Rc::into_raw for MinissWaker in
+    // create_waker or a previous clone.
     let waker = Rc::from_raw(data as *const MinissWaker);
     let cloned = waker.clone(); // non-atomic: Cell<usize> increment
     std::mem::forget(waker); // Don't drop the original
@@ -77,17 +89,21 @@ unsafe fn waker_clone(data: *const ()) -> RawWaker {
 }
 
 unsafe fn waker_wake(data: *const ()) {
+    // SAFETY: `wake` consumes exactly one Rc strong ref encoded in `data`.
     let waker = Rc::from_raw(data as *const MinissWaker);
     waker.wake_impl();
     // Rc dropped here — non-atomic refcount decrement
 }
 
 unsafe fn waker_wake_by_ref(data: *const ()) {
+    // SAFETY: `wake_by_ref` borrows the MinissWaker without consuming the Rc
+    // strong ref represented by `data`.
     let waker = &*(data as *const MinissWaker);
     waker.wake_impl();
 }
 
 unsafe fn waker_drop(data: *const ()) {
+    // SAFETY: `drop` consumes exactly one Rc strong ref encoded in `data`.
     let _ = Rc::from_raw(data as *const MinissWaker);
     // Rc dropped here — non-atomic refcount decrement, may free MinissWaker
 }
@@ -111,6 +127,8 @@ pub fn dummy_waker() -> Waker {
         )
     }
 
+    // SAFETY: The dummy RawWaker vtable never dereferences the null data
+    // pointer and implements no-op wake/drop functions.
     unsafe { Waker::from_raw(dummy_raw_waker()) }
 }
 

@@ -1,63 +1,28 @@
-//! Owned-buffer HTTP echo using read_rent and vectored writes.
+//! Owned-buffer HTTP echo using read_rent and static writes.
 //!
-//! The key insight: read data stays in the Buffer the kernel wrote into.
-//! The response uses one writev submission for header + body:
-//!   1. read_rent → kernel fills user's Buffer directly (zero copy)
-//!   2. write_vectored_rent(header, body) → one kernel writev operation
-//!
-//! HTTP pipelining over a single TCP connection works because TCP
-//! guarantees ordering: header bytes arrive before body bytes.
+//! The connection keeps one owned buffer alive and hands it back and forth
+//! between user space and the kernel.
 
-use futures::io::AsyncWriteExt;
 use rust_miniss::net::AsyncTcpListener;
-use rust_miniss::{Buffer, MultiCoreRuntime};
+use rust_miniss::MultiCoreRuntime;
 
 use std::io;
-use std::io::Write as _;
 use std::net::SocketAddr;
 
-async fn write_response(
-    stream: &mut rust_miniss::net::AsyncTcpStream,
-    header: Buffer,
-    body: Buffer,
-) -> io::Result<Buffer> {
-    let total_len = header.len() + body.len();
-    let (written, mut buffers) = stream.write_vectored_rent(vec![header, body]).await?;
+static RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 22\r\nConnection: keep-alive\r\n\r\nHello from rust-miniss";
 
-    let header = buffers.remove(0);
-    let body = buffers.remove(0);
-    if written >= total_len {
-        return Ok(body);
-    }
-
-    if written < header.len() {
-        stream.write_all(&header[written..]).await?;
-        stream.write_all(&body).await?;
-    } else {
-        let body_offset = written - header.len();
-        stream.write_all(&body[body_offset..]).await?;
-    }
-
-    Ok(body)
-}
-
-async fn handle_client(mut stream: rust_miniss::net::AsyncTcpStream) {
-    // Single buffer per connection, reused across the entire lifecycle.
-    let mut buf = Buffer::with_capacity(8192);
-    let mut header = Vec::with_capacity(64);
+async fn handle_client(stream: rust_miniss::net::AsyncTcpStream) {
+    let mut buf = Vec::with_capacity(8192);
 
     loop {
         match stream.read_rent(buf).await {
-            Ok((0, _consumed)) => break,
-            Ok((n, read_buf)) => {
-                header.clear();
-                let _ = write!(header, "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
-                match write_response(&mut stream, Buffer::from_slice(&header), read_buf).await {
-                    Ok(returned_body) => buf = returned_body,
-                    Err(_) => break,
+            Ok((0, _)) | Err(_) => break,
+            Ok((_, owned_buf)) => {
+                if stream.write_static_all(RESPONSE).await.is_err() {
+                    break;
                 }
+                buf = owned_buf;
             }
-            Err(_) => break,
         }
     }
 }
@@ -79,7 +44,7 @@ fn main() -> io::Result<()> {
     let rt = runtime.clone();
     runtime
         .spawn(async move {
-            let listener = match AsyncTcpListener::bind(addr) {
+            let mut listener = match AsyncTcpListener::bind(addr) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("Failed to bind to {addr}: {e}");
@@ -90,7 +55,7 @@ fn main() -> io::Result<()> {
             loop {
                 match listener.accept().await {
                     Ok((stream, _client_addr)) => {
-                        let _ = rt.spawn(handle_client(stream));
+                        let _ = rt.spawn_local(handle_client(stream));
                     }
                     Err(e) => {
                         eprintln!("Accept error: {e}");

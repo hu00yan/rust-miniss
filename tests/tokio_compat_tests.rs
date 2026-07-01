@@ -10,7 +10,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 fn test_tokio_compat_read() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -46,7 +46,7 @@ fn test_tokio_compat_read() {
 fn test_tokio_compat_write() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -82,7 +82,7 @@ fn test_tokio_compat_write() {
 fn test_tokio_futures_interop() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 

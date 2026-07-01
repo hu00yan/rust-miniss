@@ -49,22 +49,65 @@ fn async_file_sync_all_completes_after_write() {
 }
 
 #[test]
+fn cpu_io_slots_do_not_alias_different_token_generations() {
+    use rust_miniss::cpu::CpuIoState;
+    use rust_miniss::{CompletionKind, IoError, IoProvider, IoToken, Op};
+    use std::task::Poll;
+
+    struct DummyProvider;
+
+    impl IoProvider for DummyProvider {
+        type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+        fn submit(&self, _op: Op) -> IoToken {
+            IoToken::from_id(1)
+        }
+
+        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+            Poll::Pending
+        }
+    }
+
+    let state = CpuIoState {
+        io_backend: Arc::new(DummyProvider),
+        io_slots: Default::default(),
+    };
+    let old = IoToken::from_id((1u64 << 32) | 7);
+    let new = IoToken::from_id((2u64 << 32) | 7);
+
+    // SAFETY: The test owns this CpuIoState and never shares it across
+    // threads, matching the runtime's shard-local access contract.
+    unsafe {
+        state.insert_completed(old, Ok(CompletionKind::Nop));
+        assert!(state.has_completed(old));
+        assert!(!state.has_completed(new));
+
+        state.insert_completed(new, Ok(CompletionKind::Nop));
+        assert!(!state.has_completed(old));
+        assert!(state.has_completed(new));
+
+        state.clear_slot(old);
+        assert!(state.has_completed(new));
+        assert!(state.take_completed(new).is_some());
+    }
+}
+
+#[test]
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 fn tcp_read_rent_reads_into_empty_capacity_buffer() {
     use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
-    use rust_miniss::Buffer;
     use std::net::SocketAddr;
 
     let runtime = Runtime::new();
 
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let buf = Buffer::with_capacity(64);
+            let buf = Vec::with_capacity(64);
             assert_eq!(buf.len(), 0);
             assert!(buf.capacity() >= 64);
 
@@ -77,12 +120,52 @@ fn tcp_read_rent_reads_into_empty_capacity_buffer() {
         let client = async move {
             let stream = AsyncTcpStream::connect(addr).await.unwrap();
             stream
-                .write_rent(Buffer::from_slice(b"hello"))
+                .write_rent(Vec::from(b"hello".as_slice()))
                 .await
                 .unwrap();
         };
 
         futures::future::join(server, client).await;
+    });
+}
+
+#[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn tcp_accept_multishot_completes_after_delayed_connect() {
+    use futures::future::{select, Either};
+    use futures::pin_mut;
+    use rust_miniss::net::AsyncTcpListener;
+    use std::net::{SocketAddr, TcpStream};
+    use std::thread;
+
+    let runtime = Runtime::new();
+
+    runtime.block_on(async {
+        let mut listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            TcpStream::connect(addr).expect("connect");
+        });
+
+        let accept = listener.accept();
+        let timeout = rust_miniss::sleep(Duration::from_secs(1));
+        pin_mut!(accept);
+        pin_mut!(timeout);
+
+        match select(accept, timeout).await {
+            Either::Left((Ok((stream, _addr)), _timeout)) => {
+                drop(stream);
+            }
+            Either::Left((Err(err), _timeout)) => {
+                panic!("accept failed unexpectedly: {err}");
+            }
+            Either::Right((_timeout, _accept)) => {
+                panic!("timed out waiting for async accept completion");
+            }
+        }
     });
 }
 
@@ -165,7 +248,7 @@ fn mio_backend_close_completes_successfully_once() {
     use rust_miniss::io::epoll::EpollBackend;
     use rust_miniss::{CompletionKind, IoProvider, Op};
     use std::os::fd::IntoRawFd;
-    use std::task::{Context, Poll};
+    use std::task::Poll;
 
     struct IoStateGuard;
 
@@ -178,9 +261,7 @@ fn mio_backend_close_completes_successfully_once() {
     let backend = Arc::new(EpollBackend::new().expect("backend"));
     let state = CpuIoState {
         io_backend: backend.clone(),
-        io_wakers: Default::default(),
-        completed_io: Default::default(),
-        pending_tasks: Default::default(),
+        io_slots: Default::default(),
     };
     set_current_io_state(&state);
     let _guard = IoStateGuard;
@@ -188,14 +269,11 @@ fn mio_backend_close_completes_successfully_once() {
     let fd = tempfile::tempfile().expect("temp file").into_raw_fd();
     let token = backend.submit(Op::Close { fd });
     backend.flush();
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
-    match backend.drain_completions(&mut cx) {
+    match backend.drain_completions() {
         Poll::Ready(completions) => {
-            let (_, _, result) = completions
+            let (_, result) = completions
                 .into_iter()
-                .find(|(completion_token, _, _)| *completion_token == token)
+                .find(|(completion_token, _)| *completion_token == token)
                 .expect("close completion");
 
             assert!(

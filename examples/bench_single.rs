@@ -31,7 +31,7 @@ fn main() {
 
     let _server = std::thread::spawn(move || {
         rt.block_on(async {
-            let listener =
+            let mut listener =
                 AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
             let addr = listener.local_addr().unwrap();
             port_tx.send(addr.port()).unwrap();

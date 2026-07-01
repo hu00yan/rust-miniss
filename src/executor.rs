@@ -18,7 +18,6 @@
 //! JoinHandles return `TaskResult<T>` which is `Result<T, TaskError>` where
 //! `TaskError::Panic` contains the panic payload for analysis.
 
-use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -26,9 +25,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::task::{JoinHandle, JoinTaskFuture, Task};
+use crate::task::{DetachedTaskFuture, JoinHandle, JoinTaskFuture, Task};
 use crate::timer::TimerWheel;
-use crate::waker::{MinissWaker, TaskId};
+use crate::waker::TaskId;
+
+type IoCompletion = (
+    crate::io::IoToken,
+    std::result::Result<crate::io::CompletionKind, crate::io::IoError>,
+);
 
 /// A single-threaded async runtime
 pub struct Runtime {
@@ -64,6 +68,8 @@ impl Runtime {
         let mut timer_wheel = TimerWheel::default();
         crate::cpu::set_current_timer(&mut timer_wheel);
         let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+        let mut io_completions: Vec<IoCompletion> =
+            Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT * 4);
         struct TimerContextGuard;
         impl Drop for TimerContextGuard {
             fn drop(&mut self) {
@@ -101,24 +107,37 @@ impl Runtime {
                 }
                 Poll::Pending => {
                     crate::cpu::set_current_task_id(None);
-                    let mut made_progress = false;
+                    let mut made_progress = self.executor.borrow_mut().tick();
 
                     // Check for I/O completions
-                    let noop_waker = futures::task::noop_waker();
-                    let mut io_context = Context::from_waker(&noop_waker);
-
                     // Flush all queued SQEs before polling for completions
                     io_state.io_backend.flush();
 
                     // Drain I/O completions
-                    if let Poll::Ready(completions) =
-                        io_state.io_backend.drain_completions(&mut io_context)
+                    io_completions.clear();
+                    if let Poll::Ready(()) = io_state
+                        .io_backend
+                        .drain_completions_into(&mut io_completions)
                     {
-                        if !completions.is_empty() {
+                        if !io_completions.is_empty() {
                             // SAFETY: Single-threaded access.
-                            for (token, _op, result) in completions {
-                                unsafe { io_state.insert_completed(token, result) };
-                                if let Some(waker) = unsafe { io_state.take_waker(token) } {
+                            for (token, result) in io_completions.drain(..) {
+                                let is_accept =
+                                    matches!(result, Ok(crate::io::CompletionKind::Accept { .. }))
+                                        && io_state.io_backend.supports_multishot_accept();
+                                if is_accept {
+                                    // SAFETY: Single-threaded executor owns
+                                    // CpuIoState while polling completions.
+                                    if let Some(waker) = unsafe { io_state.take_waker(token) } {
+                                        waker.wake();
+                                    }
+                                    continue;
+                                }
+                                // SAFETY: Completion token came from this
+                                // executor's backend and is consumed once.
+                                if let Some(waker) = unsafe {
+                                    io_state.insert_completed_and_take_waker(token, result)
+                                } {
                                     waker.wake();
                                 }
                             }
@@ -136,6 +155,14 @@ impl Runtime {
                         }
                     }
 
+                    // Drive tasks spawned by the accept loop / connection handlers
+                    // once more after I/O and timer work. This keeps spawned work
+                    // from waiting until the next outer poll when the main future
+                    // has already made progress.
+                    if self.executor.borrow_mut().tick() {
+                        made_progress = true;
+                    }
+
                     if made_progress {
                         continue;
                     }
@@ -143,20 +170,32 @@ impl Runtime {
                     // Park using the I/O backend. With DEFER_TASKRUN, completions are
                     // only posted to the CQ ring when we enter the kernel via
                     // submit_and_wait. park() handles this correctly.
-                    io_state
-                        .io_backend
-                        .park(std::time::Duration::from_millis(1));
+                    io_state.io_backend.park(crate::config::park_timeout());
 
                     // Drain any completions that arrived during park.
-                    let noop_waker = futures::task::noop_waker();
-                    let mut io_context = Context::from_waker(&noop_waker);
-                    if let Poll::Ready(completions) =
-                        io_state.io_backend.drain_completions(&mut io_context)
+                    io_completions.clear();
+                    if let Poll::Ready(()) = io_state
+                        .io_backend
+                        .drain_completions_into(&mut io_completions)
                     {
-                        if !completions.is_empty() {
-                            for (token, _op, result) in completions {
-                                unsafe { io_state.insert_completed(token, result) };
-                                if let Some(waker) = unsafe { io_state.take_waker(token) } {
+                        if !io_completions.is_empty() {
+                            for (token, result) in io_completions.drain(..) {
+                                let is_accept =
+                                    matches!(result, Ok(crate::io::CompletionKind::Accept { .. }))
+                                        && io_state.io_backend.supports_multishot_accept();
+                                if is_accept {
+                                    // SAFETY: Single-threaded executor owns
+                                    // CpuIoState while polling completions.
+                                    if let Some(waker) = unsafe { io_state.take_waker(token) } {
+                                        waker.wake();
+                                    }
+                                    continue;
+                                }
+                                // SAFETY: Completion token came from this
+                                // executor's backend and is consumed once.
+                                if let Some(waker) = unsafe {
+                                    io_state.insert_completed_and_take_waker(token, result)
+                                } {
                                     waker.wake();
                                 }
                             }
@@ -176,6 +215,14 @@ impl Runtime {
     {
         self.executor.borrow_mut().spawn(future) // Changed from lock().unwrap()
     }
+
+    /// Spawn a fire-and-forget task without creating a join handle.
+    pub fn spawn_detached<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.executor.borrow_mut().spawn_detached(future);
+    }
 }
 
 impl Default for Runtime {
@@ -186,18 +233,34 @@ impl Default for Runtime {
 
 /// The core executor that manages task scheduling
 pub struct Executor {
-    tasks: FxHashMap<TaskId, Task>,
+    tasks: Vec<Option<Task>>,
     ready_queue: VecDeque<TaskId>,
     next_task_id: AtomicU64,
+    active_tasks: usize,
+    park_timeout: std::time::Duration,
 }
 
 impl Executor {
     /// Create a new executor
     pub fn new() -> Self {
+        Self::with_park_timeout(crate::config::park_timeout())
+    }
+
+    /// Create a new executor with explicit idle park timeout.
+    pub fn with_park_timeout(park_timeout: std::time::Duration) -> Self {
         Self {
-            tasks: FxHashMap::default(),
+            tasks: Vec::with_capacity(256),
             ready_queue: VecDeque::with_capacity(256),
             next_task_id: AtomicU64::new(1),
+            active_tasks: 0,
+            park_timeout,
+        }
+    }
+
+    #[inline]
+    fn ensure_task_capacity(&mut self, idx: usize) {
+        if idx >= self.tasks.len() {
+            self.tasks.resize_with(idx + 1, || None);
         }
     }
 
@@ -241,18 +304,40 @@ impl Executor {
         T: Send + 'static,
     {
         let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
+        let idx = task_id.sequence() as usize;
 
         let (handle, completer) = JoinHandle::new(task_id);
         let wrapped_future = JoinTaskFuture::new(future, completer);
 
         // Create the task
-        let task = Task::new(task_id, wrapped_future);
+        let mut task = Task::new(task_id, wrapped_future);
 
         // Add to our task list and ready queue
-        self.tasks.insert(task_id, task);
+        self.ensure_task_capacity(idx);
+        task.ensure_waker(&self.ready_queue as *const VecDeque<_>);
+        self.tasks[idx] = Some(task);
         self.ready_queue.push_back(task_id);
+        self.active_tasks += 1;
 
         handle
+    }
+
+    /// Spawn a task without tracking a join handle.
+    pub fn spawn_detached<F>(&mut self, future: F) -> TaskId
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
+        let idx = task_id.sequence() as usize;
+
+        let mut task = Task::new(task_id, DetachedTaskFuture::new(future));
+        self.ensure_task_capacity(idx);
+        task.ensure_waker(&self.ready_queue as *const VecDeque<_>);
+        self.tasks[idx] = Some(task);
+        self.ready_queue.push_back(task_id);
+        self.active_tasks += 1;
+
+        task_id
     }
 
     /// Run all ready tasks once
@@ -260,32 +345,25 @@ impl Executor {
         let mut made_progress = false;
 
         while let Some(task_id) = self.ready_queue.pop_front() {
-            if let Some(mut task) = self.tasks.remove(&task_id) {
-                // Create a waker for this task
-                let waker =
-                    MinissWaker::create_waker(task_id, &self.ready_queue as *const VecDeque<_>);
-                let mut context = Context::from_waker(&waker);
-
-                // Poll the task, catching any panics
-                let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    task.poll(&mut context)
-                }));
+            let idx = task_id.sequence() as usize;
+            if let Some(mut task) = self.tasks.get_mut(idx).and_then(Option::take) {
+                // Reuse the task-local waker cache so the hot path does not
+                // allocate or clone a new Rc on every poll.
+                crate::cpu::set_current_task_id(Some(task_id));
+                let poll_result = task.poll_with_cached_waker();
+                crate::cpu::set_current_task_id(None);
 
                 match poll_result {
-                    Ok(Poll::Ready(())) => {
+                    Poll::Ready(()) => {
                         // Task completed successfully, don't put it back
+                        self.active_tasks = self.active_tasks.saturating_sub(1);
                         made_progress = true;
                     }
-                    Ok(Poll::Pending) => {
+                    Poll::Pending => {
                         // Task is still pending, put it back
-                        self.tasks.insert(task_id, task);
+                        self.ensure_task_capacity(idx);
+                        self.tasks[idx] = Some(task);
                         made_progress = true;
-                    }
-                    Err(_panic_payload) => {
-                        // Task panicked, log it and continue with other tasks
-                        eprintln!("Task {task_id:?} panicked");
-                        made_progress = true;
-                        // Don't put the task back - it's considered "completed" due to panic
                     }
                 }
             }
@@ -296,18 +374,17 @@ impl Executor {
 
     /// Run the executor until all tasks complete
     pub fn run(&mut self) {
-        use std::time::Duration;
-        while !self.tasks.is_empty() {
+        while self.active_tasks > 0 {
             if !self.tick() {
                 // No progress made; park the thread briefly to avoid busy loop
-                std::thread::park_timeout(Duration::from_millis(1));
+                std::thread::park_timeout(self.park_timeout);
             }
         }
     }
 
     /// Get the number of active tasks
     pub fn task_count(&self) -> usize {
-        self.tasks.len()
+        self.active_tasks
     }
 }
 
@@ -363,7 +440,7 @@ mod tests {
         let completed_clone = completed.clone();
 
         let _handle = executor.spawn(async move {
-            completed_clone.store(true, Ordering::SeqCst);
+            completed_clone.store(true, Ordering::Release);
             42
         });
 
@@ -371,7 +448,7 @@ mod tests {
 
         // Tick should run the task
         assert!(executor.tick());
-        assert!(completed.load(Ordering::SeqCst));
+        assert!(completed.load(Ordering::Acquire));
         assert_eq!(executor.task_count(), 0); // Task completed
     }
 
@@ -384,7 +461,7 @@ mod tests {
         for i in 0..5 {
             let counter_clone = counter.clone();
             executor.spawn(async move {
-                counter_clone.fetch_add(i, Ordering::SeqCst);
+                counter_clone.fetch_add(i, Ordering::Relaxed);
             });
         }
 
@@ -394,7 +471,7 @@ mod tests {
         executor.run();
 
         assert_eq!(executor.task_count(), 0);
-        assert_eq!(counter.load(Ordering::SeqCst), 1 + 2 + 3 + 4);
+        assert_eq!(counter.load(Ordering::Acquire), 1 + 2 + 3 + 4);
     }
 
     #[test]
@@ -447,13 +524,13 @@ mod tests {
         });
 
         executor.spawn(async move {
-            flag_clone.store(true, Ordering::SeqCst);
+            flag_clone.store(true, Ordering::Release);
         });
 
         // This will panic if the panic is not caught
         executor.run();
 
-        assert!(flag.load(Ordering::SeqCst), "Task B should have run");
+        assert!(flag.load(Ordering::Acquire), "Task B should have run");
     }
 
     #[test]
@@ -469,7 +546,7 @@ mod tests {
                 });
             } else {
                 executor.spawn(async move {
-                    completed_count_clone.fetch_add(1, Ordering::SeqCst);
+                    completed_count_clone.fetch_add(1, Ordering::Relaxed);
                 });
             }
         }
@@ -477,7 +554,7 @@ mod tests {
         executor.run();
 
         assert_eq!(
-            completed_count.load(Ordering::SeqCst),
+            completed_count.load(Ordering::Acquire),
             5,
             "All non-panicking tasks should complete"
         );
@@ -493,14 +570,14 @@ mod tests {
         let success_clone = success.clone();
 
         executor.spawn(async move {
-            success_clone.store(true, Ordering::SeqCst);
+            success_clone.store(true, Ordering::Release);
         });
 
         executor.run();
 
         // This should not cause compilation errors with string literals
         assert!(
-            success.load(Ordering::SeqCst),
+            success.load(Ordering::Acquire),
             "Task should have completed successfully"
         );
     }
@@ -514,17 +591,17 @@ mod tests {
         for _i in 0..3 {
             let counter_clone = counter.clone();
             executor.spawn(async move {
-                counter_clone.fetch_add(1, Ordering::SeqCst);
+                counter_clone.fetch_add(1, Ordering::Relaxed);
             });
         }
 
         executor.run();
 
         assert_eq!(
-            counter.load(Ordering::SeqCst),
+            counter.load(Ordering::Acquire),
             3,
             "All tasks should complete: expected 3, got {}",
-            counter.load(Ordering::SeqCst)
+            counter.load(Ordering::Acquire)
         );
     }
 
@@ -573,13 +650,13 @@ mod tests {
             if i % 3 == 0 {
                 // Panicking task
                 executor.spawn(async move {
-                    panic_clone.fetch_add(1, Ordering::SeqCst);
+                    panic_clone.fetch_add(1, Ordering::Relaxed);
                     panic!("intentional panic in task {i}");
                 });
             } else {
                 // Normal task
                 executor.spawn(async move {
-                    completed_clone.fetch_add(1, Ordering::SeqCst);
+                    completed_clone.fetch_add(1, Ordering::Relaxed);
                 });
             }
         }
@@ -587,12 +664,12 @@ mod tests {
         executor.run();
 
         assert_eq!(
-            completed_tasks.load(Ordering::SeqCst),
+            completed_tasks.load(Ordering::Acquire),
             4,
             "Expected 4 non-panicking tasks to complete"
         );
         assert_eq!(
-            panic_tasks.load(Ordering::SeqCst),
+            panic_tasks.load(Ordering::Acquire),
             2,
             "Expected 2 panicking tasks to run before panicking"
         );

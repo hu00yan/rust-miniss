@@ -39,6 +39,7 @@ fn noop_waker() -> Waker {
     fn wake_by_ref(_: *const ()) {}
     fn drop(_: *const ()) {}
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    // SAFETY: The vtable functions never dereference the null data pointer.
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
@@ -49,6 +50,7 @@ fn custom_future_state_transitions() {
     let mut cx = Context::from_waker(&waker);
 
     // Pin the future on stack
+    // SAFETY: `fut` stays on the stack and is not moved while pinned.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
 
     // First poll -> Pending

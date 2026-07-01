@@ -18,8 +18,11 @@ mod arena_tests {
     #[test]
     fn test_buffer_new_uninitialized_no_zero_fill() {
         // new_uninitialized should NOT zero-fill (it's for kernel-written buffers).
+        // SAFETY: The test only inspects len/capacity and never reads the
+        // uninitialized memory contents.
         let buf = unsafe { Buffer::new_uninitialized_arena(4096) };
-        assert_eq!(buf.len(), 4096);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.capacity() >= 4096);
         // No assertion on contents — they're undefined.
     }
 

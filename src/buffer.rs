@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 
@@ -6,7 +6,7 @@ const MAX_RECYCLED_CAPACITY: usize = 64 * 1024;
 
 // Thread-local buffer pool — eliminates cross-core cache contention.
 thread_local! {
-    static BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static BUFFER_POOL: UnsafeCell<Vec<Vec<u8>>> = const { UnsafeCell::new(Vec::new()) };
 }
 
 const POOL_CAPACITY: usize = 256;
@@ -21,33 +21,50 @@ pub struct Buffer {
     inner: ManuallyDrop<Vec<u8>>,
 }
 
+/// Owned buffer abstraction for rent-style I/O.
+///
+/// The runtime converts the caller's buffer into its internal owned buffer
+/// representation, submits the I/O, then converts the completed buffer back
+/// into the caller's type without adding another copy.
+pub trait RentBuffer: Sized + Into<Buffer> + From<Buffer> {}
+
+impl<T> RentBuffer for T where T: Sized + Into<Buffer> + From<Buffer> {}
+
 impl Buffer {
     fn recycle_vec(vec: Vec<u8>) {
         if vec.capacity() > MAX_RECYCLED_CAPACITY {
             return;
         }
         BUFFER_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            if pool.len() < POOL_CAPACITY {
-                pool.push(vec);
+            // SAFETY: BUFFER_POOL is thread-local. Runtime accesses it only
+            // from owning worker thread, so no concurrent aliases exist.
+            unsafe {
+                let pool = &mut *pool.get();
+                if pool.len() < POOL_CAPACITY {
+                    pool.push(vec);
+                }
             }
         });
     }
 
     fn acquire_vec(capacity: usize) -> Option<Vec<u8>> {
         BUFFER_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            // Take the most recently recycled buffer (hot in cache).
-            // If it's not large enough, just skip — heap alloc is fine.
-            let buf = pool.pop()?;
-            if buf.capacity() >= capacity {
-                Some(buf)
-            } else {
-                // Return smaller buffer for reuse at its own capacity.
-                if buf.capacity() >= 64 && pool.len() < POOL_CAPACITY {
-                    pool.push(buf);
+            // SAFETY: BUFFER_POOL is thread-local. Runtime accesses it only
+            // from owning worker thread, so no concurrent aliases exist.
+            unsafe {
+                let pool = &mut *pool.get();
+                // Take the most recently recycled buffer (hot in cache).
+                // If it's not large enough, just skip — heap alloc is fine.
+                let buf = pool.pop()?;
+                if buf.capacity() >= capacity {
+                    Some(buf)
+                } else {
+                    // Return smaller buffer for reuse at its own capacity.
+                    if buf.capacity() >= 64 && pool.len() < POOL_CAPACITY {
+                        pool.push(buf);
+                    }
+                    None
                 }
-                None
             }
         })
     }
@@ -67,18 +84,18 @@ impl Buffer {
     }
 
     /// Creates a buffer without zeroing (for kernel read destinations).
-    /// SAFETY: All bytes are uninitialized; caller must ensure they are
-    /// written before reading (io_uring CQE sets the length on completion).
+    /// The returned buffer has `len() == 0` and at least `len` bytes of
+    /// capacity. The I/O backend passes the raw pointer and requested length to
+    /// the kernel, then sets the logical length to the completed byte count.
     pub fn new_uninitialized(len: usize) -> Self {
         if let Some(mut vec) = Self::acquire_vec(len) {
             vec.clear();
-            vec.resize(len, 0);
             return Self {
                 inner: ManuallyDrop::new(vec),
             };
         }
         Self {
-            inner: ManuallyDrop::new(vec![0u8; len]),
+            inner: ManuallyDrop::new(Vec::with_capacity(len)),
         }
     }
 
@@ -184,25 +201,25 @@ impl Buffer {
     }
 
     #[cfg(feature = "arena")]
-    /// Creates a buffer without zeroing (for kernel read destinations).
-    /// SAFETY: All bytes are uninitialized; caller must ensure they are
-    /// written before reading (io_uring CQE sets the length on completion).
     /// Creates a buffer intended for kernel-written data.
+    ///
+    /// The returned buffer has `len() == 0` and at least `len` bytes of
+    /// capacity. Callers must not read from it until I/O completion has set the
+    /// initialized length.
     ///
     /// # Safety
     ///
-    /// Callers must not read from the returned buffer until the bytes have
-    /// been initialized by an I/O operation or another write.
+    /// Callers must ensure the logical length is only increased after the new
+    /// byte range has been initialized by the kernel or another writer.
     pub unsafe fn new_uninitialized_arena(len: usize) -> Self {
         if let Some(mut vec) = Self::acquire_vec(len) {
             vec.clear();
-            vec.resize(len, 0);
             return Self {
                 inner: ManuallyDrop::new(vec),
             };
         }
         Self {
-            inner: ManuallyDrop::new(vec![0u8; len]),
+            inner: ManuallyDrop::new(Vec::with_capacity(len)),
         }
     }
 
@@ -272,6 +289,18 @@ impl From<Buffer> for Vec<u8> {
         let vec = unsafe { ManuallyDrop::take(&mut buffer.inner) };
         std::mem::forget(buffer);
         vec
+    }
+}
+
+impl From<Box<[u8]>> for Buffer {
+    fn from(slice: Box<[u8]>) -> Self {
+        Self::from(slice.into_vec())
+    }
+}
+
+impl From<Buffer> for Box<[u8]> {
+    fn from(buffer: Buffer) -> Self {
+        Vec::<u8>::from(buffer).into_boxed_slice()
     }
 }
 

@@ -33,7 +33,7 @@ fn test_cancel_before_execution() {
 
     let task_id = runtime
         .spawn(async move {
-            started_clone.store(true, Ordering::SeqCst);
+            started_clone.store(true, Ordering::Release);
         })
         .unwrap();
 

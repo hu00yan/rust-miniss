@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 fn test_futures_io_compat_read_write() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -35,7 +35,7 @@ fn test_futures_io_compat_read_write() {
 fn test_futures_io_compat_ping_pong() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 

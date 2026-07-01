@@ -11,7 +11,7 @@ fn test_futures_async_read() {
     let runtime = Runtime::new();
 
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -47,7 +47,7 @@ fn test_futures_async_write() {
     let runtime = Runtime::new();
 
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -83,7 +83,7 @@ fn test_futures_partial_reads() {
     let runtime = Runtime::new();
 
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 

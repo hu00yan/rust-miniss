@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 fn async_read_write_roundtrip() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -39,7 +39,7 @@ fn async_read_write_roundtrip() {
 fn async_partial_reads() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -68,7 +68,7 @@ fn async_partial_reads() {
 fn async_shutdown_notifies_peer() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 

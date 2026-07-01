@@ -33,14 +33,18 @@ How to use (practical today):
   - Experiment with UDP operations and buffer management.
 
 Benchmarks & environment:
-- Includes HTTP benchmark comparing rust-miniss vs Tokio/Monoio/Glommio.
-- Run `cargo bench` for micro-benchmarks.
+- Performance evaluation should be micro-benchmark first:
+  - Use micro-benchmarks to expose scheduler, wakeup, submit/drain, timer, and buffer-path regressions.
+  - Use HTTP/QUIC end-to-end benchmarks as validation layers, not as the only performance verdict.
+  - Compare against Tokio/Monoio/Glommio on the same scenario set, but do not let one large scenario hide hot-path regressions.
+- Run `cargo bench` for micro-benchmarks and use the HTTP benchmark matrix for representative end-to-end validation.
 - Authoritative benchmarks should be run on Linux with io_uring enabled; record CPU, memory, OS, and Rust version alongside results for reproducibility.
 - Recent optimizations reduced CPU usage in event loops and improved I/O efficiency.
 
 Roadmap alignment (why this direction):
 - Validate design assumptions (shared-nothing, lock-free fast paths) with small, measurable slices.
 - Keep scope tight to learn faster: correctness first, then targeted performance measurements.
+- Prefer micro-benchmarks when deciding whether an optimization helped; use protocol benchmarks to confirm end-to-end impact.
 - Use examples (like HTTP echo) to ground performance conversations in runnable code.
 
 Where it can go (if we continue):
@@ -51,4 +55,3 @@ Where it can go (if we continue):
 If you are evaluating this project:
 - Treat it as a learning artifact and a starting point for experiments.
 - Expect APIs to evolve; prefer reading `docs/API_REFERENCE.md` and examples for up-to-date usage.
-

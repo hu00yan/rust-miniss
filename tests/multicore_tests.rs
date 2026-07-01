@@ -21,7 +21,7 @@ mod tests {
 
         // Test scheduling
         let waker = create_test_waker();
-        let timer_id = wheel.schedule(now + Duration::from_millis(5), waker);
+        let timer_id = wheel.schedule(now + Duration::from_millis(5), &waker);
         assert_eq!(wheel.pending_count(), 1);
 
         // Test cancelling
@@ -48,7 +48,7 @@ fn test_timer_schedule_across_cpus() {
         runtime
             .spawn(async move {
                 // Simulate timer scheduling work on this CPU
-                cpus_completed_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                cpus_completed_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tx_clone.send(()).unwrap();
             })
             .unwrap();
@@ -117,14 +117,92 @@ fn test_multicore_basic_functionality() {
     let (tx, rx) = mpsc::channel();
     runtime
         .spawn(async move {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
+            counter_clone.fetch_add(1, Ordering::Relaxed);
             tx.send(()).unwrap();
         })
         .unwrap();
 
     // Wait for task to complete
     rx.recv_timeout(Duration::from_millis(200)).unwrap();
-    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert_eq!(counter.load(Ordering::Acquire), 1);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_spawn_local_requires_worker_core() {
+    init_tracing();
+    let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+
+    let result = runtime.spawn_local(async {});
+    assert!(result.is_err());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_spawn_local_runs_from_worker_core() {
+    init_tracing();
+    let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    let rt = runtime.clone();
+    runtime
+        .spawn_on(0, async move {
+            let tx_inner = tx.clone();
+            rt.spawn_local(async move {
+                tx_inner.send(()).unwrap();
+            })
+            .unwrap();
+        })
+        .unwrap();
+
+    rx.recv_timeout(Duration::from_millis(200)).unwrap();
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_spawn_wait_runs_task() {
+    init_tracing();
+    let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    runtime
+        .block_on(runtime.spawn_wait(
+            async move {
+                tx.send(()).unwrap();
+            },
+            Duration::from_millis(200),
+        ))
+        .unwrap();
+
+    rx.recv_timeout(Duration::from_millis(200)).unwrap();
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_spawn_on_wait_rejects_invalid_core() {
+    init_tracing();
+    let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+
+    let result = runtime.block_on(runtime.spawn_on_wait(2, async {}, Duration::from_millis(200)));
+    assert!(result.is_err());
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn test_runtime_metrics_snapshot_reports_each_core() {
+    init_tracing();
+    let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+
+    let metrics = runtime
+        .metrics_snapshot(Duration::from_millis(200))
+        .unwrap();
+
+    assert_eq!(metrics.cores.len(), 2);
+    assert_eq!(metrics.cores[0].core_id, 0);
+    assert_eq!(metrics.cores[1].core_id, 1);
 
     runtime.shutdown().unwrap();
 }
@@ -169,7 +247,7 @@ fn test_multicore_round_robin_distribution() {
         let tx_clone = tx.clone();
         runtime
             .spawn(async move {
-                counter.fetch_add(1, Ordering::SeqCst);
+                counter.fetch_add(1, Ordering::Relaxed);
                 tx_clone.send(()).unwrap();
             })
             .unwrap();
@@ -181,7 +259,7 @@ fn test_multicore_round_robin_distribution() {
     }
 
     // Check that tasks were executed
-    let total_tasks = task_counter.load(Ordering::SeqCst);
+    let total_tasks = task_counter.load(Ordering::Acquire);
     assert_eq!(total_tasks, 15, "Expected 15 tasks to be executed");
 
     runtime.shutdown().unwrap();
@@ -244,7 +322,7 @@ fn test_multicore_concurrent_spawning() {
                 let counter_inner = counter_clone.clone();
                 runtime_clone
                     .spawn(async move {
-                        counter_inner.fetch_add(1, Ordering::SeqCst);
+                        counter_inner.fetch_add(1, Ordering::Relaxed);
                     })
                     .unwrap();
             }
@@ -261,13 +339,13 @@ fn test_multicore_concurrent_spawning() {
     // Wait for all tasks to complete - use a more reliable method
     // Since task execution is asynchronous, we need to wait longer
     for _ in 0..100 {
-        if counter.load(Ordering::SeqCst) == 40 {
+        if counter.load(Ordering::Acquire) == 40 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    let final_count = counter.load(Ordering::SeqCst);
+    let final_count = counter.load(Ordering::Acquire);
     assert_eq!(
         final_count, 40,
         "Expected 40 tasks to complete, but only {final_count} completed"
@@ -319,7 +397,7 @@ fn test_multicore_task_isolation() {
     runtime
         .spawn(async move {
             for _ in 0..100 {
-                cpu0_clone.fetch_add(1, Ordering::SeqCst);
+                cpu0_clone.fetch_add(1, Ordering::Relaxed);
             }
             tx_clone.send(()).unwrap();
         })
@@ -330,7 +408,7 @@ fn test_multicore_task_isolation() {
     runtime
         .spawn(async move {
             for _ in 0..50 {
-                cpu1_clone.fetch_add(2, Ordering::SeqCst);
+                cpu1_clone.fetch_add(2, Ordering::Relaxed);
             }
             tx_clone.send(()).unwrap();
         })
@@ -341,8 +419,8 @@ fn test_multicore_task_isolation() {
         rx.recv_timeout(Duration::from_millis(200)).unwrap();
     }
 
-    assert_eq!(cpu0_data.load(Ordering::SeqCst), 100);
-    assert_eq!(cpu1_data.load(Ordering::SeqCst), 100);
+    assert_eq!(cpu0_data.load(Ordering::Acquire), 100);
+    assert_eq!(cpu1_data.load(Ordering::Acquire), 100);
 
     runtime.shutdown().unwrap();
 }
@@ -359,10 +437,10 @@ fn test_multicore_graceful_shutdown() {
         let tx_clone = tx.clone();
         runtime
             .spawn(async move {
-                counter.fetch_add(1, Ordering::SeqCst);
+                counter.fetch_add(1, Ordering::Relaxed);
                 // Simulate some work
                 std::thread::yield_now();
-                counter.fetch_sub(1, Ordering::SeqCst);
+                counter.fetch_sub(1, Ordering::Relaxed);
                 tx_clone.send(()).unwrap();
             })
             .unwrap();
@@ -377,5 +455,23 @@ fn test_multicore_graceful_shutdown() {
     runtime.shutdown().unwrap();
 
     // All tasks should have completed
-    assert_eq!(running_tasks.load(Ordering::SeqCst), 0);
+    assert_eq!(running_tasks.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn test_shutdown_drains_running_timer_task() {
+    init_tracing();
+    let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    runtime
+        .spawn(async move {
+            rust_miniss::timer::sleep(Duration::from_millis(20)).await;
+            tx.send(()).unwrap();
+        })
+        .unwrap();
+
+    runtime.shutdown().unwrap();
+
+    rx.recv_timeout(Duration::from_millis(500)).unwrap();
 }

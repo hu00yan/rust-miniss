@@ -30,9 +30,6 @@ fn main() {
             let state = rust_miniss::cpu::io_state();
 
             // Warmup: 2 batches
-            let waker = futures::task::noop_waker();
-            let mut ctx = std::task::Context::from_waker(&waker);
-
             for _ in 0..2 {
                 for _ in 0..batch {
                     state.io_backend.submit(rust_miniss::io::Op::Nop);
@@ -40,11 +37,11 @@ fn main() {
                 state.io_backend.flush();
                 let mut remaining: usize = batch;
                 while remaining > 0 {
-                    match state.io_backend.drain_completions(&mut ctx) {
-                        Poll::Ready(cqes) => {
+                    match state.io_backend.drain_completions() {
+                        std::task::Poll::Ready(cqes) => {
                             remaining = remaining.saturating_sub(cqes.len());
                         }
-                        Poll::Pending => {
+                        std::task::Poll::Pending => {
                             state.io_backend.flush();
                             state.io_backend.park(std::time::Duration::from_millis(1));
                         }
@@ -63,11 +60,11 @@ fn main() {
                 state.io_backend.flush();
                 let mut remaining: usize = batch;
                 while remaining > 0 {
-                    match state.io_backend.drain_completions(&mut ctx) {
-                        Poll::Ready(cqes) => {
+                    match state.io_backend.drain_completions() {
+                        std::task::Poll::Ready(cqes) => {
                             remaining = remaining.saturating_sub(cqes.len());
                         }
-                        Poll::Pending => {
+                        std::task::Poll::Pending => {
                             state.io_backend.flush();
                             state.io_backend.park(std::time::Duration::from_millis(1));
                         }

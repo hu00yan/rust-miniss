@@ -2,24 +2,21 @@
 //! Client sends a small message, server echoes it back.
 //! Measures raw I/O + scheduling overhead without HTTP overhead.
 
-use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
 use rust_miniss::MultiCoreRuntime;
 
 use std::io;
 use std::net::SocketAddr;
 
-async fn handle_client(mut stream: AsyncTcpStream) {
-    let mut buf = [0u8; 256];
+async fn handle_client(stream: AsyncTcpStream) {
+    let mut buf = Vec::with_capacity(256);
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if stream.write_all(&buf[..n]).await.is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
+        match stream.read_rent(buf).await {
+            Ok((0, _)) | Err(_) => break,
+            Ok((_, owned_buf)) => match stream.write_rent(owned_buf).await {
+                Ok((_, returned_buf)) => buf = returned_buf,
+                Err(_) => break,
+            },
         }
     }
 }
@@ -41,7 +38,7 @@ fn main() -> io::Result<()> {
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
     runtime.block_on(async {
-        let listener = AsyncTcpListener::bind(addr).expect("Failed to bind");
+        let mut listener = AsyncTcpListener::bind(addr).expect("Failed to bind");
         while let Ok((stream, _)) = listener.accept().await {
             runtime.spawn(handle_client(stream)).ok();
         }

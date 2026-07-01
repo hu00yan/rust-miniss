@@ -125,7 +125,7 @@
                       否则 → completed_io map + waker.wake()
     2c. flush() — 提交 inline poll 过程中产生的新 SQE
 3. execute_tasks()       — poll 所有 ready task
-4. flush()               — 一次 io_uring_enter 提交所有批量 SQE
+4. flush()               — 一次 io_uring_enter 提交批量 SQE
 5. process_timers()      — 过期 timer → waker.wake()
 6. park_if_idle()        — submit_and_wait(1) + min timeout
 ```
@@ -136,11 +136,22 @@
 
 ```
 Task::poll() 可能产生 0~N 个 SQE，这些 SQE 塞进 SQ 但不立即提交。
-事件循环末尾调用一次 flush() → 一次 io_uring_enter 提交所有累积 SQE。
+事件循环末尾调用一次 flush() → 一次 io_uring_enter 提交累积 SQE。
 
 例外：inline completion 路径中，如果 inline poll 产生了新 SQE，
-      立即 flush，避免等待整个事件循环周期。
-      这发生在 poll_io() 内部的 needs_flush 路径。
+      会调用 flush()，但仍遵守正常 batch 阈值。
+      实验过 force-submit continuation：低连接场景会明显增加 syscall 压力，
+      对 ka8/close8 不稳定且可退化，因此拒绝作为默认策略。
+
+默认策略优先控制 `io_uring_enter` 频率：`FLUSH_BATCH_SIZE = 61`。这个值故意避开 32/64 这类二次幂，
+减少 batch 和 page/cache 边界耦合导致的抖动。低连接场景（连接数约等于核心数）
+可能因为每 shard batch 太小而延迟提交，但不能把默认 batch 降到 1；那会把 syscall 数重新打爆。
+`MINISS_URING_FLUSH_BATCH_SIZE` 只用于实验不同负载下的 batch/latency tradeoff。
+
+短连接路径使用 `AcceptMulti` 的 `SOCK_NONBLOCK | SOCK_CLOEXEC` flags，让内核直接返回非阻塞 fd。
+net 层只在 backend 明确声明 accepted stream 已非阻塞时跳过重复 `set_nonblocking()`，避免每个 accepted
+connection 多一次 fcntl syscall。
+TCP send/recv buffer 大小在 listener 创建时设置一次，不在 accepted stream 热路径重复 `setsockopt()`。
 
 优化：当 SQ occupancy > 75% 时主动提前 flush，避免 push 失败回退。
 ```
@@ -154,7 +165,7 @@ Task::poll() 可能产生 0~N 个 SQE，这些 SQE 塞进 SQ 但不立即提交�
 │ execute_tasks()  poll task       │
 │   └ 每个 poll 可能 push SQE     │
 ├─────────────────────────────────┤
-│ flush() 一次提交所有 SQ（常规）   │
+│ flush() 一次提交 SQ batch（常规） │
 └─────────────────────────────────┘
 ```
 
@@ -168,6 +179,47 @@ Task::poll() 可能产生 0~N 个 SQE，这些 SQE 塞进 SQ 但不立即提交�
 
 新连接的分发：用 `SO_REUSEPORT` 让内核负载均衡。不在运行时层做。
 
+### 任务亲和性与背压
+
+运行时提供三类 spawn API，边界必须保持清晰：
+
+| API | 用途 | 失败/背压语义 |
+|-----|------|---------------|
+| `spawn()` | 控制面或无亲和性要求的任务，round-robin 选择 shard | bounded inbox 满时立即返回错误 |
+| `spawn_on(core)` | 显式指定 shard，适合 dispatcher 或测试 | bounded inbox 满时立即返回错误 |
+| `spawn_local()` | worker 内创建同连接/同 shard 子任务 | 直接进入 thread-local 本地 spawn 队列；必须在 worker 线程调用，否则返回错误 |
+| `spawn_wait()` / `spawn_on_wait()` | 控制面需要等待 bounded inbox 容量时使用 | timer backoff 重试，直到入队或 timeout |
+
+HTTP keep-alive 连接处理使用 `spawn_local()`：accept task 和连接 handler 保持同 shard，避免
+连接状态、I/O token、timer 在不同核心之间跳动。
+
+`spawn_local()` 不能通过 cross-core channel 给本核心发消息。worker poll 过程中产生的本地子任务先进入
+thread-local spawn 队列，`CpuCore::execute_tasks()` 在同一轮 drain 到本 shard 的 `task_queue` 和
+`ready_queue`。这保留 task affinity，并避免短连接场景每个 accept 都触碰跨核消息队列。
+
+`spawn_wait()` 不引入 unbounded queue，也不阻塞 worker 线程；它只是在 bounded inbox 满时按
+1ms timer backoff 重试。它不是负载均衡机制，也不会把任务迁移到其他核心。
+
+### Shutdown Drain
+
+`shutdown()` 分两层信号：
+
+1. control plane 把 runtime state 切到 `ShuttingDown`，阻止后续 `spawn*` 接收新任务；
+2. 每个 worker 进入 draining 模式，继续处理已经入队、已经 ready、或正在等待 I/O/timer 的任务。
+
+worker 的退出条件是：
+
+```
+draining
+&& local_task_count == 0
+&& ready_queue.is_empty()
+&& message_inbox.is_empty()
+```
+
+这保证 shutdown 不会因为普通 task 消息堆积而完全饿死，也不会粗暴丢掉已入队任务。它仍然不是
+强制终止机制：如果业务 task 永不完成，worker 会继续等待。未来如果需要生产级优雅关闭，应增加
+显式超时和 force-shutdown 阶段，但不能把强制取消塞进数据面热路径。
+
 ---
 
 ## I/O 模型
@@ -180,6 +232,24 @@ Task::poll() 可能产生 0~N 个 SQE，这些 SQE 塞进 SQ 但不立即提交�
 | CQE 数量 | 4096 |
 | 提交模式 | 普通（非 SQPOLL，减少内核线程竞争） |
 | 特性 | `IORING_FEAT_FAST_POLL`、`IORING_FEAT_EXT_ARG` |
+
+### io_uring 性能敏感开关
+
+这些开关不是“越多越好”，而是要按内核能力和负载形态逐个验证。
+
+| 开关 | 当前策略 | 观测结论 |
+|------|----------|----------|
+| `MINISS_URING_SINGLE_ISSUER` | 仅在实验时开启 | 800 keep-alive 的 10s 样本里 p99 有改善，但仍明显慢于 monoio / compio；不适合作为默认值。 |
+| `MINISS_URING_SQPOLL` | 仅在实验时开启 | 在 OrbStack VM 的 800 keep-alive 样本里 p99 优于 baseline，但尾延迟仍不及 monoio / compio；对 VM / 内核配置敏感。 |
+| `MINISS_URING_DEFER_TASKRUN` | 默认关闭 | 在当前 OrbStack 内核上启用时，runtime 直接报 `No suitable IO backend available`，说明这类 taskrun 语义不是所有环境都可用。 |
+| `MINISS_URING_COOP_TASKRUN` | 默认关闭 | 同上，当前 VM 上不能把它当成稳定默认项。 |
+| `MINISS_URING_FLUSH_BATCH_SIZE` | 默认 61 | 已验证过把它调高并不总是更好；对 p99 的影响比吞吐更敏感。 |
+
+实测结论先记在这里：
+
+- `setup_single_issuer()`、`setup_sqpoll()` 属于可以继续 benchmark 的调参项，但默认不应打开。
+- `setup_coop_taskrun()` / `setup_defer_taskrun()` 需要先确认目标内核确实支持，再考虑作为默认优化。
+- 当前优先级仍然是让 `park()` / `drain()` 的尾延迟稳定，而不是把所有 ring feature 一次性开满。
 
 ### Slab 分配器（PendingOp 管理）
 
@@ -199,6 +269,26 @@ Slab<PendingOp> {
 
 **关键：slab slot 存的是 PendingOp（请求描述符），不是 Waker。**
 Task 通过 `CpuIoState::pending_tasks` 的 `IoToken → TaskId` 映射找到。
+
+### PendingOp Slab 后续优化
+
+当前实现为了避免 CQE 晚到时 slot 复用导致 ABA/misroute，保留了 `token_id → slab_idx`
+查找层。这个设计牺牲了少量 hash lookup，但优先保证完成事件路由正确。
+
+未来可以把 token 设计成 `generation + slab_idx`：
+
+- `user_data` 携带 slab index 和 generation，CQE 回来后先校验 generation
+- slab slot 复用时递增 generation，晚到 CQE 会被识别为 stale completion
+- `CpuIoState` 的 waker/completion/pending-task 索引也必须使用同一 token 编码，不能只改
+  `PendingOp` 查找层
+- 必须配套 ABA 回归测试：提交 op A → 释放 slot → op B 复用 slot → A 的迟到 CQE
+  不得唤醒/完成 B
+- 必须配套 pending-op churn benchmark；只有当 hash lookup/分配在 perf 中成为可见瓶颈时，
+  才把这个优化设为默认
+
+这条路线的潜在收益是减少 HashMap 内存访问和哈希成本，尤其适合短连接、大量 pending op、
+多 I/O/请求的真实 workload。但在当前 HTTP keep-alive echo 基准里，主要瓶颈仍是
+event loop/syscall/TCP batch，不能用这个高风险改动替代更直接的 I/O 路径优化。
 
 ### 支持的 I/O 操作
 
@@ -241,10 +331,11 @@ poll_read(user_buf):
     // 混合流量场景下不会因为 buffer 不够用而被迫新分配
 ```
 
-真正的 zero-copy 只能通过 `read_rent`（用户传自己的 Buffer 所有权）实现。
+真正的 zero-copy 只能通过 `read_rent` / `write_rent`（用户传自己的 owned buffer 所有权）实现。
 `Rent` 模式是 thread-per-core + completion-based I/O 的最佳匹配：
-- `read_rent`: 用户提供 Buffer → 内核直接写入 → 返还用户（零拷贝）
-- `write_rent`: 用户提供 Buffer → 内核直接读取 → 返还用户（零拷贝）
+- `read_rent`: 用户提供 owned buffer → 内核直接写入 → 返还用户（零拷贝）
+- `write_rent`: 用户提供 owned buffer → 内核直接读取 → 返还用户（零拷贝）
+- 当前库层接口对 `Buffer` / `Vec<u8>` / `Box<[u8]>` 开放，例子不再需要自己维护专用胶水
 
 ---
 
@@ -346,43 +437,36 @@ bit 31..0  = 本核自增序号
 ### 核心原则
 
 第三方库的 `spawn` / `Executor` trait 不能在背后另起线程。必须复用当前线程的执行上下文。
+生态目标不只包括原生适配的库，也包括那些“只认 `tokio::io` trait”的现成库；这类库优先走 compat 层，不强迫重写协议栈。
 
-### Hyper 集成（未实现，延期）
+### 已实现
 
-```
-hyper::rt::Read for TcpIo
-    → AsyncTcpStream::poll_read （走 io_uring Read，最终 memcpy）
+### Hyper
 
-hyper::rt::Write for TcpIo
-    → AsyncTcpStream::poll_write（走 io_uring Write）
+- `src/net.rs` 直接实现了 `hyper::rt::Read` / `hyper::rt::Write`
+- `tests/hyper_http1.rs` 验证了 `hyper::server::conn::http1::Builder::serve_connection` 能直接跑在 miniss 上
+- 没有引入 tokio runtime，也没有靠 `hyper-util` 做二次包装
+- `src/hyper_rt.rs` 提供了 `hyper::rt::Executor` / `hyper::rt::Timer`
+- `tests/hyper_http2.rs` 验证了 `hyper::server::conn::http2::Builder::serve_connection` 和 `hyper::client::conn::http2::handshake` 都能直接跑在 miniss 上
 
-hyper::rt::Executor<F> for HyperExecutor
-    → 当前 CpuCore 的 ready_queue.push(task)
-    → 不创建新线程
+### tokio trait 生态
 
-hyper::rt::Timer for MinissTimer
-    → timer::sleep() → TimerWheel
-```
+- `src/compat.rs` 提供 `tokio::io` trait 兼容层，保留给只认 Tokio IO trait 的第三方库
+- `tests/tokio_compat_tests.rs` 和 `tests/tokio_io_compat.rs` 继续验证 tokio trait 兼容
+- `TlsStream` 仍然通过 compat 复用 `tokio-rustls`，这是最短路径的 TLS 入口
+- `quinn + h3-quinn` 已有原生 runtime 适配和端到端回归测试
 
-**推迟实现。** 当前阶段专注于运行时核心性能，Hyper/Quinn 集成等运行时性能达标后再做。
+### 进行中
 
-### Quinn 集成（未实现，延期）
+- hyper 的少量连接生命周期收尾细节还可以继续收紧
 
-```
-quinn::Runtime for MinissQuinnRuntime
-    spawn → 当前 core 的 spawn_on_core
-    new_timer → timer::sleep
-    wrap_udp_socket → 用 io_uring 的 RecvMsg/SendMsg
-    now → Instant::now
+### 未做
 
-quinn::AsyncUdpSocket for MinissUdpSocket
-    try_send → io_uring SendMsg 提交（不 flush）
-    poll_recv → io_uring RecvMsg → CQE
-```
+- 删除 compat 层，强迫所有库改成 miniss 专用 trait
+- 自己重写 TLS / HTTP / QUIC 的完整协议栈
+- 把还在用 tokio trait 的第三方库当成“不支持的生态”
 
-**推迟实现。**
-
-### TLS 集成（未实现，延期）
+### TLS 集成
 
 ```
 TlsStream {
@@ -390,7 +474,7 @@ TlsStream {
 }
 ```
 
-**推迟实现。** `tokio-rustls` 内部依赖 `tokio::spawn`，在 thread-per-core 模式下无法使用。
+**当前实现** 还是通过 `tokio-rustls` + compat 复用现成生态。等后续要做纯 rustls 版本时，再把这段迁移成原生实现。
 
 ---
 
@@ -531,7 +615,9 @@ neon 是 ntex 框架的内部运行时，它基于 compio 的架构思路但更�
 
 ### 分层 Benchmark
 
-运行时 benchmark 必须分层测量，不能用单一综合 benchmark 代替。
+运行时 benchmark 必须分层测量，但**默认以微基准为主**。
+微基准最容易暴露基础问题：调度、唤醒、提交/收割、buffer 管理、timer、poll 路径。
+端到端 HTTP/QUIC benchmark 仍然需要保留，但它们是验证层，不是主要诊断层。
 
 **第一层：运行时基础能力微 benchmark**
 
@@ -564,6 +650,14 @@ Task spawn + wakeup roundtrip：spawn 一个 task 立刻 wake 另一个
 TechEmpower 风格：plaintext（纯 HTTP 吞吐）→ JSON（加序列化）→ DB query（加数据库 I/O）。
 这三个场景的瓶颈依次从网络栈转移到 CPU 再转移到 I/O，能区分运行时在不同压力下的表现。
 
+端到端场景的作用是回答两个问题：
+
+- 微基准暴露的问题，是否真的会传导到真实协议栈
+- 在接近业务的负载下，runtime 还能不能维持可接受的吞吐和 p99
+
+所以不能反过来用一个大而全的 HTTP/QUIC 场景替代微基准。
+那样会把“问题出在 timer、executor、I/O backend 还是协议状态机”混在一起。
+
 ### 协议选择
 
 | 协议 | 测试目的 | 暴露的运行时弱点 |
@@ -573,6 +667,11 @@ TechEmpower 风格：plaintext（纯 HTTP 吞吐）→ JSON（加序列化）→
 | HTTP/1.1 长连接 | 稳态吞吐，连接复用 | SQ 批量提交能力 |
 | HTTP/2 + 多路复用 | 流管理 + 状态机开销 | 高并发下的内存管理 |
 | 自定义二进制协议 | 贴近真实消息/数据库场景 | 综合表现 |
+
+连接数只是压力手段，不是目标本身。`ka8`、`ka200`、`ka800` 的意义是把
+相同协议路径拉到不同并发区间，观察 p99 和吞吐是否出现拐点。
+如果微基准已经显示某个提交把 submit/drain、wake、timer 或 waker 弄慢了，
+HTTP 场景只是进一步确认，不是第一证据。
 
 ### 线程与运行时间确定
 
@@ -603,6 +702,9 @@ perf report
 
 如果 io_uring_enter 调用次数比 Monoio 多一个数量级，就是批量提交问题。
 火焰图上如果 `_Atomic***` 或 `malloc`/`free` 在热点前几位，就是锁或分配器问题。
+
+基线优先用 `HTTP_COLLECT_DIAGNOSTICS=1 bench/scripts/bench_http_matrix.sh <base_port>` 跑同一组场景，
+把 `summary.csv` 和 `diagnostics.csv` 一起保存，避免只看单次吞吐。
 
 ### 关于 fsync 的基准测试
 

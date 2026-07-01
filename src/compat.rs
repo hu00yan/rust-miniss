@@ -3,7 +3,8 @@
 //! Re-exports [`tokio_util::compat`] so users can convert any
 //! `futures::io::AsyncRead`/`AsyncWrite` type into a `tokio::io`
 //! compatible wrapper for use with the tokio ecosystem
-//! (hyper, tower, reqwest, etc.).
+//! (tokio-rustls, tower, reqwest, and other libraries that still only
+//! accept `tokio::io` traits).
 //!
 //! # Example
 //!

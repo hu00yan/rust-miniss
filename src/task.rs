@@ -138,6 +138,44 @@ where
     }
 }
 
+/// Wraps a detached task so panics are isolated without a per-poll wrapper.
+pub(crate) struct DetachedTaskFuture<F>
+where
+    F: Future<Output = ()>,
+{
+    future: Pin<Box<F>>,
+}
+
+impl<F> DetachedTaskFuture<F>
+where
+    F: Future<Output = ()>,
+{
+    pub(crate) fn new(future: F) -> Self {
+        Self {
+            future: Box::pin(future),
+        }
+    }
+}
+
+impl<F> Future for DetachedTaskFuture<F>
+where
+    F: Future<Output = ()>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.future.as_mut().poll(cx)
+        }));
+
+        match poll_result {
+            Ok(Poll::Ready(())) | Err(_) => Poll::Ready(()),
+            Ok(Poll::Pending) => Poll::Pending,
+        }
+    }
+}
+
 /// A task wraps a future for execution in the runtime
 pub struct Task {
     id: TaskId,
@@ -145,6 +183,7 @@ pub struct Task {
     /// Cached waker — created once and reused across polls.
     /// Eliminates per-poll `Rc<MinissWaker>` heap allocation.
     waker: Option<Waker>,
+    completed: bool,
 }
 
 impl Task {
@@ -154,6 +193,7 @@ impl Task {
             id,
             future: Box::pin(future),
             waker: None,
+            completed: false,
         }
     }
 
@@ -163,6 +203,7 @@ impl Task {
             id,
             future,
             waker: None,
+            completed: false,
         }
     }
 
@@ -175,27 +216,76 @@ impl Task {
     /// Poll the task's future
     #[inline(always)]
     pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        self.future.as_mut().poll(cx)
+        if self.completed {
+            return Poll::Ready(());
+        }
+        match self.future.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.completed = true;
+                self.waker = None;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
-    /// Get or create the cached waker for this task.
-    /// The waker is created lazily on first access, then reused for all
-    /// subsequent polls — avoids per-poll Rc heap allocation.
-    ///
-    /// Returns a cloned Waker (cheap: Rc refcount bump, no heap alloc)
-    /// so that the borrow on `self` is released before the caller's
-    /// closure captures `task` for `task.poll()`.
+    /// Poll the task using its cached waker for the given ready queue.
     #[inline(always)]
-    pub fn get_or_create_waker(&mut self, queue: *const VecDeque<TaskId>) -> Waker {
-        self.waker
-            .get_or_insert_with(|| crate::waker::MinissWaker::create_waker(self.id, queue))
-            .clone()
+    pub fn poll_with_cached_waker(&mut self) -> Poll<()> {
+        if self.completed {
+            return Poll::Ready(());
+        }
+        let waker_ptr = self
+            .waker
+            .as_ref()
+            .expect("waker cached by ensure_waker") as *const Waker;
+        // SAFETY: `waker_ptr` points to the cached waker stored in `self`.
+        // The reference is only used to build a Context for the duration of
+        // this poll call, and the cached waker outlives the Context.
+        let mut context = unsafe { Context::from_waker(&*waker_ptr) };
+        match self.future.as_mut().poll(&mut context) {
+            Poll::Ready(()) => {
+                self.completed = true;
+                self.waker = None;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Ensure a cached waker exists without cloning it back out.
+    #[inline(always)]
+    pub fn ensure_waker(&mut self, queue: *const VecDeque<TaskId>) {
+        if self.waker.is_none() {
+            self.waker = Some(crate::waker::MinissWaker::create_waker(self.id, queue));
+        }
+    }
+
+    /// Ensure a cached waker exists and return a raw pointer to it.
+    #[inline(always)]
+    pub fn cached_waker_ptr(&mut self, queue: *const VecDeque<TaskId>) -> *const Waker {
+        self.ensure_waker(queue);
+        self.waker.as_ref().expect("waker cached by ensure_waker") as *const Waker
+    }
+
+    /// Borrow the cached waker by reference after ensuring it exists.
+    #[inline(always)]
+    pub fn cached_waker(&mut self, queue: *const VecDeque<TaskId>) -> &Waker {
+        self.ensure_waker(queue);
+        self.waker.as_ref().expect("waker cached by ensure_waker")
     }
 
     /// Take the cached waker (called on task completion to free memory).
     #[inline(always)]
     pub fn take_waker(&mut self) -> Option<Waker> {
         self.waker.take()
+    }
+
+    /// Mark the task as completed so stale ready-queue entries cannot poll it again.
+    #[inline(always)]
+    pub fn mark_completed(&mut self) {
+        self.completed = true;
+        self.waker = None;
     }
 }
 
@@ -410,6 +500,8 @@ mod tests {
             )
         }
 
+        // SAFETY: The dummy RawWaker vtable never dereferences the null data
+        // pointer and all wake/drop functions are no-ops.
         unsafe { std::task::Waker::from_raw(dummy_raw_waker()) }
     }
 
@@ -420,14 +512,14 @@ mod tests {
 
         let mut executor = crate::executor::Executor::new();
         let handle = executor.spawn(async move {
-            completed_clone.store(true, Ordering::SeqCst);
+            completed_clone.store(true, Ordering::Release);
             42
         });
 
         executor.run();
 
         assert!(handle.is_finished());
-        assert!(completed.load(Ordering::SeqCst));
+        assert!(completed.load(Ordering::Acquire));
     }
 
     #[cfg(not(miri))]
@@ -440,14 +532,14 @@ mod tests {
 
         let mut executor = crate::executor::Executor::new();
         let handle = executor.spawn(async move {
-            completed_clone.store(true, Ordering::SeqCst);
+            completed_clone.store(true, Ordering::Release);
             "hello from multicore"
         });
 
         executor.run();
 
         assert!(handle.is_finished());
-        assert!(completed.load(Ordering::SeqCst));
+        assert!(completed.load(Ordering::Acquire));
     }
 
     #[test]
@@ -457,7 +549,7 @@ mod tests {
 
         let task_id = TaskId(1);
         let future = async move {
-            completed_clone.store(true, Ordering::SeqCst);
+            completed_clone.store(true, Ordering::Release);
         };
 
         let mut task = Task::new(task_id, future);
@@ -470,7 +562,20 @@ mod tests {
 
         // Task should complete immediately
         assert!(matches!(result, Poll::Ready(())));
-        assert!(completed.load(Ordering::SeqCst));
+        assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_task_poll_after_completion_stays_ready() {
+        use std::collections::VecDeque;
+
+        let queue = VecDeque::new();
+        let task_id = TaskId(7);
+        let mut task = Task::new(task_id, async {});
+        task.ensure_waker(&queue as *const VecDeque<_>);
+
+        assert!(matches!(task.poll_with_cached_waker(), Poll::Ready(())));
+        assert!(matches!(task.poll_with_cached_waker(), Poll::Ready(())));
     }
 
     #[test]
@@ -484,7 +589,7 @@ mod tests {
         let _ = spawn_periodic(Duration::from_millis(100), move || {
             let counter = counter_clone.clone();
             async move {
-                counter.store(true, Ordering::SeqCst);
+                counter.store(true, Ordering::Release);
             }
         });
     }

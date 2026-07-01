@@ -5,6 +5,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 /// A future that completes once the specified duration has elapsed.
+#[derive(Debug)]
 pub struct SleepFuture {
     deadline: Instant,
     timer_id: Option<TimerId>,
@@ -41,15 +42,16 @@ impl SleepFuture {
                 crate::cpu::cancel_timer_waker(id);
             }
 
-            if let Some(id) = crate::cpu::register_timer_waker(self.deadline, waker.clone()) {
+            let cached_waker = waker.clone();
+            if let Some(id) = crate::cpu::register_timer_waker(self.deadline, &cached_waker) {
                 self.timer_id = Some(id);
-                self.registered_waker = Some(waker.clone());
+                self.registered_waker = Some(cached_waker);
             } else {
-                self.registered_waker = Some(waker.clone());
+                self.registered_waker = Some(cached_waker.clone());
                 if !self.fallback_triggered {
                     self.fallback_triggered = true;
                     let deadline = self.deadline;
-                    let waker_clone = waker.clone();
+                    let waker_clone = cached_waker;
                     std::thread::spawn(move || {
                         let now = Instant::now();
                         if deadline > now {

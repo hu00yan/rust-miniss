@@ -3,6 +3,8 @@
 //! This module contains tunable parameters that affect runtime behavior,
 //! particularly around back-pressure and resource management.
 
+use std::time::Duration;
+
 /// Channel capacity for cross-CPU communication
 ///
 /// This controls the bounded channel size used for sending messages between CPUs.
@@ -39,3 +41,23 @@ pub const EXPECTED_WAKEUP_COUNT: usize = 16;
 /// theoretical maximum number of tasks that could be queued per CPU.
 /// Used for normalizing utilization percentages.
 pub const MAX_TASKS: usize = 1024;
+
+/// Default I/O park timeout in microseconds.
+///
+/// This bounds how long worker threads wait in `submit_and_wait` when the
+/// ready queue is empty. Lower values favor p99 latency; higher values favor
+/// throughput.
+pub const DEFAULT_PARK_TIMEOUT_US: u64 = 100;
+
+/// Resolve the I/O park timeout from `MINISS_PARK_TIMEOUT_US`.
+///
+/// This is read at runtime startup only. Invalid or absent values fall back to
+/// `DEFAULT_PARK_TIMEOUT_US`.
+pub fn park_timeout() -> Duration {
+    let timeout_us = std::env::var("MINISS_PARK_TIMEOUT_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PARK_TIMEOUT_US);
+    Duration::from_micros(timeout_us)
+}

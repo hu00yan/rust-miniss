@@ -20,7 +20,7 @@ fn test_async_write_trait_implementation() {
 fn test_tcp_read_from_server() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -47,7 +47,7 @@ fn test_tcp_read_from_server() {
 fn test_tcp_write_from_client() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -74,7 +74,7 @@ fn test_tcp_write_from_client() {
 fn test_poll_flush_returns_ok() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -98,7 +98,7 @@ fn test_poll_flush_returns_ok() {
 fn test_poll_close_returns_ok() {
     let runtime = Runtime::new();
     runtime.block_on(async {
-        let listener =
+        let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 

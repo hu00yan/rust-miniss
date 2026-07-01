@@ -1,31 +1,26 @@
 //! HTTP echo server — all work on one core thread, zero cross-thread dispatch.
 
-use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+use rust_miniss::executor::Runtime;
+use rust_miniss::Buffer;
 use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
-use rust_miniss::MultiCoreRuntime;
 
 use std::io;
-use std::io::Write as _;
 use std::net::SocketAddr;
 
-async fn handle_client(mut stream: AsyncTcpStream) {
-    let mut buf = vec![0u8; 4096];
-    let mut response = Vec::with_capacity(8192);
+static RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 22\r\nConnection: keep-alive\r\n\r\nHello from rust-miniss";
+
+async fn handle_client(stream: AsyncTcpStream) {
+    let mut buf = Buffer::with_capacity(4096);
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(bytes_read) => {
-                response.clear();
-                let _ = write!(
-                    response,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {bytes_read}\r\n\r\n"
-                );
-                response.extend_from_slice(&buf[..bytes_read]);
-                if stream.write_all(&response).await.is_err() {
+        match stream.read_rent(buf).await {
+            Ok((0, _)) => break,
+            Err(_) => break,
+            Ok((_, returned_buf)) => {
+                buf = returned_buf;
+                if stream.write_static_all(RESPONSE).await.is_err() {
                     break;
                 }
             }
-            Err(_) => break,
         }
     }
 }
@@ -41,16 +36,12 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let runtime = MultiCoreRuntime::new(Some(1)).map_err(|e| io::Error::other(e.to_string()))?;
+    let runtime = Runtime::new();
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
-    // Spawn the accept loop as a task on core 0.
-    // handle_client also runs on core 0 via runtime.spawn().
-    // Everything is on one thread — zero cross-thread dispatch overhead.
-    let rt = runtime.clone();
-    runtime
-        .spawn(async move {
-            let listener = match AsyncTcpListener::bind(addr) {
+    let rt = &runtime;
+    runtime.block_on(async move {
+            let mut listener = match AsyncTcpListener::bind(addr) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("Failed to bind to {addr}: {e}");
@@ -61,7 +52,7 @@ fn main() -> io::Result<()> {
             loop {
                 match listener.accept().await {
                     Ok((stream, _client_addr)) => {
-                        let _ = rt.spawn(handle_client(stream));
+                        rt.spawn_detached(handle_client(stream));
                     }
                     Err(e) => {
                         eprintln!("Accept error: {e}");
@@ -69,10 +60,7 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
-        })
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        });
 
-    // Park main thread — core 0 runs everything.
-    std::thread::park();
     Ok(())
 }

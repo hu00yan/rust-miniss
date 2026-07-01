@@ -4,11 +4,13 @@
 //! It supports basic HTTP/1.1 request parsing and response generation.
 
 use crate::net::AsyncTcpStream;
-use futures::io::{AsyncReadExt, AsyncWriteExt};
+use futures::io::AsyncReadExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::str;
+use std::sync::Arc;
+use smallvec::SmallVec;
 
 /// HTTP request method
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,15 +42,22 @@ impl fmt::Display for Method {
 
 impl From<&str> for Method {
     fn from(method: &str) -> Self {
-        match method.to_uppercase().as_str() {
-            "GET" => Method::GET,
-            "POST" => Method::POST,
-            "PUT" => Method::PUT,
-            "DELETE" => Method::DELETE,
-            "HEAD" => Method::HEAD,
-            "OPTIONS" => Method::OPTIONS,
-            "PATCH" => Method::PATCH,
-            _ => Method::Other(method.to_string()),
+        if method.eq_ignore_ascii_case("GET") {
+            Method::GET
+        } else if method.eq_ignore_ascii_case("POST") {
+            Method::POST
+        } else if method.eq_ignore_ascii_case("PUT") {
+            Method::PUT
+        } else if method.eq_ignore_ascii_case("DELETE") {
+            Method::DELETE
+        } else if method.eq_ignore_ascii_case("HEAD") {
+            Method::HEAD
+        } else if method.eq_ignore_ascii_case("OPTIONS") {
+            Method::OPTIONS
+        } else if method.eq_ignore_ascii_case("PATCH") {
+            Method::PATCH
+        } else {
+            Method::Other(method.to_string())
         }
     }
 }
@@ -62,18 +71,34 @@ impl StatusCode {
     pub const NOT_FOUND: StatusCode = StatusCode(404);
     pub const INTERNAL_SERVER_ERROR: StatusCode = StatusCode(500);
     pub const BAD_REQUEST: StatusCode = StatusCode(400);
-}
 
-impl fmt::Display for StatusCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let reason = match self.0 {
+    #[inline]
+    fn reason_phrase(self) -> &'static str {
+        match self.0 {
             200 => "OK",
             400 => "Bad Request",
             404 => "Not Found",
             500 => "Internal Server Error",
             _ => "Unknown",
+        }
+    }
+
+    #[inline]
+    fn wire_len(self) -> usize {
+        let digits = match self.0 {
+            0..=9 => 1,
+            10..=99 => 2,
+            100..=999 => 3,
+            1000..=9999 => 4,
+            _ => 5,
         };
-        write!(f, "{} {reason}", self.0)
+        digits + 1 + self.reason_phrase().len()
+    }
+}
+
+impl fmt::Display for StatusCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.0, self.reason_phrase())
     }
 }
 
@@ -93,7 +118,7 @@ impl Request {
             method,
             path,
             version: "HTTP/1.1".to_string(),
-            headers: HashMap::new(),
+            headers: HashMap::with_capacity(8),
             body: Vec::new(),
         }
     }
@@ -103,49 +128,54 @@ impl Request {
         let request_str = str::from_utf8(data)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8"))?;
 
-        let mut lines = request_str.lines();
+        let (head, body) = request_str
+            .split_once("\r\n\r\n")
+            .unwrap_or((request_str, ""));
+        let mut lines = head.lines();
 
         // Parse request line
         let request_line = lines
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty request"))?;
 
-        let parts: Vec<&str> = request_line.split_whitespace().collect();
-        if parts.len() != 3 {
+        let mut parts = request_line.split_whitespace();
+        let method_str = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid request line"))?;
+        let path = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid request line"))?;
+        let version = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid request line"))?;
+        if parts.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid request line",
             ));
         }
 
-        let method = Method::from(parts[0]);
-        let path = parts[1].to_string();
-        let version = parts[2].to_string();
+        let method = Method::from(method_str);
+        let path = path.to_string();
+        let version = version.to_string();
 
         // Parse headers
-        let mut headers = HashMap::new();
-        let mut body_start = None;
+        let mut headers = HashMap::with_capacity(8);
 
-        for (i, line) in lines.enumerate() {
+        for line in lines {
             if line.is_empty() {
-                body_start = Some(i + 2); // +2 because we consumed the request line
                 break;
             }
 
             if let Some(colon_pos) = line.find(':') {
-                let name = line[..colon_pos].trim().to_lowercase();
+                let mut name = line[..colon_pos].trim().to_owned();
+                name.make_ascii_lowercase();
                 let value = line[colon_pos + 1..].trim().to_string();
                 headers.insert(name, value);
             }
         }
 
-        // Extract body if present
-        let body = if let Some(start) = body_start {
-            let body_lines: Vec<&str> = request_str.lines().skip(start).collect();
-            body_lines.join("\n").into_bytes()
-        } else {
-            Vec::new()
-        };
+        let body = body.as_bytes().to_vec();
 
         Ok(Request {
             method,
@@ -164,49 +194,93 @@ pub struct Response {
     pub version: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    content_length: Option<usize>,
 }
 
 impl Response {
     pub fn new(status: StatusCode) -> Self {
-        let mut response = Self {
+        Self {
             status,
             version: "HTTP/1.1".to_string(),
-            headers: HashMap::new(),
+            headers: HashMap::with_capacity(8),
             body: Vec::new(),
-        };
-
-        // Add default headers
-        response
-            .headers
-            .insert("server".to_string(), "miniss/1.0".to_string());
-        response
+            content_length: None,
+        }
     }
 
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         let body_bytes = body.into();
-        self.headers
-            .insert("content-length".to_string(), body_bytes.len().to_string());
+        self.content_length = Some(body_bytes.len());
         self.body = body_bytes;
         self
     }
 
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
-        self.headers.insert(name.to_lowercase(), value.to_string());
+        if name.eq_ignore_ascii_case("content-length") {
+            if let Ok(len) = value.parse::<usize>() {
+                self.content_length = Some(len);
+            } else {
+                self.headers
+                    .insert(name.to_ascii_lowercase(), value.to_string());
+            }
+        } else {
+            self.headers
+                .insert(name.to_ascii_lowercase(), value.to_string());
+        }
         self
+    }
+
+    fn build_headers(&self) -> SmallVec<[u8; 512]> {
+        let header_bytes: usize = self
+            .headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len() + 4)
+            .sum();
+        let content_length = self.content_length.unwrap_or(self.body.len());
+        let mut len_buf = itoa::Buffer::new();
+        let mut status_buf = itoa::Buffer::new();
+        let content_length_bytes = if self.content_length.is_some() {
+            len_buf.format(content_length).len()
+        } else {
+            0
+        };
+        let fixed_bytes = b"server: miniss/1.0\r\n".len() + content_length_bytes;
+        let mut response = SmallVec::<[u8; 512]>::with_capacity(
+            self.version.len() + 1 + self.status.wire_len() + fixed_bytes + header_bytes + 2,
+        );
+        response.extend_from_slice(self.version.as_bytes());
+        response.extend_from_slice(b" ");
+        response.extend_from_slice(status_buf.format(self.status.0).as_bytes());
+        response.extend_from_slice(b" ");
+        response.extend_from_slice(self.status.reason_phrase().as_bytes());
+        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(b"server: miniss/1.0\r\n");
+        if self.content_length.is_some() {
+            response.extend_from_slice(b"content-length: ");
+            response.extend_from_slice(len_buf.format(content_length).as_bytes());
+            response.extend_from_slice(b"\r\n");
+        }
+
+        for (name, value) in &self.headers {
+            response.extend_from_slice(name.as_bytes());
+            response.extend_from_slice(b": ");
+            response.extend_from_slice(value.as_bytes());
+            response.extend_from_slice(b"\r\n");
+        }
+
+        response.extend_from_slice(b"\r\n");
+        response
+    }
+
+    fn serialize_headers(&self) -> Vec<u8> {
+        self.build_headers().into_vec()
     }
 
     /// Convert response to bytes for sending over TCP
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut response = format!("{} {}\r\n", self.version, self.status);
-
-        for (name, value) in &self.headers {
-            response.push_str(&format!("{name}: {value}\r\n"));
-        }
-
-        response.push_str("\r\n");
-        let mut bytes = response.into_bytes();
-        bytes.extend_from_slice(&self.body);
-        bytes
+        let mut response = self.serialize_headers();
+        response.extend_from_slice(&self.body);
+        response
     }
 }
 
@@ -230,8 +304,8 @@ impl HttpConnection {
 
     /// Send HTTP response to the connection
     pub async fn send_response(&mut self, response: Response) -> io::Result<()> {
-        let response_bytes = response.to_bytes();
-        self.stream.write_all(&response_bytes).await
+        let header = response.build_headers();
+        self.stream.write_all_slices(&header, &response.body).await
     }
 }
 
@@ -262,15 +336,15 @@ impl HttpHandler for EchoHandler {
 
 /// Static file/text handler
 pub struct StaticHandler {
-    content: String,
-    content_type: String,
+    content: Arc<str>,
+    content_type: Arc<str>,
 }
 
 impl StaticHandler {
     pub fn new(content: impl Into<String>, content_type: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
-            content_type: content_type.into(),
+            content: Arc::<str>::from(content.into()),
+            content_type: Arc::<str>::from(content_type.into()),
         }
     }
 }
@@ -282,7 +356,7 @@ impl HttpHandler for StaticHandler {
 
         async move {
             Response::new(StatusCode::OK)
-                .with_header("content-type", &content_type)
+                .with_header("content-type", content_type.as_ref())
                 .with_body(content.as_bytes())
         }
     }

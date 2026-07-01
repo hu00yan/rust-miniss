@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use slab::Slab;
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
@@ -59,19 +59,16 @@ pub trait FutureExt: std::future::Future + Sized {
 
 impl<F: std::future::Future> FutureExt for F {}
 
-/// A high-performance timer wheel implementation for scheduling timeouts
+/// A high-performance timer wheel implementation for scheduling timeouts.
 ///
-/// This implementation uses a circular buffer of timer slots with minimal
-/// unsafe code for performance-critical slot indexing. Includes a HashMap
-/// for O(1) timer cancellation.
+/// Each wheel slot uses a `Slab` so timer cancel stays O(1) without hash lookup.
 pub struct TimerWheel {
-    slots: Vec<VecDeque<Entry>>,
+    slots: Vec<Slab<Entry>>,
+    slot_generations: Vec<Vec<u32>>,
     resolution_ms: u64,
     num_slots: usize,
     current_tick: u64,
     start_time: Instant,
-    /// Maps TimerId to slot index for cancellation
-    timer_locations: HashMap<TimerId, usize>,
     pending_timers: usize,
 }
 
@@ -90,19 +87,19 @@ impl TimerWheel {
             "Timer resolution must be greater than zero"
         );
         let mut slots = Vec::with_capacity(num_slots);
+        let mut slot_generations = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
-            slots.push(VecDeque::with_capacity(
-                crate::config::EXPECTED_WAKEUP_COUNT,
-            ));
+            slots.push(Slab::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT));
+            slot_generations.push(Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT));
         }
 
         Self {
             slots,
+            slot_generations,
             resolution_ms,
             num_slots,
             current_tick: 0,
             start_time: Instant::now(),
-            timer_locations: HashMap::new(),
             pending_timers: 0,
         }
     }
@@ -114,8 +111,7 @@ impl TimerWheel {
     /// due to floor division, but `Instant::now()` is still before the deadline.
     ///
     /// Returns a TimerId that can be used to cancel the timer.
-    pub fn schedule(&mut self, at: Instant, waker: Waker) -> TimerId {
-        let timer_id = TimerId::new();
+    pub fn schedule(&mut self, at: Instant, waker: &Waker) -> TimerId {
         debug_assert!(self.resolution_ms > 0, "Timer resolution must be non-zero");
 
         // Use ceiling division: ensures the deadline tick is strictly at or after `at`.
@@ -126,18 +122,24 @@ impl TimerWheel {
         let rounds = distance / self.num_slots as u64;
         let slot_index = ((self.current_tick + distance) % self.num_slots as u64) as usize;
 
-        let entry = Entry {
-            id: timer_id,
-            waker,
-            remaining_rounds: rounds,
-        };
-
-        self.slots
+        let slot = self
+            .slots
             .get_mut(slot_index)
-            .expect("slot index must be valid")
-            .push_back(entry);
-
-        self.timer_locations.insert(timer_id, slot_index);
+            .expect("slot index must be valid");
+        let key = slot.insert(Entry {
+            waker: waker.clone(),
+            remaining_rounds: rounds,
+        });
+        let generations = self
+            .slot_generations
+            .get_mut(slot_index)
+            .expect("slot generation index must be valid");
+        if key >= generations.len() {
+            generations.resize(key + 1, 0);
+        }
+        let generation = generations[key].wrapping_add(1).max(1);
+        generations[key] = generation;
+        let timer_id = TimerId::from_parts(slot_index, key, generation);
         self.pending_timers += 1;
         timer_id
     }
@@ -146,16 +148,20 @@ impl TimerWheel {
     ///
     /// Returns true if the timer was found and cancelled, false otherwise
     pub fn cancel(&mut self, id: TimerId) -> bool {
-        if let Some(slot_index) = self.timer_locations.remove(&id) {
-            if let Some(slot) = self.slots.get_mut(slot_index) {
-                for idx in 0..slot.len() {
-                    if slot[idx].id == id {
-                        slot.remove(idx);
-                        self.pending_timers = self.pending_timers.saturating_sub(1);
-                        return true;
-                    }
-                }
-            }
+        let (slot_index, key, generation) = id.parts();
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            return false;
+        };
+        let Some(generations) = self.slot_generations.get_mut(slot_index) else {
+            return false;
+        };
+        if key >= generations.len() || generations[key] != generation {
+            return false;
+        }
+        if slot.contains(key) {
+            slot.remove(key);
+            self.pending_timers = self.pending_timers.saturating_sub(1);
+            return true;
         }
         false
     }
@@ -175,20 +181,16 @@ impl TimerWheel {
             let slot_index = (self.current_tick % self.num_slots as u64) as usize;
 
             if let Some(slot) = self.slots.get_mut(slot_index) {
-                let mut remaining = slot.len();
-                while remaining > 0 {
-                    if let Some(mut entry) = slot.pop_front() {
-                        if entry.remaining_rounds == 0 {
-                            self.timer_locations.remove(&entry.id);
-                            self.pending_timers = self.pending_timers.saturating_sub(1);
-                            ready.push(entry.waker);
-                        } else {
-                            entry.remaining_rounds -= 1;
-                            slot.push_back(entry);
-                        }
+                slot.retain(|_, entry| {
+                    if entry.remaining_rounds == 0 {
+                        self.pending_timers = self.pending_timers.saturating_sub(1);
+                        ready.push(std::mem::replace(&mut entry.waker, Waker::noop().clone()));
+                        false
+                    } else {
+                        entry.remaining_rounds -= 1;
+                        true
                     }
-                    remaining -= 1;
-                }
+                });
             }
 
             self.current_tick = self.current_tick.saturating_add(1);
@@ -250,12 +252,12 @@ mod tests {
         let now = Instant::now();
         let future_time = now + Duration::from_millis(50);
 
-        let timer_id = wheel.schedule(future_time, waker);
+        let timer_id = wheel.schedule(future_time, &waker);
         assert_eq!(wheel.pending_count(), 1);
 
         // Test that we can schedule multiple timers
         let waker2 = create_test_waker();
-        let timer_id2 = wheel.schedule(future_time + Duration::from_millis(10), waker2);
+        let timer_id2 = wheel.schedule(future_time + Duration::from_millis(10), &waker2);
         assert_eq!(wheel.pending_count(), 2);
 
         // Timer IDs should be different
@@ -268,7 +270,7 @@ mod tests {
         let waker = create_test_waker();
         let future_time = Instant::now() + Duration::from_millis(50);
 
-        let timer_id = wheel.schedule(future_time, waker);
+        let timer_id = wheel.schedule(future_time, &waker);
         assert_eq!(wheel.pending_count(), 1);
 
         // Cancel the timer
@@ -286,7 +288,7 @@ mod tests {
         let now = Instant::now();
 
         // Schedule a timer that should expire immediately
-        wheel.schedule(now, waker);
+        wheel.schedule(now, &waker);
         assert_eq!(wheel.pending_count(), 1);
 
         let mut ready = Vec::new();
@@ -306,9 +308,9 @@ mod tests {
         let waker2 = create_test_waker();
         let waker3 = create_test_waker();
 
-        wheel.schedule(now + Duration::from_millis(1), waker1);
-        wheel.schedule(now + Duration::from_millis(2), waker2);
-        wheel.schedule(now + Duration::from_millis(5), waker3);
+        wheel.schedule(now + Duration::from_millis(1), &waker1);
+        wheel.schedule(now + Duration::from_millis(2), &waker2);
+        wheel.schedule(now + Duration::from_millis(5), &waker3);
 
         assert_eq!(wheel.pending_count(), 3);
 
@@ -348,7 +350,7 @@ mod tests {
         let wakers: Vec<_> = (0..8).map(|_| create_test_waker()).collect();
 
         for (i, waker) in wakers.into_iter().enumerate() {
-            wheel.schedule(now + Duration::from_millis((i + 1) as u64), waker);
+            wheel.schedule(now + Duration::from_millis((i + 1) as u64), &waker);
         }
 
         assert_eq!(wheel.pending_count(), 8);
@@ -368,7 +370,7 @@ mod tests {
         let waker = create_test_waker();
 
         // Schedule timer far in the future (multiple full rotations)
-        wheel.schedule(now + Duration::from_millis(100), waker);
+        wheel.schedule(now + Duration::from_millis(100), &waker);
 
         let mut ready = Vec::new();
         wheel.expire(now + Duration::from_millis(99), &mut ready);

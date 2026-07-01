@@ -57,6 +57,33 @@ search_pattern() {
         | grep -v 'arch-audit: allow' || true
 }
 
+search_unjustified_unsafe() {
+    local dir="$1"
+    python3 - "$dir" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+unsafe_re = re.compile(r"\bunsafe\b")
+comment_re = re.compile(r"(SAFETY:|# Safety|arch-audit: allow)")
+
+for path in sorted(root.rglob("*.rs")):
+    lines = path.read_text(errors="ignore").splitlines()
+    for idx, line in enumerate(lines):
+        if not unsafe_re.search(line):
+            continue
+        if line.lstrip().startswith(("//", "//!","///", "*")):
+            continue
+        start = max(0, idx - 8)
+        end = min(len(lines), idx + 3)
+        context = lines[start:end]
+        if any(comment_re.search(item) for item in context):
+            continue
+        print(f"{path}:{idx + 1}:{line}")
+PY
+}
+
 # ─── Hard Fail ──────────────────────────────────────────────────
 echo "--- Hard Fail Patterns ---"
 for pattern in "${HOT_PATH_PATTERNS[@]}"; do
@@ -103,7 +130,11 @@ echo "--- Needs Justification Patterns ---"
 for pattern in "${NEEDS_JUSTIFICATION_PATTERNS[@]}"; do
     for dir in "${SCAN_DIRS[@]}"; do
         if [ -d "$dir" ]; then
-            results=$(grep -rn "$pattern" "$dir" 2>/dev/null || true)
+            if [ "$pattern" = "unsafe" ]; then
+                results=$(search_unjustified_unsafe "$dir")
+            else
+                results=$(grep -rn "$pattern" "$dir" 2>/dev/null || true)
+            fi
             if [ -n "$results" ]; then
                 echo "NEEDS JUSTIFICATION: '$pattern' in $dir/"
                 echo "$results"

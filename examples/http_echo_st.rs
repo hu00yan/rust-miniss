@@ -46,7 +46,7 @@ fn main() -> io::Result<()> {
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
     runtime.block_on(async {
-        let listener = match AsyncTcpListener::bind(addr) {
+        let mut listener = match AsyncTcpListener::bind(addr) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("Failed to bind to {addr}: {e}");

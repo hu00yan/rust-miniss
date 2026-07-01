@@ -20,7 +20,7 @@ fn timer_insertion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let waker = create_bench_waker();
             let future_time = black_box(now + Duration::from_millis(100));
-            let _timer_id = black_box(wheel.schedule(future_time, waker));
+            let _timer_id = black_box(wheel.schedule(future_time, &waker));
         })
     });
 
@@ -40,7 +40,7 @@ fn timer_batch_insertion_benchmark(c: &mut Criterion) {
                 for i in 0..size {
                     let waker = create_bench_waker();
                     let future_time = black_box(now + Duration::from_millis(i + 1));
-                    let _timer_id = black_box(wheel.schedule(future_time, waker));
+                    let _timer_id = black_box(wheel.schedule(future_time, &waker));
                 }
             })
         });
@@ -59,7 +59,7 @@ fn timer_cancellation_benchmark(c: &mut Criterion) {
                 let mut wheel = TimerWheel::new(4096, 1);
                 let waker = create_bench_waker();
                 let future_time = Instant::now() + Duration::from_millis(100);
-                let timer_id = wheel.schedule(future_time, waker);
+                let timer_id = wheel.schedule(future_time, &waker);
                 (wheel, timer_id)
             },
             |(mut wheel, timer_id)| {
@@ -91,7 +91,7 @@ fn timer_expiration_benchmark(c: &mut Criterion) {
                         for i in 0..count {
                             let waker = create_bench_waker();
                             let timer_time = now + Duration::from_millis(1 + (i % 10));
-                            wheel.schedule(timer_time, waker);
+                            wheel.schedule(timer_time, &waker);
                         }
 
                         (wheel, now + Duration::from_millis(20))
