@@ -84,6 +84,14 @@ pub trait IoProvider: Send + Sync + 'static {
         0
     }
 
+    /// Drain and reset park-specific flush metrics.
+    ///
+    /// Used by the runtime to separate normal event-loop flush cost from
+    /// flushes that happen right before blocking in park().
+    fn take_park_flush_stats(&self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+
     /// Pop a multi-shot accept result for the given token.
     /// Returns None for non-accept ops or when no result is available.
     fn pop_accept_result(&self, _token: IoToken) -> Option<Result<CompletionKind, IoError>> {
@@ -98,6 +106,22 @@ pub trait IoProvider: Send + Sync + 'static {
     /// Whether accepted TCP streams are already created in non-blocking mode.
     fn accepted_streams_are_nonblocking(&self) -> bool {
         false
+    }
+
+    /// Fused CQE processing: iterate completions and process them inline
+    /// (write to slot + wake task) without an intermediate Vec.
+    /// Processes up to `batch_limit` CQEs per call.
+    /// Returns `(processed_completions, saw_wakeup_poll_completion, wakeups)`.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from the owning CPU thread.
+    unsafe fn drain_completions_fused(
+        &self,
+        _wakeup_poll_token: Option<IoToken>,
+        _batch_limit: usize,
+    ) -> (usize, bool, usize) {
+        (0, false, 0)
     }
 }
 
@@ -243,7 +267,6 @@ impl IoToken {
     pub(crate) fn slot_index(&self) -> usize {
         (self.id as u32) as usize
     }
-
 }
 
 /// Describes the result of a successfully completed I/O operation.

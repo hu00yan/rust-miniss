@@ -17,17 +17,17 @@ use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use std::sync::Arc;
 use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cpu::{
-    clear_current_io_state, clear_current_timer, set_current_io_state, set_current_task_id,
-    set_current_timer, CpuIoState,
+    CpuIoState, clear_current_io_state, clear_current_timer, set_current_io_state,
+    set_current_task_id, set_current_timer,
 };
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
@@ -148,6 +148,9 @@ pub struct CoreMetricsSnapshot {
     pub flushes: u64,
     pub flush_total_us: u64,
     pub max_flush_us: u64,
+    pub park_flushes: u64,
+    pub park_flush_total_us: u64,
+    pub max_park_flush_us: u64,
     pub io_completion_batches: u64,
     pub io_completion_total_ns: u64,
     pub max_io_completion_batch_ns: u64,
@@ -185,6 +188,9 @@ struct CoreMetrics {
     flushes: u64,
     flush_total_us: u64,
     max_flush_us: u64,
+    park_flushes: u64,
+    park_flush_total_us: u64,
+    max_park_flush_us: u64,
     io_completion_batches: u64,
     io_completion_total_ns: u64,
     max_io_completion_batch_ns: u64,
@@ -309,6 +315,9 @@ impl CpuCore {
             flushes: self.metrics.flushes,
             flush_total_us: self.metrics.flush_total_us,
             max_flush_us: self.metrics.max_flush_us,
+            park_flushes: self.metrics.park_flushes,
+            park_flush_total_us: self.metrics.park_flush_total_us,
+            max_park_flush_us: self.metrics.max_park_flush_us,
             io_completion_batches: self.metrics.io_completion_batches,
             io_completion_total_ns: self.metrics.io_completion_total_ns,
             max_io_completion_batch_ns: self.metrics.max_io_completion_batch_ns,
@@ -375,11 +384,10 @@ impl CpuCore {
 
         /// Maximum inner-loop iterations before yielding to I/O (prevents
         /// starvation of completions and timers during a busy-task storm).
-        const MAX_BUSY_ROUNDS: u32 = 64;
+        const MAX_BUSY_ROUNDS: u32 = 96;
         const MESSAGE_POLL_TICKS_LIGHT: usize = 3;
         const MESSAGE_POLL_TICKS_BUSY: usize = 15;
         let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
-        let mut io_completions = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT * 4);
 
         loop {
             if self.shutdown.load(Ordering::Acquire) {
@@ -405,7 +413,7 @@ impl CpuCore {
                 }
 
                 // 2. Process I/O completions — may wake tasks into ready_queue.
-                work_done |= self.process_io_completions(&mut io_completions, false);
+                work_done |= self.process_io_completions(false);
 
                 // 3. Execute ready tasks — may submit new SQEs.
                 work_done |= self.execute_tasks();
@@ -426,6 +434,16 @@ impl CpuCore {
                 if self.timer_wheel.has_pending() {
                     let now = Instant::now();
                     work_done |= self.process_timers(now, &mut ready_timers);
+                }
+
+                if !work_done && self.io_state.io_backend.pending_submission_count() > 0 {
+                    self.metrics.flushes += 1;
+                    let flush_started = Instant::now();
+                    self.io_state.io_backend.flush();
+                    let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
+                    self.metrics.flush_total_us += flush_elapsed_us;
+                    self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
+                    work_done = true;
                 }
 
                 // 6. Nothing left to do — exit inner loop, go park (wait for I/O).
@@ -467,10 +485,18 @@ impl CpuCore {
             let park_started = Instant::now();
             let n_completions = self.io_state.io_backend.park(self.park_timeout);
             let park_elapsed_us = park_started.elapsed().as_micros() as u64;
+            let (park_flushes, park_flush_total_us, max_park_flush_us) =
+                self.io_state.io_backend.take_park_flush_stats();
             #[cfg(target_os = "linux")]
             self.sleeping.store(false, Ordering::Release);
             self.metrics.park_total_us += park_elapsed_us;
             self.metrics.max_park_us = self.metrics.max_park_us.max(park_elapsed_us);
+            self.metrics.park_flushes += park_flushes;
+            self.metrics.park_flush_total_us += park_flush_total_us;
+            self.metrics.max_park_flush_us = self
+                .metrics
+                .max_park_flush_us
+                .max(max_park_flush_us);
             if n_completions == 0 {
                 self.metrics.park_timeouts += 1;
             } else {
@@ -478,7 +504,7 @@ impl CpuCore {
             }
 
             if n_completions > 0 {
-                let _ = self.process_io_completions(&mut io_completions, true);
+                let _ = self.process_io_completions(true);
             }
             // Execute tasks that were just woken by the park+drain
             if self.execute_tasks() {
@@ -505,7 +531,7 @@ impl CpuCore {
     /// Bind thread to CPU core (Linux-specific)
     #[cfg(target_os = "linux")]
     fn bind_to_cpu(&self) -> Result<()> {
-        use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
+        use libc::{CPU_SET, CPU_ZERO, cpu_set_t, sched_setaffinity};
         use std::mem;
 
         // SAFETY: The cpu_set_t is zero-initialized before CPU_SET, and
@@ -693,104 +719,58 @@ impl CpuCore {
     /// Process I/O completions — tries inline poll when the waiting task is known.
     /// Completion-based: io_uring returns completed operations, this processes them.
     /// Returns `true` if any progress was made.
-    fn process_io_completions(
-        &mut self,
-        completions: &mut Vec<IoCompletion>,
-        drain_all: bool,
-    ) -> bool {
-        let mut made_progress = false;
+    fn process_io_completions(&mut self, after_park: bool) -> bool {
+        // Fused path: CQE → slot + wake, no intermediate Vec.
+        // SAFETY: UringBackend is thread-affine and we are on the owning thread.
+        #[cfg(target_os = "linux")]
+        let wakeup_token = self.wakeup_poll_token;
+        #[cfg(not(target_os = "linux"))]
+        let wakeup_token: Option<IoToken> = None;
 
-        loop {
-            if completions.is_empty() {
-                match self.io_state.io_backend.drain_completions_into(completions) {
-                    Poll::Ready(()) => {}
-                    Poll::Pending => return made_progress,
-                }
-            }
+        let drain_limit = if after_park {
+            256
+        } else if self.ready_queue.is_empty() {
+            128
+        } else if self.ready_queue.len() < 8 {
+            128
+        } else {
+            61
+        };
+        let drain_started = Instant::now();
+        #[cfg(target_os = "linux")]
+        let (count, saw_wakeup_poll, wakeups) = unsafe {
+            self.io_state
+                .io_backend
+                .drain_completions_fused(wakeup_token, drain_limit)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (count, saw_wakeup_poll, wakeups) = unsafe {
+            self.io_state
+                .io_backend
+                .drain_completions_fused(wakeup_token, drain_limit)
+        };
 
-            if completions.is_empty() {
-                return made_progress;
-            }
+        #[cfg(target_os = "linux")]
+        if self.wakeup_poll_armed && saw_wakeup_poll {
+            self.clear_wakeup_poll();
+        }
 
-            made_progress = true;
+        let drain_elapsed_ns = drain_started.elapsed().as_nanos() as u64;
+        self.metrics.io_completion_total_ns += drain_elapsed_ns;
+        self.metrics.max_io_completion_batch_ns = self
+            .metrics
+            .max_io_completion_batch_ns
+            .max(drain_elapsed_ns);
+        self.metrics.max_io_completion_batch_len =
+            self.metrics.max_io_completion_batch_len.max(count);
+
+        if count > 0 || saw_wakeup_poll {
             self.metrics.io_completion_batches += 1;
-            self.metrics.max_io_completion_batch_len = self
-                .metrics
-                .max_io_completion_batch_len
-                .max(completions.len());
-            let io_batch_started = Instant::now();
-            let mut io_completion_count = 0u64;
-            for (token, result) in completions.drain(..) {
-                #[cfg(target_os = "linux")]
-                if self.wakeup_poll_armed
-                    && self.wakeup_poll_token == Some(token)
-                    && matches!(result, Ok(CompletionKind::PollAdd { .. }))
-                {
-                    self.clear_wakeup_poll();
-                    continue;
-                }
-
-                io_completion_count += 1;
-                let is_multishot_accept = matches!(&result, Ok(CompletionKind::Accept { .. }))
-                    && self.io_state.io_backend.supports_multishot_accept();
-                let should_inline = matches!(
-                    &result,
-                    Ok(CompletionKind::Accept { .. })
-                        | Ok(CompletionKind::Connect)
-                        | Ok(CompletionKind::Read { .. })
-                        | Ok(CompletionKind::ReadFile { .. })
-                        | Ok(CompletionKind::ReadRent { .. })
-                        | Ok(CompletionKind::ReadVectored { .. })
-                        | Ok(CompletionKind::UdpRecv { .. })
-                        | Ok(CompletionKind::UdpRecvVectored { .. })
-                );
-
-                // Try inline completion: if we know which task is waiting,
-                // insert completion and poll it immediately.
-                // SAFETY: Completion handling runs on the owning worker
-                // thread, and the token came from this shard's backend.
-                let task_id = if is_multishot_accept {
-                    unsafe { self.io_state.take_pending_task(token) }
-                } else {
-                    unsafe {
-                        self.io_state
-                            .take_pending_task_and_store_completed(token, result)
-                    }
-                };
-                if let Some(_tid) = task_id {
-                    if should_inline {
-                        // SAFETY: The token is shard-local and the waker
-                        // slot belongs to this worker thread.
-                        if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
-                            self.metrics.waker_wakeups += 1;
-                            waker.wake();
-                        }
-                        continue;
-                    }
-                }
-
-                // No task_id, or task not found: the completion has
-                // already been stored in the shard-local slot; just wake
-                // the waiting task via its waker.
-                // SAFETY: Completion handling runs on the owning worker
-                // thread, and this token is consumed once.
-                if let Some(waker) = unsafe { self.io_state.take_waker(token) } {
-                    self.metrics.waker_wakeups += 1;
-                    waker.wake();
-                }
-            }
-
-            self.metrics.io_completions += io_completion_count;
-            let io_batch_elapsed_ns = io_batch_started.elapsed().as_nanos() as u64;
-            self.metrics.io_completion_total_ns += io_batch_elapsed_ns;
-            self.metrics.max_io_completion_batch_ns = self
-                .metrics
-                .max_io_completion_batch_ns
-                .max(io_batch_elapsed_ns);
-
-            if !drain_all {
-                return true;
-            }
+            self.metrics.io_completions += count as u64;
+            self.metrics.waker_wakeups += wakeups as u64;
+            true
+        } else {
+            false
         }
     }
 

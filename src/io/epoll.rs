@@ -9,15 +9,15 @@
 //! Like the `uring` backend, this module uses `UnsafeCell` and `unsafe` trait impls
 //! to manage thread-local state within the `IoBackend` trait's `&self` methods.
 
-use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
 use crate::Buffer;
-use mio::{unix::SourceFd, Events, Interest, Poll, Token};
+use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use std::cell::UnsafeCell;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Poll as TaskPoll;
 use std::time::Duration;
 use threadpool::ThreadPool;
@@ -954,7 +954,7 @@ fn syscall_accept(fd: RawFd) -> io::Result<(RawFd, std::net::SocketAddr)> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Unsupported address family",
-                ))
+                ));
             }
         }
     };

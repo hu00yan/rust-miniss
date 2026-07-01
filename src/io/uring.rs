@@ -4,7 +4,7 @@
 
 use crate::buffer::Buffer;
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
-use io_uring::{cqueue, opcode, types, IoUring};
+use io_uring::{IoUring, cqueue, opcode, types};
 use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
 use slab::Slab;
 use smallvec::SmallVec;
@@ -120,6 +120,12 @@ pub struct UringBackend {
     flush_high_watermark: usize,
     /// Minimum queued SQEs before flush() submits. Parsed once at backend startup.
     flush_batch_size: usize,
+    /// Maximum CQEs processed in one drain pass. Parsed once at backend startup.
+    drain_batch_size: usize,
+    /// Park-only flush stats, drained by the runtime after each park.
+    park_flushes: Cell<u64>,
+    park_flush_total_us: Cell<u64>,
+    max_park_flush_us: Cell<u64>,
     thread_id: std::thread::ThreadId,
 }
 
@@ -132,9 +138,9 @@ unsafe impl Sync for UringBackend {}
 /// Kept below MAX_BUSY_ROUNDS in multicore.rs so busy workers still submit
 /// without waiting for the outer park path.
 const FLUSH_BATCH_SIZE: usize = 61;
-/// Maximum CQEs processed in one drain pass. Keeps one completion burst from
-/// monopolizing a core and pushing tail latency up.
-const MAX_COMPLETIONS_PER_DRAIN: usize = 61;
+/// Maximum CQEs processed in one drain pass when the runtime asks for a
+/// larger sweep. The caller can still cap this lower on busy shards.
+const MAX_COMPLETIONS_PER_DRAIN: usize = 256;
 
 impl UringBackend {
     pub fn new(entries: u32) -> io::Result<Self> {
@@ -143,6 +149,11 @@ impl UringBackend {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(FLUSH_BATCH_SIZE);
+        let drain_batch_size = std::env::var("MINISS_URING_DRAIN_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(MAX_COMPLETIONS_PER_DRAIN);
         fn base_builder() -> io_uring::Builder {
             let mut builder = IoUring::builder();
             // Match monoio's default posture: leave the builder mostly plain
@@ -189,6 +200,10 @@ impl UringBackend {
             sqpoll_enabled,
             flush_high_watermark,
             flush_batch_size,
+            drain_batch_size,
+            park_flushes: Cell::new(0),
+            park_flush_total_us: Cell::new(0),
+            max_park_flush_us: Cell::new(0),
             thread_id: std::thread::current().id(),
         })
     }
@@ -223,6 +238,426 @@ impl UringBackend {
         let idx = (token_id & 0xffff_ffff) as usize;
         let generation = (token_id >> 32) as u32;
         Some((idx, generation))
+    }
+
+    /// Fused CQE processing: iterate CQ ring, reconstruct results, and
+    /// write directly to CpuIoState slots + wake tasks. No intermediate Vec.
+    /// Processes up to `batch_limit` CQEs per call; the event loop calls
+    /// this repeatedly, interleaving with task execution.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from the owning CPU thread.
+    pub unsafe fn drain_completions_fused_inline(
+        &self,
+        wakeup_poll_token: Option<IoToken>,
+        batch_limit: usize,
+    ) -> (usize, bool, usize) {
+        let ring = &mut *self.ring.get();
+        let pending_ops = &mut *self.pending_ops.get();
+        let accept_results = &mut *self.accept_results.get();
+        let slot_meta = &*self.slot_meta.get();
+        let io_state = crate::cpu::io_state();
+
+        let mut cq = ring.completion();
+        cq.sync();
+
+        let mut processed = 0usize;
+        let mut saw_wakeup_poll_completion = false;
+        let mut wakeups = 0usize;
+        for cqe in cq {
+            let token_id = cqe.user_data();
+            let result = cqe.result();
+            let flags = cqe.flags();
+            let has_more = cqueue::more(flags);
+
+            if token_id == u64::MAX {
+                continue;
+            }
+            let Some((idx, generation)) = Self::unpack_token(token_id) else {
+                continue;
+            };
+            if idx >= slot_meta.len() || slot_meta[idx].generation != generation {
+                continue;
+            }
+            let token = IoToken::from_id(slot_meta[idx].token_id);
+
+            // Skip the wakeup poll token — caller handles it separately.
+            if wakeup_poll_token == Some(token) {
+                saw_wakeup_poll_completion = true;
+                continue;
+            }
+
+            // Multishot accept: stays armed, result goes into accept_results VecDeque.
+            if has_more {
+                if let Some(PendingOp::Accept {
+                    addr_storage,
+                    addr_len,
+                    ..
+                }) = pending_ops.get(idx)
+                {
+                    let completion_result = if result < 0 {
+                        Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                    } else if let (Some(addr_storage), Some(addr_len)) =
+                        (addr_storage.as_ref(), addr_len.as_ref())
+                    {
+                        let storage: *const sockaddr_storage = &**addr_storage as *const _;
+                        let socket_addr = unsafe {
+                            match (*storage).ss_family as libc::c_int {
+                                libc::AF_INET => {
+                                    let sa = &*(storage as *const _ as *const libc::sockaddr_in);
+                                    let ip =
+                                        std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+                                    let port = u16::from_be(sa.sin_port);
+                                    Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                                        ip, port,
+                                    )))
+                                }
+                                libc::AF_INET6 => {
+                                    let sa = &*(storage as *const _ as *const libc::sockaddr_in6);
+                                    let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+                                    let port = u16::from_be(sa.sin6_port);
+                                    Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                                        ip,
+                                        port,
+                                        sa.sin6_flowinfo,
+                                        sa.sin6_scope_id,
+                                    )))
+                                }
+                                _ => Err(IoError::Io(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Unsupported address family",
+                                ))),
+                            }
+                        };
+                        let _ = **addr_len;
+                        match socket_addr {
+                            Ok(sa) => Ok(CompletionKind::Accept {
+                                fd: result,
+                                addr: Some(sa),
+                            }),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Ok(CompletionKind::Accept {
+                            fd: result,
+                            addr: None,
+                        })
+                    };
+                    let token_idx = token.slot_index();
+                    let queue = accept_results[token_idx].get_or_insert_with(VecDeque::new);
+                    queue.push_back(completion_result);
+                    if let Some(waker) = io_state.take_waker(token) {
+                        wakeups += 1;
+                        waker.wake();
+                    }
+                    continue;
+                }
+            }
+
+            // Normal completion: remove PendingOp, reconstruct result, store + wake.
+            if let Some(pending_op) = pending_ops.try_remove(idx) {
+                let completion_result = match pending_op {
+                    PendingOp::Accept {
+                        addr_storage,
+                        addr_len,
+                        ..
+                    } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else if let (Some(addr_storage), Some(addr_len)) =
+                            (addr_storage.as_ref(), addr_len.as_ref())
+                        {
+                            let storage: *const sockaddr_storage = &**addr_storage as *const _;
+                            let socket_addr = unsafe {
+                                match (*storage).ss_family as libc::c_int {
+                                    libc::AF_INET => {
+                                        let sa =
+                                            &*(storage as *const _ as *const libc::sockaddr_in);
+                                        let ip = std::net::Ipv4Addr::from(u32::from_be(
+                                            sa.sin_addr.s_addr,
+                                        ));
+                                        let port = u16::from_be(sa.sin_port);
+                                        Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                                            ip, port,
+                                        )))
+                                    }
+                                    libc::AF_INET6 => {
+                                        let sa =
+                                            &*(storage as *const _ as *const libc::sockaddr_in6);
+                                        let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+                                        let port = u16::from_be(sa.sin6_port);
+                                        Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                                            ip,
+                                            port,
+                                            sa.sin6_flowinfo,
+                                            sa.sin6_scope_id,
+                                        )))
+                                    }
+                                    _ => Err(IoError::Io(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "Unsupported address family",
+                                    ))),
+                                }
+                            };
+                            let _ = **addr_len;
+                            match socket_addr {
+                                Ok(sa) => Ok(CompletionKind::Accept {
+                                    fd: result,
+                                    addr: Some(sa),
+                                }),
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Ok(CompletionKind::Accept {
+                                fd: result,
+                                addr: None,
+                            })
+                        }
+                    }
+                    PendingOp::Read { op, mut buf } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            let bytes_read = result as usize;
+                            unsafe {
+                                buf.set_len(bytes_read);
+                            }
+                            match &op {
+                                Op::ReadRent { .. } => Ok(CompletionKind::ReadRent { buffer: buf }),
+                                _ => Ok(CompletionKind::Read {
+                                    bytes_read,
+                                    data: buf,
+                                }),
+                            }
+                        }
+                    }
+                    PendingOp::Write { op, data } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            match &op {
+                                Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
+                                    bytes_written: result as usize,
+                                    data,
+                                }),
+                                _ => {
+                                    let _ = data;
+                                    Ok(CompletionKind::Write {
+                                        bytes_written: result as usize,
+                                    })
+                                }
+                            }
+                        }
+                    }
+                    PendingOp::WriteStatic { .. } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::Write {
+                                bytes_written: result as usize,
+                            })
+                        }
+                    }
+                    PendingOp::Fsync { .. } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::Fsync)
+                        }
+                    }
+                    PendingOp::Close { .. } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::Close)
+                        }
+                    }
+                    PendingOp::ReadFile { mut buf, .. } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            let bytes_read = result as usize;
+                            unsafe {
+                                buf.set_len(bytes_read);
+                            }
+                            Ok(CompletionKind::ReadFile {
+                                bytes_read,
+                                data: buf,
+                            })
+                        }
+                    }
+                    PendingOp::WriteFile { data, .. } => {
+                        let _ = data;
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::WriteFile {
+                                bytes_written: result as usize,
+                            })
+                        }
+                    }
+                    PendingOp::UdpRecv {
+                        mut buffer,
+                        addr_storage,
+                        addr_len,
+                        ..
+                    } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            let bytes_read = result as usize;
+                            unsafe {
+                                buffer.set_len(bytes_read);
+                            }
+                            let socket_addr = {
+                                let storage: *const sockaddr_storage = &*addr_storage as *const _;
+                                unsafe {
+                                    match (*storage).ss_family as libc::c_int {
+                                        libc::AF_INET => {
+                                            let sa =
+                                                &*(storage as *const _ as *const libc::sockaddr_in);
+                                            let ip = std::net::Ipv4Addr::from(u32::from_be(
+                                                sa.sin_addr.s_addr,
+                                            ));
+                                            let port = u16::from_be(sa.sin_port);
+                                            Ok(std::net::SocketAddr::V4(
+                                                std::net::SocketAddrV4::new(ip, port),
+                                            ))
+                                        }
+                                        libc::AF_INET6 => {
+                                            let sa = &*(storage as *const _
+                                                as *const libc::sockaddr_in6);
+                                            let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+                                            let port = u16::from_be(sa.sin6_port);
+                                            Ok(std::net::SocketAddr::V6(
+                                                std::net::SocketAddrV6::new(
+                                                    ip,
+                                                    port,
+                                                    sa.sin6_flowinfo,
+                                                    sa.sin6_scope_id,
+                                                ),
+                                            ))
+                                        }
+                                        _ => Err(IoError::Io(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "Unsupported address family",
+                                        ))),
+                                    }
+                                }
+                            };
+                            let _ = *addr_len;
+                            match socket_addr {
+                                Ok(sa) => Ok(CompletionKind::UdpRecv {
+                                    bytes_read,
+                                    buffer,
+                                    addr: sa,
+                                }),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                    PendingOp::UdpSend {
+                        data,
+                        addr_storage,
+                        addr_len,
+                        ..
+                    } => {
+                        let _ = &*addr_storage as *const _;
+                        let _ = *addr_len;
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::UdpSend {
+                                bytes_written: result as usize,
+                                data,
+                            })
+                        }
+                    }
+                    PendingOp::Connect { addr_storage, .. } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            let _ = &*addr_storage;
+                            Ok(CompletionKind::Connect)
+                        }
+                    }
+                    PendingOp::ReadVectored {
+                        mut buffers,
+                        iovecs,
+                        ..
+                    } => {
+                        let _ = iovecs;
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            let bytes_read = result as usize;
+                            let mut remaining = bytes_read;
+                            for buf in buffers.iter_mut() {
+                                let can_read = std::cmp::min(remaining, buf.capacity());
+                                unsafe {
+                                    buf.set_len(can_read);
+                                }
+                                remaining -= can_read;
+                                if remaining == 0 {
+                                    break;
+                                }
+                            }
+                            Ok(CompletionKind::ReadVectored {
+                                bytes_read,
+                                buffers,
+                            })
+                        }
+                    }
+                    PendingOp::WriteVectored {
+                        buffers, iovecs, ..
+                    } => {
+                        let _ = iovecs;
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::WriteVectored {
+                                bytes_written: result as usize,
+                                buffers,
+                            })
+                        }
+                    }
+                    PendingOp::PollAdd { .. } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::PollAdd {
+                                events: result as u32,
+                            })
+                        }
+                    }
+                    PendingOp::Nop { .. } => {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            Ok(CompletionKind::Nop)
+                        }
+                    }
+                };
+
+                // Store result in slot and wake the task — no intermediate Vec.
+                if let Some(task_id) =
+                    io_state.take_pending_task_and_store_completed(token, completion_result)
+                {
+                    let _ = task_id;
+                }
+                if let Some(waker) = io_state.take_waker(token) {
+                    wakeups += 1;
+                    waker.wake();
+                }
+            }
+
+            processed += 1;
+            if processed >= self.drain_batch_size.min(batch_limit) {
+                break;
+            }
+        }
+        (processed, saw_wakeup_poll_completion, wakeups)
     }
 }
 
@@ -735,10 +1170,27 @@ impl IoProvider for UringBackend {
 
         // Check if completions are already available.
         // No need to wait if results are ready.
-        let ready = {
-            let completions = ring.completion();
-            completions.len()
-        };
+        let ready = ring.completion().len();
+        if ready != 0 {
+            return ready;
+        }
+
+        // Before sleeping, force any pending SQEs into the kernel. Otherwise
+        // the runtime can go idle with low-volume work still sitting in the
+        // submission queue, which inflates tail latency under backlog.
+        let flushed = self.pending_submission_count() > 0;
+        let flush_started = if flushed { Some(std::time::Instant::now()) } else { None };
+        self.do_flush();
+        if let Some(flush_started) = flush_started {
+            let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
+            self.park_flushes.set(self.park_flushes.get() + 1);
+            self.park_flush_total_us
+                .set(self.park_flush_total_us.get() + flush_elapsed_us);
+            self.max_park_flush_us
+                .set(self.max_park_flush_us.get().max(flush_elapsed_us));
+        }
+
+        let ready = ring.completion().len();
         if ready != 0 {
             return ready;
         }
@@ -1208,7 +1660,7 @@ impl IoProvider for UringBackend {
             }
 
             processed += 1;
-            if processed >= MAX_COMPLETIONS_PER_DRAIN {
+            if processed >= self.drain_batch_size {
                 break;
             }
         }
@@ -1239,5 +1691,20 @@ impl IoProvider for UringBackend {
 
     fn accepted_streams_are_nonblocking(&self) -> bool {
         true
+    }
+
+    fn take_park_flush_stats(&self) -> (u64, u64, u64) {
+        let flushes = self.park_flushes.replace(0);
+        let flush_total_us = self.park_flush_total_us.replace(0);
+        let max_park_flush_us = self.max_park_flush_us.replace(0);
+        (flushes, flush_total_us, max_park_flush_us)
+    }
+
+    unsafe fn drain_completions_fused(
+        &self,
+        wakeup_poll_token: Option<IoToken>,
+        batch_limit: usize,
+    ) -> (usize, bool, usize) {
+        self.drain_completions_fused_inline(wakeup_poll_token, batch_limit)
     }
 }

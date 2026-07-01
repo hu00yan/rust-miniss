@@ -41,6 +41,9 @@ fn format_metrics(metrics: &RuntimeMetrics) -> String {
         0u64,   // flushes
         0u64,   // flush_total_us
         0u64,   // max_flush_us
+        0u64,   // park_flushes
+        0u64,   // park_flush_total_us
+        0u64,   // max_park_flush_us
         0u64,   // io_completion_batches
         0u64,   // io_completion_total_ns
         0u64,   // max_io_completion_batch_ns
@@ -73,26 +76,29 @@ fn format_metrics(metrics: &RuntimeMetrics) -> String {
         totals.10 += core.flushes;
         totals.11 += core.flush_total_us;
         totals.12 = totals.12.max(core.max_flush_us);
-        totals.13 += core.io_completion_batches;
-        totals.14 += core.io_completion_total_ns;
-        totals.15 = totals.15.max(core.max_io_completion_batch_ns);
-        totals.16 = totals.16.max(core.max_io_completion_batch_len);
-        totals.17 += core.inline_poll_total_ns;
-        totals.18 = totals.18.max(core.max_inline_poll_ns);
-        totals.19 += core.wake_total_ns;
-        totals.20 = totals.20.max(core.max_wake_ns);
-        totals.21 += core.parks;
-        totals.22 += core.park_timeouts;
-        totals.23 += core.park_completions;
-        totals.24 += core.park_total_us;
-        totals.25 = totals.25.max(core.max_park_us);
-        totals.26 += core.timer_expirations;
-        totals.27 += core.inline_completion_hits;
-        totals.28 += core.waker_wakeups;
+        totals.13 += core.park_flushes;
+        totals.14 += core.park_flush_total_us;
+        totals.15 = totals.15.max(core.max_park_flush_us);
+        totals.16 += core.io_completion_batches;
+        totals.17 += core.io_completion_total_ns;
+        totals.18 = totals.18.max(core.max_io_completion_batch_ns);
+        totals.19 = totals.19.max(core.max_io_completion_batch_len);
+        totals.20 += core.inline_poll_total_ns;
+        totals.21 = totals.21.max(core.max_inline_poll_ns);
+        totals.22 += core.wake_total_ns;
+        totals.23 = totals.23.max(core.max_wake_ns);
+        totals.24 += core.parks;
+        totals.25 += core.park_timeouts;
+        totals.26 += core.park_completions;
+        totals.27 += core.park_total_us;
+        totals.28 = totals.28.max(core.max_park_us);
+        totals.29 += core.timer_expirations;
+        totals.30 += core.inline_completion_hits;
+        totals.31 += core.waker_wakeups;
     }
 
     let mut lines = vec![format!(
-        "miniss.metrics cores={} ready={} max_ready={} spawned={} completed={} polled={} completions={} msgs={} msg_batches={} max_inbox={} busy_rounds={} flushes={} flush_total_us={} max_flush_us={} io_completion_batches={} io_completion_total_ns={} max_io_completion_batch_ns={} max_io_completion_batch_len={} inline_poll_total_ns={} max_inline_poll_ns={} wake_total_ns={} max_wake_ns={} parks={} park_timeouts={} park_completions={} park_total_us={} max_park_us={} timer_expirations={} inline_hits={} waker_wakes={}",
+        "miniss.metrics cores={} ready={} max_ready={} spawned={} completed={} polled={} completions={} msgs={} msg_batches={} max_inbox={} busy_rounds={} flushes={} flush_total_us={} max_flush_us={} park_flushes={} park_flush_total_us={} max_park_flush_us={} io_completion_batches={} io_completion_total_ns={} max_io_completion_batch_ns={} max_io_completion_batch_len={} inline_poll_total_ns={} max_inline_poll_ns={} wake_total_ns={} max_wake_ns={} parks={} park_timeouts={} park_completions={} park_total_us={} max_park_us={} timer_expirations={} inline_hits={} waker_wakes={}",
         metrics.cores.len(),
         totals.0,
         totals.1,
@@ -123,11 +129,14 @@ fn format_metrics(metrics: &RuntimeMetrics) -> String {
         totals.26,
         totals.27,
         totals.28,
+        totals.29,
+        totals.30,
+        totals.31,
     )];
 
     for core in &metrics.cores {
         lines.push(format!(
-            "miniss.metrics.core id={} ready={} max_ready={} spawned={} completed={} polled={} completions={} msgs={} msg_batches={} max_inbox={} busy_rounds={} flushes={} flush_total_us={} max_flush_us={} io_completion_batches={} io_completion_total_ns={} max_io_completion_batch_ns={} max_io_completion_batch_len={} inline_poll_total_ns={} max_inline_poll_ns={} wake_total_ns={} max_wake_ns={} parks={} park_timeouts={} park_completions={} park_total_us={} max_park_us={} timer_expirations={} inline_hits={} waker_wakes={}",
+            "miniss.metrics.core id={} ready={} max_ready={} spawned={} completed={} polled={} completions={} msgs={} msg_batches={} max_inbox={} busy_rounds={} flushes={} flush_total_us={} max_flush_us={} park_flushes={} park_flush_total_us={} max_park_flush_us={} io_completion_batches={} io_completion_total_ns={} max_io_completion_batch_ns={} max_io_completion_batch_len={} inline_poll_total_ns={} max_inline_poll_ns={} wake_total_ns={} max_wake_ns={} parks={} park_timeouts={} park_completions={} park_total_us={} max_park_us={} timer_expirations={} inline_hits={} waker_wakes={}",
             core.core_id,
             core.ready_queue_len,
             core.max_ready_queue_len,
@@ -142,6 +151,9 @@ fn format_metrics(metrics: &RuntimeMetrics) -> String {
             core.flushes,
             core.flush_total_us,
             core.max_flush_us,
+            core.park_flushes,
+            core.park_flush_total_us,
+            core.max_park_flush_us,
             core.io_completion_batches,
             core.io_completion_total_ns,
             core.max_io_completion_batch_ns,
