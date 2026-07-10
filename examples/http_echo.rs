@@ -262,7 +262,9 @@ fn main() -> io::Result<()> {
                 loop {
                     match listener.accept().await {
                         Ok((stream, _)) => {
-                            if let Err(e) = worker_runtime.spawn(handle_client(stream)) {
+                            // Keep the accepted connection on this reuse-port
+                            // shard; do not hop through the global dispatcher.
+                            if let Err(e) = worker_runtime.spawn_local(handle_client(stream)) {
                                 eprintln!("spawn error on core {core_id}: {e}");
                                 break;
                             }
