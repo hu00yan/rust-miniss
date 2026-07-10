@@ -1359,8 +1359,14 @@ impl IoProvider for UringBackend {
             .sec(timeout.as_secs())
             .nsec(timeout.subsec_nanos() as _);
         let args = types::SubmitArgs::new().timespec(&ts);
-        let _ = ring.submitter().submit_with_args(1, &args);
-        self.pending_sqes.set(0);
+        match ring.submitter().submit_with_args(1, &args) {
+            Ok(_) => self.pending_sqes.set(0),
+            Err(error) => {
+                // Keep the pending count and operation ownership intact so a
+                // transient enter failure is retried on the next turn.
+                tracing::error!("io_uring park submit failed: {error}");
+            }
+        }
         ring.completion().len()
     }
 
