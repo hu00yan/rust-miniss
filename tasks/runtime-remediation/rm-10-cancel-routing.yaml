@@ -35,3 +35,10 @@ architecture_audit: |
 ## Problem (S1-2)
 
 Broadcast cancel by sequence; JoinHandle lies.
+
+## Verification (2026-07-11)
+
+Owner-shard routing and full-key matching are implemented; bounded send errors
+are propagated. JoinHandle cancellation now wakes and waits for owner polling
+to publish `Cancelled`. Explicit outcome enum and terminal drop accounting
+remain.
