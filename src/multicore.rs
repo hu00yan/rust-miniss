@@ -37,18 +37,26 @@ type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
 // Local tasks never cross the accepting worker boundary.  Keep this queue
 // explicitly `!Send` so the API cannot accidentally migrate shard-local
 // state through the cross-core message path.
-type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
-type LocalFuture = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
+type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>, AdmissionTicket);
+type LocalFuture = (TaskId, Pin<Box<dyn Future<Output = ()>>>, AdmissionTicket);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
 const ADMISSION_COUNT_MASK: usize = !ADMISSION_CLOSED;
 
-struct AdmissionGuard<'a> {
-    counter: &'a AtomicUsize,
+struct AdmissionTicket(Arc<AtomicUsize>);
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
-impl Drop for AdmissionGuard<'_> {
+struct AdmissionGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for AdmissionGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Release);
     }
@@ -59,8 +67,12 @@ thread_local! {
     static LOCAL_SPAWN_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-fn push_local_spawn(task_id: TaskId, future: Pin<Box<dyn Future<Output = ()>>>) {
-    LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().push((task_id, future)));
+fn push_local_spawn(
+    task_id: TaskId,
+    future: Pin<Box<dyn Future<Output = ()>>>,
+    ticket: AdmissionTicket,
+) {
+    LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().push((task_id, future, ticket)));
     LOCAL_SPAWN_COUNT.with(|count| count.set(count.get() + 1));
 }
 
@@ -678,7 +690,7 @@ impl CpuCore {
         while local_index < self.local_futures.len() && polled < local_budget {
             polled += 1;
             let poll_result = {
-                let (_, future) = &mut self.local_futures[local_index];
+                let (_, future, _) = &mut self.local_futures[local_index];
                 let waker = futures::task::noop_waker();
                 let mut cx = std::task::Context::from_waker(&waker);
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -771,8 +783,8 @@ impl CpuCore {
                 return false;
             }
 
-            for (id, future) in queue.drain(..) {
-                self.local_futures.push((id, future));
+            for (id, future, ticket) in queue.drain(..) {
+                self.local_futures.push((id, future, ticket));
                 self.local_task_count += 1;
                 self.metrics.tasks_spawned += 1;
             }
@@ -901,7 +913,7 @@ pub struct MultiCoreRuntime {
     /// Admission counter/close bit. Spawn owns one count until its bounded
     /// owner-shard send completes, so shutdown cannot cut across an in-flight
     /// admission.
-    admission: AtomicUsize,
+    admission: Arc<AtomicUsize>,
     /// Next core for round-robin task distribution
     next_core: AtomicUsize,
 }
@@ -917,7 +929,7 @@ impl std::fmt::Debug for MultiCoreRuntime {
 }
 
 impl MultiCoreRuntime {
-    fn begin_admission(&self) -> Result<AdmissionGuard<'_>> {
+    fn begin_admission(&self) -> Result<AdmissionGuard> {
         let mut current = self.admission.load(Ordering::Acquire);
         loop {
             if current & ADMISSION_CLOSED != 0 {
@@ -937,7 +949,7 @@ impl MultiCoreRuntime {
             ) {
                 Ok(_) => {
                     return Ok(AdmissionGuard {
-                        counter: &self.admission,
+                        counter: self.admission.clone(),
                     })
                 }
                 Err(observed) => current = observed,
@@ -950,6 +962,12 @@ impl MultiCoreRuntime {
         while self.admission.load(Ordering::Acquire) & ADMISSION_COUNT_MASK != 0 {
             thread::yield_now();
         }
+    }
+
+    fn keep_admission(guard: AdmissionGuard) -> AdmissionTicket {
+        let counter = guard.counter.clone();
+        std::mem::forget(guard);
+        AdmissionTicket(counter)
     }
 
     /// Create new multi-core runtime with specified number of CPU cores
@@ -1113,7 +1131,7 @@ impl MultiCoreRuntime {
             join_handles,
             task_counters,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
-            admission: AtomicUsize::new(0),
+            admission: Arc::new(AtomicUsize::new(0)),
             next_core: AtomicUsize::new(0),
         });
 
@@ -1298,7 +1316,7 @@ impl MultiCoreRuntime {
     where
         F: Future<Output = ()> + 'static,
     {
-        let _admission = self.begin_admission()?;
+        let admission = Self::keep_admission(self.begin_admission()?);
         let state = self.state.load(Ordering::Acquire);
         if state != RuntimeState::Running as u8 {
             return Err(RuntimeError::TaskFailed(
@@ -1310,7 +1328,11 @@ impl MultiCoreRuntime {
             RuntimeError::TaskFailed("spawn_local called outside a worker core".to_string())
         })?;
         let task_id = self.next_task_id_for_core(core_id);
-        push_local_spawn(task_id, Box::pin(DetachedTaskFuture::new(future)));
+        push_local_spawn(
+            task_id,
+            Box::pin(DetachedTaskFuture::new(future)),
+            admission,
+        );
         Ok(task_id)
     }
 
