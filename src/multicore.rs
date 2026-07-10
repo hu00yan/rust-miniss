@@ -356,8 +356,11 @@ impl CpuCore {
     fn run(&mut self) -> Result<()> {
         // Bind to CPU core for optimal cache locality
         self.bind_to_cpu()?;
-        let _runtime_context =
-            RuntimeContextGuard::enter(&self.io_state, &mut self.timer_wheel, Some(self.id));
+        // SAFETY: CpuCore owns both fields for the whole run invocation; the
+        // context guard drops before CpuCore can be moved or destroyed.
+        let _runtime_context = unsafe {
+            RuntimeContextGuard::enter(&self.io_state, &mut self.timer_wheel, Some(self.id))
+        };
         struct LocalSpawnContextGuard;
         impl Drop for LocalSpawnContextGuard {
             fn drop(&mut self) {

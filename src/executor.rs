@@ -78,7 +78,10 @@ impl Runtime {
         // Pin the future to the stack
         let mut future = Box::pin(future);
         let mut timer_wheel = TimerWheel::default();
-        let _runtime_context = RuntimeContextGuard::enter(&io_state, &mut timer_wheel, None);
+        // SAFETY: io_state and timer_wheel are local owners that remain alive
+        // until _runtime_context drops at the end of block_on.
+        let _runtime_context =
+            unsafe { RuntimeContextGuard::enter(&io_state, &mut timer_wheel, None) };
         let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
         let mut io_completions: Vec<IoCompletion> =
             Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT * 4);
@@ -768,9 +771,8 @@ mod tests {
         assert!(crate::cpu::try_with_io_state(|_| ()).is_none());
         // A new runtime can still install context and run.
         let runtime2 = Runtime::new();
-        let installed = runtime2.block_on(async {
-            crate::cpu::try_with_io_state(|_| true).unwrap_or(false)
-        });
+        let installed =
+            runtime2.block_on(async { crate::cpu::try_with_io_state(|_| true).unwrap_or(false) });
         assert!(installed, "fresh runtime must install its own context");
         // And it clears it again on exit.
         assert!(crate::cpu::try_with_io_state(|_| ()).is_none());

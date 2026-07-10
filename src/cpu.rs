@@ -412,7 +412,10 @@ pub(crate) struct RuntimeContextGuard {
 }
 
 impl RuntimeContextGuard {
-    pub(crate) fn enter(
+    /// # Safety
+    /// `io_state` and `timer_wheel` must outlive the returned guard. Callers
+    /// must keep both owners on this thread until the guard is dropped.
+    pub(crate) unsafe fn enter(
         io_state: &CpuIoState,
         timer_wheel: &mut TimerWheel,
         core_id: Option<usize>,
@@ -507,7 +510,7 @@ pub fn current_task_id() -> Option<crate::waker::TaskId> {
 /// event loop and must remain valid for all task polling. A previous bug
 /// cleared it here, which caused every I/O op to panic with a null pointer.
 #[inline(always)]
-pub fn set_current_task_id(id: Option<crate::waker::TaskId>) {
+pub(crate) fn set_current_task_id(id: Option<crate::waker::TaskId>) {
     CURRENT_TASK_ID.with(|cell| cell.set(id));
 }
 
@@ -583,5 +586,37 @@ mod tests {
             assert!(state.has_completed(new));
             assert!(state.take_completed(new).is_some());
         }
+    }
+
+    #[test]
+    fn runtime_context_guard_restores_timer_task_and_core_on_nesting() {
+        let outer_io = CpuIoState::default();
+        let mut outer_timer = TimerWheel::default();
+        // SAFETY: both owners live until their matching guards are dropped.
+        let outer = unsafe { RuntimeContextGuard::enter(&outer_io, &mut outer_timer, Some(7)) };
+        set_current_task_id(Some(crate::waker::TaskId(11)));
+        let outer_ptr = with_io_state(|state| state as *const _);
+        let waker = futures::task::noop_waker();
+        let timer = register_timer_waker(Instant::now(), &waker).expect("outer timer");
+
+        let inner_io = CpuIoState::default();
+        let mut inner_timer = TimerWheel::default();
+        // SAFETY: both owners live until their matching guards are dropped.
+        let inner = unsafe { RuntimeContextGuard::enter(&inner_io, &mut inner_timer, Some(8)) };
+        set_current_task_id(Some(crate::waker::TaskId(12)));
+        assert_eq!(current_core_id(), Some(8));
+        assert_eq!(current_task_id(), Some(crate::waker::TaskId(12)));
+        assert_ne!(outer_ptr, with_io_state(|state| state as *const _));
+
+        drop(inner);
+        assert_eq!(current_core_id(), Some(7));
+        assert_eq!(current_task_id(), Some(crate::waker::TaskId(11)));
+        assert_eq!(outer_ptr, with_io_state(|state| state as *const _));
+        assert!(cancel_timer_waker(timer));
+
+        drop(outer);
+        assert!(try_with_io_state(|_| ()).is_none());
+        assert_eq!(current_core_id(), None);
+        assert_eq!(current_task_id(), None);
     }
 }
