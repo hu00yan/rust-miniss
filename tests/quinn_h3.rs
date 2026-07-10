@@ -54,12 +54,12 @@ fn quinn_and_h3_quinn_run_on_miniss() {
         client_crypto.enable_early_data = true;
         client_crypto.alpn_protocols = vec![b"h3".to_vec()];
 
-        let mut server_config =
-            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto).unwrap()));
-        server_config.transport = Arc::new(quinn::TransportConfig::default());
-        let client_config = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(client_crypto).unwrap(),
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server_crypto).unwrap(),
         ));
+        server_config.transport = Arc::new(quinn::TransportConfig::default());
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
 
         let server_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_endpoint = quinn::Endpoint::new(
@@ -112,10 +112,10 @@ fn quinn_and_h3_quinn_run_on_miniss() {
                 .unwrap()
                 .await
                 .unwrap();
-            let (mut driver, mut client) = client::new(H3QuinnConnection::new(conn))
-                .await
-                .unwrap();
-            let driver_task = async { let _ = future::poll_fn(|cx| driver.poll_close(cx)).await; };
+            let (mut driver, mut client) = client::new(H3QuinnConnection::new(conn)).await.unwrap();
+            let driver_task = async {
+                let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
+            };
 
             let request_task = async move {
                 let mut request_stream = client

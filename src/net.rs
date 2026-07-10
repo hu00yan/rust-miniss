@@ -794,9 +794,8 @@ impl HyperRead for AsyncTcpStream {
         let state = io_state();
         let this = self.as_mut().get_mut();
         let raw = unsafe { buf.as_mut() };
-        let read_buf = unsafe {
-            std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len())
-        };
+        let read_buf =
+            unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
 
         if this.read_token.is_none() {
             match try_read(this.inner.as_raw_fd(), read_buf) {

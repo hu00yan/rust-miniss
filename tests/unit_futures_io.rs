@@ -111,7 +111,10 @@ fn test_poll_close_returns_ok() {
         };
 
         let server = async move {
-            let _ = listener.accept().await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, b"test");
         };
 
         future::join(server, client).await;

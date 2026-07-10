@@ -4,7 +4,7 @@
 
 use crate::buffer::Buffer;
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
-use io_uring::{IoUring, cqueue, opcode, types};
+use io_uring::{cqueue, opcode, types, IoUring};
 use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
 use slab::Slab;
 use smallvec::SmallVec;
@@ -94,6 +94,7 @@ struct SlotMeta {
 
 /// The completion type for the io_uring backend.
 pub(super) type Completion = (IoToken, Result<CompletionKind, IoError>);
+type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
 
 /// A `io-uring` based `IoProvider`.
 /// Thread-local to ensure single-threaded access.
@@ -109,7 +110,7 @@ pub struct UringBackend {
     /// for the reusable completion buffer.
     completed_ops: UnsafeCell<Vec<Completion>>,
     /// Multi-shot accept completions indexed by slab slot.
-    accept_results: UnsafeCell<Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>>,
+    accept_results: UnsafeCell<AcceptResults>,
     /// Count of SQEs not yet flushed. Zero means flush() can skip the syscall.
     pending_sqes: Cell<usize>,
     /// True when the kernel SQPOLL thread owns submission. In that mode flush()
@@ -1179,7 +1180,11 @@ impl IoProvider for UringBackend {
         // the runtime can go idle with low-volume work still sitting in the
         // submission queue, which inflates tail latency under backlog.
         let flushed = self.pending_submission_count() > 0;
-        let flush_started = if flushed { Some(std::time::Instant::now()) } else { None };
+        let flush_started = if flushed {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.do_flush();
         if let Some(flush_started) = flush_started {
             let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
@@ -1337,7 +1342,7 @@ impl IoProvider for UringBackend {
                         addr_storage,
                         addr_len,
                     } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else if let (Some(addr_storage), Some(addr_len)) =
                             (addr_storage.as_ref(), addr_len.as_ref())
@@ -1393,11 +1398,10 @@ impl IoProvider for UringBackend {
                                 fd: result,
                                 addr: None,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::Read { op, mut buf } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
@@ -1413,58 +1417,51 @@ impl IoProvider for UringBackend {
                                     data: buf,
                                 }),
                             }
-                        };
-                        res
+                        }
                     }
                     PendingOp::Write { op, data } => {
-                        let res = {
-                            if result < 0 {
-                                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                            } else {
-                                match &op {
-                                    Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
+                        if result < 0 {
+                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+                        } else {
+                            match &op {
+                                Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
+                                    bytes_written: result as usize,
+                                    data,
+                                }),
+                                _ => {
+                                    let _ = data;
+                                    Ok(CompletionKind::Write {
                                         bytes_written: result as usize,
-                                        data,
-                                    }),
-                                    _ => {
-                                        let _ = data;
-                                        Ok(CompletionKind::Write {
-                                            bytes_written: result as usize,
-                                        })
-                                    }
+                                    })
                                 }
                             }
-                        };
-                        res
+                        }
                     }
                     PendingOp::WriteStatic { op: _op } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::Write {
                                 bytes_written: result as usize,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::Fsync { op: _op } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::Fsync)
-                        };
-                        res
+                        }
                     }
                     PendingOp::Close { op: _op } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::Close)
-                        };
-                        res
+                        }
                     }
                     PendingOp::ReadFile { op: _op, mut buf } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
@@ -1477,19 +1474,17 @@ impl IoProvider for UringBackend {
                                 bytes_read,
                                 data: buf,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::WriteFile { op: _op, data } => {
                         let _ = data;
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::WriteFile {
                                 bytes_written: result as usize,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::UdpRecv {
                         op: _op,
@@ -1498,7 +1493,7 @@ impl IoProvider for UringBackend {
                         addr_len,
                         ..
                     } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
@@ -1557,8 +1552,7 @@ impl IoProvider for UringBackend {
                                 }),
                                 Err(e) => Err(e),
                             }
-                        };
-                        res
+                        }
                     }
                     PendingOp::UdpSend {
                         op: _op,
@@ -1569,27 +1563,25 @@ impl IoProvider for UringBackend {
                     } => {
                         let _ = &*addr_storage as *const _;
                         let _ = *addr_len;
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::UdpSend {
                                 bytes_written: result as usize,
                                 data,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::Connect {
                         op: _op,
                         addr_storage,
                     } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let _ = &*addr_storage;
                             Ok(CompletionKind::Connect)
-                        };
-                        res
+                        }
                     }
                     PendingOp::ReadVectored {
                         op: _op,
@@ -1597,7 +1589,7 @@ impl IoProvider for UringBackend {
                         iovecs,
                     } => {
                         let _ = iovecs;
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
@@ -1618,8 +1610,7 @@ impl IoProvider for UringBackend {
                                 bytes_read,
                                 buffers,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::WriteVectored {
                         op: _op,
@@ -1627,33 +1618,30 @@ impl IoProvider for UringBackend {
                         iovecs,
                     } => {
                         let _ = iovecs;
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::WriteVectored {
                                 bytes_written: result as usize,
                                 buffers,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::PollAdd { op: _op } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::PollAdd {
                                 events: result as u32,
                             })
-                        };
-                        res
+                        }
                     }
                     PendingOp::Nop { op: _op } => {
-                        let res = if result < 0 {
+                        if result < 0 {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             Ok(CompletionKind::Nop)
-                        };
-                        res
+                        }
                     }
                 };
                 completions.push((token, completion_result));

@@ -37,7 +37,9 @@ impl Timer for MinissHyperTimer {
     }
 
     fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Sleep>> {
-        Box::pin(SleepFuture::new(deadline.saturating_duration_since(Instant::now())))
+        Box::pin(SleepFuture::new(
+            deadline.saturating_duration_since(Instant::now()),
+        ))
     }
 
     fn reset(&self, sleep: &mut Pin<Box<dyn Sleep>>, new_deadline: Instant) {

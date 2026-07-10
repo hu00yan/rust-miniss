@@ -235,10 +235,7 @@ impl Task {
         if self.completed {
             return Poll::Ready(());
         }
-        let waker_ptr = self
-            .waker
-            .as_ref()
-            .expect("waker cached by ensure_waker") as *const Waker;
+        let waker_ptr = self.waker.as_ref().expect("waker cached by ensure_waker") as *const Waker;
         // SAFETY: `waker_ptr` points to the cached waker stored in `self`.
         // The reference is only used to build a Context for the duration of
         // this poll call, and the cached waker outlives the Context.

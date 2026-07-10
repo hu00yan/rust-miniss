@@ -5,12 +5,12 @@
 
 use crate::net::AsyncTcpStream;
 use futures::io::AsyncReadExt;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::str;
 use std::sync::Arc;
-use smallvec::SmallVec;
 
 /// HTTP request method
 #[derive(Debug, Clone, PartialEq, Eq)]

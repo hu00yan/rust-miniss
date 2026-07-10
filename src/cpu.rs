@@ -495,3 +495,50 @@ pub(crate) fn register_timer_waker(at: Instant, waker: &Waker) -> Option<TimerId
 pub(crate) fn cancel_timer_waker(id: TimerId) -> bool {
     with_current_timer(|wheel| wheel.cancel(id)).unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{CompletionKind, IoError, IoProvider, Op};
+    use std::task::Poll;
+
+    struct DummyProvider;
+
+    impl IoProvider for DummyProvider {
+        type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+        fn submit(&self, _op: Op) -> IoToken {
+            IoToken::from_id(1)
+        }
+
+        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn cpu_io_slots_do_not_alias_different_token_generations() {
+        let state = CpuIoState {
+            io_backend: Arc::new(DummyProvider),
+            io_slots: Default::default(),
+        };
+        let old = IoToken::from_id((1u64 << 32) | 7);
+        let new = IoToken::from_id((2u64 << 32) | 7);
+
+        // SAFETY: The test owns this CpuIoState and never shares it across
+        // threads, matching the runtime's shard-local access contract.
+        unsafe {
+            state.insert_completed(old, Ok(CompletionKind::Nop));
+            assert!(state.has_completed(old));
+            assert!(!state.has_completed(new));
+
+            state.insert_completed(new, Ok(CompletionKind::Nop));
+            assert!(!state.has_completed(old));
+            assert!(state.has_completed(new));
+
+            state.clear_slot(old);
+            assert!(state.has_completed(new));
+            assert!(state.take_completed(new).is_some());
+        }
+    }
+}

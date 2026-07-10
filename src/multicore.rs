@@ -17,17 +17,17 @@ use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cpu::{
-    CpuIoState, clear_current_io_state, clear_current_timer, set_current_io_state,
-    set_current_task_id, set_current_timer,
+    clear_current_io_state, clear_current_timer, set_current_io_state, set_current_task_id,
+    set_current_timer, CpuIoState,
 };
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
@@ -493,10 +493,7 @@ impl CpuCore {
             self.metrics.max_park_us = self.metrics.max_park_us.max(park_elapsed_us);
             self.metrics.park_flushes += park_flushes;
             self.metrics.park_flush_total_us += park_flush_total_us;
-            self.metrics.max_park_flush_us = self
-                .metrics
-                .max_park_flush_us
-                .max(max_park_flush_us);
+            self.metrics.max_park_flush_us = self.metrics.max_park_flush_us.max(max_park_flush_us);
             if n_completions == 0 {
                 self.metrics.park_timeouts += 1;
             } else {
@@ -531,7 +528,7 @@ impl CpuCore {
     /// Bind thread to CPU core (Linux-specific)
     #[cfg(target_os = "linux")]
     fn bind_to_cpu(&self) -> Result<()> {
-        use libc::{CPU_SET, CPU_ZERO, cpu_set_t, sched_setaffinity};
+        use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
         use std::mem;
 
         // SAFETY: The cpu_set_t is zero-initialized before CPU_SET, and
@@ -727,10 +724,9 @@ impl CpuCore {
         #[cfg(not(target_os = "linux"))]
         let wakeup_token: Option<IoToken> = None;
 
+        // Empty or nearly-empty ready queues can afford a larger CQE drain batch.
         let drain_limit = if after_park {
             256
-        } else if self.ready_queue.is_empty() {
-            128
         } else if self.ready_queue.len() < 8 {
             128
         } else {

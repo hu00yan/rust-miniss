@@ -48,49 +48,9 @@ fn async_file_sync_all_completes_after_write() {
     });
 }
 
-#[test]
-fn cpu_io_slots_do_not_alias_different_token_generations() {
-    use rust_miniss::cpu::CpuIoState;
-    use rust_miniss::{CompletionKind, IoError, IoProvider, IoToken, Op};
-    use std::task::Poll;
-
-    struct DummyProvider;
-
-    impl IoProvider for DummyProvider {
-        type Completion = (IoToken, Result<CompletionKind, IoError>);
-
-        fn submit(&self, _op: Op) -> IoToken {
-            IoToken::from_id(1)
-        }
-
-        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
-            Poll::Pending
-        }
-    }
-
-    let state = CpuIoState {
-        io_backend: Arc::new(DummyProvider),
-        io_slots: Default::default(),
-    };
-    let old = IoToken::from_id((1u64 << 32) | 7);
-    let new = IoToken::from_id((2u64 << 32) | 7);
-
-    // SAFETY: The test owns this CpuIoState and never shares it across
-    // threads, matching the runtime's shard-local access contract.
-    unsafe {
-        state.insert_completed(old, Ok(CompletionKind::Nop));
-        assert!(state.has_completed(old));
-        assert!(!state.has_completed(new));
-
-        state.insert_completed(new, Ok(CompletionKind::Nop));
-        assert!(!state.has_completed(old));
-        assert!(state.has_completed(new));
-
-        state.clear_slot(old);
-        assert!(state.has_completed(new));
-        assert!(state.take_completed(new).is_some());
-    }
-}
+// Token-generation slot aliasing is covered by the crate-private unit test
+// `cpu::tests::cpu_io_slots_do_not_alias_different_token_generations` (rm-00):
+// integration tests cannot call `IoToken::from_id` without exposing a public footgun.
 
 #[test]
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]

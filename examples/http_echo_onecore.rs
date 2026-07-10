@@ -1,8 +1,8 @@
 //! HTTP echo server — all work on one core thread, zero cross-thread dispatch.
 
 use rust_miniss::executor::Runtime;
-use rust_miniss::Buffer;
 use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
+use rust_miniss::Buffer;
 
 use std::io;
 use std::net::SocketAddr;
@@ -41,26 +41,26 @@ fn main() -> io::Result<()> {
 
     let rt = &runtime;
     runtime.block_on(async move {
-            let mut listener = match AsyncTcpListener::bind(addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Failed to bind to {addr}: {e}");
-                    return;
-                }
-            };
+        let mut listener = match AsyncTcpListener::bind(addr) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Failed to bind to {addr}: {e}");
+                return;
+            }
+        };
 
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _client_addr)) => {
-                        rt.spawn_detached(handle_client(stream));
-                    }
-                    Err(e) => {
-                        eprintln!("Accept error: {e}");
-                        break;
-                    }
+        loop {
+            match listener.accept().await {
+                Ok((stream, _client_addr)) => {
+                    rt.spawn_detached(handle_client(stream));
+                }
+                Err(e) => {
+                    eprintln!("Accept error: {e}");
+                    break;
                 }
             }
-        });
+        }
+    });
 
     Ok(())
 }

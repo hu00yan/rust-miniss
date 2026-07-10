@@ -2,21 +2,21 @@ use crate::cpu::{current_task_id, io_state};
 use crate::io::IoToken;
 use crate::multicore::MultiCoreRuntime;
 use crate::timer::SleepFuture;
+use libc;
 use quinn::udp::{RecvMeta, Transmit, UdpSockRef};
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime as QuinnRuntimeTrait, UdpPoller};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::UdpSocket;
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
-use std::os::unix::io::AsRawFd;
 use std::task::{Context, Poll};
 use std::time::Instant;
-use libc;
 
 #[derive(Clone)]
 pub struct MinissQuicRuntime {
@@ -127,9 +127,9 @@ impl MinissUdpSocket {
     }
 
     fn clear_recv_token(&self, token: IoToken) {
-        let _ = self
-            .recv_token
-            .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire);
+        let _ =
+            self.recv_token
+                .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
