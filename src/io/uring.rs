@@ -1361,6 +1361,11 @@ impl IoProvider for UringBackend {
         let args = types::SubmitArgs::new().timespec(&ts);
         match ring.submitter().submit_with_args(1, &args) {
             Ok(_) => self.pending_sqes.set(0),
+            Err(error) if error.raw_os_error() == Some(libc::ETIME) => {
+                // The wait timeout is the normal no-CQE result from
+                // submit_with_args; SQEs were still handed to the kernel.
+                self.pending_sqes.set(0);
+            }
             Err(error) => {
                 // Keep the pending count and operation ownership intact so a
                 // transient enter failure is retried on the next turn.
