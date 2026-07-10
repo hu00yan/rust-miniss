@@ -1782,9 +1782,11 @@ impl MultiCoreRuntime {
             )));
         }
 
-        // For now, we'll just use the same implementation as block_on
-        // In a more sophisticated implementation, we might want to run this on the specific core
-        Ok(self.block_on(future)) // arch-audit: allow control-plane compatibility wrapper
+        drop(future);
+        Err(RuntimeError::TaskFailed(
+            "block_on_cpu dispatch is unavailable; use spawn_on or spawn_local on the target shard"
+                .to_string(),
+        ))
     }
 
     /// Get runtime statistics
