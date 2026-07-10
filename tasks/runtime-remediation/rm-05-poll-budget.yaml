@@ -1,6 +1,6 @@
 ---
 id: rm-05-poll-budget
-status: YELLOW
+status: GREEN
 batch: 1-B
 depends_on: [rm-04-safe-waker]
 parallel_wave: W3
@@ -31,7 +31,8 @@ architecture_audit: |
 ## Verification (2026-07-10)
 
 Configurable executor/shard poll budgets and self-waker fairness regression
-pass. Queue-depth deduplication remains dependent on rm-04 safe-waker work.
+pass. Queue-depth recovery is now covered by the integrated rm-04 sticky
+overflow path.
 ---
 
 # rm-05: Per-turn poll budget

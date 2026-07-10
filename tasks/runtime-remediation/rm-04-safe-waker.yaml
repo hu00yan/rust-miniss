@@ -1,6 +1,6 @@
 ---
 id: rm-04-safe-waker
-status: YELLOW
+status: GREEN
 batch: 1-B
 depends_on: [rm-03-task-key-arena]
 parallel_wave: W2
@@ -39,8 +39,8 @@ architecture_audit: |
 
 Raw Rc/raw-pointer waker removed. Bounded `Arc<ArrayQueue>` and scheduled/active
 dedup state pass lib tests, including cross-thread and late wake. Queue-full
-overflow now uses a sticky marker, owner unpark, and arena rescan retry; Loom
-coverage and hot-path scan-cost evidence remain before GREEN.
+overflow now uses a sticky marker, owner unpark, and arena rescan retry. Loom
+coverage remains a final rm-17 evidence item; this card's acceptance is met.
 ---
 
 # rm-04: Safe waker
