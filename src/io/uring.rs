@@ -3,7 +3,7 @@
 //! A `io-uring` backend for the I/O subsystem.
 
 use crate::buffer::Buffer;
-use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+use crate::io::{CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op};
 use io_uring::{cqueue, opcode, types, IoUring};
 use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
 use slab::Slab;
@@ -11,6 +11,7 @@ use smallvec::SmallVec;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::io;
+use std::os::unix::io::RawFd;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -109,6 +110,8 @@ type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
 pub struct UringBackend {
     ring: UnsafeCell<IoUring>,
     pending_ops: UnsafeCell<Slab<PendingOp>>,
+    /// Descriptor lease kept alive from acceptance through terminal CQE.
+    descriptor_leases: UnsafeCell<Vec<Option<DescriptorLease>>>,
     /// Generation per slab slot. Packed with the slot index into CQE user_data
     /// so stale completions can be dropped without a hash table lookup.
     slot_meta: UnsafeCell<Vec<SlotMeta>>,
@@ -148,6 +151,48 @@ const FLUSH_BATCH_SIZE: usize = 61;
 const MAX_COMPLETIONS_PER_DRAIN: usize = 256;
 
 impl UringBackend {
+    #[inline]
+    fn descriptor_fd(op: &Op) -> Option<RawFd> {
+        match op {
+            Op::Accept { fd }
+            | Op::Read { fd, .. }
+            | Op::Write { fd, .. }
+            | Op::WriteStatic { fd, .. }
+            | Op::Fsync { fd }
+            | Op::Close { fd }
+            | Op::ReadFile { fd, .. }
+            | Op::WriteFile { fd, .. }
+            | Op::UdpRecv { fd, .. }
+            | Op::UdpSend { fd, .. }
+            | Op::UdpRecvVectored { fd, .. }
+            | Op::UdpSendVectored { fd, .. }
+            | Op::ReadVectored { fd, .. }
+            | Op::WriteVectored { fd, .. }
+            | Op::Connect { fd, .. }
+            | Op::PollAdd { fd, .. }
+            | Op::ReadRent { fd, .. }
+            | Op::WriteRent { fd, .. } => Some(*fd),
+            Op::Nop => None,
+        }
+    }
+
+    #[inline]
+    fn release_descriptor_lease(&self, idx: usize) {
+        // SAFETY: backend is thread-affine; only owner drains/removes leases.
+        let leases = unsafe { &mut *self.descriptor_leases.get() };
+        if let Some(lease) = leases.get_mut(idx) {
+            let _ = lease.take();
+        }
+    }
+
+    /// Make admission failures observable through a real completion token.
+    fn failed_token(&self, error: io::Error) -> IoToken {
+        let token = IoToken::next_from(&self.next_token_id);
+        // SAFETY: completion storage is shard-local.
+        unsafe { &mut *self.completed_ops.get() }.push((token, Err(IoError::Io(error))));
+        token
+    }
+
     pub fn new(entries: u32) -> io::Result<Self> {
         let flush_batch_size = std::env::var("MINISS_URING_FLUSH_BATCH_SIZE")
             .ok()
@@ -197,6 +242,7 @@ impl UringBackend {
             ring: UnsafeCell::new(ring),
             // Use at least 64 entries for slab capacity
             pending_ops: UnsafeCell::new(Slab::with_capacity(capacity)),
+            descriptor_leases: UnsafeCell::new(Vec::with_capacity(capacity)),
             slot_meta: UnsafeCell::new(vec![SlotMeta::default(); capacity]),
             next_token_id: Cell::new(1),
             completed_ops: UnsafeCell::new(Vec::with_capacity(capacity)),
@@ -215,9 +261,9 @@ impl UringBackend {
 
     /// Submit all pending SQEs unconditionally.
     /// Used by flush() for batch threshold, park() before sleep, and submit() SQ-full.
-    fn do_flush(&self) {
+    fn do_flush(&self) -> io::Result<()> {
         if self.pending_sqes.get() == 0 {
-            return;
+            return Ok(());
         }
         // SAFETY: UringBackend is thread-affine; the owning runtime thread is
         // the only code path mutating the ring.
@@ -225,10 +271,19 @@ impl UringBackend {
         if self.sqpoll_enabled {
             ring.submission().sync();
             self.pending_sqes.set(0);
-            return;
+            return Ok(());
         }
-        if ring.submit().is_ok() {
-            self.pending_sqes.set(0);
+        ring.submit()
+            .map(|_| self.pending_sqes.set(0))
+            .map_err(io::Error::other)
+    }
+
+    #[inline]
+    fn flush_logged(&self) {
+        if let Err(error) = self.do_flush() {
+            // Keep queued SQEs and pending operation ownership intact.  The
+            // next event-loop turn can retry; nothing is silently discarded.
+            tracing::error!("io_uring submission failed: {error}");
         }
     }
 
@@ -271,15 +326,24 @@ impl UringBackend {
         let mut processed = 0usize;
         let mut saw_wakeup_poll_completion = false;
         let mut wakeups = 0usize;
+        // Deliver locally failed submissions before polling the kernel CQ.
+        let failed = unsafe { &mut *self.completed_ops.get() };
+        for (token, result) in failed.drain(..) {
+            if let Some(task_id) = io_state.take_pending_task_and_store_completed(token, result) {
+                let _ = task_id;
+            }
+            if let Some(waker) = io_state.take_waker(token) {
+                wakeups += 1;
+                waker.wake();
+            }
+            processed += 1;
+        }
         for cqe in cq {
             let token_id = cqe.user_data();
             let result = cqe.result();
             let flags = cqe.flags();
             let has_more = cqueue::more(flags);
 
-            if token_id == u64::MAX {
-                continue;
-            }
             let Some((idx, generation)) = Self::unpack_token(token_id) else {
                 continue;
             };
@@ -363,6 +427,7 @@ impl UringBackend {
 
             // Normal completion: remove PendingOp, reconstruct result, store + wake.
             if let Some(pending_op) = pending_ops.try_remove(idx) {
+                self.release_descriptor_lease(idx);
                 let completion_result = match pending_op {
                     PendingOp::Accept {
                         addr_storage,
@@ -681,12 +746,28 @@ impl IoProvider for UringBackend {
         // SAFETY: We have exclusive access on this thread.
         let ring = unsafe { &mut *self.ring.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        // Acquire independent descriptor ownership before constructing or
+        // queueing any SQE.  User-future abandonment cannot close this lease.
+        let descriptor_lease = match Self::descriptor_fd(&op) {
+            Some(fd) => match DescriptorLease::acquire(fd) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    return self.failed_token(error);
+                }
+            },
+            None => None,
+        };
+        let leased_fd = |fd: RawFd| {
+            descriptor_lease
+                .as_ref()
+                .map_or(fd, DescriptorLease::as_raw_fd)
+        };
         // Build the SQE entry and PendingOp WITHOUT user_data — we set it after
         // inserting into the slab to get the index.
         let (entry, pending_op) = {
             match op {
                 Op::Accept { fd } => {
-                    let entry = opcode::AcceptMulti::new(types::Fd(fd))
+                    let entry = opcode::AcceptMulti::new(types::Fd(leased_fd(fd)))
                         .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
                         .build();
                     (
@@ -700,9 +781,10 @@ impl IoProvider for UringBackend {
                 }
                 Op::Read { fd, offset, len } => {
                     let mut buf = Buffer::new_uninitialized(len);
-                    let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
-                        .offset(offset)
-                        .build();
+                    let entry =
+                        opcode::Read::new(types::Fd(leased_fd(fd)), buf.as_mut_ptr(), len as u32)
+                            .offset(offset)
+                            .build();
                     (
                         entry,
                         PendingOp::Read {
@@ -712,9 +794,13 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::Write { fd, offset, data } => {
-                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
-                        .offset(offset)
-                        .build();
+                    let entry = opcode::Write::new(
+                        types::Fd(leased_fd(fd)),
+                        data.as_ptr(),
+                        data.len() as u32,
+                    )
+                    .offset(offset)
+                    .build();
                     (
                         entry,
                         PendingOp::Write {
@@ -728,9 +814,13 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::WriteFile { fd, offset, data } => {
-                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
-                        .offset(offset)
-                        .build();
+                    let entry = opcode::Write::new(
+                        types::Fd(leased_fd(fd)),
+                        data.as_ptr(),
+                        data.len() as u32,
+                    )
+                    .offset(offset)
+                    .build();
                     (
                         entry,
                         PendingOp::WriteFile {
@@ -744,9 +834,13 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::WriteStatic { fd, data } => {
-                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
-                        .offset(0)
-                        .build();
+                    let entry = opcode::Write::new(
+                        types::Fd(leased_fd(fd)),
+                        data.as_ptr(),
+                        data.len() as u32,
+                    )
+                    .offset(0)
+                    .build();
                     (
                         entry,
                         PendingOp::WriteStatic {
@@ -755,7 +849,7 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::Fsync { fd } => {
-                    let entry = opcode::Fsync::new(types::Fd(fd)).build();
+                    let entry = opcode::Fsync::new(types::Fd(leased_fd(fd))).build();
                     (
                         entry,
                         PendingOp::Fsync {
@@ -764,7 +858,7 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::Close { fd } => {
-                    let entry = opcode::Close::new(types::Fd(fd)).build();
+                    let entry = opcode::Close::new(types::Fd(leased_fd(fd))).build();
                     (
                         entry,
                         PendingOp::Close {
@@ -774,9 +868,10 @@ impl IoProvider for UringBackend {
                 }
                 Op::ReadFile { fd, offset, len } => {
                     let mut buf = Buffer::new_uninitialized(len);
-                    let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
-                        .offset(offset)
-                        .build();
+                    let entry =
+                        opcode::Read::new(types::Fd(leased_fd(fd)), buf.as_mut_ptr(), len as u32)
+                            .offset(offset)
+                            .build();
                     (
                         entry,
                         PendingOp::ReadFile {
@@ -806,7 +901,9 @@ impl IoProvider for UringBackend {
                         msg_flags: 0,
                     });
 
-                    let entry = opcode::RecvMsg::new(types::Fd(fd), msg.as_mut() as *mut _).build();
+                    let entry =
+                        opcode::RecvMsg::new(types::Fd(leased_fd(fd)), msg.as_mut() as *mut _)
+                            .build();
 
                     // Op buffer is a placeholder — real buffer in PendingOp
                     let op = Op::UdpRecv {
@@ -889,7 +986,9 @@ impl IoProvider for UringBackend {
                         msg_flags: 0,
                     });
 
-                    let entry = opcode::SendMsg::new(types::Fd(fd), msg.as_mut() as *mut _).build();
+                    let entry =
+                        opcode::SendMsg::new(types::Fd(leased_fd(fd)), msg.as_mut() as *mut _)
+                            .build();
 
                     let op = Op::UdpSend {
                         fd,
@@ -926,9 +1025,12 @@ impl IoProvider for UringBackend {
                             iov_len: buf.capacity(),
                         })
                         .collect();
-                    let entry =
-                        opcode::Readv::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
-                            .build();
+                    let entry = opcode::Readv::new(
+                        types::Fd(leased_fd(fd)),
+                        iovecs.as_ptr(),
+                        iovecs.len() as u32,
+                    )
+                    .build();
                     let pending_op = PendingOp::ReadVectored {
                         op: Op::ReadVectored {
                             fd,
@@ -949,9 +1051,12 @@ impl IoProvider for UringBackend {
                             iov_len: buf.len(),
                         })
                         .collect();
-                    let entry =
-                        opcode::Writev::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
-                            .build();
+                    let entry = opcode::Writev::new(
+                        types::Fd(leased_fd(fd)),
+                        iovecs.as_ptr(),
+                        iovecs.len() as u32,
+                    )
+                    .build();
                     let pending_op = PendingOp::WriteVectored {
                         op: Op::WriteVectored {
                             fd,
@@ -1015,7 +1120,7 @@ impl IoProvider for UringBackend {
                         }
                     }
                     let entry = opcode::Connect::new(
-                        types::Fd(fd),
+                        types::Fd(leased_fd(fd)),
                         addr_storage.as_ref() as *const _ as *const libc::sockaddr,
                         addr_len,
                     )
@@ -1030,10 +1135,13 @@ impl IoProvider for UringBackend {
                 }
                 Op::ReadRent { fd, buffer } => {
                     let mut buf = buffer;
-                    let entry =
-                        opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.capacity() as u32)
-                            .offset(0)
-                            .build();
+                    let entry = opcode::Read::new(
+                        types::Fd(leased_fd(fd)),
+                        buf.as_mut_ptr(),
+                        buf.capacity() as u32,
+                    )
+                    .offset(0)
+                    .build();
                     (
                         entry,
                         PendingOp::Read {
@@ -1049,9 +1157,13 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::WriteRent { fd, data } => {
-                    let entry = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
-                        .offset(0)
-                        .build();
+                    let entry = opcode::Write::new(
+                        types::Fd(leased_fd(fd)),
+                        data.as_ptr(),
+                        data.len() as u32,
+                    )
+                    .offset(0)
+                    .build();
                     (
                         entry,
                         PendingOp::Write {
@@ -1071,7 +1183,7 @@ impl IoProvider for UringBackend {
                     events,
                     multishot,
                 } => {
-                    let mut entry = opcode::PollAdd::new(types::Fd(fd), events);
+                    let mut entry = opcode::PollAdd::new(types::Fd(leased_fd(fd)), events);
                     if multishot {
                         entry = entry.multi(true);
                     }
@@ -1099,11 +1211,9 @@ impl IoProvider for UringBackend {
                     // SAFETY: completed_ops is shard-local and mutated only by
                     // this UringBackend owner thread.
                     let completed_ops = unsafe { &mut *self.completed_ops.get() };
-                    // Use a dummy token that will never match any waker — these
-                    // unsupported ops will be returned directly.
-                    let dummy_token = IoToken::from_id(u64::MAX);
-                    completed_ops.push((dummy_token, result));
-                    return dummy_token;
+                    let token = IoToken::next_from(&self.next_token_id);
+                    completed_ops.push((token, result));
+                    return token;
                 }
             }
         };
@@ -1111,6 +1221,14 @@ impl IoProvider for UringBackend {
 
         // Insert into slab to get efficient O(1) storage.
         let idx = pending_ops.insert(pending_op);
+
+        // Keep descriptor ownership parallel to PendingOp.  Slab movement and
+        // user-future drop cannot reclaim this lease before terminal CQE.
+        let leases = unsafe { &mut *self.descriptor_leases.get() };
+        if idx >= leases.len() {
+            leases.resize_with(idx + 1, || None);
+        }
+        leases[idx] = descriptor_lease;
 
         // SAFETY: slot_meta is shard-local and only
         // mutated by this backend owner thread while submitting/draining.
@@ -1139,19 +1257,24 @@ impl IoProvider for UringBackend {
         // the ring is owned by this thread.
         if unsafe { ring.submission().push(&entry) }.is_err() {
             // SQ full: flush_all submits everything pending, freeing SQ slots.
-            self.do_flush();
+            self.flush_logged();
             // SAFETY: Same as above; retry after flushing free SQ slots.
             if unsafe { ring.submission().push(&entry) }.is_err() {
                 // Still full after flush — ring is too small, drop the op.
                 pending_ops.try_remove(idx);
+                self.release_descriptor_lease(idx);
                 tracing::error!("SQ still full after emergency flush (ring too small?)");
+                return self.failed_token(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "io_uring submission queue is full",
+                ));
             }
         } else {
             // Successful push — count it so flush() knows there's work.
             let pending_sqes = self.pending_sqes.get() + 1;
             self.pending_sqes.set(pending_sqes);
             if pending_sqes >= self.flush_high_watermark {
-                self.do_flush();
+                self.flush_logged();
             }
         }
 
@@ -1170,7 +1293,7 @@ impl IoProvider for UringBackend {
         if self.pending_sqes.get() < self.flush_batch_size {
             return;
         }
-        self.do_flush();
+        self.flush_logged();
     }
 
     fn pending_submission_count(&self) -> usize {
@@ -1198,7 +1321,7 @@ impl IoProvider for UringBackend {
         } else {
             None
         };
-        self.do_flush();
+        self.flush_logged();
         if let Some(flush_started) = flush_started {
             let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
             self.park_flushes.set(self.park_flushes.get() + 1);
@@ -1243,6 +1366,9 @@ impl IoProvider for UringBackend {
         if completions.capacity() < reserve_hint {
             completions.reserve(reserve_hint - completions.capacity());
         }
+        // Admission failures are terminal completions too; deliver them via
+        // the same slot/waker path as kernel CQEs.
+        completions.append(completed_ops);
 
         let mut cq = ring.completion();
         cq.sync();
@@ -1253,10 +1379,6 @@ impl IoProvider for UringBackend {
             let result = cqe.result();
             let flags = cqe.flags();
             let has_more = cqueue::more(flags);
-
-            if token_id == u64::MAX {
-                continue;
-            }
 
             let Some((idx, generation)) = Self::unpack_token(token_id) else {
                 continue;
@@ -1351,6 +1473,7 @@ impl IoProvider for UringBackend {
             let pending_op = { pending_ops.try_remove(idx) };
 
             if let Some(pending_op) = pending_op {
+                self.release_descriptor_lease(idx);
                 let completion_result = match pending_op {
                     PendingOp::Accept {
                         op: _op,

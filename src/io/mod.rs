@@ -19,6 +19,8 @@
 //! configuration flag.
 
 use std::cell::Cell;
+use std::io;
+use std::os::fd::{AsRawFd as StdAsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::task::Poll;
 use std::time::Duration;
@@ -30,6 +32,60 @@ use smallvec::SmallVec;
 pub trait AsRawFd {
     /// Returns the raw file descriptor of this I/O resource.
     fn as_raw_fd(&self) -> RawFd;
+}
+
+/// Shard-local ownership of the descriptor used by an accepted operation.
+///
+/// The user-facing descriptor may be closed and its number reused while the
+/// kernel operation is still queued.  Keeping an independent duplicate alive
+/// prevents that reuse from redirecting the in-flight operation.  Lease drop
+/// is the terminal reclamation point; dropping `IoFuture` only abandons result
+/// delivery.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct DescriptorLease(OwnedFd);
+
+#[allow(dead_code)]
+impl DescriptorLease {
+    /// Duplicate `fd`, acquiring ownership before an SQE is queued.
+    pub(crate) fn acquire(fd: RawFd) -> io::Result<Self> {
+        // SAFETY: `dup` returns a fresh descriptor owned by this call on
+        // success; `OwnedFd` takes ownership exactly once.
+        let duplicate = unsafe { libc::dup(fd) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: duplicate is newly created and exclusively owned here.
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(duplicate) }))
+    }
+
+    #[inline]
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod descriptor_lease_tests {
+    use super::DescriptorLease;
+
+    #[test]
+    fn lease_survives_user_fd_close_until_drop() {
+        let (read_fd, write_fd) = {
+            let mut fds = [0; 2];
+            // SAFETY: fds points to two writable RawFd slots.
+            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            assert_eq!(rc, 0);
+            (fds[0], fds[1])
+        };
+        let lease = DescriptorLease::acquire(read_fd).expect("dup read end");
+        // SAFETY: read_fd is still owned by this test and closed exactly once.
+        unsafe { libc::close(read_fd) };
+        assert_ne!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, -1);
+        drop(lease);
+        // SAFETY: write_fd is still owned by this test and closed exactly once.
+        unsafe { libc::close(write_fd) };
+    }
 }
 
 /// The core asynchronous I/O backend trait.
