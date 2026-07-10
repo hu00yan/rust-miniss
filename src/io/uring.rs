@@ -1836,6 +1836,31 @@ impl IoProvider for UringBackend {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_submission_is_a_real_terminal_completion() {
+        let Ok(backend) = UringBackend::new(2) else {
+            // Kernels without io_uring support are covered by the fallback
+            // backend tests; keep this unit test portable across CI hosts.
+            return;
+        };
+        let token = backend.failed_token(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "synthetic submission failure",
+        ));
+        assert_ne!(token.id(), u64::MAX);
+        let Poll::Ready(completions) = backend.drain_completions() else {
+            panic!("failed submission was not surfaced");
+        };
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, token);
+        assert!(completions[0].1.is_err());
+    }
+}
+
+#[cfg(test)]
 mod stable_iovec_tests {
     use super::*;
     use smallvec::SmallVec;
