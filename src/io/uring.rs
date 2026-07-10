@@ -15,7 +15,10 @@ use std::task::Poll;
 use std::time::Duration;
 
 /// A struct to hold a pending operation and any associated data, like buffers.
-#[derive(Clone)]
+///
+/// Not `Clone`: several variants hold raw pointers into sibling heap allocations
+/// (boxed `iovec` arrays, `msghdr`, `sockaddr_storage`). Cloning would duplicate
+/// those pointers without duplicating pointees and would be unsound.
 enum PendingOp {
     Read {
         op: Op,
@@ -24,12 +27,17 @@ enum PendingOp {
     ReadVectored {
         op: Op,
         buffers: SmallVec<[Buffer; 4]>,
-        iovecs: SmallVec<[iovec; 4]>,
+        /// Kernel-visible iovec metadata in immovable heap storage.
+        /// Must be boxed *before* SQE construction so `as_ptr()` remains valid
+        /// across moves into this enum and into the pending-ops slab.
+        iovecs: Box<[iovec]>,
     },
     WriteVectored {
         op: Op,
         buffers: SmallVec<[Buffer; 4]>,
-        iovecs: SmallVec<[iovec; 4]>,
+        /// Kernel-visible iovec metadata in immovable heap storage.
+        /// See `ReadVectored::iovecs`.
+        iovecs: Box<[iovec]>,
     },
     Write {
         op: Op,
@@ -905,16 +913,22 @@ impl IoProvider for UringBackend {
                     )
                 }
                 Op::ReadVectored { fd, buffers } => {
-                    // Take ownership of buffers for PendingOp; Op gets empty placeholder
+                    // Take ownership of buffers for PendingOp; Op gets empty placeholder.
+                    // Buffer data lives on the heap, so buffer pointers stay valid after
+                    // Buffer is moved into PendingOp / the slab.
                     let mut pending_buffers = buffers;
-                    let mut iovecs: SmallVec<[iovec; 4]> =
-                        SmallVec::with_capacity(pending_buffers.len());
-                    for buf in pending_buffers.iter_mut() {
-                        iovecs.push(iovec {
+                    // CRITICAL (S0-4): allocate kernel-visible iovec metadata in stable
+                    // heap storage *before* SQE construction. SmallVec<[_; 4]> stores
+                    // 1–4 elements inline; taking as_ptr() then moving the SmallVec
+                    // (into PendingOp, then into the slab) invalidates the SQE pointer.
+                    // Box<[iovec]> keeps the pointee immovable across those moves.
+                    let iovecs: Box<[iovec]> = pending_buffers
+                        .iter_mut()
+                        .map(|buf| iovec {
                             iov_base: buf.as_mut_ptr() as *mut _,
                             iov_len: buf.capacity(),
-                        });
-                    }
+                        })
+                        .collect();
                     let entry =
                         opcode::Readv::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
                             .build();
@@ -929,13 +943,15 @@ impl IoProvider for UringBackend {
                     (entry, pending_op)
                 }
                 Op::WriteVectored { fd, buffers } => {
-                    let mut iovecs: SmallVec<[iovec; 4]> = SmallVec::with_capacity(buffers.len());
-                    for buf in buffers.iter() {
-                        iovecs.push(iovec {
+                    // CRITICAL (S0-4): same stable-boxed iovec pattern as ReadVectored.
+                    // Build Box<[iovec]> first, then form the SQE from its as_ptr().
+                    let iovecs: Box<[iovec]> = buffers
+                        .iter()
+                        .map(|buf| iovec {
                             iov_base: buf.as_ptr() as *mut _,
                             iov_len: buf.len(),
-                        });
-                    }
+                        })
+                        .collect();
                     let entry =
                         opcode::Writev::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
                             .build();
@@ -1694,5 +1710,109 @@ impl IoProvider for UringBackend {
         batch_limit: usize,
     ) -> (usize, bool, usize) {
         self.drain_completions_fused_inline(wakeup_poll_token, batch_limit)
+    }
+}
+
+#[cfg(test)]
+mod stable_iovec_tests {
+    use super::*;
+    use smallvec::SmallVec;
+
+    /// Structural proof for S0-4 / rm-06: `Box<[iovec]>` pointees stay fixed
+    /// after the owning Box is moved (as happens when inserting PendingOp into
+    /// the slab and while the SQE remains unsubmitted / delayed-submit).
+    ///
+    /// Covers inline-equivalent counts (1–4) and spill (5+).
+    #[test]
+    fn boxed_iovec_ptr_stable_after_move_for_inline_and_spill_counts() {
+        for count in [1usize, 2, 3, 4, 5, 8] {
+            let mut storage: Vec<u8> = vec![0u8; count * 16];
+            let iovecs: Box<[iovec]> = (0..count)
+                .map(|i| iovec {
+                    iov_base: unsafe { storage.as_mut_ptr().add(i * 16) } as *mut _,
+                    iov_len: 16,
+                })
+                .collect();
+            let ptr_before = iovecs.as_ptr();
+            let len_before = iovecs.len();
+
+            // Simulate move into PendingOp then into the slab.
+            let moved = iovecs;
+            assert_eq!(
+                ptr_before,
+                moved.as_ptr(),
+                "Box<[iovec]> as_ptr must stay valid after move (count={count})"
+            );
+            assert_eq!(len_before, moved.len());
+            // Pointee contents still readable through the original raw pointer.
+            assert_eq!(unsafe { (*ptr_before).iov_len }, 16);
+            let _keep = moved;
+        }
+    }
+
+    /// Documents the bug class we removed: inline SmallVec storage moves with
+    /// the SmallVec, so as_ptr()-then-move is unsafe for kernel SQE arguments.
+    #[test]
+    fn smallvec_inline_as_ptr_is_invalidated_by_slab_like_move() {
+        let mut sv: SmallVec<[iovec; 4]> = SmallVec::new();
+        sv.push(iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 1,
+        });
+        assert!(
+            !sv.spilled(),
+            "precondition: single element must use inline storage"
+        );
+        let ptr_before = sv.as_ptr() as usize;
+        // Move into a Vec (mirrors slab insert) so the SmallVec itself relocates.
+        let mut slab = Vec::with_capacity(4);
+        slab.push(sv);
+        let ptr_after = slab[0].as_ptr() as usize;
+        // Inline storage lives inside the SmallVec; relocating the SmallVec
+        // relocates the iovec array. (If this ever fails, SmallVec changed
+        // layout — re-evaluate the fix.)
+        assert_ne!(
+            ptr_before, ptr_after,
+            "expected inline SmallVec as_ptr to change when moved into a slab"
+        );
+    }
+
+    /// Delayed-submit structural proof: capture as_ptr from a Box, move the
+    /// owner through a slab-like container, and only then "submit" (read via
+    /// the captured pointer). Kernel would observe the same address.
+    #[test]
+    fn delayed_submit_sees_stable_iovec_after_slab_like_move() {
+        for count in [1usize, 4, 5] {
+            let mut bufs: Vec<Vec<u8>> = (0..count).map(|i| vec![i as u8; 8]).collect();
+            let iovecs: Box<[iovec]> = bufs
+                .iter_mut()
+                .map(|b| iovec {
+                    iov_base: b.as_mut_ptr() as *mut _,
+                    iov_len: b.len(),
+                })
+                .collect();
+
+            // SQE would store this pointer at build time (before flush).
+            let sqe_iov_base = iovecs.as_ptr();
+            let sqe_nr = iovecs.len() as u32;
+
+            // PendingOp owns the box; slab insertion moves the owner.
+            struct FakePending {
+                iovecs: Box<[iovec]>,
+            }
+            let pending = FakePending { iovecs };
+            let mut slab: Vec<Option<FakePending>> = Vec::new();
+            slab.push(Some(pending));
+
+            // Delayed submit / kernel CQE window: pointer must still be valid.
+            let live = slab[0].as_ref().unwrap();
+            assert_eq!(live.iovecs.as_ptr(), sqe_iov_base);
+            assert_eq!(live.iovecs.len() as u32, sqe_nr);
+            for i in 0..count {
+                let iov = unsafe { *sqe_iov_base.add(i) };
+                assert_eq!(iov.iov_len, 8);
+                assert_eq!(unsafe { *(iov.iov_base as *const u8) }, i as u8);
+            }
+        }
     }
 }

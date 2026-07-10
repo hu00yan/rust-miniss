@@ -1,6 +1,6 @@
 ---
 id: rm-06-stable-iovec
-status: TODO
+status: YELLOW
 batch: 1-C
 depends_on: [rm-00-gate-all-targets]
 parallel_wave: W1
@@ -40,6 +40,13 @@ Readv/Writev take SmallVec::as_ptr then move inline storage.
 1. Box/pin iovec arrays before opcode builder.
 2. Remove Clone from PendingOp.
 3. Tests for 1–4 iovecs + spill.
+
+## Verification note (2026-07-10)
+
+Orb Linux structural and TCP vectored tests pass for inline counts 1–4 and a
+heap-spilled count. The card remains YELLOW until a delayed-submit,
+kernel-executed readv/writev regression exercises the SQE-to-terminal-CQE
+lifetime under relocation pressure, as required by the verified plan.
 
 ## Out of scope
 
