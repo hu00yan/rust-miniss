@@ -1,6 +1,6 @@
 ---
 id: rm-06-stable-iovec
-status: YELLOW
+status: GREEN
 batch: 1-C
 depends_on: [rm-00-gate-all-targets]
 parallel_wave: W1
@@ -44,9 +44,8 @@ Readv/Writev take SmallVec::as_ptr then move inline storage.
 ## Verification note (2026-07-10)
 
 Orb Linux structural and TCP vectored tests pass for inline counts 1–4 and a
-heap-spilled count. The card remains YELLOW until a delayed-submit,
-kernel-executed readv/writev regression exercises the SQE-to-terminal-CQE
-lifetime under relocation pressure, as required by the verified plan.
+heap-spilled count. Delayed-submit kernel-executed readv/writev regressions
+also pass under relocation pressure, covering the SQE-to-terminal-CQE lifetime.
 
 ## Out of scope
 
