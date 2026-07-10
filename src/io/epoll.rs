@@ -168,7 +168,7 @@ impl IoProvider for EpollBackend {
         // Acquire the lease before registration/queueing.  File operations
         // move it into the worker closure; readiness operations retain it in
         // the slot until their terminal completion.
-        let descriptor_lease = if matches!(op, Op::Nop) {
+        let descriptor_lease = if matches!(op, Op::Nop | Op::Close { .. }) {
             None
         } else {
             match DescriptorLease::acquire(op.as_raw_fd()) {
@@ -356,7 +356,8 @@ impl IoProvider for EpollBackend {
                     addr: _addr,
                 } => {
                     // Register the UDP socket for write events, make it asynchronous
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
                         poll.registry()
                             .register(&mut source, mio_token, mio::Interest::WRITABLE)
@@ -367,7 +368,8 @@ impl IoProvider for EpollBackend {
                     pending_ops[slot] = Some((io_token, op));
                 }
                 Op::Fsync { fd } => {
-                    let result = match SafeFdFile::new(*fd) {
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let result = match SafeFdFile::new(effective_fd) {
                         Ok(mut safe_file) => safe_file
                             .as_mut()
                             .sync_all()
@@ -400,7 +402,8 @@ impl IoProvider for EpollBackend {
                     multishot: _,
                 } => {
                     // Register fd with mio for epoll-based polling
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     let events_u32 = *events;
                     let interest = if events_u32 & libc::POLLIN as u32 != 0 {
                         Interest::READABLE
@@ -485,14 +488,19 @@ impl IoProvider for EpollBackend {
             let mio_token = event.token();
             let slot = mio_token.0;
             if let Some((io_token, op)) = pending_ops.get_mut(slot).and_then(Option::take) {
-                let raw_fd = op.as_raw_fd();
+                let leased_fd = descriptor_leases
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .map(DescriptorLease::as_raw_fd);
+                let raw_fd = leased_fd.unwrap_or_else(|| op.as_raw_fd());
                 let mut source = SourceFd(&raw_fd);
                 let _ = poll.registry().deregister(&mut source);
 
                 let result = match &op {
                     Op::Accept { fd } => {
+                        let effective_fd = leased_fd.unwrap_or(*fd);
                         // The file descriptor is a listening socket, so we can accept a connection.
-                        match syscall_accept(*fd) {
+                        match syscall_accept(effective_fd) {
                             Ok((new_fd, addr)) => Ok(CompletionKind::Accept {
                                 fd: new_fd,
                                 addr: Some(addr),
@@ -501,13 +509,18 @@ impl IoProvider for EpollBackend {
                         }
                     }
                     Op::Read { fd, len, .. } => {
+                        let effective_fd = leased_fd.unwrap_or(*fd);
                         let mut buffer = Buffer::with_capacity(*len);
                         let mut requeue = false;
                         let result = loop {
                             // SAFETY: buffer has at least `len` capacity and
                             // libc::read writes at most that many bytes.
                             let ret = unsafe {
-                                libc::read(*fd, buffer.as_mut_ptr() as *mut libc::c_void, *len)
+                                libc::read(
+                                    effective_fd,
+                                    buffer.as_mut_ptr() as *mut libc::c_void,
+                                    *len,
+                                )
                             };
                             if ret < 0 {
                                 let err = io::Error::last_os_error();
@@ -533,7 +546,7 @@ impl IoProvider for EpollBackend {
                         };
 
                         if requeue {
-                            let mut source = SourceFd(fd);
+                            let mut source = SourceFd(&effective_fd);
                             if let Err(reg_err) =
                                 poll.registry()
                                     .register(&mut source, mio_token, Interest::READABLE)
@@ -549,6 +562,7 @@ impl IoProvider for EpollBackend {
                         result
                     }
                     Op::Write { fd, data, .. } => {
+                        let effective_fd = leased_fd.unwrap_or(*fd);
                         let mut written = 0usize;
                         let mut requeue = false;
                         let result = loop {
@@ -562,7 +576,7 @@ impl IoProvider for EpollBackend {
                             // owned by `data`; write reads at most len bytes.
                             let ret = unsafe {
                                 libc::write(
-                                    *fd,
+                                    effective_fd,
                                     remaining.as_ptr() as *const libc::c_void,
                                     remaining.len(),
                                 )
@@ -600,7 +614,7 @@ impl IoProvider for EpollBackend {
                         };
 
                         if requeue {
-                            let mut source = SourceFd(fd);
+                            let mut source = SourceFd(&effective_fd);
                             if let Err(reg_err) =
                                 poll.registry()
                                     .register(&mut source, mio_token, Interest::WRITABLE)
@@ -616,6 +630,7 @@ impl IoProvider for EpollBackend {
                         result
                     }
                     Op::WriteStatic { fd, data } => {
+                        let effective_fd = leased_fd.unwrap_or(*fd);
                         let mut written = 0usize;
                         let mut requeue = false;
                         let result = loop {
@@ -629,7 +644,7 @@ impl IoProvider for EpollBackend {
                             // bytes; write reads at most len bytes.
                             let ret = unsafe {
                                 libc::write(
-                                    *fd,
+                                    effective_fd,
                                     remaining.as_ptr() as *const libc::c_void,
                                     remaining.len(),
                                 )
@@ -667,7 +682,7 @@ impl IoProvider for EpollBackend {
                         };
 
                         if requeue {
-                            let mut source = SourceFd(fd);
+                            let mut source = SourceFd(&effective_fd);
                             if let Err(reg_err) =
                                 poll.registry()
                                     .register(&mut source, mio_token, Interest::WRITABLE)
@@ -687,7 +702,8 @@ impl IoProvider for EpollBackend {
                         // but included for completeness if event-driven file I/O were enabled.
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
-                        let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
                         let result = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
                             let mut buf = Buffer::new_zeroed(*len);
                             file.read(buf.as_mut()).and_then(|bytes_read| {
@@ -711,7 +727,8 @@ impl IoProvider for EpollBackend {
                         // This path should ideally not be hit.
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
-                        let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
                         let result = file
                             .seek(SeekFrom::Start(*offset))
                             .and_then(|_| file.write(data.as_ref()))
@@ -720,6 +737,7 @@ impl IoProvider for EpollBackend {
                         result.map_err(IoError::Io)
                     }
                     Op::UdpRecv { fd, .. } => {
+                        let effective_fd = leased_fd.unwrap_or(*fd);
                         // Matched by `event.token()`
                         // SAFETY: udp_recv_buffers is shard-local and only
                         // accessed by this epoll owner thread.
@@ -729,7 +747,7 @@ impl IoProvider for EpollBackend {
                         {
                             // SAFETY: UdpSocket temporarily wraps fd and is
                             // converted back with into_raw_fd before drop.
-                            let socket = unsafe { std::net::UdpSocket::from_raw_fd(*fd) };
+                            let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
                             let mut retry = false;
                             let result = match socket.recv_from(buffer.as_mut()) {
                                 Ok((bytes_read, addr)) => {
@@ -743,7 +761,7 @@ impl IoProvider for EpollBackend {
                                     }
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    let mut mio_source = SourceFd(fd);
+                                    let mut mio_source = SourceFd(&effective_fd);
                                     if let Err(reg_err) = poll.registry().register(
                                         &mut mio_source,
                                         mio_token,
@@ -776,7 +794,8 @@ impl IoProvider for EpollBackend {
 
                         // SAFETY: UdpSocket temporarily wraps fd and is
                         // converted back with into_raw_fd before drop.
-                        let socket = unsafe { std::net::UdpSocket::from_raw_fd(*fd) };
+                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
                         let result = socket.send_to(data.as_ref(), *addr).map(|bytes_written| {
                             CompletionKind::UdpSend {
                                 bytes_written,
@@ -787,7 +806,7 @@ impl IoProvider for EpollBackend {
                         result.map_err(IoError::Io)
                     }
                     Op::Connect { fd, addr: _ } => {
-                        let raw_fd = *fd;
+                        let raw_fd = leased_fd.unwrap_or(*fd);
                         // SAFETY: TcpStream temporarily wraps fd to call
                         // take_error, then into_raw_fd preserves ownership.
                         let sock = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
@@ -800,6 +819,7 @@ impl IoProvider for EpollBackend {
                         result
                     }
                     Op::ReadVectored { fd, buffers } => {
+                        let effective_fd = leased_fd.unwrap_or(*fd);
                         // Buffer::clone copies logical bytes, not spare capacity. Read
                         // destinations are often empty, so clone would create zero-length
                         // iovecs and make readv report EOF without reading anything.
@@ -818,8 +838,9 @@ impl IoProvider for EpollBackend {
                         let result = loop {
                             // SAFETY: iovecs point to writable capacity in the
                             // cloned buffers and remain valid for this call.
-                            let ret =
-                                unsafe { libc::readv(*fd, iovecs.as_ptr(), iovecs.len() as i32) };
+                            let ret = unsafe {
+                                libc::readv(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
+                            };
                             if ret < 0 {
                                 let err = io::Error::last_os_error();
                                 if err.kind() == io::ErrorKind::Interrupted {
@@ -863,7 +884,7 @@ impl IoProvider for EpollBackend {
                         };
 
                         if requeue {
-                            let mut source = SourceFd(fd);
+                            let mut source = SourceFd(&effective_fd);
                             if let Err(reg_err) =
                                 poll.registry()
                                     .register(&mut source, mio_token, Interest::READABLE)
@@ -879,6 +900,7 @@ impl IoProvider for EpollBackend {
                         result
                     }
                     Op::WriteVectored { fd, buffers } => {
+                        let effective_fd = leased_fd.unwrap_or(*fd);
                         let total_len: usize = buffers.iter().map(|b| b.len()).sum();
                         if total_len == 0 {
                             Ok(CompletionKind::WriteVectored {
@@ -920,7 +942,7 @@ impl IoProvider for EpollBackend {
                                 // SAFETY: iovecs point to initialized bytes in
                                 // buffers and remain valid for this syscall.
                                 let ret = unsafe {
-                                    libc::writev(*fd, iovecs.as_ptr(), iovecs.len() as i32)
+                                    libc::writev(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
                                 };
                                 if ret < 0 {
                                     let err = io::Error::last_os_error();
@@ -957,7 +979,7 @@ impl IoProvider for EpollBackend {
                             };
 
                             if requeue {
-                                let mut source = SourceFd(fd);
+                                let mut source = SourceFd(&effective_fd);
                                 if let Err(reg_err) = poll.registry().register(
                                     &mut source,
                                     mio_token,
