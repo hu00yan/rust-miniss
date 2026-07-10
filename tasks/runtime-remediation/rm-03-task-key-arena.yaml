@@ -31,12 +31,12 @@ review_questions:
 architecture_audit: |
   Arena is shard-local. No global task map. No locks on hot path.
 
-## Verification (2026-07-10)
+## Verification (2026-07-11)
 
-`TaskKey` and bounded `TaskArena` are implemented; all live task indexing now
-uses full-key validation, rejecting stale wake/cancel ABA. Existing task
-storage remains Vec-backed with generation checks; migrate live storage onto
-`TaskArena` before GREEN.
+`Executor` and `CpuCore` live task storage now use bounded `TaskArena`; full
+keys validate stale wake/cancel ABA, external admission rejects wrong shard
+and out-of-capacity keys, and runtime generations are allocated per runtime.
+Capacity exhaustion still needs a fallible public spawn result before GREEN.
 ---
 
 # rm-03: Generational TaskKey + arena

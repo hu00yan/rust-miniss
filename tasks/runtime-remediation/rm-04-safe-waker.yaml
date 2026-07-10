@@ -38,8 +38,9 @@ architecture_audit: |
 ## Verification (2026-07-11)
 
 Raw Rc/raw-pointer waker removed. Bounded `Arc<ArrayQueue>` and scheduled/active
-dedup state pass 49 lib tests, including cross-thread and late wake. Queue-full
-overflow recovery remains before GREEN.
+dedup state pass lib tests, including cross-thread and late wake. Queue-full
+overflow now uses a sticky marker, owner unpark, and arena rescan retry; Loom
+coverage and hot-path scan-cost evidence remain before GREEN.
 ---
 
 # rm-04: Safe waker
