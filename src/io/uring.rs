@@ -128,6 +128,9 @@ pub struct UringBackend {
     /// True when the kernel SQPOLL thread owns submission. In that mode flush()
     /// only publishes the SQ tail; it must not call io_uring_enter.
     sqpoll_enabled: bool,
+    /// Runtime opcode probe result. Multishot accept is only advertised when
+    /// the kernel reports accept support; unsupported kernels use fallback.
+    supports_multishot_accept: bool,
     /// High watermark for proactive submission. When pending SQEs reach this
     /// point, submit() flushes before the ring gets too full.
     flush_high_watermark: usize,
@@ -235,6 +238,9 @@ impl UringBackend {
             (base_builder().build(entries)?, false)
         };
         let ring_entries = entries as usize;
+        let mut probe = io_uring::Probe::new();
+        let supports_multishot_accept = ring.submitter().register_probe(&mut probe).is_ok()
+            && probe.is_supported(opcode::Accept::CODE);
         let flush_high_watermark = std::cmp::max(1, ring_entries.saturating_mul(3) / 4);
         let capacity = std::cmp::max(entries, 64) as usize;
         let mut accept_results = Vec::with_capacity(capacity);
@@ -250,6 +256,7 @@ impl UringBackend {
             accept_results: UnsafeCell::new(accept_results),
             pending_sqes: Cell::new(0),
             sqpoll_enabled,
+            supports_multishot_accept,
             flush_high_watermark,
             flush_batch_size,
             drain_batch_size,
@@ -1833,7 +1840,7 @@ impl IoProvider for UringBackend {
     }
 
     fn supports_multishot_accept(&self) -> bool {
-        true
+        self.supports_multishot_accept
     }
 
     fn accepted_streams_are_nonblocking(&self) -> bool {
