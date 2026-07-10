@@ -1,0 +1,49 @@
+---
+id: rm-03-task-key-arena
+status: TODO
+batch: 1-B
+depends_on: [rm-00-gate-all-targets]
+parallel_wave: W1
+goal: Replace generationless sequence TaskId indexing with bounded arena + TaskKey.
+allowed_files:
+  - src/waker.rs
+  - src/task.rs
+  - src/multicore.rs
+  - src/executor.rs
+  - src/lib.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-03-task-key-arena.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+  - unbounded
+test_commands:
+  - cargo test --locked --all-features -- task_key
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - Task identity includes shard + slot + generation (and runtime generation if needed)
+  - Slot reuse only after terminal cleanup and generation advance
+  - Stale key cannot target replacement task (unit test)
+  - No live task addressed by bare u32 sequence alone
+review_questions:
+  - Is the arena capacity bounded and what happens at capacity?
+  - Compatibility: public TaskId API broken or versioned?
+architecture_audit: |
+  Arena is shard-local. No global task map. No locks on hot path.
+---
+
+# rm-03: Generational TaskKey + arena
+
+## Problem (S1-5)
+
+u64 counter truncated to u32; cancel/wake by sequence → ABA / wrong task.
+
+## Work
+
+1. Introduce `TaskKey` / arena storage.
+2. Migrate spawn/ready/cancel indexing to full keys.
+3. Keep old TaskId as wrapper only if generation-safe.
+
+## Out of scope
+
+Waker Arc implementation (rm-04); cancel ack protocol (rm-10).

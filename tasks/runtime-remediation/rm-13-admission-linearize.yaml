@@ -1,0 +1,34 @@
+---
+id: rm-13-admission-linearize
+status: TODO
+batch: 3
+depends_on: [rm-12-shutdown-lifecycle]
+parallel_wave: W5
+goal: One linearization point for spawn vs shutdown; no silent post-close ownership.
+allowed_files:
+  - src/multicore.rs
+  - tests/**
+  - docs/DECISION_LOG.md
+  - tasks/runtime-remediation/rm-13-admission-linearize.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - unbounded
+test_commands:
+  - cargo test --locked --all-features -- admission
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - Spawn either accepted-before-close (owned by shard) or rejected-after-close with explicit error
+  - No task enqueued after admission cutoff without ownership ack
+  - Stress: concurrent spawn + shutdown does not leave orphan tasks or hang join
+review_questions:
+  - Is linearization channel-close, generation counter, or epoch? Document.
+  - SeqCst not used as substitute for protocol?
+architecture_audit: |
+  Bounded channels. Document atomics' published transitions.
+---
+
+# rm-13: Admission linearization
+
+## Problem (S1-6)
+
+Load Running then enqueue races shutdown independently.

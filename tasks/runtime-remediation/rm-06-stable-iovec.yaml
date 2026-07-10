@@ -1,0 +1,46 @@
+---
+id: rm-06-stable-iovec
+status: TODO
+batch: 1-C
+depends_on: [rm-00-gate-all-targets]
+parallel_wave: W1
+goal: Kernel-visible iovec/msghdr pointees stay immovable from SQE build through terminal CQE.
+allowed_files:
+  - src/io/uring.rs
+  - src/io/mod.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-06-stable-iovec.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+  - "derive(Clone)"  # on PendingOp
+test_commands:
+  - cargo test --locked --all-features -- vectored
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - PendingOp is not Clone
+  - Vectored SQEs built only after iovec metadata is in Box/pinned stable storage
+  - Moving PendingOp into slab cannot invalidate SQE pointers (1–4 and spilled counts covered by test or structural proof)
+  - msghdr-related pointees similarly stable where applicable
+review_questions:
+  - Is there any path that still calls SmallVec::as_ptr before move into PendingOp?
+  - Linux delayed-submit test present or marked required-on-Linux?
+architecture_audit: |
+  No shared state. Ownership stays in PendingOp until CQE.
+---
+
+# rm-06: Stable vectored metadata
+
+## Problem (S0-4)
+
+Readv/Writev take SmallVec::as_ptr then move inline storage.
+
+## Work
+
+1. Box/pin iovec arrays before opcode builder.
+2. Remove Clone from PendingOp.
+3. Tests for 1–4 iovecs + spill.
+
+## Out of scope
+
+Descriptor lease (rm-07); fallible submit (rm-09).

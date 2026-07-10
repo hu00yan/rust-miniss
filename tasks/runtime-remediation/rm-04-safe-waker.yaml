@@ -1,0 +1,53 @@
+---
+id: rm-04-safe-waker
+status: TODO
+batch: 1-B
+depends_on: [rm-03-task-key-arena]
+parallel_wave: W2
+goal: Replace Rc+raw-queue RawWaker with cross-thread-safe TaskWake; late wakes are no-ops.
+allowed_files:
+  - src/waker.rs
+  - src/task.rs
+  - src/multicore.rs
+  - src/executor.rs
+  - src/timer/sleep.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-04-safe-waker.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+  - "Rc::into_raw"
+  - "*const VecDeque"
+  - "unsafe impl Send for MinissWaker"
+test_commands:
+  - cargo test --locked --all-features -- waker
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - No custom RawWaker vtable using Rc or raw ready-queue pointers
+  - Waker state holds TaskKey + atomic scheduled/closed + lifetime-safe notifier only
+  - At most one ready notification per live task (dedup)
+  - Cross-thread clone/wake/drop does not race
+  - Escaped waker after cancel/shutdown/drop is a no-op
+  - Timer fallback must not require unsound same-thread waker (delete or route via notifier)
+review_questions:
+  - Are atomics only on the wake seam, not on every shard-local poll field?
+  - Can a wake be silently dropped when mailbox full? (must sticky-overflow or equivalent)
+architecture_audit: |
+  Arc/atomic only for cross-thread wake seam. Ready queue remains shard-owned. No Arc<Mutex>.
+---
+
+# rm-04: Safe waker
+
+## Problem (S0-1)
+
+Rc + raw VecDeque + fake Send/Sync; timer thread wakes across threads.
+
+## Work
+
+1. `futures::task::ArcWake` or equivalent safe Wake.
+2. Scheduled-bit dedup; closed-before-reclaim.
+3. Fix/remove timer fallback thread path.
+
+## Out of scope
+
+Poll budget (rm-05); full cancel ack (rm-10).

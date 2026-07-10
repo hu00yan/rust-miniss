@@ -1,0 +1,58 @@
+---
+id: rm-02-local-driver-ownership
+status: TODO
+batch: 1-A
+depends_on: [rm-01-scoped-tls-context]
+parallel_wave: W2
+goal: Make local I/O driver and CpuIoState !Send+!Sync; remove shared Arc driver mutation.
+allowed_files:
+  - src/cpu.rs
+  - src/io/mod.rs
+  - src/io/uring.rs
+  - src/io/epoll.rs
+  - src/io/kqueue.rs
+  - src/executor.rs
+  - src/multicore.rs
+  - src/lib.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-02-local-driver-ownership.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+  - "unsafe impl Send for UringBackend"
+  - "unsafe impl Sync for UringBackend"
+  - "unsafe impl Send for EpollBackend"
+  - "unsafe impl Sync for EpollBackend"
+  - "unsafe impl Send for CpuIoState"
+  - "unsafe impl Sync for CpuIoState"
+test_commands:
+  - cargo test --locked --all-targets --all-features
+  - cargo test --locked --all-features -- not_send
+acceptance:
+  - IoProvider (local driver) no longer requires Send+Sync OR is split into local driver vs remote handle traits
+  - UringBackend, EpollBackend, CpuIoState do not implement Send/Sync
+  - Shard state does not store Arc<dyn IoProvider> for local mutation
+  - Runtime (single-thread) is !Send+!Sync; driver/timer constructed once and reused across block_on
+  - compile-fail or static_assert tests document !Send/!Sync
+review_questions:
+  - How do remote cores submit work without holding the driver Arc?
+  - Any remaining cloneable handle that can call submit concurrently?
+architecture_audit: |
+  Cross-core path must be bounded messages only. No Arc<Mutex>. Document any Arc used for control handles.
+---
+
+# rm-02: Local-only driver ownership
+
+## Problem (S0-3)
+
+Safe APIs allow concurrent mutation of backends via Send+Sync + Arc.
+
+## Work
+
+1. Split local driver vs Send control handle if needed.
+2. Own driver in worker/`Runtime` directly.
+3. Remove unsafe Send/Sync impls.
+
+## Out of scope
+
+Waker rewrite (rm-04); full RuntimeOwner split (rm-12).

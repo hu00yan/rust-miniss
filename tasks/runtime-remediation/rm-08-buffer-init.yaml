@@ -1,0 +1,42 @@
+---
+id: rm-08-buffer-init
+status: TODO
+batch: 1-D
+depends_on: [rm-00-gate-all-targets]
+parallel_wave: W1
+goal: Never expose uninitialized buffer bytes as initialized slices on fallback backends.
+allowed_files:
+  - src/buffer.rs
+  - src/io/epoll.rs
+  - src/io/kqueue.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-08-buffer-init.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+test_commands:
+  - cargo test --locked --all-features -- buffer
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - Fallback file/TCP/UDP/vectored reads do not set_len before OS fills bytes unless storage was initialized
+  - Prefer MaybeUninit spare-capacity or zeroed containment for safe Read APIs
+  - Validate 0 <= n <= capacity before publishing length
+  - Miri-friendly unit tests for short read/EOF/error paths
+review_questions:
+  - Any remaining set_len on uninitialized capacity?
+  - Performance: zero-fill only as containment, measured later?
+architecture_audit: |
+  No shared state. Buffer pool remains TLS/shard-local.
+---
+
+# rm-08: Initialized-buffer correctness
+
+## Problem (S0-6)
+
+epoll/kqueue set_len then pass to safe Read → uninit as init (macOS too).
+
+## Work
+
+1. Buffer spare-capacity API or zeroed path.
+2. Fix all fallback read sites.
+3. Tests under Miri where possible.

@@ -1,0 +1,39 @@
+---
+id: rm-17-arch-audit-safety-tests
+status: TODO
+batch: 5
+depends_on: [rm-04-safe-waker, rm-08-buffer-init]
+parallel_wave: W1-partial + final
+goal: Extend architecture audit beyond Arc<Mutex>; add Miri/Loom/Linux evidence hooks.
+allowed_files:
+  - scripts/audit_architecture.sh
+  - justfile
+  - tests/**
+  - .github/**
+  - docs/DECISION_LOG.md
+  - docs/ARCHITECTURE_EXCEPTIONS.md
+  - tasks/runtime-remediation/rm-17-arch-audit-safety-tests.yaml
+  - tasks/runtime-remediation/README.md
+forbidden_patterns:
+  - Arc<Mutex
+test_commands:
+  - just arch-audit
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - audit_architecture.sh hard-fails on: Rc::into_raw in waker path, io_state() -> &'static, unsafe impl Send for *Backend (allowlist documented)
+  - Documented Miri target set for TLS/waker/buffer (run when toolchain available)
+  - Documented Loom target for wake/close/notify (optional CI)
+  - Linux-only tests gated cfg(target_os="linux") for delayed-submit / fd-reuse where implemented by prior cards
+  - README epic status updated; no S0 marked closed without listed evidence
+review_questions:
+  - Can someone reintroduce Rc waker and still pass just arch-audit?
+  - Gate still green on macOS host without Linux sanitizers?
+architecture_audit: |
+  Meta-task: improves detection only.
+---
+
+# rm-17: Arch-audit hardening + safety tests
+
+## Problem
+
+June script only caught pseudo-sync; not lifetime/UB patterns.

@@ -1,0 +1,49 @@
+---
+id: rm-01-scoped-tls-context
+status: TODO
+batch: 1-A
+depends_on: [rm-00-gate-all-targets]
+parallel_wave: W1
+goal: Eliminate TLS 'static escape and restore I/O/timer/task context on panic/nesting.
+allowed_files:
+  - src/cpu.rs
+  - src/executor.rs
+  - src/multicore.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-01-scoped-tls-context.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+  - "fn io_state() -> &'static"
+  - unbounded
+test_commands:
+  - cargo test --locked --all-features -- tls_context
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - No public function returns &'static CpuIoState (or equivalent forged 'static)
+  - Context access is closure-based or lifetime-bound so references cannot escape
+  - One RAII guard saves/restores I/O, timer, task (and core if present) on success, panic, nesting
+  - catch_unwind inside block_on then subsequent I/O/timer works without stale context
+  - Nested block_on restores outer context (or rejects same-runtime re-entry with documented error)
+review_questions:
+  - Can safe code still smuggle a reference out of with_io_state?
+  - Does MultiCoreRuntime::block_on still create a nested Runtime (defer full fix to rm-02/rm-15 if needed, but must not leave dangling TLS)?
+architecture_audit: |
+  No new cross-core traffic. TLS remains thread-local; installation crate-private.
+---
+
+# rm-01: Scoped TLS / RuntimeContextGuard
+
+## Problem (S0-2)
+
+`io_state()` forges `&'static`; panic paths leave dangling TLS; nesting overwrites outer context.
+
+## Work
+
+1. Replace reference-returning TLS getters with `with_io_state(|s| ...)` (and timer/task analogs as needed).
+2. `RuntimeContextGuard` on all install sites (`Runtime::block_on`, `CpuCore::run`).
+3. Tests: panic restore, nest restore.
+
+## Out of scope
+
+Removing `Send` from backends (rm-02); full MultiCore block_on redesign (rm-15).

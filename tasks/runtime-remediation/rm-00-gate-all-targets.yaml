@@ -1,0 +1,55 @@
+---
+id: rm-00-gate-all-targets
+status: GREEN
+batch: 0
+depends_on: []
+parallel_wave: W0
+goal: Restore cargo check/test --all-targets so later cards have a real gate.
+allowed_files:
+  - src/cpu.rs
+  - src/multicore.rs
+  - tests/runtime_regressions.rs
+  - tasks/runtime-remediation/rm-00-gate-all-targets.yaml
+  - tasks/runtime-remediation/README.md
+  - tasks/runtime-remediation/CARD_REVIEW.md
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+  - std::sync::Mutex
+  - unbounded
+test_commands:
+  - cargo check --locked --all-targets --all-features
+  - cargo test --locked --all-targets --all-features -- --nocapture
+  - cargo fmt --all -- --check
+acceptance:
+  - cargo check --locked --all-targets --all-features succeeds
+  - runtime_regressions compiles without using private IoToken::from_id from outside crate (pub(crate) test helper or public test-only constructor)
+  - No new S0/S1 behavior changes beyond visibility/test plumbing
+review_questions:
+  - Did we expose a footgun public API only for tests, or keep it crate/test-scoped?
+  - Are pre-existing clippy/fmt failures fixed here or explicitly deferred with a note?
+architecture_audit: |
+  No hot-path shared state. Test/API visibility only.
+---
+
+# rm-00: Repair all-target compile gate
+
+## Problem
+
+`cargo check --all-targets` fails: `tests/runtime_regressions.rs` calls private `IoToken::from_id`.
+
+## Work
+
+1. Either make a `#[cfg(test)]` / `pub(crate)` test constructor, or rewrite tests to construct tokens only via public submit paths.
+2. Fix any trivial fmt/clippy blockers discovered while restoring the gate (only if in allowed_files; otherwise note deferral).
+
+## Out of scope
+
+Safety rewrites, waker, TLS, uring logic.
+
+## Execution notes (2026-07-10)
+
+- Moved generation-slot test into `src/cpu.rs` unit tests (keeps `IoToken::from_id` `pub(crate)`).
+- Fixed clippy `if_same_then_else` in `process_io_completions` drain_limit (empty vs len&lt;8 both returned 128).
+- Verified: `cargo check/clippy --all-targets --all-features`, unit test, `runtime_regressions` 6/7.
+- Pre-existing (not this card): `multicore_spawned_async_file_future_completes` timeout; `hyper_http2` hangs &gt;60s. Track under later I/O lifecycle cards.

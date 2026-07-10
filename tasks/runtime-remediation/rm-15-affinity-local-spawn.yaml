@@ -1,0 +1,45 @@
+---
+id: rm-15-affinity-local-spawn
+status: TODO
+batch: 4
+depends_on: [rm-02-local-driver-ownership, rm-05-poll-budget]
+parallel_wave: W4
+goal: Restore thread-per-core ownership: local !Send spawn, HTTP keep-local, honest CPU APIs.
+allowed_files:
+  - src/multicore.rs
+  - src/executor.rs
+  - src/lib.rs
+  - examples/http_echo.rs
+  - examples/http_echo_onecore.rs
+  - examples/http_echo_rent.rs
+  - examples/http_echo_st.rs
+  - docs/ARCHITECTURE_EXCEPTIONS.md
+  - docs/DECISION_LOG.md
+  - docs/DESIGN.md
+  - tests/**
+  - tasks/runtime-remediation/rm-15-affinity-local-spawn.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - unbounded
+test_commands:
+  - cargo test --locked --all-targets --all-features
+  - cargo check --locked --examples --all-features
+acceptance:
+  - spawn_local accepts !Send futures (or separate LocalSpawner API)
+  - HTTP echo accept path spawns handlers on accepting shard (no global spawn hop)
+  - block_on_cpu either runs on target shard via message+ack or is removed/renamed
+  - MultiCoreRuntime::block_on does not create a second backend on caller thread when called as worker facade (reject or dispatch)
+  - Worker count / affinity: physical cores or documented exception; bind failure not silent success
+  - Readiness acknowledged after affinity+TLS+driver init
+review_questions:
+  - SO_REUSEPORT ownership documented and matched by examples?
+  - Any remaining O(N) inbox scan load balance justified?
+architecture_audit: |
+  No task migration. Cross-core only via explicit remote spawn of Send futures.
+---
+
+# rm-15: Affinity + local spawn + HTTP
+
+## Problem (S1-8)
+
+HTTP cross-core spawn; fake block_on_cpu; logical CPUs; readiness before init.

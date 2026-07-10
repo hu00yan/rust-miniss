@@ -1,0 +1,45 @@
+---
+id: rm-05-poll-budget
+status: TODO
+batch: 1-B
+depends_on: [rm-04-safe-waker]
+parallel_wave: W3
+goal: Bound per-turn task polls so self-wakers cannot starve I/O/timer/messages/shutdown.
+allowed_files:
+  - src/multicore.rs
+  - src/executor.rs
+  - src/config.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-05-poll-budget.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - Arc<RwLock
+  - unbounded
+test_commands:
+  - cargo test --locked --all-features -- poll_budget
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - Configurable per-turn task poll budget
+  - Self-waking task cannot prevent processing of I/O completion, timer, remote message, or shutdown flag within bounded turns
+  - Ready queue depth remains bounded under wake storms (with rm-04 dedup)
+review_questions:
+  - Is budget enforced inside execute_tasks before outer loop can resume?
+  - Any fairness regression tests flaky?
+architecture_audit: |
+  Shard-local counters only. No global atomics on poll path.
+---
+
+# rm-05: Per-turn poll budget
+
+## Problem (S1-4)
+
+`execute_tasks` drains forever; self-waker monopolizes shard.
+
+## Work
+
+1. Budget constant/config.
+2. Return to event loop when budget exhausted; re-queue remainder.
+
+## Out of scope
+
+Message/CQE budgets beyond task polls (nice-to-have, not required).

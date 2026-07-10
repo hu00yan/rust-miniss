@@ -1,0 +1,37 @@
+---
+id: rm-10-cancel-routing
+status: TODO
+batch: 2
+depends_on: [rm-03-task-key-arena, rm-04-safe-waker]
+parallel_wave: W3
+goal: Cancel routes to owner shard by full TaskKey; JoinHandle cancel stops polling.
+allowed_files:
+  - src/multicore.rs
+  - src/task.rs
+  - src/waker.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-10-cancel-routing.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - unbounded
+test_commands:
+  - cargo test --locked --all-features -- cancel
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - cancel_task sends only to owner shard (cpu_id/shard in key)
+  - Receiver matches full key/generation, not sequence alone
+  - Outcomes: Accepted | NotFound | AlreadyTerminal | Backpressured | RuntimeStopping (or equivalent enum)
+  - No silent Ok when try_send fails
+  - JoinHandle::cancel resolves Cancelled only after owner stops polling and drops future
+review_questions:
+  - Neighbor tasks on other shards unaffected by cancel?
+  - Join state vs task storage race handled?
+architecture_audit: |
+  Bounded cancel messages. No broadcast-all-cores cancel.
+---
+
+# rm-10: Owner-acked task cancellation
+
+## Problem (S1-2)
+
+Broadcast cancel by sequence; JoinHandle lies.

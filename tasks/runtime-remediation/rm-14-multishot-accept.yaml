@@ -1,0 +1,36 @@
+---
+id: rm-14-multishot-accept
+status: TODO
+batch: 4
+depends_on: [rm-07-descriptor-lease, rm-09-fallible-submit]
+parallel_wave: W4
+goal: Capability-probed multishot accept with bounded OwnedFd delivery and terminal rearm.
+allowed_files:
+  - src/io/uring.rs
+  - src/io/mod.rs
+  - src/net.rs
+  - tests/**
+  - tasks/runtime-remediation/rm-14-multishot-accept.yaml
+forbidden_patterns:
+  - Arc<Mutex
+  - unbounded
+test_commands:
+  - cargo test --locked --all-features -- accept
+  - cargo test --locked --all-targets --all-features
+acceptance:
+  - Multishot not assumed; runtime probe or safe fallback
+  - Accept result queue bounded; overflow policy closes surplus fds
+  - Results are OwnedFd until delivered to stream
+  - Terminal CQE triggers rearm/fallback; listener does not hang on dead token
+  - Listener drop cancels/drains outstanding accept ops
+review_questions:
+  - Behavior on kernels without AcceptMulti verified or cfg-tested?
+architecture_audit: |
+  Per-shard queues only. Bound documented in config.
+---
+
+# rm-14: Multishot accept
+
+## Problem (S1-7)
+
+Always AcceptMulti; unbounded VecDeque; raw fds; terminal hangs.
