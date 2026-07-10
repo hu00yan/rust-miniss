@@ -8,7 +8,7 @@ authority for scope and acceptance.
 |---|---|---|---|
 | rm-00 | GREEN | GREEN | Orb Linux: fmt, all-target check, strict clippy, and tests/examples all pass. Benchmark binaries are excluded from the test gate because `--all-targets` executes the intentionally long-running listener benchmark. |
 | rm-01 | YELLOW | YELLOW | Commit `128e5ca` contains scoped TLS. Follow-up closes review gap: context installation is unsafe crate-private, task setter crate-private, and timer/task/core nesting regression passes. Local check/clippy pass; Orb full gate pending. |
-| rm-02 | TODO | TODO | Confirmed not started: `CpuIoState`/`UringBackend`/`EpollBackend` still carry `unsafe impl Send/Sync` (forbidden patterns) and `CpuIoState::io_backend` is still `Arc<IoBackend>`. Depends on rm-01. |
+| rm-02 | GREEN | GREEN | Local and Orb Linux check/clippy pass. Drivers/state are local `Box` ownership, no unsafe Send/Sync impls; Runtime reuses one owned driver/timer pair across block_on. |
 | rm-03 | TODO | TODO | No corresponding commits or source fixes on `main`. |
 | rm-04 | TODO | TODO | No corresponding commits or source fixes on `main`. |
 | rm-05 | TODO | TODO | No corresponding commits or source fixes on `main`. |

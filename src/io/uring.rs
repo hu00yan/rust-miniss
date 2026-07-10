@@ -138,10 +138,6 @@ pub struct UringBackend {
     thread_id: std::thread::ThreadId,
 }
 
-// SAFETY: This is safe in our thread-per-core model.
-unsafe impl Send for UringBackend {}
-unsafe impl Sync for UringBackend {}
-
 /// Minimum pending SQEs before flush() calls io_uring_enter submit.
 /// Deferring small batches reduces syscall rate.
 /// Kept below MAX_BUSY_ROUNDS in multicore.rs so busy workers still submit

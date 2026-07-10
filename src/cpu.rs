@@ -1,6 +1,5 @@
 use std::cell::UnsafeCell;
 use std::ptr;
-use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
@@ -11,10 +10,10 @@ use crate::timer::{TimerId, TimerWheel};
 
 type IoBackend = dyn IoProvider<Completion = (IoToken, Result<CompletionKind, IoError>)>;
 
-pub(crate) fn create_default_io_backend() -> Arc<IoBackend> {
+pub(crate) fn create_default_io_backend() -> Box<IoBackend> {
     #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
     {
-        Arc::new(
+        Box::new(
             crate::io::uring::UringBackend::new(4096)
                 .unwrap_or_else(|e| panic!("Failed to create io_uring backend: {e}")),
         )
@@ -22,7 +21,7 @@ pub(crate) fn create_default_io_backend() -> Arc<IoBackend> {
 
     #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
     {
-        Arc::new(
+        Box::new(
             crate::io::kqueue::KqueueBackend::new()
                 .unwrap_or_else(|e| panic!("Failed to create kqueue backend: {e}")),
         )
@@ -36,7 +35,7 @@ pub(crate) fn create_default_io_backend() -> Arc<IoBackend> {
         )
     ))]
     {
-        Arc::new(
+        Box::new(
             crate::io::epoll::EpollBackend::new()
                 .unwrap_or_else(|e| panic!("Failed to create epoll backend: {e}")),
         )
@@ -67,10 +66,15 @@ pub(crate) fn create_default_io_backend() -> Arc<IoBackend> {
 /// I/O tokens are sequential slab indices, so we use a flat `Vec` of slots
 /// instead of HashMap for O(1) direct-indexed access with zero hashing overhead.
 /// The vec grows lazily as needed; resizes are amortized O(1).
+///
+/// ```compile_fail
+/// fn requires_send<T: Send>(_: T) {}
+/// requires_send(rust_miniss::cpu::CpuIoState::default());
+/// ```
 #[repr(C)]
 pub struct CpuIoState {
     /// The I/O backend for submitting operations.
-    pub io_backend: Arc<IoBackend>,
+    pub io_backend: Box<IoBackend>,
     /// Per-token state packed into a single slot to avoid three separate table lookups.
     /// SAFETY: Single-threaded access only.
     pub io_slots: UnsafeCell<Vec<IoSlot>>,
@@ -83,10 +87,6 @@ pub struct IoSlot {
     completed: Option<Result<CompletionKind, IoError>>,
     pending_task: Option<crate::waker::TaskId>,
 }
-
-// SAFETY: CpuIoState is only accessed from the owning CPU thread.
-unsafe impl Send for CpuIoState {}
-unsafe impl Sync for CpuIoState {}
 
 impl Default for CpuIoState {
     fn default() -> Self {
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn cpu_io_slots_do_not_alias_different_token_generations() {
         let state = CpuIoState {
-            io_backend: Arc::new(DummyProvider),
+            io_backend: Box::new(DummyProvider),
             io_slots: Default::default(),
         };
         let old = IoToken::from_id((1u64 << 32) | 7);

@@ -37,7 +37,7 @@ pub trait AsRawFd {
 /// Each CPU thread will own an instance of a type that implements this trait.
 /// This design follows the thread-per-core model, avoiding locks within the
 /// I/O backend implementation.
-pub trait IoProvider: Send + Sync + 'static {
+pub trait IoProvider: 'static {
     /// The type of completion event returned by the backend.
     type Completion;
 

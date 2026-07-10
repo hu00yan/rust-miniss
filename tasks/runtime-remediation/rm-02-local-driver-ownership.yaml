@@ -1,6 +1,6 @@
 ---
 id: rm-02-local-driver-ownership
-status: TODO
+status: GREEN
 batch: 1-A
 depends_on: [rm-01-scoped-tls-context]
 parallel_wave: W2
@@ -39,6 +39,15 @@ review_questions:
   - Any remaining cloneable handle that can call submit concurrently?
 architecture_audit: |
   Cross-core path must be bounded messages only. No Arc<Mutex>. Document any Arc used for control handles.
+
+## Verification (2026-07-10)
+
+- `IoProvider` no longer requires `Send + Sync`.
+- `CpuIoState`, io_uring, and fallback drivers no longer have unsafe Send/Sync
+  implementations; shard driver ownership uses `Box`.
+- `Runtime` constructs and owns one driver/timer pair, reused across block_on.
+- Compile-fail docs cover `CpuIoState: !Send`; local and Orb Linux check/clippy
+  pass. `bench_single` now constructs Runtime on its owner thread.
 ---
 
 # rm-02: Local-only driver ownership

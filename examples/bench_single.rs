@@ -26,10 +26,10 @@ async fn handle_client(mut stream: AsyncTcpStream) {
 }
 
 fn main() {
-    let rt = Runtime::new();
     let (port_tx, port_rx) = std::sync::mpsc::channel();
 
     let _server = std::thread::spawn(move || {
+        let rt = Runtime::new();
         rt.block_on(async {
             let mut listener =
                 AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();

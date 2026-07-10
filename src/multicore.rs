@@ -256,7 +256,7 @@ impl CpuCore {
     /// Create new CPU core
     fn new(
         id: usize,
-        io_backend: Arc<dyn IoProvider<Completion = IoCompletion>>,
+        io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
         #[cfg(target_os = "linux")] sleeping: Arc<AtomicBool>,
         message_inbox: Receiver<CoreMessage>,
@@ -990,13 +990,13 @@ impl MultiCoreRuntime {
     fn notify_core(&self, _core_id: usize) {}
 
     /// Create IO backend for a specific core
-    fn create_io_backend(core_id: usize) -> Result<Arc<dyn IoProvider<Completion = IoCompletion>>> {
+    fn create_io_backend(core_id: usize) -> Result<Box<dyn IoProvider<Completion = IoCompletion>>> {
         #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
         {
             match crate::io::uring::UringBackend::new(4096) {
                 Ok(uring) => {
                     tracing::debug!("Core {} using io_uring backend", core_id);
-                    return Ok(Arc::new(uring));
+                    return Ok(Box::new(uring));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1013,7 +1013,7 @@ impl MultiCoreRuntime {
             match crate::io::kqueue::KqueueBackend::new() {
                 Ok(kqueue) => {
                     tracing::debug!("Core {} using kqueue backend", core_id);
-                    return Ok(Arc::new(kqueue));
+                    return Ok(Box::new(kqueue));
                 }
                 Err(e) => {
                     tracing::warn!("Core {} failed to create kqueue: {}", core_id, e);
@@ -1026,7 +1026,7 @@ impl MultiCoreRuntime {
             match crate::io::epoll::EpollBackend::new() {
                 Ok(epoll) => {
                     tracing::debug!("Core {} using epoll backend", core_id);
-                    return Ok(Arc::new(epoll));
+                    return Ok(Box::new(epoll));
                 }
                 Err(e) => {
                     tracing::warn!("Core {} failed to create epoll: {}", core_id, e);

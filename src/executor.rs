@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::cpu::CpuIoState;
 use crate::task::{DetachedTaskFuture, JoinHandle, JoinTaskFuture, Task};
 use crate::timer::TimerWheel;
 use crate::waker::TaskId;
@@ -39,8 +40,15 @@ type IoCompletion = (
 /// `Runtime` owns its I/O driver and timer wheel directly. It is not `Send`
 /// or `Sync` and must only be used from the thread that created it. The
 /// `RefCell` field is what makes the type non-`Send` (rm-01).
+///
+/// ```compile_fail
+/// fn requires_send<T: Send>(_: T) {}
+/// requires_send(rust_miniss::Runtime::new());
+/// ```
 pub struct Runtime {
     executor: RefCell<Executor>, // Changed from Mutex to RefCell (single-threaded)
+    io_state: RefCell<CpuIoState>,
+    timer_wheel: RefCell<TimerWheel>,
 }
 
 // SAFETY: Runtime owns shard-local driver/timer state behind `RefCell` and
@@ -59,6 +67,8 @@ impl Runtime {
     pub fn new() -> Self {
         Self {
             executor: RefCell::new(Executor::new()), // Changed from Mutex::new
+            io_state: RefCell::new(CpuIoState::default()),
+            timer_wheel: RefCell::new(TimerWheel::default()),
         }
     }
 
@@ -68,18 +78,15 @@ impl Runtime {
     where
         F: Future,
     {
-        // CpuIoState::default() auto-selects the right backend (io_uring/kqueue/epoll)
-        // based on compile-time cfg, removing duplicated cfg logic here.
-        // No Arc needed — io_state is a stack local that lives for block_on's duration.
-        use crate::cpu::{CpuIoState, RuntimeContextGuard};
+        use crate::cpu::RuntimeContextGuard;
 
-        let io_state = CpuIoState::default();
+        let io_state = self.io_state.borrow_mut();
 
         // Pin the future to the stack
         let mut future = Box::pin(future);
-        let mut timer_wheel = TimerWheel::default();
-        // SAFETY: io_state and timer_wheel are local owners that remain alive
-        // until _runtime_context drops at the end of block_on.
+        let mut timer_wheel = self.timer_wheel.borrow_mut();
+        // SAFETY: Runtime owns both RefCell values for its full lifetime;
+        // borrows remain active until context guard and block_on return.
         let _runtime_context =
             unsafe { RuntimeContextGuard::enter(&io_state, &mut timer_wheel, None) };
         let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);

@@ -98,13 +98,6 @@ pub struct EpollBackend {
     completed_rx: UnsafeCell<Receiver<IoCompletion>>,
 }
 
-// SAFETY: The `EpollBackend` is designed to be thread-local. It is created within a
-// thread and must not be moved or accessed from another. The `Send` and `Sync` markers
-// are required to satisfy the `IoBackend` trait bounds. The thread-per-core
-// architecture of the runtime ensures this is safe.
-unsafe impl Send for EpollBackend {}
-unsafe impl Sync for EpollBackend {}
-
 impl EpollBackend {
     /// Creates a new `EpollBackend`.
     pub fn new() -> io::Result<Self> {
