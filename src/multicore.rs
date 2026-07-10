@@ -997,7 +997,9 @@ impl MultiCoreRuntime {
                     let _ = ready_sender.send(Ok(()));
                     let result = core.run();
                     // Set shutdown flag when core exits
-                    core_shutdown.store(true, Ordering::Relaxed);
+                    // Publish worker teardown before the coordinator observes
+                    // the shutdown flag and returns from its deadline wait.
+                    core_shutdown.store(true, Ordering::Release);
                     core_exited_flag.store(true, Ordering::Release);
                     result
                 })
