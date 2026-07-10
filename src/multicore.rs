@@ -241,6 +241,8 @@ pub struct CpuCore {
     local_task_count: usize,
     /// Countdown for polling cross-core messages while the shard is busy.
     message_poll_ticks: usize,
+    /// Maximum local tasks polled in one turn before returning to the event loop.
+    task_poll_budget: usize,
     /// Shard-local metrics. Aggregated only by explicit control-plane request.
     metrics: CoreMetrics,
 }
@@ -286,6 +288,7 @@ impl CpuCore {
             draining: false,
             local_task_count: 0,
             message_poll_ticks: 0,
+            task_poll_budget: crate::config::task_poll_budget(),
             metrics: CoreMetrics::default(),
         }
     }
@@ -624,8 +627,16 @@ impl CpuCore {
     /// Execute local tasks — in-place poll, no remove/insert.
     fn execute_tasks(&mut self) -> bool {
         let mut executed = 0;
+        let mut polled = 0;
 
-        while let Some(task_id) = self.ready_queue.pop_front() {
+        while polled < self.task_poll_budget {
+            let Some(task_id) = self.ready_queue.pop_front() else {
+                break;
+            };
+            // Count every scheduled record, including stale wakes, against
+            // the turn budget. Otherwise a wake storm for cancelled tasks
+            // could drain the queue without returning to I/O/messages/timers.
+            polled += 1;
             let removed = {
                 // In-place poll: borrow task mutably from task_queue.
                 // Scope ensures the mutable borrow is released before remove().

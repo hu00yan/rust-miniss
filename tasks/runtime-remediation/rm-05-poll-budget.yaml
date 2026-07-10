@@ -1,6 +1,6 @@
 ---
 id: rm-05-poll-budget
-status: TODO
+status: YELLOW
 batch: 1-B
 depends_on: [rm-04-safe-waker]
 parallel_wave: W3
@@ -27,6 +27,11 @@ review_questions:
   - Any fairness regression tests flaky?
 architecture_audit: |
   Shard-local counters only. No global atomics on poll path.
+
+## Verification (2026-07-10)
+
+Configurable executor/shard poll budgets and self-waker fairness regression
+pass. Queue-depth deduplication remains dependent on rm-04 safe-waker work.
 ---
 
 # rm-05: Per-turn poll budget

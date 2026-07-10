@@ -49,6 +49,13 @@ pub const MAX_TASKS: usize = 1024;
 /// throughput.
 pub const DEFAULT_PARK_TIMEOUT_US: u64 = 100;
 
+/// Default number of local tasks polled during one executor turn.
+///
+/// A task may wake itself while it is being polled.  Limiting the number of
+/// polls before returning to the event loop prevents that task from starving
+/// I/O completions, timers, messages, and shutdown processing.
+pub const DEFAULT_TASK_POLL_BUDGET: usize = 64;
+
 /// Resolve the I/O park timeout from `MINISS_PARK_TIMEOUT_US`.
 ///
 /// This is read at runtime startup only. Invalid or absent values fall back to
@@ -60,4 +67,16 @@ pub fn park_timeout() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_PARK_TIMEOUT_US);
     Duration::from_micros(timeout_us)
+}
+
+/// Resolve the per-turn task poll budget from `MINISS_TASK_POLL_BUDGET`.
+///
+/// Invalid, zero, or absent values fall back to the safe default.  Read at
+/// runtime/executor startup, never from the task polling hot path.
+pub fn task_poll_budget() -> usize {
+    std::env::var("MINISS_TASK_POLL_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TASK_POLL_BUDGET)
 }

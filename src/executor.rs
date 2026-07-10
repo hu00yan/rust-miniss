@@ -252,6 +252,8 @@ pub struct Executor {
     next_task_id: AtomicU64,
     active_tasks: usize,
     park_timeout: std::time::Duration,
+    /// Maximum tasks polled before returning control to the event loop.
+    poll_budget: usize,
 }
 
 impl Executor {
@@ -262,12 +264,21 @@ impl Executor {
 
     /// Create a new executor with explicit idle park timeout.
     pub fn with_park_timeout(park_timeout: std::time::Duration) -> Self {
+        Self::with_park_timeout_and_budget(park_timeout, crate::config::task_poll_budget())
+    }
+
+    /// Create an executor with explicit park timeout and per-turn poll budget.
+    pub fn with_park_timeout_and_budget(
+        park_timeout: std::time::Duration,
+        poll_budget: usize,
+    ) -> Self {
         Self {
             tasks: Vec::with_capacity(256),
             ready_queue: VecDeque::with_capacity(256),
             next_task_id: AtomicU64::new(1),
             active_tasks: 0,
             park_timeout,
+            poll_budget: poll_budget.max(1),
         }
     }
 
@@ -357,8 +368,13 @@ impl Executor {
     /// Run all ready tasks once
     pub fn tick(&mut self) -> bool {
         let mut made_progress = false;
+        let mut polled = 0;
 
-        while let Some(task_id) = self.ready_queue.pop_front() {
+        while polled < self.poll_budget {
+            let Some(task_id) = self.ready_queue.pop_front() else {
+                break;
+            };
+            polled += 1;
             let idx = task_id.sequence() as usize;
             if let Some(mut task) = self.tasks.get_mut(idx).and_then(Option::take) {
                 // Reuse the task-local waker cache so the hot path does not
@@ -492,6 +508,53 @@ mod tests {
         assert!(executor.tick());
         assert!(completed.load(Ordering::Acquire));
         assert_eq!(executor.task_count(), 0); // Task completed
+    }
+
+    #[test]
+    fn poll_budget_bounds_self_waking_task_and_runs_peer() {
+        use std::task::Poll;
+
+        struct SelfWaking {
+            polls: Arc<AtomicU32>,
+        }
+
+        impl Future for SelfWaking {
+            type Output = ();
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Self::Output> {
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        let mut executor = Executor::with_park_timeout_and_budget(
+            std::time::Duration::from_millis(1),
+            1,
+        );
+        let self_polls = Arc::new(AtomicU32::new(0));
+        executor.spawn(SelfWaking {
+            polls: self_polls.clone(),
+        });
+
+        let peer_ran = Arc::new(AtomicBool::new(false));
+        let peer_ran_clone = peer_ran.clone();
+        executor.spawn(async move {
+            peer_ran_clone.store(true, Ordering::Release);
+        });
+
+        // One tick may poll only one ready task, despite the first task
+        // continually waking itself. The peer must run on the next turn.
+        assert!(executor.tick());
+        assert_eq!(self_polls.load(Ordering::Acquire), 1);
+        assert!(!peer_ran.load(Ordering::Acquire));
+        assert!(executor.tick());
+        assert!(peer_ran.load(Ordering::Acquire));
+        assert_eq!(self_polls.load(Ordering::Acquire), 1);
+        assert_eq!(executor.task_count(), 1);
     }
 
     #[test]
