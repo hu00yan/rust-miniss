@@ -9,7 +9,7 @@
 //! Like the `uring` backend, this module uses `UnsafeCell` and `unsafe` trait impls
 //! to manage thread-local state within the `IoBackend` trait's `&self` methods.
 
-use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+use crate::io::{CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op};
 use crate::Buffer;
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use std::cell::UnsafeCell;
@@ -83,6 +83,11 @@ pub struct EpollBackend {
     events: UnsafeCell<Events>,
     /// Pending operations indexed by the `mio::Token` slot.
     pending_ops: UnsafeCell<Vec<Option<(IoToken, Op)>>>,
+    /// Descriptor leases acquired when an operation is accepted.  Keeping the
+    /// duplicate alive through terminal completion prevents fd-number reuse
+    /// from retargeting a queued fallback operation.
+    descriptor_leases: UnsafeCell<Vec<Option<crate::io::DescriptorLease>>>,
+    descriptor_lease_tokens: UnsafeCell<Vec<Option<IoToken>>>,
     /// UDP receive buffers indexed by the `mio::Token` slot.
     udp_recv_buffers: UnsafeCell<Vec<Option<crate::buffer::Buffer>>>,
     /// A counter to generate unique `mio::Token` values.
@@ -110,6 +115,8 @@ impl EpollBackend {
             poll: UnsafeCell::new(Poll::new()?),
             events: UnsafeCell::new(Events::with_capacity(1024)),
             pending_ops: UnsafeCell::new(Vec::with_capacity(1024)),
+            descriptor_leases: UnsafeCell::new(Vec::with_capacity(1024)),
+            descriptor_lease_tokens: UnsafeCell::new(Vec::with_capacity(1024)),
             udp_recv_buffers: UnsafeCell::new(Vec::with_capacity(1024)),
             next_token: UnsafeCell::new(0),
             next_io_token: std::cell::Cell::new(1),
@@ -145,19 +152,45 @@ impl IoProvider for EpollBackend {
         let next_token = unsafe { &mut *self.next_token.get() };
         let poll = unsafe { &mut *self.poll.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
+        let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
 
         let mio_token = Token(*next_token);
         *next_token += 1;
         let slot = mio_token.0;
         Self::ensure_slot_capacity(pending_ops, slot);
+        Self::ensure_slot_capacity(descriptor_leases, slot);
+        Self::ensure_slot_capacity(descriptor_lease_tokens, slot);
         // SAFETY: udp_recv_buffers is shard-local and only accessed from this
         // epoll backend owner thread while submitting operations.
         Self::ensure_slot_capacity(unsafe { &mut *self.udp_recv_buffers.get() }, slot);
 
+        // Acquire the lease before registration/queueing.  File operations
+        // move it into the worker closure; readiness operations retain it in
+        // the slot until their terminal completion.
+        let descriptor_lease = if matches!(op, Op::Nop) {
+            None
+        } else {
+            match DescriptorLease::acquire(op.as_raw_fd()) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    self.complete_local((io_token, Err(IoError::Io(error))));
+                    return io_token;
+                }
+            }
+        };
+        descriptor_leases[slot] = descriptor_lease;
+        descriptor_lease_tokens[slot] = Some(io_token);
+        let leased_fd = descriptor_leases[slot]
+            .as_ref()
+            .map(DescriptorLease::as_raw_fd);
+        let is_threadpool_file = matches!(op, Op::ReadFile { .. } | Op::WriteFile { .. });
+
         match op {
             Op::UdpRecv { fd, mut buffer } => {
                 // Register the UDP socket for read events.
-                let mut source = mio::unix::SourceFd(&fd);
+                let effective_fd = leased_fd.unwrap_or(fd);
+                let mut source = mio::unix::SourceFd(&effective_fd);
                 if let Err(e) =
                     poll.registry()
                         .register(&mut source, mio_token, mio::Interest::READABLE)
@@ -181,7 +214,8 @@ impl IoProvider for EpollBackend {
             }
             op => match &op {
                 Op::Accept { fd } => {
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
                         poll.registry()
                             .register(&mut source, mio_token, Interest::READABLE)
@@ -192,7 +226,8 @@ impl IoProvider for EpollBackend {
                     }
                 }
                 Op::Read { fd, .. } => {
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
                         poll.registry()
                             .register(&mut source, mio_token, Interest::READABLE)
@@ -203,7 +238,8 @@ impl IoProvider for EpollBackend {
                     }
                 }
                 Op::Write { fd, .. } | Op::WriteStatic { fd, .. } => {
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
                         poll.registry()
                             .register(&mut source, mio_token, Interest::WRITABLE)
@@ -214,7 +250,8 @@ impl IoProvider for EpollBackend {
                     }
                 }
                 Op::ReadVectored { fd, .. } => {
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
                         poll.registry()
                             .register(&mut source, mio_token, Interest::READABLE)
@@ -225,7 +262,8 @@ impl IoProvider for EpollBackend {
                     }
                 }
                 Op::WriteVectored { fd, .. } => {
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
                         poll.registry()
                             .register(&mut source, mio_token, Interest::WRITABLE)
@@ -236,7 +274,8 @@ impl IoProvider for EpollBackend {
                     }
                 }
                 Op::Connect { fd, addr: _ } => {
-                    let mut source = mio::unix::SourceFd(fd);
+                    let effective_fd = leased_fd.unwrap_or(*fd);
+                    let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
                         poll.registry()
                             .register(&mut source, mio_token, Interest::WRITABLE)
@@ -251,7 +290,7 @@ impl IoProvider for EpollBackend {
                     let completed_tx = self.completed_tx.clone();
                     let thread_pool = self.thread_pool.clone();
                     let io_token_copy = io_token;
-                    let fd_copy = *fd;
+                    let fd_copy = leased_fd.unwrap_or(*fd);
                     let offset_copy = *offset;
                     let len_copy = *len;
 
@@ -290,7 +329,7 @@ impl IoProvider for EpollBackend {
                     let completed_tx = self.completed_tx.clone();
                     let thread_pool = self.thread_pool.clone();
                     let io_token_copy = io_token;
-                    let fd_copy = *fd;
+                    let fd_copy = leased_fd.unwrap_or(*fd);
                     let offset_copy = *offset;
                     let data_clone = data.clone();
 
@@ -337,6 +376,8 @@ impl IoProvider for EpollBackend {
                         Err(err) => Err(IoError::Io(err)),
                     };
                     self.complete_local((io_token, result));
+                    descriptor_leases[slot] = None;
+                    descriptor_lease_tokens[slot] = None;
                 }
                 Op::Close { fd } => {
                     let result = {
@@ -350,6 +391,8 @@ impl IoProvider for EpollBackend {
                         }
                     };
                     self.complete_local((io_token, result));
+                    descriptor_leases[slot] = None;
+                    descriptor_lease_tokens[slot] = None;
                 }
                 Op::PollAdd {
                     fd,
@@ -379,9 +422,19 @@ impl IoProvider for EpollBackend {
                         "Operation not supported by epoll backend",
                     )));
                     self.complete_local((io_token, result));
+                    descriptor_leases[slot] = None;
+                    descriptor_lease_tokens[slot] = None;
                 }
             },
         };
+
+        // Registration failures and unsupported/immediate operations do not
+        // leave a pending slot.  Release their acceptance lease here; file
+        // jobs retain theirs until the completion token is drained.
+        if pending_ops[slot].is_none() && !is_threadpool_file {
+            descriptor_leases[slot] = None;
+            descriptor_lease_tokens[slot] = None;
+        }
 
         io_token
     }
@@ -391,6 +444,8 @@ impl IoProvider for EpollBackend {
         let poll = unsafe { &mut *self.poll.get() };
         let events = unsafe { &mut *self.events.get() };
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
+        let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
         let completed_local = unsafe { &mut *self.completed_local.get() };
         let completed_rx = unsafe { &mut *self.completed_rx.get() };
 
@@ -399,7 +454,16 @@ impl IoProvider for EpollBackend {
         // First, collect any completed operations from the thread pool
         loop {
             match completed_rx.try_recv() {
-                Ok(completion) => completions.push(completion),
+                Ok(completion) => {
+                    if let Some(slot) = descriptor_lease_tokens
+                        .iter()
+                        .position(|token| *token == Some(completion.0))
+                    {
+                        descriptor_lease_tokens[slot] = None;
+                        descriptor_leases[slot] = None;
+                    }
+                    completions.push(completion)
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -914,6 +978,14 @@ impl IoProvider for EpollBackend {
                     _ => continue,
                 };
 
+                // The lease is retained across every readiness requeue and is
+                // released only after this terminal result is published.
+                // The lease vectors are backend-owned and remain valid for
+                // this owner-thread drain pass.
+                unsafe {
+                    (&mut *self.descriptor_leases.get())[slot] = None;
+                    (&mut *self.descriptor_lease_tokens.get())[slot] = None;
+                }
                 completions.push((io_token, result));
             }
         }
@@ -923,6 +995,36 @@ impl IoProvider for EpollBackend {
         } else {
             TaskPoll::Ready(completions)
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod descriptor_lease_acceptance_tests {
+    use super::EpollBackend;
+    use crate::io::{IoProvider, Op};
+
+    #[test]
+    fn accepted_read_keeps_descriptor_lease_after_user_close() {
+        let mut fds = [0; 2];
+        // SAFETY: fds points to two writable descriptor slots.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let backend = EpollBackend::new().expect("epoll backend");
+        let token = backend.submit(Op::Read {
+            fd: fds[0],
+            offset: 0,
+            len: 1,
+        });
+        // SAFETY: the read end is still owned by this test and is closed once.
+        unsafe { libc::close(fds[0]) };
+        let leases = unsafe { &*backend.descriptor_leases.get() };
+        assert!(leases.iter().any(|lease| {
+            lease
+                .as_ref()
+                .is_some_and(|lease| unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) } >= 0)
+        }));
+        let _ = token;
+        // SAFETY: write end remains owned by this test and is closed once.
+        unsafe { libc::close(fds[1]) };
     }
 }
 
