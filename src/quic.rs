@@ -1,4 +1,4 @@
-use crate::cpu::{current_task_id, io_state};
+use crate::cpu::{current_task_id, with_io_state};
 use crate::io::IoToken;
 use crate::multicore::MultiCoreRuntime;
 use crate::timer::SleepFuture;
@@ -136,10 +136,9 @@ impl MinissUdpSocket {
 impl Drop for MinissUdpSocket {
     fn drop(&mut self) {
         if let Some(token) = self.load_recv_token() {
-            let state = io_state();
-            unsafe {
+            with_io_state(|state| unsafe {
                 state.clear_slot(token);
-            }
+            });
         }
     }
 }
@@ -159,39 +158,40 @@ impl AsyncUdpSocket for MinissUdpSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let state = io_state();
-        if let Some(token) = self.load_recv_token() {
-            if let Some(result) = unsafe { state.take_completed(token) } {
-                self.clear_recv_token(token);
-                match result {
-                    Ok(_) => {}
-                    Err(err) => return Poll::Ready(Err(err.into())),
+        with_io_state(|state| {
+            if let Some(token) = self.load_recv_token() {
+                if let Some(result) = unsafe { state.take_completed(token) } {
+                    self.clear_recv_token(token);
+                    match result {
+                        Ok(_) => {}
+                        Err(err) => return Poll::Ready(Err(err.into())),
+                    }
+                } else {
+                    unsafe {
+                        state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+                    }
+                    return Poll::Pending;
                 }
-            } else {
-                unsafe {
-                    state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-                }
-                return Poll::Pending;
             }
-        }
 
-        match self.state.recv(UdpSockRef::from(&self.inner), bufs, meta) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let op = crate::io::Op::PollAdd {
-                    fd: self.inner.as_raw_fd(),
-                    events: libc::POLLIN as u32,
-                    multishot: false,
-                };
-                let token = state.io_backend.submit(op);
-                self.store_recv_token(token);
-                unsafe {
-                    state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+            match self.state.recv(UdpSockRef::from(&self.inner), bufs, meta) {
+                Ok(n) => Poll::Ready(Ok(n)),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    let op = crate::io::Op::PollAdd {
+                        fd: self.inner.as_raw_fd(),
+                        events: libc::POLLIN as u32,
+                        multishot: false,
+                    };
+                    let token = state.io_backend.submit(op);
+                    self.store_recv_token(token);
+                    unsafe {
+                        state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+                    }
+                    Poll::Pending
                 }
-                Poll::Pending
+                Err(err) => Poll::Ready(Err(err)),
             }
-            Err(err) => Poll::Ready(Err(err)),
-        }
+        })
     }
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
@@ -248,41 +248,41 @@ impl MinissUdpPoller {
 impl Drop for MinissUdpPoller {
     fn drop(&mut self) {
         if let Some(token) = self.load_token() {
-            let state = io_state();
-            unsafe {
+            with_io_state(|state| unsafe {
                 state.clear_slot(token);
-            }
+            });
         }
     }
 }
 
 impl UdpPoller for MinissUdpPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let state = io_state();
-        if let Some(token) = self.load_token() {
-            if let Some(result) = unsafe { state.take_completed(token) } {
-                self.clear_token(token);
-                return match result {
-                    Ok(_) => Poll::Ready(Ok(())),
-                    Err(err) => Poll::Ready(Err(err.into())),
-                };
+        with_io_state(|state| {
+            if let Some(token) = self.load_token() {
+                if let Some(result) = unsafe { state.take_completed(token) } {
+                    self.clear_token(token);
+                    return match result {
+                        Ok(_) => Poll::Ready(Ok(())),
+                        Err(err) => Poll::Ready(Err(err.into())),
+                    };
+                }
+                unsafe {
+                    state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+                }
+                return Poll::Pending;
             }
+
+            let op = crate::io::Op::PollAdd {
+                fd: self.socket.inner.as_raw_fd(),
+                events: libc::POLLOUT as u32,
+                multishot: false,
+            };
+            let token = state.io_backend.submit(op);
+            self.store_token(token);
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
-            return Poll::Pending;
-        }
-
-        let op = crate::io::Op::PollAdd {
-            fd: self.socket.inner.as_raw_fd(),
-            events: libc::POLLOUT as u32,
-            multishot: false,
-        };
-        let token = state.io_backend.submit(op);
-        self.store_token(token);
-        unsafe {
-            state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-        }
-        Poll::Pending
+            Poll::Pending
+        })
     }
 }

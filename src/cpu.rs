@@ -395,53 +395,104 @@ thread_local! {
     /// Used by IoFuture to register for inline completion.
     static CURRENT_TASK_ID: std::cell::Cell<Option<crate::waker::TaskId>> =
         const { std::cell::Cell::new(None) };
+    /// The shard currently installed on this thread, if any.
+    static CURRENT_CORE_ID: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// Provides access to the I/O state of the current CPU thread.
+/// Scoped installation for all runtime TLS state.
 ///
-/// Uses a raw pointer — zero atomic overhead, zero Mutex.
-/// Panics if not called from within a `miniss` runtime thread.
+/// The guard restores the complete previous context on normal return, panic,
+/// and nesting. It deliberately owns no reference to the installed state: the
+/// raw pointers are used only while the caller keeps the owner alive.
+pub(crate) struct RuntimeContextGuard {
+    previous_io: *const CpuIoState,
+    previous_timer: *mut TimerWheel,
+    previous_task: Option<crate::waker::TaskId>,
+    previous_core: Option<usize>,
+}
+
+impl RuntimeContextGuard {
+    pub(crate) fn enter(
+        io_state: &CpuIoState,
+        timer_wheel: &mut TimerWheel,
+        core_id: Option<usize>,
+    ) -> Self {
+        let previous_io = CURRENT_IO_STATE.with(|cell| cell.replace(io_state));
+        let previous_timer = CURRENT_TIMER_WHEEL.with(|cell| cell.replace(timer_wheel));
+        let previous_task = CURRENT_TASK_ID.with(|cell| cell.replace(None));
+        let previous_core = CURRENT_CORE_ID.with(|cell| cell.replace(core_id));
+        Self {
+            previous_io,
+            previous_timer,
+            previous_task,
+            previous_core,
+        }
+    }
+}
+
+impl Drop for RuntimeContextGuard {
+    fn drop(&mut self) {
+        CURRENT_CORE_ID.with(|cell| cell.set(self.previous_core));
+        CURRENT_TASK_ID.with(|cell| cell.set(self.previous_task));
+        CURRENT_TIMER_WHEEL.with(|cell| cell.set(self.previous_timer));
+        CURRENT_IO_STATE.with(|cell| cell.set(self.previous_io));
+    }
+}
+
+/// Executes `f` with the current shard I/O state.
+///
+/// The higher-ranked closure prevents safe code from returning a reference to
+/// stack-owned runtime state.
+///
+/// ```compile_fail
+/// let escaped = rust_miniss::cpu::with_io_state(|state| state);
+/// let _ = escaped.io_backend.pending_submission_count();
+/// ```
 #[inline(always)]
-pub fn io_state() -> &'static CpuIoState {
+pub fn with_io_state<R>(f: impl for<'a> FnOnce(&'a CpuIoState) -> R) -> R {
     CURRENT_IO_STATE.with(|cell| {
         let ptr = cell.get();
         assert!(
             !ptr.is_null(),
             "I/O operation attempted outside of a miniss runtime thread"
         );
-        // SAFETY: The pointer is valid for the lifetime of the CPU thread.
-        // The CpuCore owns the CpuIoState and sets the pointer before running tasks.
-        unsafe { &*ptr }
+        // SAFETY: RuntimeContextGuard installs this pointer only while its
+        // owner is alive, and the borrow cannot escape `f`.
+        f(unsafe { &*ptr })
     })
 }
 
-/// Try to get the I/O state of the current CPU thread.
+/// Executes `f` with the current shard I/O state when one is installed.
 #[inline(always)]
-pub fn try_io_state() -> Option<&'static CpuIoState> {
+pub fn try_with_io_state<R>(f: impl for<'a> FnOnce(&'a CpuIoState) -> R) -> Option<R> {
     CURRENT_IO_STATE.with(|cell| {
         let ptr = cell.get();
         if ptr.is_null() {
             None
         } else {
-            // SAFETY: Non-null pointer was installed by the current runtime
-            // thread and remains valid until `clear_current_io_state`.
-            Some(unsafe { &*ptr })
+            // SAFETY: see with_io_state.
+            Some(f(unsafe { &*ptr }))
         }
     })
 }
 
-/// Sets the current CPU I/O state for the current thread.
-pub fn set_current_io_state(io_state: &CpuIoState) {
+/// Returns the installed state for unsafe internals that already prove their
+/// execution is confined to the owning shard turn.
+///
+/// # Safety
+/// The caller must not retain the reference past the active
+/// `RuntimeContextGuard`, nor access it from another thread.
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+pub(crate) unsafe fn current_io_state_unchecked() -> &'static CpuIoState {
     CURRENT_IO_STATE.with(|cell| {
-        cell.set(io_state as *const CpuIoState);
-    });
-}
-
-/// Clears the current CPU I/O state for the current thread.
-pub fn clear_current_io_state() {
-    CURRENT_IO_STATE.with(|cell| {
-        cell.set(ptr::null());
-    });
+        let ptr = cell.get();
+        assert!(
+            !ptr.is_null(),
+            "I/O operation attempted outside miniss runtime"
+        );
+        // SAFETY: upheld by the caller's contract above.
+        unsafe { &*ptr }
+    })
 }
 
 /// Get the current task ID (set before polling each task).
@@ -460,6 +511,10 @@ pub fn set_current_task_id(id: Option<crate::waker::TaskId>) {
     CURRENT_TASK_ID.with(|cell| cell.set(id));
 }
 
+pub(crate) fn current_core_id() -> Option<usize> {
+    CURRENT_CORE_ID.with(std::cell::Cell::get)
+}
+
 fn with_current_timer<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut TimerWheel) -> R,
@@ -474,18 +529,6 @@ where
             Some(f(unsafe { &mut *ptr }))
         }
     })
-}
-
-pub(crate) fn set_current_timer(timer: &mut TimerWheel) {
-    CURRENT_TIMER_WHEEL.with(|cell| {
-        cell.set(timer as *mut _);
-    });
-}
-
-pub(crate) fn clear_current_timer() {
-    CURRENT_TIMER_WHEEL.with(|cell| {
-        cell.set(ptr::null_mut());
-    });
 }
 
 pub(crate) fn register_timer_waker(at: Instant, waker: &Waker) -> Option<TimerId> {

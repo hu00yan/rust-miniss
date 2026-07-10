@@ -1,4 +1,4 @@
-use crate::cpu::{current_task_id, io_state};
+use crate::cpu::{current_task_id, try_with_io_state, with_io_state};
 use crate::io::IoToken;
 use crate::{Buffer, RentBuffer};
 use futures::io::{AsyncRead, AsyncWrite};
@@ -43,7 +43,6 @@ impl AsyncTcpListener {
     }
 
     pub async fn accept(&mut self) -> io::Result<(AsyncTcpStream, Option<SocketAddr>)> {
-        let state = io_state();
         if self.accept_token.is_none() {
             match self.inner.accept() {
                 Ok((stream, addr)) => {
@@ -60,14 +59,20 @@ impl AsyncTcpListener {
                 let op = crate::io::Op::Accept {
                     fd: self.inner.as_raw_fd(),
                 };
-                let token = state.io_backend.submit(op);
+                let token = with_io_state(|state| state.io_backend.submit(op));
                 self.accept_token = Some(token);
                 token
             }
         };
         let future = crate::io::future::IoFuture::accept(token);
         let result = future.await;
-        if !state.io_backend.supports_multishot_accept() {
+        let (supports_multishot, streams_nonblocking) = with_io_state(|state| {
+            (
+                state.io_backend.supports_multishot_accept(),
+                state.io_backend.accepted_streams_are_nonblocking(),
+            )
+        });
+        if !supports_multishot {
             self.accept_token = None;
         }
         match result? {
@@ -75,7 +80,7 @@ impl AsyncTcpListener {
                 // SAFETY: The accepted fd is newly returned by the OS/backend
                 // and ownership is transferred into TcpStream exactly once.
                 let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-                let async_stream = if state.io_backend.accepted_streams_are_nonblocking() {
+                let async_stream = if streams_nonblocking {
                     AsyncTcpStream::from_nonblocking(stream)?
                 } else {
                     AsyncTcpStream::new(stream)?
@@ -175,9 +180,8 @@ impl AsyncTcpStream {
                 Ok((bytes_read, T::from(buffer)))
             }
             Err(err) if is_wouldblock(&err) => {
-                let state = io_state();
                 let op = crate::io::Op::ReadRent { fd, buffer };
-                let token = state.io_backend.submit(op);
+                let token = with_io_state(|state| state.io_backend.submit(op));
                 let future = crate::io::future::IoFuture::new(token);
                 match future.await? {
                     crate::io::CompletionKind::ReadRent { buffer } => {
@@ -215,9 +219,8 @@ impl AsyncTcpStream {
                 Ok((bytes_written, T::from(data)))
             }
             Err(err) if is_wouldblock(&err) => {
-                let state = io_state();
                 let op = crate::io::Op::WriteRent { fd, data };
-                let token = state.io_backend.submit(op);
+                let token = with_io_state(|state| state.io_backend.submit(op));
                 let future = crate::io::future::IoFuture::new(token);
                 match future.await? {
                     crate::io::CompletionKind::WriteRent {
@@ -237,12 +240,11 @@ impl AsyncTcpStream {
     /// Write multiple owned buffers in one call.
     /// Returns the buffers so callers can recycle or reuse them.
     pub async fn write_buffers(&self, buffers: Vec<Buffer>) -> io::Result<(usize, Vec<Buffer>)> {
-        let state = io_state();
         let op = crate::io::Op::WriteVectored {
             fd: self.inner.as_raw_fd(),
             buffers: buffers.into(),
         };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::WriteVectored {
@@ -307,12 +309,11 @@ impl AsyncTcpStream {
     /// Write a static byte slice without copying it into an owned Buffer.
     pub async fn write_static_all(&self, mut data: &'static [u8]) -> io::Result<()> {
         while !data.is_empty() {
-            let state = io_state();
             let op = crate::io::Op::WriteStatic {
                 fd: self.inner.as_raw_fd(),
                 data,
             };
-            let token = state.io_backend.submit(op);
+            let token = with_io_state(|state| state.io_backend.submit(op));
             let future = crate::io::future::IoFuture::new(token);
             match future.await? {
                 crate::io::CompletionKind::Write { bytes_written } => {
@@ -395,9 +396,8 @@ impl AsyncTcpStream {
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let stream = Self::new(std_stream)?;
 
-        let state = io_state();
         let op = crate::io::Op::Connect { fd, addr: resolved };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::Connect => Ok(stream),
@@ -424,9 +424,8 @@ impl AsRawFd for AsyncTcpStream {
 impl IntoRawFd for AsyncTcpStream {
     fn into_raw_fd(self) -> RawFd {
         let fd = self.inner.as_raw_fd();
-        let state = crate::cpu::io_state();
-        // SAFETY: Single-threaded access.
-        unsafe {
+        with_io_state(|state| unsafe {
+            // SAFETY: Single-threaded access.
             if let Some(token) = self.read_token {
                 state.clear_slot(token);
             }
@@ -436,7 +435,7 @@ impl IntoRawFd for AsyncTcpStream {
             if let Some(token) = self.pollout_token {
                 state.clear_slot(token);
             }
-        }
+        });
         std::mem::forget(self);
         fd
     }
@@ -444,20 +443,18 @@ impl IntoRawFd for AsyncTcpStream {
 
 impl Drop for AsyncTcpStream {
     fn drop(&mut self) {
-        if let Some(state) = crate::cpu::try_io_state() {
+        try_with_io_state(|state| unsafe {
             // SAFETY: Single-threaded access.
-            unsafe {
-                if let Some(token) = self.read_token {
-                    state.clear_slot(token);
-                }
-                if let Some(token) = self.write_token {
-                    state.clear_slot(token);
-                }
-                if let Some(token) = self.pollout_token {
-                    state.clear_slot(token);
-                }
+            if let Some(token) = self.read_token {
+                state.clear_slot(token);
             }
-        }
+            if let Some(token) = self.write_token {
+                state.clear_slot(token);
+            }
+            if let Some(token) = self.pollout_token {
+                state.clear_slot(token);
+            }
+        });
     }
 }
 
@@ -468,53 +465,54 @@ impl AsyncRead for AsyncTcpStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let state = io_state();
-        // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
-        // self-referential fields; poll never moves fields after projection.
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        with_io_state(|state| {
+            // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
+            // self-referential fields; poll never moves fields after projection.
+            let this = unsafe { self.as_mut().get_unchecked_mut() };
 
-        if this.read_token.is_none() {
-            match try_read(this.inner.as_raw_fd(), buf) {
-                Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
+            if this.read_token.is_none() {
+                match try_read(this.inner.as_raw_fd(), buf) {
+                    Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
+                    Err(err) if is_wouldblock(&err) => {}
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
             }
-        }
 
-        let token = if let Some(token) = this.read_token {
-            // SAFETY: Single-threaded access.
-            if let Some(result) = unsafe { state.take_completed(token) } {
-                this.read_token = None;
-                return match result {
-                    Ok(crate::io::CompletionKind::Read { bytes_read, data }) => {
-                        let copy_len = std::cmp::min(bytes_read, buf.len());
-                        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                        Poll::Ready(Ok(copy_len))
-                    }
-                    Ok(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Unexpected completion",
-                    ))),
-                    Err(e) => Poll::Ready(Err(e.into())),
+            let token = if let Some(token) = this.read_token {
+                // SAFETY: Single-threaded access.
+                if let Some(result) = unsafe { state.take_completed(token) } {
+                    this.read_token = None;
+                    return match result {
+                        Ok(crate::io::CompletionKind::Read { bytes_read, data }) => {
+                            let copy_len = std::cmp::min(bytes_read, buf.len());
+                            buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                            Poll::Ready(Ok(copy_len))
+                        }
+                        Ok(_) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected completion",
+                        ))),
+                        Err(e) => Poll::Ready(Err(e.into())),
+                    };
+                }
+                token
+            } else {
+                let op = crate::io::Op::Read {
+                    fd: this.inner.as_raw_fd(),
+                    offset: 0,
+                    len: buf.len(),
                 };
-            }
-            token
-        } else {
-            let op = crate::io::Op::Read {
-                fd: this.inner.as_raw_fd(),
-                offset: 0,
-                len: buf.len(),
+                let token = state.io_backend.submit(op);
+                this.read_token = Some(token);
+                token
             };
-            let token = state.io_backend.submit(op);
-            this.read_token = Some(token);
-            token
-        };
-        // Register waker AND pending_task for inline completion.
-        // SAFETY: Single-threaded access.
-        unsafe {
-            state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-        }
-        Poll::Pending
+            // Register waker AND pending_task for inline completion.
+            // SAFETY: Single-threaded access.
+            unsafe {
+                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+            }
+            Poll::Pending
+        })
     }
 
     fn poll_read_vectored(
@@ -527,68 +525,69 @@ impl AsyncRead for AsyncTcpStream {
             return AsyncRead::poll_read(self, cx, &mut *buf);
         }
 
-        let state = io_state();
-        // SAFETY: AsyncTcpStream has no self-referential fields; poll only
-        // mutates fields in place and never moves them out of the pin.
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        with_io_state(|state| {
+            // SAFETY: AsyncTcpStream has no self-referential fields; poll only
+            // mutates fields in place and never moves them out of the pin.
+            let this = unsafe { self.as_mut().get_unchecked_mut() };
 
-        if !bufs.is_empty() && this.read_token.is_none() {
-            match try_read_vectored(this.inner.as_raw_fd(), bufs) {
-                Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
+            if !bufs.is_empty() && this.read_token.is_none() {
+                match try_read_vectored(this.inner.as_raw_fd(), bufs) {
+                    Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
+                    Err(err) if is_wouldblock(&err) => {}
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
             }
-        }
 
-        let token = if let Some(token) = this.read_token {
-            // SAFETY: Single-threaded access.
-            if let Some(result) = unsafe { state.take_completed(token) } {
-                this.read_token = None;
-                return match result {
-                    Ok(crate::io::CompletionKind::ReadVectored {
-                        bytes_read,
-                        buffers,
-                    }) => {
-                        let mut remaining = bytes_read;
-                        for (owned_buf, caller_buf) in buffers.iter().zip(bufs.iter_mut()) {
-                            let copy_len = std::cmp::min(
-                                remaining,
-                                std::cmp::min(owned_buf.len(), caller_buf.len()),
-                            );
-                            caller_buf[..copy_len].copy_from_slice(&owned_buf[..copy_len]);
-                            remaining -= copy_len;
-                            if remaining == 0 {
-                                break;
+            let token = if let Some(token) = this.read_token {
+                // SAFETY: Single-threaded access.
+                if let Some(result) = unsafe { state.take_completed(token) } {
+                    this.read_token = None;
+                    return match result {
+                        Ok(crate::io::CompletionKind::ReadVectored {
+                            bytes_read,
+                            buffers,
+                        }) => {
+                            let mut remaining = bytes_read;
+                            for (owned_buf, caller_buf) in buffers.iter().zip(bufs.iter_mut()) {
+                                let copy_len = std::cmp::min(
+                                    remaining,
+                                    std::cmp::min(owned_buf.len(), caller_buf.len()),
+                                );
+                                caller_buf[..copy_len].copy_from_slice(&owned_buf[..copy_len]);
+                                remaining -= copy_len;
+                                if remaining == 0 {
+                                    break;
+                                }
                             }
+                            Poll::Ready(Ok(bytes_read))
                         }
-                        Poll::Ready(Ok(bytes_read))
-                    }
-                    Ok(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Unexpected completion",
-                    ))),
-                    Err(e) => Poll::Ready(Err(e.into())),
+                        Ok(_) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected completion",
+                        ))),
+                        Err(e) => Poll::Ready(Err(e.into())),
+                    };
+                }
+                token
+            } else {
+                let mut buffers: SmallVec<[crate::Buffer; 4]> = SmallVec::new();
+                for buf in bufs {
+                    buffers.push(crate::Buffer::with_capacity(buf.len()));
+                }
+                let op = crate::io::Op::ReadVectored {
+                    fd: this.inner.as_raw_fd(),
+                    buffers,
                 };
-            }
-            token
-        } else {
-            let mut buffers: SmallVec<[crate::Buffer; 4]> = SmallVec::new();
-            for buf in bufs {
-                buffers.push(crate::Buffer::with_capacity(buf.len()));
-            }
-            let op = crate::io::Op::ReadVectored {
-                fd: this.inner.as_raw_fd(),
-                buffers,
+                let token = state.io_backend.submit(op);
+                this.read_token = Some(token);
+                token
             };
-            let token = state.io_backend.submit(op);
-            this.read_token = Some(token);
-            token
-        };
-        // SAFETY: Single-threaded access.
-        unsafe {
-            state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-        }
-        Poll::Pending
+            // SAFETY: Single-threaded access.
+            unsafe {
+                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+            }
+            Poll::Pending
+        })
     }
 }
 
@@ -599,85 +598,86 @@ impl AsyncWrite for AsyncTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let state = io_state();
-        // SAFETY: AsyncTcpStream has no self-referential fields; poll only
-        // mutates fields in place and never moves them out of the pin.
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        with_io_state(|state| {
+            // SAFETY: AsyncTcpStream has no self-referential fields; poll only
+            // mutates fields in place and never moves them out of the pin.
+            let this = unsafe { self.as_mut().get_unchecked_mut() };
 
-        // Clear stale POLLOUT completion (fire-and-forget).
-        // POLLOUT just serves as a wakeup mechanism when the socket
-        // becomes writable after an EAGAIN; the completion itself is
-        // discarded, then poll_write submits a fresh Write SQE.
-        if let Some(pollout_tok) = this.pollout_token.take() {
-            // SAFETY: pollout_tok belongs to this stream and is being cleared
-            // once before submitting/reusing any write state.
-            unsafe {
-                state.clear_slot(pollout_tok);
+            // Clear stale POLLOUT completion (fire-and-forget).
+            // POLLOUT just serves as a wakeup mechanism when the socket
+            // becomes writable after an EAGAIN; the completion itself is
+            // discarded, then poll_write submits a fresh Write SQE.
+            if let Some(pollout_tok) = this.pollout_token.take() {
+                // SAFETY: pollout_tok belongs to this stream and is being cleared
+                // once before submitting/reusing any write state.
+                unsafe {
+                    state.clear_slot(pollout_tok);
+                }
             }
-        }
 
-        if this.write_token.is_none() {
-            match try_write(this.inner.as_raw_fd(), buf) {
-                Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
+            if this.write_token.is_none() {
+                match try_write(this.inner.as_raw_fd(), buf) {
+                    Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
+                    Err(err) if is_wouldblock(&err) => {}
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
             }
-        }
 
-        let token = if let Some(token) = this.write_token {
-            // SAFETY: Single-threaded access.
-            if let Some(result) = unsafe { state.take_completed(token) } {
-                this.write_token = None;
-                return match result {
-                    Ok(crate::io::CompletionKind::Write { bytes_written }) => {
-                        Poll::Ready(Ok(bytes_written))
-                    }
-                    Ok(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Unexpected completion",
-                    ))),
-                    Err(ref e) if is_write_wouldblock(e) => {
-                        // Socket send buffer full. Submit POLLOUT to be
-                        // notified when buffer space becomes available.
-                        // Then return Pending; the task will be woken by
-                        // POLLOUT and retry the write with a fresh SQE.
-                        let pollout_op = crate::io::Op::PollAdd {
-                            fd: this.inner.as_raw_fd(),
-                            events: libc::POLLOUT as u32,
-                            multishot: false,
-                        };
-                        let pollout_tok = state.io_backend.submit(pollout_op);
-                        this.pollout_token = Some(pollout_tok);
-                        // SAFETY: pollout_tok was just submitted on this
-                        // shard; waker/task association is shard-local.
-                        unsafe {
-                            state.store_waker_and_pending_task(
-                                pollout_tok,
-                                cx.waker(),
-                                current_task_id(),
-                            );
+            let token = if let Some(token) = this.write_token {
+                // SAFETY: Single-threaded access.
+                if let Some(result) = unsafe { state.take_completed(token) } {
+                    this.write_token = None;
+                    return match result {
+                        Ok(crate::io::CompletionKind::Write { bytes_written }) => {
+                            Poll::Ready(Ok(bytes_written))
                         }
-                        return Poll::Pending;
-                    }
-                    Err(e) => Poll::Ready(Err(e.into())),
+                        Ok(_) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected completion",
+                        ))),
+                        Err(ref e) if is_write_wouldblock(e) => {
+                            // Socket send buffer full. Submit POLLOUT to be
+                            // notified when buffer space becomes available.
+                            // Then return Pending; the task will be woken by
+                            // POLLOUT and retry the write with a fresh SQE.
+                            let pollout_op = crate::io::Op::PollAdd {
+                                fd: this.inner.as_raw_fd(),
+                                events: libc::POLLOUT as u32,
+                                multishot: false,
+                            };
+                            let pollout_tok = state.io_backend.submit(pollout_op);
+                            this.pollout_token = Some(pollout_tok);
+                            // SAFETY: pollout_tok was just submitted on this
+                            // shard; waker/task association is shard-local.
+                            unsafe {
+                                state.store_waker_and_pending_task(
+                                    pollout_tok,
+                                    cx.waker(),
+                                    current_task_id(),
+                                );
+                            }
+                            return Poll::Pending;
+                        }
+                        Err(e) => Poll::Ready(Err(e.into())),
+                    };
+                }
+                token
+            } else {
+                let op = crate::io::Op::Write {
+                    fd: this.inner.as_raw_fd(),
+                    offset: 0,
+                    data: Buffer::from_slice(buf),
                 };
-            }
-            token
-        } else {
-            let op = crate::io::Op::Write {
-                fd: this.inner.as_raw_fd(),
-                offset: 0,
-                data: Buffer::from_slice(buf),
+                let token = state.io_backend.submit(op);
+                this.write_token = Some(token);
+                token
             };
-            let token = state.io_backend.submit(op);
-            this.write_token = Some(token);
-            token
-        };
-        // SAFETY: Single-threaded access.
-        unsafe {
-            state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-        }
-        Poll::Pending
+            // SAFETY: Single-threaded access.
+            unsafe {
+                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+            }
+            Poll::Pending
+        })
     }
 
     fn poll_write_vectored(
@@ -693,82 +693,83 @@ impl AsyncWrite for AsyncTcpStream {
             return Poll::Ready(Ok(0));
         }
 
-        let state = io_state();
-        // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
-        // self-referential fields; poll never moves fields after projection.
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        with_io_state(|state| {
+            // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
+            // self-referential fields; poll never moves fields after projection.
+            let this = unsafe { self.as_mut().get_unchecked_mut() };
 
-        // Clear stale POLLOUT completion (fire-and-forget).
-        if let Some(pollout_tok) = this.pollout_token.take() {
-            // SAFETY: pollout_tok belongs to this stream and is being cleared
-            // once before submitting/reusing any write state.
-            unsafe {
-                state.clear_slot(pollout_tok);
+            // Clear stale POLLOUT completion (fire-and-forget).
+            if let Some(pollout_tok) = this.pollout_token.take() {
+                // SAFETY: pollout_tok belongs to this stream and is being cleared
+                // once before submitting/reusing any write state.
+                unsafe {
+                    state.clear_slot(pollout_tok);
+                }
             }
-        }
 
-        if !bufs.is_empty() && this.write_token.is_none() {
-            match try_write_vectored(this.inner.as_raw_fd(), bufs) {
-                Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
+            if !bufs.is_empty() && this.write_token.is_none() {
+                match try_write_vectored(this.inner.as_raw_fd(), bufs) {
+                    Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
+                    Err(err) if is_wouldblock(&err) => {}
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
             }
-        }
 
-        let token = if let Some(token) = this.write_token {
-            // SAFETY: Single-threaded access.
-            if let Some(result) = unsafe { state.take_completed(token) } {
-                this.write_token = None;
-                return match result {
-                    Ok(crate::io::CompletionKind::WriteVectored { bytes_written, .. }) => {
-                        Poll::Ready(Ok(bytes_written))
-                    }
-                    Ok(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Unexpected completion",
-                    ))),
-                    Err(ref e) if is_write_wouldblock(e) => {
-                        // Same as poll_write: EAGAIN → POLLOUT → retry
-                        let pollout_op = crate::io::Op::PollAdd {
-                            fd: this.inner.as_raw_fd(),
-                            events: libc::POLLOUT as u32,
-                            multishot: false,
-                        };
-                        let pollout_tok = state.io_backend.submit(pollout_op);
-                        this.pollout_token = Some(pollout_tok);
-                        // SAFETY: pollout_tok was just submitted on this
-                        // shard; waker/task association is shard-local.
-                        unsafe {
-                            state.store_waker_and_pending_task(
-                                pollout_tok,
-                                cx.waker(),
-                                current_task_id(),
-                            );
+            let token = if let Some(token) = this.write_token {
+                // SAFETY: Single-threaded access.
+                if let Some(result) = unsafe { state.take_completed(token) } {
+                    this.write_token = None;
+                    return match result {
+                        Ok(crate::io::CompletionKind::WriteVectored { bytes_written, .. }) => {
+                            Poll::Ready(Ok(bytes_written))
                         }
-                        return Poll::Pending;
-                    }
-                    Err(e) => Poll::Ready(Err(e.into())),
+                        Ok(_) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected completion",
+                        ))),
+                        Err(ref e) if is_write_wouldblock(e) => {
+                            // Same as poll_write: EAGAIN → POLLOUT → retry
+                            let pollout_op = crate::io::Op::PollAdd {
+                                fd: this.inner.as_raw_fd(),
+                                events: libc::POLLOUT as u32,
+                                multishot: false,
+                            };
+                            let pollout_tok = state.io_backend.submit(pollout_op);
+                            this.pollout_token = Some(pollout_tok);
+                            // SAFETY: pollout_tok was just submitted on this
+                            // shard; waker/task association is shard-local.
+                            unsafe {
+                                state.store_waker_and_pending_task(
+                                    pollout_tok,
+                                    cx.waker(),
+                                    current_task_id(),
+                                );
+                            }
+                            return Poll::Pending;
+                        }
+                        Err(e) => Poll::Ready(Err(e.into())),
+                    };
+                }
+                token
+            } else {
+                let mut buffers: SmallVec<[crate::Buffer; 4]> = SmallVec::new();
+                for buf in bufs {
+                    buffers.push(crate::Buffer::from_slice(buf));
+                }
+                let op = crate::io::Op::WriteVectored {
+                    fd: this.inner.as_raw_fd(),
+                    buffers,
                 };
-            }
-            token
-        } else {
-            let mut buffers: SmallVec<[crate::Buffer; 4]> = SmallVec::new();
-            for buf in bufs {
-                buffers.push(crate::Buffer::from_slice(buf));
-            }
-            let op = crate::io::Op::WriteVectored {
-                fd: this.inner.as_raw_fd(),
-                buffers,
+                let token = state.io_backend.submit(op);
+                this.write_token = Some(token);
+                token
             };
-            let token = state.io_backend.submit(op);
-            this.write_token = Some(token);
-            token
-        };
-        // SAFETY: Single-threaded access.
-        unsafe {
-            state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-        }
-        Poll::Pending
+            // SAFETY: Single-threaded access.
+            unsafe {
+                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+            }
+            Poll::Pending
+        })
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -791,61 +792,62 @@ impl HyperRead for AsyncTcpStream {
             return Poll::Ready(Ok(()));
         }
 
-        let state = io_state();
-        let this = self.as_mut().get_mut();
-        let raw = unsafe { buf.as_mut() };
-        let read_buf =
-            unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
+        with_io_state(|state| {
+            let this = self.as_mut().get_mut();
+            let raw = unsafe { buf.as_mut() };
+            let read_buf =
+                unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
 
-        if this.read_token.is_none() {
-            match try_read(this.inner.as_raw_fd(), read_buf) {
-                Ok(bytes_read) => {
-                    // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
-                    unsafe {
-                        buf.advance(bytes_read);
-                    }
-                    return Poll::Ready(Ok(()));
-                }
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-        }
-
-        let token = if let Some(token) = this.read_token {
-            // SAFETY: Single-threaded access.
-            if let Some(result) = unsafe { state.take_completed(token) } {
-                this.read_token = None;
-                return match result {
-                    Ok(crate::io::CompletionKind::Read { bytes_read, data }) => {
-                        let copy_len = std::cmp::min(bytes_read, buf.remaining());
-                        if copy_len > 0 {
-                            buf.put_slice(&data[..copy_len]);
+            if this.read_token.is_none() {
+                match try_read(this.inner.as_raw_fd(), read_buf) {
+                    Ok(bytes_read) => {
+                        // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
+                        unsafe {
+                            buf.advance(bytes_read);
                         }
-                        Poll::Ready(Ok(()))
+                        return Poll::Ready(Ok(()));
                     }
-                    Ok(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Unexpected completion",
-                    ))),
-                    Err(e) => Poll::Ready(Err(e.into())),
-                };
+                    Err(err) if is_wouldblock(&err) => {}
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
             }
-            token
-        } else {
-            let op = crate::io::Op::Read {
-                fd: this.inner.as_raw_fd(),
-                offset: 0,
-                len: buf.remaining(),
+
+            let token = if let Some(token) = this.read_token {
+                // SAFETY: Single-threaded access.
+                if let Some(result) = unsafe { state.take_completed(token) } {
+                    this.read_token = None;
+                    return match result {
+                        Ok(crate::io::CompletionKind::Read { bytes_read, data }) => {
+                            let copy_len = std::cmp::min(bytes_read, buf.remaining());
+                            if copy_len > 0 {
+                                buf.put_slice(&data[..copy_len]);
+                            }
+                            Poll::Ready(Ok(()))
+                        }
+                        Ok(_) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected completion",
+                        ))),
+                        Err(e) => Poll::Ready(Err(e.into())),
+                    };
+                }
+                token
+            } else {
+                let op = crate::io::Op::Read {
+                    fd: this.inner.as_raw_fd(),
+                    offset: 0,
+                    len: buf.remaining(),
+                };
+                let token = state.io_backend.submit(op);
+                this.read_token = Some(token);
+                token
             };
-            let token = state.io_backend.submit(op);
-            this.read_token = Some(token);
-            token
-        };
-        // SAFETY: Single-threaded access.
-        unsafe {
-            state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-        }
-        Poll::Pending
+            // SAFETY: Single-threaded access.
+            unsafe {
+                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+            }
+            Poll::Pending
+        })
     }
 }
 
@@ -916,13 +918,12 @@ impl AsyncUdpSocket {
     }
 
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let state = io_state();
         let op = crate::io::Op::UdpRecv {
             fd: self.inner.as_raw_fd(),
             // Kernel writes into this owned buffer, so zero-fill is wasted work.
             buffer: Buffer::new_uninitialized(buf.len()),
         };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::UdpRecv {
@@ -947,12 +948,11 @@ impl AsyncUdpSocket {
     where
         T: RentBuffer,
     {
-        let state = io_state();
         let op = crate::io::Op::UdpRecv {
             fd: self.inner.as_raw_fd(),
             buffer: buffer.into(),
         };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::UdpRecv {
@@ -968,13 +968,12 @@ impl AsyncUdpSocket {
     }
 
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        let state = io_state();
         let op = crate::io::Op::UdpSend {
             fd: self.inner.as_raw_fd(),
             data: Buffer::from_slice(buf),
             addr: target,
         };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::UdpSend { bytes_written, .. } => Ok(bytes_written),

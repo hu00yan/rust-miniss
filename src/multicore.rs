@@ -25,10 +25,7 @@ use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cpu::{
-    clear_current_io_state, clear_current_timer, set_current_io_state, set_current_task_id,
-    set_current_timer, CpuIoState,
-};
+use crate::cpu::{current_core_id, set_current_task_id, CpuIoState, RuntimeContextGuard};
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
 use crate::task::{DetachedTaskFuture, Task};
@@ -42,13 +39,8 @@ const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 thread_local! {
-    static CURRENT_CORE_ID: Cell<Option<usize>> = const { Cell::new(None) };
     static LOCAL_SPAWN_QUEUE: RefCell<Vec<LocalSpawn>> = const { RefCell::new(Vec::new()) };
     static LOCAL_SPAWN_COUNT: Cell<usize> = const { Cell::new(0) };
-}
-
-fn current_core_id() -> Option<usize> {
-    CURRENT_CORE_ID.with(Cell::get)
 }
 
 fn push_local_spawn(task_id: TaskId, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
@@ -364,21 +356,16 @@ impl CpuCore {
     fn run(&mut self) -> Result<()> {
         // Bind to CPU core for optimal cache locality
         self.bind_to_cpu()?;
-        set_current_io_state(&self.io_state);
-        set_current_timer(&mut self.timer_wheel);
-
-        struct RuntimeContextGuard;
-        impl Drop for RuntimeContextGuard {
+        let _runtime_context =
+            RuntimeContextGuard::enter(&self.io_state, &mut self.timer_wheel, Some(self.id));
+        struct LocalSpawnContextGuard;
+        impl Drop for LocalSpawnContextGuard {
             fn drop(&mut self) {
                 LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().clear());
                 LOCAL_SPAWN_COUNT.with(|count| count.set(0));
-                CURRENT_CORE_ID.with(|core_id| core_id.set(None));
-                clear_current_timer();
-                clear_current_io_state();
             }
         }
-        let _context_guard = RuntimeContextGuard;
-        CURRENT_CORE_ID.with(|core_id| core_id.set(Some(self.id)));
+        let _local_spawn_context = LocalSpawnContextGuard;
 
         tracing::info!("CPU core {} started", self.id);
 

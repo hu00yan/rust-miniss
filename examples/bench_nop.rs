@@ -27,62 +27,62 @@ fn main() {
 
     runtime
         .spawn(async move {
-            let state = rust_miniss::cpu::io_state();
-
-            // Warmup: 2 batches
-            for _ in 0..2 {
-                for _ in 0..batch {
-                    state.io_backend.submit(rust_miniss::io::Op::Nop);
-                }
-                state.io_backend.flush();
-                let mut remaining: usize = batch;
-                while remaining > 0 {
-                    match state.io_backend.drain_completions() {
-                        std::task::Poll::Ready(cqes) => {
-                            remaining = remaining.saturating_sub(cqes.len());
-                        }
-                        std::task::Poll::Pending => {
-                            state.io_backend.flush();
-                            state.io_backend.park(std::time::Duration::from_millis(1));
+            rust_miniss::cpu::with_io_state(|state| {
+                // Warmup: 2 batches
+                for _ in 0..2 {
+                    for _ in 0..batch {
+                        state.io_backend.submit(rust_miniss::io::Op::Nop);
+                    }
+                    state.io_backend.flush();
+                    let mut remaining: usize = batch;
+                    while remaining > 0 {
+                        match state.io_backend.drain_completions() {
+                            std::task::Poll::Ready(cqes) => {
+                                remaining = remaining.saturating_sub(cqes.len());
+                            }
+                            std::task::Poll::Pending => {
+                                state.io_backend.flush();
+                                state.io_backend.park(std::time::Duration::from_millis(1));
+                            }
                         }
                     }
                 }
-            }
 
-            // Measured run
-            let total = batch * iterations;
-            let start = Instant::now();
+                // Measured run
+                let total = batch * iterations;
+                let start = Instant::now();
 
-            for _ in 0..iterations {
-                for _ in 0..batch {
-                    state.io_backend.submit(rust_miniss::io::Op::Nop);
-                }
-                state.io_backend.flush();
-                let mut remaining: usize = batch;
-                while remaining > 0 {
-                    match state.io_backend.drain_completions() {
-                        std::task::Poll::Ready(cqes) => {
-                            remaining = remaining.saturating_sub(cqes.len());
-                        }
-                        std::task::Poll::Pending => {
-                            state.io_backend.flush();
-                            state.io_backend.park(std::time::Duration::from_millis(1));
+                for _ in 0..iterations {
+                    for _ in 0..batch {
+                        state.io_backend.submit(rust_miniss::io::Op::Nop);
+                    }
+                    state.io_backend.flush();
+                    let mut remaining: usize = batch;
+                    while remaining > 0 {
+                        match state.io_backend.drain_completions() {
+                            std::task::Poll::Ready(cqes) => {
+                                remaining = remaining.saturating_sub(cqes.len());
+                            }
+                            std::task::Poll::Pending => {
+                                state.io_backend.flush();
+                                state.io_backend.park(std::time::Duration::from_millis(1));
+                            }
                         }
                     }
                 }
-            }
 
-            let elapsed = start.elapsed();
-            let ops = total as f64 / elapsed.as_secs_f64();
-            let ns = elapsed.as_nanos() as f64 / total as f64;
+                let elapsed = start.elapsed();
+                let ops = total as f64 / elapsed.as_secs_f64();
+                let ns = elapsed.as_nanos() as f64 / total as f64;
 
-            println!(
-                "batch={batch}  {total} NOPs  {:.4}s  {ops:>10.0} NOPs/sec  {ns:>6.0} ns/op",
-                elapsed.as_secs_f64(),
-            );
+                println!(
+                    "batch={batch}  {total} NOPs  {:.4}s  {ops:>10.0} NOPs/sec  {ns:>6.0} ns/op",
+                    elapsed.as_secs_f64(),
+                );
 
-            let _ = result_tx.send(ops);
-            d.store(true, Ordering::Release);
+                let _ = result_tx.send(ops);
+                d.store(true, Ordering::Release);
+            });
         })
         .ok();
 

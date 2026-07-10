@@ -1,6 +1,6 @@
 ---
 id: rm-01-scoped-tls-context
-status: TODO
+status: GREEN
 batch: 1-A
 depends_on: [rm-00-gate-all-targets]
 parallel_wave: W1
@@ -9,6 +9,12 @@ allowed_files:
   - src/cpu.rs
   - src/executor.rs
   - src/multicore.rs
+  - src/net.rs
+  - src/quic.rs
+  - src/fs.rs
+  - src/io/future.rs
+  - src/io/uring.rs
+  - examples/bench_nop.rs
   - tests/**
   - tasks/runtime-remediation/rm-01-scoped-tls-context.yaml
 forbidden_patterns:

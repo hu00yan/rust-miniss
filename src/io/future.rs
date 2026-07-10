@@ -3,7 +3,7 @@
 //! Also checks the multi-shot accept result queue for the token,
 //! enabling zero-syscall multi-shot accept handling.
 
-use crate::cpu::io_state;
+use crate::cpu::{try_with_io_state, with_io_state};
 use crate::io::{CompletionKind, IoError, IoToken};
 use crate::waker::TaskId;
 use std::future::Future;
@@ -49,28 +49,28 @@ impl Future for IoFuture {
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let state = io_state();
-
-        // Check if the completion is already available in the standard map.
-        // SAFETY: Single-threaded access.
-        if let Some(result) = unsafe { state.take_completed(this.token) } {
-            this.completed = true;
-            return Poll::Ready(result);
-        }
-
-        if this.is_accept {
-            // Check the multi-shot accept result queue.
-            if let Some(result) = state.io_backend.pop_accept_result(this.token) {
+        with_io_state(|state| {
+            // Check if the completion is already available in the standard map.
+            // SAFETY: Single-threaded access.
+            if let Some(result) = unsafe { state.take_completed(this.token) } {
                 this.completed = true;
                 return Poll::Ready(result);
             }
-        }
 
-        // Store the waker and cached task id in one slot lookup.
-        // SAFETY: Single-threaded access.
-        unsafe { state.store_waker_and_pending_task(this.token, cx.waker(), this.task_id) };
+            if this.is_accept {
+                // Check the multi-shot accept result queue.
+                if let Some(result) = state.io_backend.pop_accept_result(this.token) {
+                    this.completed = true;
+                    return Poll::Ready(result);
+                }
+            }
 
-        Poll::Pending
+            // Store the waker and cached task id in one slot lookup.
+            // SAFETY: Single-threaded access.
+            unsafe { state.store_waker_and_pending_task(this.token, cx.waker(), this.task_id) };
+
+            Poll::Pending
+        })
     }
 }
 
@@ -80,11 +80,11 @@ impl Drop for IoFuture {
             return;
         }
 
-        if let Some(state) = crate::cpu::try_io_state() {
+        try_with_io_state(|state| {
             // SAFETY: Single-threaded access.
             unsafe {
                 state.clear_slot(self.token);
             }
-        }
+        });
     }
 }

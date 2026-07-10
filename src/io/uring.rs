@@ -266,7 +266,8 @@ impl UringBackend {
         let pending_ops = &mut *self.pending_ops.get();
         let accept_results = &mut *self.accept_results.get();
         let slot_meta = &*self.slot_meta.get();
-        let io_state = crate::cpu::io_state();
+        // SAFETY: this method is itself restricted to the owning shard turn.
+        let io_state = unsafe { crate::cpu::current_io_state_unchecked() };
 
         let mut cq = ring.completion();
         cq.sync();
@@ -1343,9 +1344,11 @@ impl IoProvider for UringBackend {
                 queue.push_back(completion_result);
                 // SAFETY: token belongs to this shard and the waker slot is
                 // owned by the current io_state.
-                if let Some(waker) = unsafe { crate::cpu::io_state().take_waker(token) } {
-                    waker.wake();
-                }
+                crate::cpu::with_io_state(|io_state| unsafe {
+                    if let Some(waker) = io_state.take_waker(token) {
+                        waker.wake();
+                    }
+                });
                 continue;
             }
 

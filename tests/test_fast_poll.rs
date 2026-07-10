@@ -20,42 +20,41 @@ mod fast_poll_tests {
             let fd = listener.as_raw_fd();
             let addr = listener.local_addr().expect("Failed to get listener addr");
 
-            // Get the IO backend
-            let state = rust_miniss::cpu::io_state();
+            rust_miniss::cpu::with_io_state(|state| {
+                // Submit a oneshot poll for readability
+                let op = Op::PollAdd {
+                    fd,
+                    events: libc::POLLIN as u32,
+                    multishot: false,
+                };
 
-            // Submit a oneshot poll for readability
-            let op = Op::PollAdd {
-                fd,
-                events: libc::POLLIN as u32,
-                multishot: false,
-            };
+                let _token = state.io_backend.submit(op);
+                state.io_backend.flush();
+                let _client = TcpStream::connect(addr).expect("Failed to connect");
+                state.io_backend.park(Duration::from_millis(10));
 
-            let _token = state.io_backend.submit(op);
-            state.io_backend.flush();
-            let _client = TcpStream::connect(addr).expect("Failed to connect");
-            state.io_backend.park(Duration::from_millis(10));
-
-            // Poll for completion
-            let completions = match state.io_backend.drain_completions() {
-                std::task::Poll::Ready(comps) => comps,
-                std::task::Poll::Pending => {
-                    // Try again after a short delay
-                    std::thread::sleep(Duration::from_millis(10));
-                    match state.io_backend.drain_completions() {
-                        std::task::Poll::Ready(comps) => comps,
-                        std::task::Poll::Pending => panic!("PollAdd did not complete"),
+                // Poll for completion
+                let completions = match state.io_backend.drain_completions() {
+                    std::task::Poll::Ready(comps) => comps,
+                    std::task::Poll::Pending => {
+                        // Try again after a short delay
+                        std::thread::sleep(Duration::from_millis(10));
+                        match state.io_backend.drain_completions() {
+                            std::task::Poll::Ready(comps) => comps,
+                            std::task::Poll::Pending => panic!("PollAdd did not complete"),
+                        }
                     }
-                }
-            };
+                };
 
-            assert!(!completions.is_empty(), "Expected at least one completion");
+                assert!(!completions.is_empty(), "Expected at least one completion");
 
-            let (_, completion_result) = &completions[0];
-            assert!(
-                completion_result.is_ok(),
-                "PollAdd failed: {:?}",
-                completion_result
-            );
+                let (_, completion_result) = &completions[0];
+                assert!(
+                    completion_result.is_ok(),
+                    "PollAdd failed: {:?}",
+                    completion_result
+                );
+            });
         });
     }
 
@@ -73,48 +72,47 @@ mod fast_poll_tests {
             let fd = listener.as_raw_fd();
             let addr = listener.local_addr().expect("Failed to get listener addr");
 
-            // Get the IO backend
-            let state = rust_miniss::cpu::io_state();
+            rust_miniss::cpu::with_io_state(|state| {
+                // Submit a multishot poll for readability
+                let op = Op::PollAdd {
+                    fd,
+                    events: libc::POLLIN as u32,
+                    multishot: true,
+                };
 
-            // Submit a multishot poll for readability
-            let op = Op::PollAdd {
-                fd,
-                events: libc::POLLIN as u32,
-                multishot: true,
-            };
+                let _token = state.io_backend.submit(op);
+                state.io_backend.flush();
+                let _client = TcpStream::connect(addr).expect("Failed to connect");
+                state.io_backend.park(Duration::from_millis(10));
 
-            let _token = state.io_backend.submit(op);
-            state.io_backend.flush();
-            let _client = TcpStream::connect(addr).expect("Failed to connect");
-            state.io_backend.park(Duration::from_millis(10));
+                // Poll for completion - multishot should generate multiple completions
+                let mut completion_count = 0;
 
-            // Poll for completion - multishot should generate multiple completions
-            let mut completion_count = 0;
-
-            for _ in 0..3 {
-                match state.io_backend.drain_completions() {
-                    std::task::Poll::Ready(comps) => {
-                        completion_count += comps.len();
-                        if !comps.is_empty() {
-                            let (_, completion_result) = &comps[0];
-                            assert!(
-                                completion_result.is_ok(),
-                                "PollAdd failed: {:?}",
-                                completion_result
-                            );
+                for _ in 0..3 {
+                    match state.io_backend.drain_completions() {
+                        std::task::Poll::Ready(comps) => {
+                            completion_count += comps.len();
+                            if !comps.is_empty() {
+                                let (_, completion_result) = &comps[0];
+                                assert!(
+                                    completion_result.is_ok(),
+                                    "PollAdd failed: {:?}",
+                                    completion_result
+                                );
+                            }
+                        }
+                        std::task::Poll::Pending => {
+                            std::thread::sleep(Duration::from_millis(10));
                         }
                     }
-                    std::task::Poll::Pending => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
                 }
-            }
 
-            // Multishot should generate at least one completion
-            assert!(
-                completion_count >= 1,
-                "Expected at least one completion from multishot poll"
-            );
+                // Multishot should generate at least one completion
+                assert!(
+                    completion_count >= 1,
+                    "Expected at least one completion from multishot poll"
+                );
+            });
         });
     }
 }

@@ -9,7 +9,7 @@
 //! The implementation ensures memory safety and proper lifecycle management
 //! for asynchronous operations across all backends.
 
-use crate::cpu::io_state;
+use crate::cpu::with_io_state;
 use crate::io::{future::IoFuture, CompletionKind, Op};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::io;
@@ -151,13 +151,12 @@ impl AsyncFile {
         offset: u64,
         len: usize,
     ) -> io::Result<(usize, crate::buffer::Buffer)> {
-        let state = io_state();
         let op = Op::ReadFile {
             fd: self.inner.as_raw_fd(),
             offset,
             len,
         };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = IoFuture::new(token);
 
         match future.await {
@@ -199,14 +198,12 @@ impl AsyncFile {
     /// });
     /// ```
     pub async fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
-        let state = io_state();
-
         let op = Op::WriteFile {
             fd: self.inner.as_raw_fd(),
             offset,
             data: crate::buffer::Buffer::from_slice(buf),
         };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = IoFuture::new(token);
 
         match future.await {
@@ -244,11 +241,10 @@ impl AsyncFile {
     /// });
     /// ```
     pub async fn sync_all(&self) -> io::Result<()> {
-        let state = io_state();
         let op = Op::Fsync {
             fd: self.inner.as_raw_fd(),
         };
-        let token = state.io_backend.submit(op);
+        let token = with_io_state(|state| state.io_backend.submit(op));
         let future = IoFuture::new(token);
 
         match future.await {

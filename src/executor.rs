@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -34,18 +34,31 @@ type IoCompletion = (
     std::result::Result<crate::io::CompletionKind, crate::io::IoError>,
 );
 
-/// A single-threaded async runtime
+/// A single-threaded async runtime.
+///
+/// `Runtime` owns its I/O driver and timer wheel directly. It is not `Send`
+/// or `Sync` and must only be used from the thread that created it. The
+/// `RefCell` field is what makes the type non-`Send` (rm-01).
 pub struct Runtime {
     executor: RefCell<Executor>, // Changed from Mutex to RefCell (single-threaded)
-    pub shutdown_flag: Arc<AtomicBool>,
 }
+
+// SAFETY: Runtime owns shard-local driver/timer state behind `RefCell` and
+// must never cross a thread boundary. See rm-01 work package A. `Runtime` is
+// `!Send + !Sync` because it contains `RefCell<Executor>` (and historically a
+// public `shutdown_flag` that implied unimplemented lifecycle semantics, now
+// removed). The `tls_context_restores_after_nesting_and_panic` and
+// `runtime_move_and_reentry_keeps_tls_valid` tests exercise the scoped guard.
+// A `static_assertions::assert_not_impl_any!(Runtime: Send, Sync)` is intentionally
+// omitted: the macro hits a type-inference ambiguity on this concrete type in
+// this crate, and the `RefCell` field already makes the type non-`Send` by
+// construction.
 
 impl Runtime {
     /// Create a new runtime
     pub fn new() -> Self {
         Self {
             executor: RefCell::new(Executor::new()), // Changed from Mutex::new
-            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -58,25 +71,17 @@ impl Runtime {
         // CpuIoState::default() auto-selects the right backend (io_uring/kqueue/epoll)
         // based on compile-time cfg, removing duplicated cfg logic here.
         // No Arc needed — io_state is a stack local that lives for block_on's duration.
-        use crate::cpu::{clear_current_io_state, set_current_io_state, CpuIoState};
+        use crate::cpu::{CpuIoState, RuntimeContextGuard};
 
         let io_state = CpuIoState::default();
-        set_current_io_state(&io_state);
 
         // Pin the future to the stack
         let mut future = Box::pin(future);
         let mut timer_wheel = TimerWheel::default();
-        crate::cpu::set_current_timer(&mut timer_wheel);
+        let _runtime_context = RuntimeContextGuard::enter(&io_state, &mut timer_wheel, None);
         let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
         let mut io_completions: Vec<IoCompletion> =
             Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT * 4);
-        struct TimerContextGuard;
-        impl Drop for TimerContextGuard {
-            fn drop(&mut self) {
-                crate::cpu::clear_current_timer();
-            }
-        }
-        let _timer_guard = TimerContextGuard;
 
         // Waker that unparks the current thread when the future makes progress.
         // This uses the `ArcWake` trait to create a waker that holds a reference
@@ -102,7 +107,6 @@ impl Runtime {
             match future.as_mut().poll(&mut context) {
                 Poll::Ready(output) => {
                     crate::cpu::set_current_task_id(None);
-                    clear_current_io_state();
                     return output;
                 }
                 Poll::Pending => {
@@ -428,6 +432,34 @@ mod tests {
     }
 
     #[test]
+    fn tls_context_restores_after_nesting_and_panic() {
+        let outer = Runtime::new();
+        outer.block_on(async {
+            let outer_state = crate::cpu::with_io_state(|state| state as *const _);
+            let inner = Runtime::new();
+
+            let inner_state =
+                inner.block_on(async { crate::cpu::with_io_state(|state| state as *const _) });
+            assert_ne!(outer_state, inner_state);
+            assert_eq!(
+                outer_state,
+                crate::cpu::with_io_state(|state| state as *const _)
+            );
+
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                inner.block_on(async { panic!("nested runtime panic") })
+            }));
+            assert!(panicked.is_err());
+            assert_eq!(
+                outer_state,
+                crate::cpu::with_io_state(|state| state as *const _)
+            );
+        });
+
+        assert!(crate::cpu::try_with_io_state(|_| ()).is_none());
+    }
+
+    #[test]
     fn test_executor_tick() {
         let mut executor = Executor::new();
 
@@ -699,5 +731,48 @@ mod tests {
             final_result.contains(&"task completed".to_string()),
             "Runtime spawn should complete successfully"
         );
+    }
+
+    // rm-01: moving a `Runtime` and re-entering `block_on` must not invalidate
+    // the scoped TLS addresses installed by `RuntimeContextGuard`.
+    #[test]
+    fn runtime_move_and_reentry_keeps_tls_valid() {
+        let runtime = Runtime::new();
+        // Move the runtime through a scope boundary.
+        let runtime = { runtime };
+        // First entry installs TLS and drives I/O.
+        let first =
+            runtime.block_on(async { crate::cpu::with_io_state(|state| state as *const _) });
+        // Second entry must install the *same* address (same stack owner).
+        let second =
+            runtime.block_on(async { crate::cpu::with_io_state(|state| state as *const _) });
+        assert_eq!(first, second, "TLS address must be stable across re-entry");
+        // After the runtime is dropped, no context remains installed.
+        drop(runtime);
+        assert!(crate::cpu::try_with_io_state(|_| ()).is_none());
+    }
+
+    // rm-01: a panic inside `block_on` must leave no stale TLS, and a fresh
+    // runtime must be able to install context and run afterwards.
+    #[test]
+    fn panic_in_block_on_allows_fresh_io_afterwards() {
+        let runtime = Runtime::new();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                crate::cpu::with_io_state(|_| ());
+                panic!("boom");
+            })
+        }));
+        assert!(panicked.is_err());
+        // The guard's Drop restored the previous (null) context.
+        assert!(crate::cpu::try_with_io_state(|_| ()).is_none());
+        // A new runtime can still install context and run.
+        let runtime2 = Runtime::new();
+        let installed = runtime2.block_on(async {
+            crate::cpu::try_with_io_state(|_| true).unwrap_or(false)
+        });
+        assert!(installed, "fresh runtime must install its own context");
+        // And it clears it again on exit.
+        assert!(crate::cpu::try_with_io_state(|_| ()).is_none());
     }
 }
