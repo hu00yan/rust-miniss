@@ -1564,6 +1564,7 @@ impl MultiCoreRuntime {
     pub fn join(mut self) -> Result<()> {
         tracing::info!("Waiting for all cores to complete");
 
+        let mut failures = Vec::new();
         for (core_id, handle) in self.join_handles.drain(..).enumerate() {
             match handle.join() {
                 Ok(Ok(())) => {
@@ -1571,13 +1572,11 @@ impl MultiCoreRuntime {
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Core {} failed: {:?}", core_id, e);
-                    return Err(e);
+                    failures.push(format!("core {core_id}: {e:?}"));
                 }
                 Err(e) => {
                     tracing::error!("Failed to join core {} thread: {:?}", core_id, e);
-                    return Err(RuntimeError::TaskFailed(format!(
-                        "Thread join failed: {e:?}"
-                    )));
+                    failures.push(format!("core {core_id} thread join failed: {e:?}"));
                 }
             }
         }
@@ -1586,6 +1585,13 @@ impl MultiCoreRuntime {
         self.state
             .store(RuntimeState::Terminated as u8, Ordering::Release);
 
+        if !failures.is_empty() {
+            return Err(RuntimeError::TaskFailed(format!(
+                "{} worker failures: {}",
+                failures.len(),
+                failures.join("; ")
+            )));
+        }
         tracing::info!("All cores completed successfully");
         Ok(())
     }
@@ -1650,10 +1656,21 @@ impl RuntimeStats {
 impl Drop for MultiCoreRuntime {
     fn drop(&mut self) {
         let state = self.state.load(Ordering::Acquire);
+        if state == RuntimeState::Terminated as u8 || self.join_handles.is_empty() {
+            return;
+        }
         if state == RuntimeState::Running as u8 {
             tracing::warn!("Runtime dropped without explicit shutdown");
             let _ = self.shutdown();
         }
+        // Worker owns raw eventfd numbers borrowed from `core_wakeup_fds`;
+        // always join before those OwnedFd values are dropped.  Drop is a
+        // control-plane blocking path, never a data-plane operation.
+        for handle in self.join_handles.drain(..) {
+            let _ = handle.join();
+        }
+        self.state
+            .store(RuntimeState::Terminated as u8, Ordering::Release);
     }
 }
 

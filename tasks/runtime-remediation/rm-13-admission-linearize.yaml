@@ -1,6 +1,6 @@
 ---
 id: rm-13-admission-linearize
-status: TODO
+status: YELLOW
 batch: 3
 depends_on: [rm-12-shutdown-lifecycle]
 parallel_wave: W5

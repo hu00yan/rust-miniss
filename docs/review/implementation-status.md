@@ -18,6 +18,8 @@ authority for scope and acceptance.
 | rm-09 | YELLOW | YELLOW | Commit `4e25b39` removes the `u64::MAX` sentinel path and delivers real terminal completion errors for admission/SQ failures; regression test `af5199b` passes locally. Public `submit` remains token-returning rather than `Result`, so literal API acceptance is deferred. |
 | rm-10 | YELLOW | YELLOW | `cancel_task` now routes by full owner shard, propagates bounded-channel backpressure/disconnect, and rejects invalid owners; targeted regression passes. `JoinHandle::cancel` still lacks owner acknowledgement and future-drop completion. |
 | rm-11 | YELLOW | YELLOW | `CancellationToken` now uses lost-wake-safe `AtomicWaker` registration/recheck and wakes on cancel; permanently-pending regression passes. Broader shutdown integration remains. |
+| rm-12 | YELLOW | YELLOW | `join` now drains and aggregates all worker failures; `Drop` signals and joins every worker before eventfd ownership drops. Shutdown deadline/escalation and explicit I/O drain state machine remain. |
+| rm-13 | TODO | YELLOW | Static review confirms the state-check/send race remains: no owner acknowledgement or admission cutoff exists. This is a design seam, so no speculative patch was applied. |
 
 ## Review boundary
 
