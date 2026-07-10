@@ -276,7 +276,7 @@ fn linux_uring_delayed_submit_readv_survives_relocation_pressure() {
             AsyncTcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
         let expected: Vec<u8> = (0..count)
-            .flat_map(|part| std::iter::repeat((part + 1) as u8).take(23))
+            .flat_map(|part| std::iter::repeat_n((part + 1) as u8, 23))
             .collect();
         let (connected_tx, connected_rx) = mpsc::sync_channel(1);
         let (write_tx, write_rx) = mpsc::sync_channel(1);

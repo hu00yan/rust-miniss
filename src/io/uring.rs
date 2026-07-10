@@ -1804,8 +1804,7 @@ mod stable_iovec_tests {
                 iovecs: Box<[iovec]>,
             }
             let pending = FakePending { iovecs };
-            let mut slab: Vec<Option<FakePending>> = Vec::new();
-            slab.push(Some(pending));
+            let slab: Vec<Option<FakePending>> = vec![Some(pending)];
 
             // Delayed submit / kernel CQE window: pointer must still be valid.
             let live = slab[0].as_ref().unwrap();
