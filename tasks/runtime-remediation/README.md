@@ -29,7 +29,7 @@
 | [rm-14](rm-14-multishot-accept.yaml) | Multishot accept bounds/OwnedFd | 4 | rm-07, rm-09 | W4 |
 | [rm-15](rm-15-affinity-local-spawn.yaml) | Affinity + local spawn + HTTP | 4 | rm-02, rm-05 | W4 |
 | [rm-16](rm-16-quic-signal-global.yaml) | QUIC token + signal + global join | 2/3 | rm-07, rm-12 | W5 |
-| [rm-17](rm-17-arch-audit-safety-tests.yaml) | Arch-audit hardening + Miri/Loom | 5 | rm-04, rm-08 (partial earlier OK) | W1+ final |
+| [rm-17](rm-17-arch-audit-safety-tests.yaml) | Arch-audit hardening + Miri/Loom | 5 | rm-04, rm-08 (partial earlier OK) | W1+ final (YELLOW: hooks added; host audit has legacy control-path false positives) |
 
 ## Recommended execution order
 

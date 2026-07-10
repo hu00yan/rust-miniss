@@ -1,6 +1,6 @@
 ---
 id: rm-17-arch-audit-safety-tests
-status: TODO
+status: YELLOW
 batch: 5
 depends_on: [rm-04-safe-waker, rm-08-buffer-init]
 parallel_wave: W1-partial + final

@@ -132,3 +132,11 @@ fmt:
 # Clippy only
 clippy:
     cargo clippy --all-targets -- -D warnings
+
+# Optional safety-model hooks. These are explicit because Miri/Loom are not
+# available on every host; CI or a Linux toolchain can enable them.
+miri-safety:
+    cargo miri test --all-features --lib cpu:: executor:: waker:: buffer::
+
+loom-safety:
+    LOOM_MAX_PREEMPTIONS=3 cargo test --all-features --lib loom_

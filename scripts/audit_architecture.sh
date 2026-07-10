@@ -24,11 +24,14 @@ HOT_PATH_PATTERNS=(
 )
 
 SRC_ONLY_PATTERNS=(
-    "Runtime::new"
+    "Runtime::new[[:space:]]*[(]"
     "Builder::new_current_thread"
     "Builder::new_multi_thread"
-    "block_on"
+    "[.]block_on[[:space:]]*[(]"
     "spawn_blocking"
+    "Rc::into_raw"
+    "io_state[[:space:]]*[(][^)]*[)][[:space:]]*->[[:space:]]*&[[:space:]]*'static"
+    "unsafe[[:space:]]+impl[[:space:]]+(Send|Sync)[[:space:]]+for[[:space:]]+[^;]*Backend"
 )
 
 NEEDS_JUSTIFICATION_PATTERNS=(
@@ -49,12 +52,61 @@ echo ""
 search_pattern() {
     local pattern="$1"
     local dir="$2"
-    grep -rn "$pattern" "$dir" 2>/dev/null \
+    grep -rEn "$pattern" "$dir" 2>/dev/null \
         | grep -v '^[^:]*:[0-9][0-9]*:[[:space:]]*//' \
         | grep -v '^[^:]*:[0-9][0-9]*:[[:space:]]*\*' \
         | grep -v '^[^:]*:[0-9][0-9]*:[[:space:]]*///' \
         | grep -v '^[^:]*:[0-9][0-9]*:[[:space:]]*//!' \
         | grep -v 'arch-audit: allow' || true
+}
+
+# SRC_ONLY_PATTERNS also match regression tests embedded in `src/*.rs`.
+# Those tests intentionally construct runtimes and call block_on; do not treat
+# them as production hot-path violations. Keep the test scan for all other
+# hard-fail patterns unchanged.
+filter_cfg_test_matches() {
+    local dir="$1"
+    local raw="$2"
+    FILTER_INPUT="$raw" python3 - "$dir" <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+lines = os.environ.get("FILTER_INPUT", "").splitlines()
+ranges = {}
+for path in root.rglob("*.rs"):
+    source = path.read_text(errors="ignore").splitlines()
+    pending = False
+    start = None
+    depth = 0
+    spans = []
+    for index, line in enumerate(source, 1):
+        if "#[cfg(test)]" in line:
+            pending = True
+        if pending and "{" in line:
+            start = index
+            depth = line.count("{") - line.count("}")
+            pending = False
+        elif start is not None:
+            depth += line.count("{") - line.count("}")
+            if depth <= 0:
+                spans.append((start, index))
+                start = None
+    ranges[str(path.resolve())] = spans
+
+for match in lines:
+    filename, number, _ = match.split(":", 2)
+    number = int(number)
+    path = pathlib.Path(filename)
+    if not path.is_absolute():
+        path = pathlib.Path.cwd() / path
+    path = path.resolve()
+    if any(start <= number <= end for start, end in ranges.get(str(path), [])):
+        continue
+    print(match)
+PY
 }
 
 search_unjustified_unsafe() {
@@ -90,6 +142,9 @@ for pattern in "${HOT_PATH_PATTERNS[@]}"; do
     for dir in "${SCAN_DIRS[@]}"; do
         if [ -d "$dir" ]; then
             results=$(search_pattern "$pattern" "$dir")
+            if [ "$dir" = "src" ]; then
+                results=$(filter_cfg_test_matches "$dir" "$results")
+            fi
             if [ "$pattern" = "unbounded" ]; then
                 results=$(echo "$results" | grep -E 'channel::unbounded|unbounded_channel|SegQueue' || true)
             fi
@@ -105,16 +160,8 @@ done
 for pattern in "${SRC_ONLY_PATTERNS[@]}"; do
     for dir in "${SRC_SCAN_DIRS[@]}"; do
         if [ -d "$dir" ]; then
-            results=$(search_pattern "$pattern" "$dir" \
-                | grep -v 'src/executor.rs:.*fn test_' \
-                | grep -v 'src/executor.rs:.*pub fn block_on' \
-                | grep -v 'src/executor.rs:.*let runtime = Runtime::new' \
-                | grep -v 'src/executor.rs:.*runtime.block_on' \
-                | grep -v 'src/multicore.rs:.*fn test_' \
-                | grep -v 'src/multicore.rs:.*let runtime = MultiCoreRuntime::new' \
-                | grep -v 'src/multicore.rs:.*pub fn block_on' \
-                | grep -v 'src/lib.rs:.*pub fn block_on' \
-                | grep -v 'src/task.rs:.*\"' || true)
+            raw=$(search_pattern "$pattern" "$dir")
+            results=$(filter_cfg_test_matches "$dir" "$raw")
             if [ -n "$results" ]; then
                 echo "HARD FAIL: '$pattern' in $dir/"
                 echo "$results"

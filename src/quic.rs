@@ -1,4 +1,4 @@
-use crate::cpu::{current_task_id, with_io_state};
+use crate::cpu::{current_core_id, current_task_id, with_io_state};
 use crate::io::IoToken;
 use crate::multicore::MultiCoreRuntime;
 use crate::timer::SleepFuture;
@@ -12,7 +12,7 @@ use std::net::UdpSocket;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::task::{Context, Poll};
@@ -101,7 +101,10 @@ pub struct MinissUdpSocket {
     inner: UdpSocket,
     state: quinn::udp::UdpSocketState,
     recv_token: AtomicU64,
+    owner_core: AtomicUsize,
 }
+
+const UNOWNED_CORE: usize = usize::MAX;
 
 impl MinissUdpSocket {
     fn new(socket: UdpSocket) -> io::Result<Self> {
@@ -110,6 +113,7 @@ impl MinissUdpSocket {
             inner: socket,
             state,
             recv_token: AtomicU64::new(0),
+            owner_core: AtomicUsize::new(UNOWNED_CORE),
         })
     }
 
@@ -131,14 +135,33 @@ impl MinissUdpSocket {
             self.recv_token
                 .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire);
     }
+
+    fn ensure_owner(&self) -> io::Result<()> {
+        let core = current_core_id()
+            .ok_or_else(|| io::Error::other("QUIC I/O requires a miniss worker shard"))?;
+        match self.owner_core.compare_exchange(
+            UNOWNED_CORE,
+            core,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(owner) if owner == core => Ok(()),
+            Err(owner) => Err(io::Error::other(format!(
+                "QUIC socket owned by shard {owner}, polled from shard {core}"
+            ))),
+        }
+    }
 }
 
 impl Drop for MinissUdpSocket {
     fn drop(&mut self) {
-        if let Some(token) = self.load_recv_token() {
-            with_io_state(|state| unsafe {
-                state.clear_slot(token);
-            });
+        if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
+            if let Some(token) = self.load_recv_token() {
+                with_io_state(|state| unsafe {
+                    state.clear_slot(token);
+                });
+            }
         }
     }
 }
@@ -158,6 +181,9 @@ impl AsyncUdpSocket for MinissUdpSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        if let Err(err) = self.ensure_owner() {
+            return Poll::Ready(Err(err));
+        }
         with_io_state(|state| {
             if let Some(token) = self.load_recv_token() {
                 if let Some(result) = unsafe { state.take_completed(token) } {
@@ -215,6 +241,7 @@ impl AsyncUdpSocket for MinissUdpSocket {
 struct MinissUdpPoller {
     socket: Arc<MinissUdpSocket>,
     token: AtomicU64,
+    owner_core: AtomicUsize,
 }
 
 impl MinissUdpPoller {
@@ -222,6 +249,7 @@ impl MinissUdpPoller {
         Self {
             socket,
             token: AtomicU64::new(0),
+            owner_core: AtomicUsize::new(UNOWNED_CORE),
         }
     }
 
@@ -243,20 +271,45 @@ impl MinissUdpPoller {
             .token
             .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire);
     }
+
+    fn ensure_owner(&self) -> io::Result<()> {
+        let core = current_core_id()
+            .ok_or_else(|| io::Error::other("QUIC I/O requires a miniss worker shard"))?;
+        match self.owner_core.compare_exchange(
+            UNOWNED_CORE,
+            core,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(owner) if owner == core => Ok(()),
+            Err(owner) => Err(io::Error::other(format!(
+                "QUIC poller owned by shard {owner}, polled from shard {core}"
+            ))),
+        }
+    }
 }
 
 impl Drop for MinissUdpPoller {
     fn drop(&mut self) {
-        if let Some(token) = self.load_token() {
-            with_io_state(|state| unsafe {
-                state.clear_slot(token);
-            });
+        if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
+            if let Some(token) = self.load_token() {
+                with_io_state(|state| unsafe {
+                    state.clear_slot(token);
+                });
+            }
         }
     }
 }
 
 impl UdpPoller for MinissUdpPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Err(err) = self.socket.ensure_owner() {
+            return Poll::Ready(Err(err));
+        }
+        if let Err(err) = self.ensure_owner() {
+            return Poll::Ready(Err(err));
+        }
         with_io_state(|state| {
             if let Some(token) = self.load_token() {
                 if let Some(result) = unsafe { state.take_completed(token) } {

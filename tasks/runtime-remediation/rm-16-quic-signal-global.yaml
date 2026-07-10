@@ -1,6 +1,6 @@
 ---
 id: rm-16-quic-signal-global
-status: TODO
+status: YELLOW
 batch: 2/3
 depends_on: [rm-07-descriptor-lease, rm-12-shutdown-lifecycle]
 parallel_wave: W5

@@ -22,6 +22,8 @@ authority for scope and acceptance.
 | rm-13 | TODO | YELLOW | Static review confirms the state-check/send race remains: no owner acknowledgement or admission cutoff exists. This is a design seam, so no speculative patch was applied. |
 | rm-14 | YELLOW | YELLOW | io_uring multishot accept result queues are capped at 256; overflow accepted fds are closed, and terminal errors clear listener tokens. Capability probing and `OwnedFd` delivery remain. |
 | rm-15 | YELLOW | YELLOW | `spawn_local` now accepts `!Send` futures, stores them in shard-local storage, and has an `Rc` regression test; check/clippy and multicore tests pass. `block_on_cpu`, physical-core affinity, readiness ordering, and HTTP keep-local path remain. |
+| rm-16 | YELLOW | YELLOW | QUIC UDP socket/poller now bind to the first worker shard that polls them; cross-shard poll and non-owner token clearing are rejected/avoided. clippy/check pass. Signal lifecycle, blocking send, and global-runtime join remain. |
+| rm-17 | YELLOW | YELLOW | Audit now checks escaped raw-Rc/TLS/unsafe-backend patterns and adds optional Miri/Loom recipes; cfg(test) runtime calls are filtered. One startup-only global-runtime construction remains reported, plus existing unsafe justifications. |
 
 ## Review boundary
 
