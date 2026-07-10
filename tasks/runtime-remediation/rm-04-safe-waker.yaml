@@ -1,6 +1,6 @@
 ---
 id: rm-04-safe-waker
-status: TODO
+status: YELLOW
 batch: 1-B
 depends_on: [rm-03-task-key-arena]
 parallel_wave: W2
@@ -34,6 +34,12 @@ review_questions:
   - Can a wake be silently dropped when mailbox full? (must sticky-overflow or equivalent)
 architecture_audit: |
   Arc/atomic only for cross-thread wake seam. Ready queue remains shard-owned. No Arc<Mutex>.
+
+## Verification (2026-07-11)
+
+Raw Rc/raw-pointer waker removed. Bounded `Arc<ArrayQueue>` and scheduled/active
+dedup state pass 49 lib tests, including cross-thread and late wake. Queue-full
+overflow recovery remains before GREEN.
 ---
 
 # rm-04: Safe waker
