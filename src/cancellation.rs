@@ -3,6 +3,7 @@
 //! This module provides utilities for implementing cooperative task cancellation.
 //! Tasks should periodically check for cancellation and exit early when requested.
 
+use futures::task::AtomicWaker;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    waker: Arc<AtomicWaker>,
 }
 
 impl CancellationToken {
@@ -17,12 +19,14 @@ impl CancellationToken {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            waker: Arc::new(AtomicWaker::new()),
         }
     }
 
     /// Cancel the token
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.waker.wake();
     }
 
     /// Check if cancellation has been requested
@@ -72,6 +76,13 @@ where
             return std::task::Poll::Ready(Err(crate::task::TaskError::Cancelled));
         }
 
+        // Register before the second check: cancellation racing this poll
+        // either sees the registered waker or is observed by this recheck.
+        this.token.waker.register(cx.waker());
+        if this.token.is_cancelled() {
+            return std::task::Poll::Ready(Err(crate::task::TaskError::Cancelled));
+        }
+
         // Poll the inner future
         // SAFETY: `inner` is pinned in place by the parent CancellableFuture
         // and is not moved before or after this delegated poll.
@@ -79,5 +90,45 @@ where
             std::task::Poll::Ready(value) => std::task::Poll::Ready(Ok(value)),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct Never;
+    impl Future for Never {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    struct WakeCounter(Arc<AtomicUsize>);
+    impl futures::task::ArcWake for WakeCounter {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn cancellation_wakes_permanently_pending_future() {
+        let token = CancellationToken::new();
+        let mut future = Box::pin(Never.cancellable(token.clone()));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = futures::task::waker(Arc::new(WakeCounter(wakes.clone())));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        token.cancel();
+        assert!(wakes.load(Ordering::Acquire) > 0);
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(crate::task::TaskError::Cancelled))
+        ));
     }
 }

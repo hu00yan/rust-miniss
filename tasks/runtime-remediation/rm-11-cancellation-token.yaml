@@ -1,6 +1,6 @@
 ---
 id: rm-11-cancellation-token
-status: TODO
+status: YELLOW
 batch: 2
 depends_on: [rm-04-safe-waker]
 parallel_wave: W3
