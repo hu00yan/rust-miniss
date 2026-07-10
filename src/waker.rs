@@ -9,7 +9,7 @@
 use crossbeam_queue::ArrayQueue;
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU16, Ordering},
     Arc,
 };
 use std::task::Waker;
@@ -25,6 +25,19 @@ pub struct TaskKey {
     pub shard: u16,
     pub slot: u16,
     pub generation: u16,
+}
+
+static NEXT_RUNTIME_GENERATION: AtomicU16 = AtomicU16::new(1);
+
+/// Allocate a non-zero runtime identity for task keys. Wraparound is
+/// unavoidable in the compact public key, but zero is reserved as invalid.
+pub(crate) fn next_runtime_generation() -> u16 {
+    let generation = NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if generation == 0 {
+        1
+    } else {
+        generation
+    }
 }
 
 impl TaskKey {
@@ -58,7 +71,7 @@ pub struct TaskArena<T> {
 impl<T> TaskArena<T> {
     pub fn with_capacity(runtime_generation: u16, shard: u16, capacity: usize) -> Self {
         assert!(
-            capacity <= u16::MAX as usize,
+            capacity <= u16::MAX as usize + 1,
             "task arena capacity exceeds key space"
         );
         let mut free = VecDeque::with_capacity(capacity);
@@ -103,6 +116,44 @@ impl<T> TaskArena<T> {
         true
     }
 
+    /// Admit an externally allocated key (for example, a bounded cross-shard
+    /// message). The first key initializes a vacant slot; every reuse must
+    /// advance the arena generation, so a delayed old message cannot recreate
+    /// a terminal occupant.
+    pub fn insert_external(&mut self, key: TaskKey, value: T) -> bool {
+        if key.runtime_generation != self.runtime_generation
+            || key.shard != self.shard
+            || key.generation == 0
+        {
+            return false;
+        }
+        let slot_index = key.slot as usize;
+        if slot_index >= self.slots.len() {
+            return false;
+        }
+        if self
+            .slots
+            .get(slot_index)
+            .and_then(Option::as_ref)
+            .is_some()
+        {
+            return false;
+        }
+        let current_generation = self.generations[slot_index];
+        let expected = if current_generation == 0 {
+            key.generation
+        } else {
+            current_generation.wrapping_add(1).max(1)
+        };
+        if expected != key.generation {
+            return false;
+        }
+        self.generations[slot_index] = key.generation;
+        self.free.retain(|free_slot| *free_slot != key.slot);
+        self.slots[slot_index] = Some(value);
+        true
+    }
+
     pub fn get(&self, key: TaskKey) -> Option<&T> {
         if self.matches(key) {
             self.slots[key.slot as usize].as_ref()
@@ -132,6 +183,22 @@ impl<T> TaskArena<T> {
 
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// Iterate over occupied slots without exposing arena internals.
+    pub fn iter(&self) -> impl Iterator<Item = Option<&T>> {
+        self.slots.iter().map(Option::as_ref)
+    }
+
+    /// Drop all occupants and make every slot available for a future
+    /// generation. Generation values are intentionally retained.
+    pub fn clear(&mut self) {
+        for slot in &mut self.slots {
+            slot.take();
+        }
+        self.free.clear();
+        self.free
+            .extend((0..self.slots.len()).map(|slot| slot as u16));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -189,6 +256,10 @@ impl TaskId {
     }
 
     pub fn new(core_id: usize, sequence: u32) -> Self {
+        Self::new_for_runtime(1, core_id, sequence)
+    }
+
+    pub fn new_for_runtime(runtime_generation: u16, core_id: usize, sequence: u32) -> Self {
         assert!(
             core_id <= u16::MAX as usize,
             "core id exceeds task key space"
@@ -198,7 +269,12 @@ impl TaskId {
         // prevents the old u32 truncation from silently aliasing a live slot.
         let slot = sequence as u16;
         let generation = (sequence >> 16).saturating_add(1).min(u16::MAX as u32) as u16;
-        Self::from_key(TaskKey::new(1, core_id as u16, slot, generation))
+        Self::from_key(TaskKey::new(
+            runtime_generation,
+            core_id as u16,
+            slot,
+            generation,
+        ))
     }
 }
 
@@ -210,6 +286,9 @@ pub(crate) struct WakerState {
     queue: ReadyQueue,
     owner_thread: std::thread::Thread,
     scheduled: AtomicBool,
+    /// Set when the bounded queue was full. The owner retries this marker
+    /// after draining the queue so a one-shot wake cannot be lost.
+    overflowed: AtomicBool,
     active: AtomicBool,
 }
 
@@ -220,6 +299,7 @@ impl WakerState {
             queue,
             owner_thread: std::thread::current(),
             scheduled: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
             active: AtomicBool::new(true),
         })
     }
@@ -229,17 +309,38 @@ impl WakerState {
             return;
         }
         if self.queue.push(self.task_id).is_err() {
+            // Keep a sticky marker. There may be no later wake call after a
+            // one-shot future observes a full queue; the owner-side retry
+            // closes that lost-wake window without growing the queue.
+            self.overflowed.store(true, Ordering::Release);
             self.scheduled.store(false, Ordering::Release);
+            // Wake the owner even when the queue is full: the owner-side
+            // retry path is what makes the sticky marker observable before
+            // the worker parks.
+            self.owner_thread.unpark();
             return;
         }
+        self.overflowed.store(false, Ordering::Release);
         self.owner_thread.unpark();
+    }
+
+    /// Retry a previously failed enqueue after the owner made queue capacity
+    /// available. Returns whether the retry successfully queued the task.
+    pub(crate) fn retry_overflowed(&self) -> bool {
+        if !self.overflowed.load(Ordering::Acquire) {
+            return false;
+        }
+        self.schedule();
+        !self.overflowed.load(Ordering::Acquire)
     }
     pub(crate) fn begin_poll(&self) {
         self.scheduled.store(false, Ordering::Release);
+        self.overflowed.store(false, Ordering::Release);
     }
     pub(crate) fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
         self.scheduled.store(false, Ordering::Release);
+        self.overflowed.store(false, Ordering::Release);
     }
 }
 
@@ -305,8 +406,22 @@ mod tests {
         let mut arena = TaskArena::<u8>::with_capacity(3, 1, 1);
         let key = arena.reserve().unwrap();
         assert!(arena.reserve().is_none());
+        assert!(!arena.insert_external(TaskKey::new(3, 1, 1, 1), 9));
         assert!(!arena.insert(TaskKey::new(3, 2, key.slot, key.generation), 1));
         assert!(arena.insert(key, 1));
+    }
+
+    #[test]
+    fn task_arena_external_admission_advances_generation() {
+        let mut arena = TaskArena::<u8>::with_capacity(4, 3, 1);
+        let first = TaskKey::new(4, 3, 0, 1);
+        assert!(arena.insert_external(first, 7));
+        assert!(!arena.insert_external(first, 8));
+        assert_eq!(arena.remove(first), Some(7));
+        let next = TaskKey::new(4, 3, 0, 2);
+        assert!(arena.insert_external(next, 8));
+        assert_eq!(arena.get(first), None);
+        assert_eq!(arena.get(next), Some(&8));
     }
 
     #[test]
@@ -398,5 +513,22 @@ mod tests {
         state.deactivate();
         waker.wake_by_ref();
         assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn full_ready_queue_retries_sticky_wake_after_drain() {
+        let queue = Arc::new(ArrayQueue::new(1));
+        let occupied = TaskId::new(0, 1);
+        let pending = TaskId::new(0, 2);
+        queue.push(occupied).unwrap();
+
+        let (_waker, state) = create_waker(pending, queue.clone());
+        state.schedule();
+        assert_eq!(queue.pop(), Some(occupied));
+
+        // No second wake is issued: owner-side retry must deliver the
+        // original one-shot wake once capacity is available.
+        assert!(state.retry_overflowed());
+        assert_eq!(queue.pop(), Some(pending));
     }
 }

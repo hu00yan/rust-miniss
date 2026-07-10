@@ -291,6 +291,14 @@ impl Task {
         }
     }
 
+    /// Retry a wake that could not enter the bounded queue while it was full.
+    #[inline]
+    pub(crate) fn retry_overflowed_wake(&self) -> bool {
+        self.wake_state
+            .as_ref()
+            .is_some_and(|state| state.retry_overflowed())
+    }
+
     /// Ensure a cached waker exists and return pointer to it for Context setup.
     #[inline(always)]
     pub fn cached_waker_ptr(&mut self, queue: ReadyQueue) -> *const Waker {

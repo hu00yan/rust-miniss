@@ -21,14 +21,13 @@
 use crossbeam_queue::ArrayQueue;
 use std::cell::RefCell;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::cpu::CpuIoState;
 use crate::task::{DetachedTaskFuture, JoinHandle, JoinTaskFuture, Task};
 use crate::timer::TimerWheel;
-use crate::waker::{ReadyQueue, TaskId};
+use crate::waker::{ReadyQueue, TaskArena, TaskId};
 
 type IoCompletion = (
     crate::io::IoToken,
@@ -247,9 +246,10 @@ impl Default for Runtime {
 
 /// The core executor that manages task scheduling
 pub struct Executor {
-    tasks: Vec<Option<Task>>,
+    /// Fixed-capacity generational storage.  Ready records carry the full
+    /// key, so an old wake can never address a replacement task.
+    tasks: TaskArena<Task>,
     ready_queue: ReadyQueue,
-    next_task_id: AtomicU64,
     active_tasks: usize,
     park_timeout: std::time::Duration,
     /// Maximum tasks polled before returning control to the event loop.
@@ -273,19 +273,11 @@ impl Executor {
         poll_budget: usize,
     ) -> Self {
         Self {
-            tasks: Vec::with_capacity(256),
+            tasks: TaskArena::with_capacity(crate::waker::next_runtime_generation(), 0, 65_536),
             ready_queue: Arc::new(ArrayQueue::new(65_536)),
-            next_task_id: AtomicU64::new(1),
             active_tasks: 0,
             park_timeout,
             poll_budget: poll_budget.max(1),
-        }
-    }
-
-    #[inline]
-    fn ensure_task_capacity(&mut self, idx: usize) {
-        if idx >= self.tasks.len() {
-            self.tasks.resize_with(idx + 1, || None);
         }
     }
 
@@ -328,9 +320,11 @@ impl Executor {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let sequence = self.next_task_id.fetch_add(1, Ordering::Relaxed) as u32;
-        let task_id = TaskId::new(0, sequence);
-        let idx = task_id.key().slot as usize;
+        let key = self
+            .tasks
+            .reserve()
+            .expect("executor task arena capacity exhausted");
+        let task_id = TaskId::from_key(key);
 
         let (handle, completer) = JoinHandle::new(task_id);
         let wrapped_future = JoinTaskFuture::new(future, completer);
@@ -338,11 +332,10 @@ impl Executor {
         // Create the task
         let mut task = Task::new(task_id, wrapped_future);
 
-        // Add to our task list and ready queue
-        self.ensure_task_capacity(idx);
+        // Add to the generational arena and ready queue.
         task.ensure_waker(self.ready_queue.clone());
         task.schedule();
-        self.tasks[idx] = Some(task);
+        assert!(self.tasks.insert(key, task));
         self.active_tasks += 1;
 
         handle
@@ -353,15 +346,16 @@ impl Executor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let sequence = self.next_task_id.fetch_add(1, Ordering::Relaxed) as u32;
-        let task_id = TaskId::new(0, sequence);
-        let idx = task_id.key().slot as usize;
+        let key = self
+            .tasks
+            .reserve()
+            .expect("executor task arena capacity exhausted");
+        let task_id = TaskId::from_key(key);
 
         let mut task = Task::new(task_id, DetachedTaskFuture::new(future));
-        self.ensure_task_capacity(idx);
         task.ensure_waker(self.ready_queue.clone());
         task.schedule();
-        self.tasks[idx] = Some(task);
+        assert!(self.tasks.insert(key, task));
         self.active_tasks += 1;
 
         task_id
@@ -377,35 +371,39 @@ impl Executor {
                 break;
             };
             polled += 1;
-            let idx = task_id.key().slot as usize;
-            let is_current = self
-                .tasks
-                .get(idx)
-                .and_then(Option::as_ref)
-                .is_some_and(|task| task.id() == task_id);
-            if is_current {
-                if let Some(mut task) = self.tasks[idx].take() {
-                    // Reuse the task-local waker cache so the hot path does not
-                    // allocate or clone a new waker on every poll.
-                    crate::cpu::set_current_task_id(Some(task_id));
-                    let poll_result = task.poll_with_cached_waker();
-                    crate::cpu::set_current_task_id(None);
+            let key = task_id.key();
+            let poll_result = {
+                let Some(task) = self.tasks.get_mut(key) else {
+                    continue;
+                };
+                if task.id() != task_id {
+                    continue;
+                }
+                // Reuse the task-local waker cache so the hot path does not
+                // allocate or clone a new waker on every poll.
+                crate::cpu::set_current_task_id(Some(task_id));
+                let result = task.poll_with_cached_waker();
+                crate::cpu::set_current_task_id(None);
+                result
+            };
 
-                    match poll_result {
-                        Poll::Ready(()) => {
-                            // Task completed successfully, don't put it back
-                            self.active_tasks = self.active_tasks.saturating_sub(1);
-                            made_progress = true;
-                        }
-                        Poll::Pending => {
-                            // Task is still pending, put it back
-                            self.ensure_task_capacity(idx);
-                            self.tasks[idx] = Some(task);
-                            made_progress = true;
-                        }
-                    }
+            match poll_result {
+                Poll::Ready(()) => {
+                    self.tasks.remove(key);
+                    self.active_tasks = self.active_tasks.saturating_sub(1);
+                    made_progress = true;
+                }
+                Poll::Pending => {
+                    made_progress = true;
                 }
             }
+        }
+
+        // A wake can arrive exactly while the bounded queue is full. Retry
+        // sticky overflow markers after consuming this turn's records so a
+        // one-shot wake cannot strand a pending task forever.
+        for task in self.tasks.iter().flatten() {
+            made_progress |= task.retry_overflowed_wake();
         }
 
         made_progress

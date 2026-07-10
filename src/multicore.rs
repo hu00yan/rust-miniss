@@ -30,7 +30,7 @@ use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
 use crate::task::{DetachedTaskFuture, Task};
 use crate::timer::TimerWheel;
-use crate::waker::{ReadyQueue, TaskId};
+use crate::waker::{next_runtime_generation, ReadyQueue, TaskArena, TaskId};
 
 /// Type alias for the IO backend completion type
 type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
@@ -41,6 +41,18 @@ type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
 type LocalFuture = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
+const ADMISSION_COUNT_MASK: usize = !ADMISSION_CLOSED;
+
+struct AdmissionGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
 
 thread_local! {
     static LOCAL_SPAWN_QUEUE: RefCell<Vec<LocalSpawn>> = const { RefCell::new(Vec::new()) };
@@ -209,8 +221,9 @@ struct CoreMetrics {
 pub struct CpuCore {
     /// Core ID (matches physical CPU)
     id: usize,
-    /// Local task queue keyed by task sequence. Readiness is tracked separately.
-    task_queue: Vec<Option<Task>>,
+    /// Fixed-capacity shard-local task arena. Readiness is tracked separately
+    /// in `ready_queue`; full TaskKey validation rejects stale wakes.
+    task_queue: TaskArena<Task>,
     /// Futures submitted by `spawn_local`; these are polled only on this
     /// worker and therefore intentionally do not require `Send`.
     local_futures: Vec<LocalFuture>,
@@ -257,19 +270,13 @@ pub struct CpuCore {
 }
 
 impl CpuCore {
-    #[inline]
-    fn ensure_task_capacity(&mut self, idx: usize) {
-        if idx >= self.task_queue.len() {
-            self.task_queue.resize_with(idx + 1, || None);
-        }
-    }
-
     /// Create new CPU core. The platform-gated constructor keeps the driver,
     /// wakeup fd, and ownership flags explicit; the argument count is kept
     /// local rather than introducing a shared configuration object.
     #[allow(clippy::too_many_arguments)]
     fn new(
         id: usize,
+        runtime_generation: u16,
         io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
         force_shutdown: Arc<AtomicBool>,
@@ -283,7 +290,7 @@ impl CpuCore {
 
         Self {
             id,
-            task_queue: Vec::with_capacity(256),
+            task_queue: TaskArena::with_capacity(runtime_generation, id as u16, 65_536),
             local_futures: Vec::new(),
             ready_queue: Arc::new(ArrayQueue::new(65_536)),
             message_inbox,
@@ -600,20 +607,16 @@ impl CpuCore {
                         id,
                         self.ready_queue.len()
                     );
-                    let mut task = Task::from_pinned(id, future);
-                    let idx = id.key().slot as usize;
-                    self.ensure_task_capacity(idx);
-                    if self.task_queue[idx]
-                        .as_ref()
-                        .is_some_and(|existing| existing.id() != id)
-                    {
+                    let task = Task::from_pinned(id, future);
+                    if !self.task_queue.insert_external(id.key(), task) {
                         tracing::warn!("Core {} rejected task {:?}: slot occupied", self.id, id);
                         processed += 1;
                         continue;
                     }
-                    task.ensure_waker(self.ready_queue.clone());
-                    task.schedule();
-                    self.task_queue[idx] = Some(task);
+                    if let Some(task) = self.task_queue.get_mut(id.key()) {
+                        task.ensure_waker(self.ready_queue.clone());
+                        task.schedule();
+                    }
                     self.metrics.max_ready_queue_len =
                         self.metrics.max_ready_queue_len.max(self.ready_queue.len());
                     self.local_task_count += 1;
@@ -631,14 +634,14 @@ impl CpuCore {
                 }
                 Ok(CoreMessage::CancelTask(task_id)) => {
                     // Remove task from queue if it exists
-                    let idx = task_id.key().slot as usize;
-                    if let Some(slot) = self.task_queue.get_mut(idx) {
-                        if slot.as_ref().is_some_and(|task| task.id() == task_id)
-                            && slot.take().is_some()
-                        {
-                            self.local_task_count = self.local_task_count.saturating_sub(1);
-                            self.metrics.tasks_completed += 1;
-                        }
+                    if self
+                        .task_queue
+                        .get(task_id.key())
+                        .is_some_and(|task| task.id() == task_id)
+                        && self.task_queue.remove(task_id.key()).is_some()
+                    {
+                        self.local_task_count = self.local_task_count.saturating_sub(1);
+                        self.metrics.tasks_completed += 1;
                     }
                     tracing::trace!("Cancelled task {:?}", task_id);
                     processed += 1;
@@ -703,8 +706,7 @@ impl CpuCore {
             let removed = {
                 // In-place poll: borrow task mutably from task_queue.
                 // Scope ensures the mutable borrow is released before remove().
-                let idx = task_id.key().slot as usize;
-                let task = match self.task_queue.get_mut(idx).and_then(Option::as_mut) {
+                let task = match self.task_queue.get_mut(task_id.key()) {
                     Some(t) => t,
                     None => continue, // stale wake after cancellation
                 };
@@ -739,11 +741,15 @@ impl CpuCore {
             };
 
             if removed {
-                let idx = task_id.key().slot as usize;
-                if let Some(slot) = self.task_queue.get_mut(idx) {
-                    *slot = None;
-                }
+                self.task_queue.remove(task_id.key());
             }
+        }
+
+        // Re-enqueue wakes that observed a full bounded ready queue. This
+        // owner-side retry preserves one-shot wake delivery without an
+        // unbounded overflow queue or cross-core mutable state.
+        for task in self.task_queue.iter().flatten() {
+            executed += usize::from(task.retry_overflowed_wake());
         }
 
         let spawned_local = self.drain_local_spawns();
@@ -865,6 +871,7 @@ enum RuntimeState {
 pub struct MultiCoreRuntime {
     /// Number of CPU cores
     num_cores: usize,
+    runtime_generation: u16,
     /// Message senders for each core
     core_senders: Vec<Sender<CoreMessage>>,
     /// Per-core shutdown flags, written directly by the control plane so
@@ -888,6 +895,10 @@ pub struct MultiCoreRuntime {
     task_counters: Vec<AtomicU64>,
     /// Runtime state
     state: AtomicU8,
+    /// Admission counter/close bit. Spawn owns one count until its bounded
+    /// owner-shard send completes, so shutdown cannot cut across an in-flight
+    /// admission.
+    admission: AtomicUsize,
     /// Next core for round-robin task distribution
     next_core: AtomicUsize,
 }
@@ -903,6 +914,41 @@ impl std::fmt::Debug for MultiCoreRuntime {
 }
 
 impl MultiCoreRuntime {
+    fn begin_admission(&self) -> Result<AdmissionGuard<'_>> {
+        let mut current = self.admission.load(Ordering::Acquire);
+        loop {
+            if current & ADMISSION_CLOSED != 0 {
+                return Err(RuntimeError::TaskFailed(
+                    "Runtime admission is closed".to_string(),
+                ));
+            }
+            let count = current & ADMISSION_COUNT_MASK;
+            let next = count.checked_add(1).ok_or_else(|| {
+                RuntimeError::TaskFailed("Admission counter exhausted".to_string())
+            })?;
+            match self.admission.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(AdmissionGuard {
+                        counter: &self.admission,
+                    })
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn close_admission_and_wait(&self) {
+        self.admission.fetch_or(ADMISSION_CLOSED, Ordering::AcqRel);
+        while self.admission.load(Ordering::Acquire) & ADMISSION_COUNT_MASK != 0 {
+            thread::yield_now();
+        }
+    }
+
     /// Create new multi-core runtime with specified number of CPU cores
     pub fn with_cpus(num_cores: usize) -> Result<Arc<Self>> {
         Self::new(Some(num_cores))
@@ -916,6 +962,7 @@ impl MultiCoreRuntime {
     /// Create new multi-core runtime
     pub fn new(num_cores: Option<usize>) -> Result<Arc<Self>> {
         let num_cores = num_cores.unwrap_or_else(num_cpus::get);
+        let runtime_generation = next_runtime_generation();
 
         if num_cores == 0 {
             return Err(RuntimeError::TaskFailed(
@@ -979,6 +1026,7 @@ impl MultiCoreRuntime {
                         let sleeping = core_sleeping_flag.clone();
                         CpuCore::new(
                             core_id,
+                            runtime_generation,
                             io_backend,
                             core_shutdown.clone(),
                             force_shutdown.clone(),
@@ -991,6 +1039,7 @@ impl MultiCoreRuntime {
                     #[cfg(not(target_os = "linux"))]
                     let mut core = CpuCore::new(
                         core_id,
+                        runtime_generation,
                         io_backend,
                         core_shutdown.clone(),
                         force_shutdown.clone(),
@@ -1043,6 +1092,7 @@ impl MultiCoreRuntime {
 
         let runtime = Arc::new(Self {
             num_cores,
+            runtime_generation,
             core_senders,
             core_shutdowns,
             core_exited,
@@ -1054,6 +1104,7 @@ impl MultiCoreRuntime {
             join_handles,
             task_counters,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
+            admission: AtomicUsize::new(0),
             next_core: AtomicUsize::new(0),
         });
 
@@ -1238,6 +1289,7 @@ impl MultiCoreRuntime {
     where
         F: Future<Output = ()> + 'static,
     {
+        let _admission = self.begin_admission()?;
         let state = self.state.load(Ordering::Acquire);
         if state != RuntimeState::Running as u8 {
             return Err(RuntimeError::TaskFailed(
@@ -1256,7 +1308,7 @@ impl MultiCoreRuntime {
     #[inline]
     fn next_task_id_for_core(&self, core_id: usize) -> TaskId {
         let sequence = self.task_counters[core_id].fetch_add(1, Ordering::Relaxed) as u32;
-        TaskId::new(core_id, sequence)
+        TaskId::new_for_runtime(self.runtime_generation, core_id, sequence)
     }
 
     /// Pick the least-loaded core as the starting point for cross-core spawn.
@@ -1289,6 +1341,7 @@ impl MultiCoreRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let _admission = self.begin_admission()?;
         // Send task to selected core
         let message = CoreMessage::Task {
             id: task_id,
@@ -1318,6 +1371,7 @@ impl MultiCoreRuntime {
         start_core: usize,
         mut future: Pin<Box<dyn Future<Output = ()> + Send>>,
     ) -> Result<TaskId> {
+        let _admission = self.begin_admission()?;
         let mut disconnected = 0usize;
 
         for offset in 0..self.num_cores {
@@ -1368,6 +1422,7 @@ impl MultiCoreRuntime {
         mut future: Pin<Box<dyn Future<Output = ()> + Send>>,
         timeout: Duration,
     ) -> Result<TaskId> {
+        let _admission = self.begin_admission()?;
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -1419,6 +1474,7 @@ impl MultiCoreRuntime {
         mut future: Pin<Box<dyn Future<Output = ()> + Send>>,
         timeout: Duration,
     ) -> Result<TaskId> {
+        let _admission = self.begin_admission()?;
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -1485,6 +1541,11 @@ impl MultiCoreRuntime {
             // Already shutting down or terminated
             return Ok(());
         }
+
+        // Close the admission gate before publishing shutdown. Any spawn
+        // already past the gate is awaited, so no task can be enqueued after
+        // this shutdown cutoff.
+        self.close_admission_and_wait();
 
         // Try to transition to shutting down state
         if self
@@ -1859,6 +1920,18 @@ mod tests {
         runtime
             .shutdown_with_timeout(Duration::from_secs(1))
             .unwrap();
+        match Arc::try_unwrap(runtime) {
+            Ok(rt) => rt.join().unwrap(),
+            Err(_) => panic!("Failed to get unique ownership of runtime"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn admission_rejects_spawn_after_shutdown_cutoff() {
+        let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+        runtime.shutdown().unwrap();
+        assert!(runtime.spawn(async {}).is_err());
         match Arc::try_unwrap(runtime) {
             Ok(rt) => rt.join().unwrap(),
             Err(_) => panic!("Failed to get unique ownership of runtime"),
