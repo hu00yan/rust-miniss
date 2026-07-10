@@ -498,3 +498,25 @@ fn test_shutdown_drains_running_timer_task() {
 
     rx.recv_timeout(Duration::from_millis(500)).unwrap();
 }
+
+#[test]
+fn test_shutdown_deadline_escalates_permanently_pending_task() {
+    let runtime = rust_miniss::multicore::MultiCoreRuntime::new(Some(1)).unwrap();
+    runtime
+        .spawn(async {
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    runtime
+        .shutdown_with_timeout(Duration::from_millis(20))
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "shutdown deadline did not return promptly"
+    );
+    // Dropping the last Arc joins the escalated worker and owns all driver
+    // cleanup on the worker thread.
+    drop(runtime);
+}

@@ -240,6 +240,9 @@ pub struct CpuCore {
     io_state: CpuIoState,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
+    /// Escalation flag set by the control plane after the graceful deadline.
+    /// The worker owns and drops all remaining task/I/O state before returning.
+    force_shutdown: Arc<AtomicBool>,
     /// Graceful drain mode: reject new control-plane spawns at the runtime
     /// level, but let already queued and running shard-local tasks finish.
     draining: bool,
@@ -266,6 +269,7 @@ impl CpuCore {
         id: usize,
         io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
+        force_shutdown: Arc<AtomicBool>,
         #[cfg(target_os = "linux")] sleeping: Arc<AtomicBool>,
         message_inbox: Receiver<CoreMessage>,
         park_timeout: Duration,
@@ -292,6 +296,7 @@ impl CpuCore {
             wakeup_poll_token: None,
             io_state,
             shutdown,
+            force_shutdown,
             draining: false,
             local_task_count: 0,
             message_poll_ticks: 0,
@@ -390,6 +395,16 @@ impl CpuCore {
         let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
 
         loop {
+            if self.force_shutdown.load(Ordering::Acquire) {
+                // Escalated shutdown is intentionally owner-local: no control
+                // thread touches task futures, timers, or driver state.
+                self.task_queue.clear();
+                self.local_futures.clear();
+                while self.ready_queue.pop().is_some() {}
+                self.local_task_count = 0;
+                self.draining = true;
+                break;
+            }
             if self.shutdown.load(Ordering::Acquire) {
                 self.draining = true;
             }
@@ -852,6 +867,11 @@ pub struct MultiCoreRuntime {
     /// Per-core shutdown flags, written directly by the control plane so
     /// shutdown is not delayed behind ordinary data-plane messages.
     core_shutdowns: Vec<Arc<AtomicBool>>,
+    /// Worker-owned completion acknowledgement; unlike `core_shutdowns`, this
+    /// is written only after the event loop has drained or escalated.
+    core_exited: Vec<Arc<AtomicBool>>,
+    /// Per-core escalation flags; only workers mutate local task/driver state.
+    force_shutdowns: Vec<Arc<AtomicBool>>,
     /// Per-core sleep flags; senders only write to the wake eventfd when the
     /// target core is actually parked.
     #[cfg(target_os = "linux")]
@@ -904,6 +924,8 @@ impl MultiCoreRuntime {
 
         let mut core_senders = Vec::with_capacity(num_cores);
         let mut core_shutdowns = Vec::with_capacity(num_cores);
+        let mut core_exited = Vec::with_capacity(num_cores);
+        let mut force_shutdowns = Vec::with_capacity(num_cores);
         #[cfg(target_os = "linux")]
         let mut core_sleeping = Vec::with_capacity(num_cores);
         #[cfg(target_os = "linux")]
@@ -915,12 +937,16 @@ impl MultiCoreRuntime {
         // Create cores and start threads
         for core_id in 0..num_cores {
             let core_shutdown = Arc::new(AtomicBool::new(false));
+            let core_exited_flag = Arc::new(AtomicBool::new(false));
+            let force_shutdown = Arc::new(AtomicBool::new(false));
             #[cfg(target_os = "linux")]
             let core_sleeping_flag = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
             let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
             core_senders.push(sender.clone());
             core_shutdowns.push(core_shutdown.clone());
+            core_exited.push(core_exited_flag.clone());
+            force_shutdowns.push(force_shutdown.clone());
             #[cfg(target_os = "linux")]
             core_sleeping.push(core_sleeping_flag.clone());
             ready_receivers.push((core_id, ready_receiver));
@@ -952,6 +978,7 @@ impl MultiCoreRuntime {
                             core_id,
                             io_backend,
                             core_shutdown.clone(),
+                            force_shutdown.clone(),
                             sleeping,
                             receiver,
                             crate::config::park_timeout(),
@@ -963,6 +990,7 @@ impl MultiCoreRuntime {
                         core_id,
                         io_backend,
                         core_shutdown.clone(),
+                        force_shutdown.clone(),
                         receiver,
                         crate::config::park_timeout(),
                     );
@@ -970,6 +998,7 @@ impl MultiCoreRuntime {
                     let result = core.run();
                     // Set shutdown flag when core exits
                     core_shutdown.store(true, Ordering::Relaxed);
+                    core_exited_flag.store(true, Ordering::Release);
                     result
                 })
                 .map_err(|e| {
@@ -1011,6 +1040,8 @@ impl MultiCoreRuntime {
             num_cores,
             core_senders,
             core_shutdowns,
+            core_exited,
+            force_shutdowns,
             #[cfg(target_os = "linux")]
             core_sleeping,
             #[cfg(target_os = "linux")]
@@ -1490,6 +1521,39 @@ impl MultiCoreRuntime {
         Ok(())
     }
 
+    /// Initiate graceful shutdown and escalate after `timeout`.
+    ///
+    /// The graceful phase stops admission and lets workers drain queued work.
+    /// If a permanently pending task or I/O prevents that, the control plane
+    /// sets an owner-local force flag and wakes every worker.  Workers then
+    /// drop their remaining futures and driver on their own thread; callers
+    /// must still call [`MultiCoreRuntime::join`] to collect worker results.
+    pub fn shutdown_with_timeout(&self, timeout: Duration) -> Result<()> {
+        self.shutdown()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .core_exited
+                .iter()
+                .all(|flag| flag.load(Ordering::Acquire))
+            {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                tracing::warn!("graceful shutdown deadline exceeded; escalating");
+                for force in &self.force_shutdowns {
+                    force.store(true, Ordering::Release);
+                }
+                for core_id in 0..self.num_cores {
+                    self.notify_core(core_id);
+                }
+                return Ok(());
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(1)));
+        }
+    }
+
     /// Cancel a task
     pub fn cancel_task(&self, task_id: TaskId) -> Result<()> {
         // Check if runtime is running
@@ -1777,6 +1841,19 @@ mod tests {
     fn test_shutdown() {
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
         runtime.shutdown().unwrap();
+        match Arc::try_unwrap(runtime) {
+            Ok(rt) => rt.join().unwrap(),
+            Err(_) => panic!("Failed to get unique ownership of runtime"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shutdown_with_timeout_waits_for_worker_exit_ack() {
+        let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .unwrap();
         match Arc::try_unwrap(runtime) {
             Ok(rt) => rt.join().unwrap(),
             Err(_) => panic!("Failed to get unique ownership of runtime"),
