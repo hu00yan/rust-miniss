@@ -565,7 +565,10 @@ impl CpuCore {
 
             let result = sched_setaffinity(0, mem::size_of::<cpu_set_t>(), &cpuset);
             if result != 0 {
-                tracing::warn!("Failed to bind CPU core {}: {}", self.id, result);
+                return Err(RuntimeError::TaskFailed(format!(
+                    "Failed to bind CPU core {}: {}",
+                    self.id, result
+                )));
             } else {
                 tracing::debug!("CPU core {} bound to physical CPU", self.id);
             }
@@ -961,7 +964,7 @@ impl MultiCoreRuntime {
 
     /// Create new multi-core runtime
     pub fn new(num_cores: Option<usize>) -> Result<Arc<Self>> {
-        let num_cores = num_cores.unwrap_or_else(num_cpus::get);
+        let num_cores = num_cores.unwrap_or_else(num_cpus::get_physical);
         let runtime_generation = next_runtime_generation();
 
         if num_cores == 0 {
@@ -1046,6 +1049,12 @@ impl MultiCoreRuntime {
                         receiver,
                         crate::config::park_timeout(),
                     );
+                    // Readiness is acknowledged only after affinity succeeds;
+                    // `run` repeats the bind defensively before installing TLS.
+                    if let Err(err) = core.bind_to_cpu() {
+                        let _ = ready_sender.send(Err(format!("{err:?}")));
+                        return Err(err);
+                    }
                     let _ = ready_sender.send(Ok(()));
                     let result = core.run();
                     // Set shutdown flag when core exits
