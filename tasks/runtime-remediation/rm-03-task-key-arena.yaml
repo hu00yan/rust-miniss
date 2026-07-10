@@ -1,6 +1,6 @@
 ---
 id: rm-03-task-key-arena
-status: TODO
+status: YELLOW
 batch: 1-B
 depends_on: [rm-00-gate-all-targets]
 parallel_wave: W1
@@ -30,6 +30,13 @@ review_questions:
   - Compatibility: public TaskId API broken or versioned?
 architecture_audit: |
   Arena is shard-local. No global task map. No locks on hot path.
+
+## Verification (2026-07-10)
+
+`TaskKey` and bounded `TaskArena` are implemented; all live task indexing now
+uses full-key validation, rejecting stale wake/cancel ABA. Existing task
+storage remains Vec-backed with generation checks; migrate live storage onto
+`TaskArena` before GREEN.
 ---
 
 # rm-03: Generational TaskKey + arena

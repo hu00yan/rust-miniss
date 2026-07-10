@@ -24,9 +24,8 @@
 //! the async ecosystem. JoinHandles can also be used to cancel tasks
 //! via the [`JoinHandle::cancel`] method.
 
-use crate::waker::TaskId;
+use crate::waker::{ReadyQueue, TaskId, WakerState};
 use std::any::Any;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -181,9 +180,20 @@ pub struct Task {
     id: TaskId,
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     /// Cached waker — created once and reused across polls.
-    /// Eliminates per-poll `Rc<MinissWaker>` heap allocation.
+    /// Reuses Arc-backed waker state across polls.
     waker: Option<Waker>,
+    wake_state: Option<Arc<WakerState>>,
     completed: bool,
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // Cancellation/removal must revoke escaped wakers before releasing
+        // the task slot. Any later wake then becomes a harmless no-op.
+        if let Some(state) = &self.wake_state {
+            state.deactivate();
+        }
+    }
 }
 
 impl Task {
@@ -193,6 +203,7 @@ impl Task {
             id,
             future: Box::pin(future),
             waker: None,
+            wake_state: None,
             completed: false,
         }
     }
@@ -203,6 +214,7 @@ impl Task {
             id,
             future,
             waker: None,
+            wake_state: None,
             completed: false,
         }
     }
@@ -222,7 +234,11 @@ impl Task {
         match self.future.as_mut().poll(cx) {
             Poll::Ready(()) => {
                 self.completed = true;
+                if let Some(state) = &self.wake_state {
+                    state.deactivate();
+                }
                 self.waker = None;
+                self.wake_state = None;
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,
@@ -235,6 +251,9 @@ impl Task {
         if self.completed {
             return Poll::Ready(());
         }
+        if let Some(state) = &self.wake_state {
+            state.begin_poll();
+        }
         let waker_ptr = self.waker.as_ref().expect("waker cached by ensure_waker") as *const Waker;
         // SAFETY: `waker_ptr` points to the cached waker stored in `self`.
         // The reference is only used to build a Context for the duration of
@@ -243,7 +262,11 @@ impl Task {
         match self.future.as_mut().poll(&mut context) {
             Poll::Ready(()) => {
                 self.completed = true;
+                if let Some(state) = &self.wake_state {
+                    state.deactivate();
+                }
                 self.waker = None;
+                self.wake_state = None;
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,
@@ -252,22 +275,32 @@ impl Task {
 
     /// Ensure a cached waker exists without cloning it back out.
     #[inline(always)]
-    pub fn ensure_waker(&mut self, queue: *const VecDeque<TaskId>) {
+    pub fn ensure_waker(&mut self, queue: ReadyQueue) {
         if self.waker.is_none() {
-            self.waker = Some(crate::waker::MinissWaker::create_waker(self.id, queue));
+            let (waker, state) = crate::waker::create_waker(self.id, queue);
+            self.waker = Some(waker);
+            self.wake_state = Some(state);
         }
     }
 
-    /// Ensure a cached waker exists and return a raw pointer to it.
+    /// Queue this task once. Used for initial admission and wake dedup.
+    #[inline]
+    pub fn schedule(&self) {
+        if let Some(state) = &self.wake_state {
+            state.schedule();
+        }
+    }
+
+    /// Ensure a cached waker exists and return pointer to it for Context setup.
     #[inline(always)]
-    pub fn cached_waker_ptr(&mut self, queue: *const VecDeque<TaskId>) -> *const Waker {
+    pub fn cached_waker_ptr(&mut self, queue: ReadyQueue) -> *const Waker {
         self.ensure_waker(queue);
         self.waker.as_ref().expect("waker cached by ensure_waker") as *const Waker
     }
 
     /// Borrow the cached waker by reference after ensuring it exists.
     #[inline(always)]
-    pub fn cached_waker(&mut self, queue: *const VecDeque<TaskId>) -> &Waker {
+    pub fn cached_waker(&mut self, queue: ReadyQueue) -> &Waker {
         self.ensure_waker(queue);
         self.waker.as_ref().expect("waker cached by ensure_waker")
     }
@@ -275,6 +308,10 @@ impl Task {
     /// Take the cached waker (called on task completion to free memory).
     #[inline(always)]
     pub fn take_waker(&mut self) -> Option<Waker> {
+        if let Some(state) = &self.wake_state {
+            state.deactivate();
+        }
+        self.wake_state = None;
         self.waker.take()
     }
 
@@ -282,7 +319,11 @@ impl Task {
     #[inline(always)]
     pub fn mark_completed(&mut self) {
         self.completed = true;
+        if let Some(state) = &self.wake_state {
+            state.deactivate();
+        }
         self.waker = None;
+        self.wake_state = None;
     }
 }
 
@@ -481,25 +522,7 @@ mod tests {
 
     // Helper to create a dummy waker for testing
     fn dummy_waker() -> std::task::Waker {
-        use std::task::{RawWaker, RawWakerVTable};
-
-        fn dummy_clone(_: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        fn dummy_wake(_: *const ()) {}
-        fn dummy_wake_by_ref(_: *const ()) {}
-        fn dummy_drop(_: *const ()) {}
-
-        fn dummy_raw_waker() -> RawWaker {
-            RawWaker::new(
-                std::ptr::null(),
-                &RawWakerVTable::new(dummy_clone, dummy_wake, dummy_wake_by_ref, dummy_drop),
-            )
-        }
-
-        // SAFETY: The dummy RawWaker vtable never dereferences the null data
-        // pointer and all wake/drop functions are no-ops.
-        unsafe { std::task::Waker::from_raw(dummy_raw_waker()) }
+        futures::task::noop_waker()
     }
 
     #[test]
@@ -564,12 +587,10 @@ mod tests {
 
     #[test]
     fn test_task_poll_after_completion_stays_ready() {
-        use std::collections::VecDeque;
-
-        let queue = VecDeque::new();
+        let queue = Arc::new(crossbeam_queue::ArrayQueue::new(16));
         let task_id = TaskId(7);
         let mut task = Task::new(task_id, async {});
-        task.ensure_waker(&queue as *const VecDeque<_>);
+        task.ensure_waker(queue);
 
         assert!(matches!(task.poll_with_cached_waker(), Poll::Ready(())));
         assert!(matches!(task.poll_with_cached_waker(), Poll::Ready(())));

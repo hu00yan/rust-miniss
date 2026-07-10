@@ -3,133 +3,278 @@
 //! This module provides a custom Waker that integrates with our executor
 //! to schedule tasks when they become ready.
 //!
-//! # Safety
-//!
-//! In the thread-per-core model, all Waker operations (clone/wake/drop)
-//! happen on the same thread that created the Waker. Therefore we use:
-//! - `Rc` (non-atomic refcount) instead of `Arc` for the outer wrapper
-//! - Raw `*const VecDeque` pointer instead of a shared locked queue to avoid
-//!   atomic operations on every wake
-//!
-//! The VecDeque is owned by CpuCore and lives for the entire runtime —
-//! strictly longer than any Waker — so the raw pointer is safe.
+//! Wakers own bounded, Arc-backed notifier state. They remain safe when moved
+//! to another thread or retained after task cancellation/shutdown.
 
+use crossbeam_queue::ArrayQueue;
 use std::collections::VecDeque;
-use std::rc::Rc;
-use std::task::{RawWaker, RawWakerVTable, Waker};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::task::Waker;
 
-/// A task ID that uniquely identifies a task in the executor
+/// Full generational identity for a task slot.
+///
+/// `slot` is owned by `shard`; `generation` changes on every reuse.  Keeping
+/// all four components in the identity prevents a delayed wake/cancel from
+/// addressing a replacement task (ABA).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskKey {
+    pub runtime_generation: u16,
+    pub shard: u16,
+    pub slot: u16,
+    pub generation: u16,
+}
+
+impl TaskKey {
+    pub const fn new(runtime_generation: u16, shard: u16, slot: u16, generation: u16) -> Self {
+        Self {
+            runtime_generation,
+            shard,
+            slot,
+            generation,
+        }
+    }
+
+    pub const fn is_live(self) -> bool {
+        self.generation != 0
+    }
+}
+
+/// Bounded shard-local arena with generational slot allocation.
+///
+/// A slot is returned to the free list only through `remove`; `reserve` then
+/// advances its generation before handing it out again.  Keys from a prior
+/// occupant therefore fail `get`/`remove` instead of touching the replacement.
+pub struct TaskArena<T> {
+    runtime_generation: u16,
+    shard: u16,
+    slots: Vec<Option<T>>,
+    generations: Vec<u16>,
+    free: VecDeque<u16>,
+}
+
+impl<T> TaskArena<T> {
+    pub fn with_capacity(runtime_generation: u16, shard: u16, capacity: usize) -> Self {
+        assert!(
+            capacity <= u16::MAX as usize,
+            "task arena capacity exceeds key space"
+        );
+        let mut free = VecDeque::with_capacity(capacity);
+        for slot in 0..capacity {
+            free.push_back(slot as u16);
+        }
+        Self {
+            runtime_generation,
+            shard,
+            slots: (0..capacity).map(|_| None).collect(),
+            generations: vec![0; capacity],
+            free,
+        }
+    }
+
+    /// Reserve a vacant slot. `None` means bounded capacity is exhausted.
+    pub fn reserve(&mut self) -> Option<TaskKey> {
+        let slot = self.free.pop_front()?;
+        let generation = self.generations[slot as usize].wrapping_add(1).max(1);
+        self.generations[slot as usize] = generation;
+        Some(TaskKey::new(
+            self.runtime_generation,
+            self.shard,
+            slot,
+            generation,
+        ))
+    }
+
+    pub fn insert(&mut self, key: TaskKey, value: T) -> bool {
+        let Some(slot) = self.slots.get_mut(key.slot as usize) else {
+            return false;
+        };
+        if key.runtime_generation != self.runtime_generation
+            || key.shard != self.shard
+            || key.generation == 0
+            || self.generations[key.slot as usize] != key.generation
+            || slot.is_some()
+        {
+            return false;
+        }
+        *slot = Some(value);
+        true
+    }
+
+    pub fn get(&self, key: TaskKey) -> Option<&T> {
+        if self.matches(key) {
+            self.slots[key.slot as usize].as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn get_mut(&mut self, key: TaskKey) -> Option<&mut T> {
+        if self.matches(key) {
+            self.slots[key.slot as usize].as_mut()
+        } else {
+            None
+        }
+    }
+
+    pub fn remove(&mut self, key: TaskKey) -> Option<T> {
+        if !self.matches(key) {
+            return None;
+        }
+        let value = self.slots[key.slot as usize].take();
+        if value.is_some() {
+            self.free.push_back(key.slot);
+        }
+        value
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn matches(&self, key: TaskKey) -> bool {
+        key.runtime_generation == self.runtime_generation
+            && key.shard == self.shard
+            && key.generation != 0
+            && self.generations.get(key.slot as usize) == Some(&key.generation)
+            && self.slots[key.slot as usize].is_some()
+    }
+}
+
+/// A task ID that uniquely identifies a task in the executor.
+///
+/// Kept as a compact public wrapper for API compatibility; use [`TaskId::key`]
+/// whenever addressing task storage. New IDs are always encoded from a full
+/// [`TaskKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TaskId(pub u64);
 
 impl TaskId {
+    const FIELD_MASK: u64 = 0xffff;
+
+    pub fn from_key(key: TaskKey) -> Self {
+        Self(
+            (key.runtime_generation as u64) << 48
+                | (key.shard as u64) << 32
+                | (key.slot as u64) << 16
+                | key.generation as u64,
+        )
+    }
+
+    pub fn key(self) -> TaskKey {
+        TaskKey::new(
+            (self.0 >> 48) as u16,
+            (self.0 >> 32) as u16,
+            ((self.0 >> 16) & Self::FIELD_MASK) as u16,
+            (self.0 & Self::FIELD_MASK) as u16,
+        )
+    }
+
     pub fn cpu_id(&self) -> usize {
-        (self.0 >> 32) as usize
+        self.key().shard as usize
     }
 
     pub fn sequence(&self) -> u32 {
-        self.0 as u32
+        self.key().slot as u32
     }
 
     pub fn new(core_id: usize, sequence: u32) -> Self {
-        Self(((core_id as u64) << 32) | sequence as u64)
+        assert!(
+            core_id <= u16::MAX as usize,
+            "core id exceeds task key space"
+        );
+        // Keep the historical `(core, u32 sequence)` constructor while
+        // splitting sequence into bounded slot + generation fields. This
+        // prevents the old u32 truncation from silently aliasing a live slot.
+        let slot = sequence as u16;
+        let generation = (sequence >> 16).saturating_add(1).min(u16::MAX as u32) as u16;
+        Self::from_key(TaskKey::new(1, core_id as u16, slot, generation))
     }
 }
 
-/// Waker implementation that can reschedule tasks
-///
-/// Uses a raw pointer to the VecDeque to avoid atomic refcount operations.
-/// The queue outlives all Wakers because it is owned by the runtime thread.
-pub struct MinissWaker {
+/// Bounded, cross-thread-safe ready queue retained by each waker.
+pub type ReadyQueue = Arc<ArrayQueue<TaskId>>;
+
+pub(crate) struct WakerState {
     task_id: TaskId,
-    queue: *const VecDeque<TaskId>,
+    queue: ReadyQueue,
+    owner_thread: std::thread::Thread,
+    scheduled: AtomicBool,
+    active: AtomicBool,
 }
 
-// SAFETY: MinissWaker is only accessed from the owning CPU thread.
-// The raw pointer is valid for the lifetime of the runtime.
-unsafe impl Send for MinissWaker {}
-unsafe impl Sync for MinissWaker {}
+impl WakerState {
+    pub(crate) fn new(task_id: TaskId, queue: ReadyQueue) -> Arc<Self> {
+        Arc::new(Self {
+            task_id,
+            queue,
+            owner_thread: std::thread::current(),
+            scheduled: AtomicBool::new(false),
+            active: AtomicBool::new(true),
+        })
+    }
+    #[inline]
+    pub(crate) fn schedule(&self) {
+        if !self.active.load(Ordering::Acquire) || self.scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.queue.push(self.task_id).is_err() {
+            self.scheduled.store(false, Ordering::Release);
+            return;
+        }
+        self.owner_thread.unpark();
+    }
+    pub(crate) fn begin_poll(&self) {
+        self.scheduled.store(false, Ordering::Release);
+    }
+    pub(crate) fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+        self.scheduled.store(false, Ordering::Release);
+    }
+}
+
+struct ArcWakeImpl(Arc<WakerState>);
+impl futures::task::ArcWake for ArcWakeImpl {
+    fn wake_by_ref(this: &Arc<Self>) {
+        this.0.schedule();
+    }
+}
+
+pub(crate) fn create_waker(task_id: TaskId, queue: ReadyQueue) -> (Waker, Arc<WakerState>) {
+    let state = WakerState::new(task_id, queue);
+    (
+        futures::task::waker(Arc::new(ArcWakeImpl(state.clone()))),
+        state,
+    )
+}
+
+pub struct MinissWaker;
+
+// Arc-backed waker state is Send + Sync by construction.
 
 impl MinissWaker {
     /// Create a new waker for the given task
     ///
-    /// Takes a raw `*const VecDeque<TaskId>` pointer for zero-overhead access.
-    /// The VecDeque is owned by the CpuCore and outlives all Wakers.
-    pub fn create_waker(task_id: TaskId, queue: *const VecDeque<TaskId>) -> Waker {
-        let waker = Rc::new(MinissWaker { task_id, queue });
-        let raw_waker = RawWaker::new(Rc::into_raw(waker) as *const (), &VTABLE);
-        // SAFETY: The RawWaker vtable reconstructs the same Rc allocation and
-        // follows RawWaker ownership rules for clone/wake/drop.
-        unsafe { Waker::from_raw(raw_waker) }
+    /// Takes an Arc-owned bounded ready queue.
+    pub fn create_waker(task_id: TaskId, queue: ReadyQueue) -> Waker {
+        create_waker(task_id, queue).0
     }
-
-    /// Wake the task by adding it to the run queue
-    #[inline(always)]
-    fn wake_impl(&self) {
-        // SAFETY: The raw pointer is valid for the lifetime of this Waker.
-        // The VecDeque is owned by the runtime thread and outlives all Wakers.
-        // Since this is thread-per-core, the cast to *mut is safe.
-        let queue = unsafe { &mut *self.queue.cast_mut() };
-        queue.push_back(self.task_id);
-    }
-}
-
-// Raw waker implementation — non-atomic Rc operations since all
-// clone/wake/drop happen on the same thread.
-static VTABLE: RawWakerVTable =
-    RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
-
-unsafe fn waker_clone(data: *const ()) -> RawWaker {
-    // SAFETY: `data` was produced by Rc::into_raw for MinissWaker in
-    // create_waker or a previous clone.
-    let waker = Rc::from_raw(data as *const MinissWaker);
-    let cloned = waker.clone(); // non-atomic: Cell<usize> increment
-    std::mem::forget(waker); // Don't drop the original
-    RawWaker::new(Rc::into_raw(cloned) as *const (), &VTABLE)
-}
-
-unsafe fn waker_wake(data: *const ()) {
-    // SAFETY: `wake` consumes exactly one Rc strong ref encoded in `data`.
-    let waker = Rc::from_raw(data as *const MinissWaker);
-    waker.wake_impl();
-    // Rc dropped here — non-atomic refcount decrement
-}
-
-unsafe fn waker_wake_by_ref(data: *const ()) {
-    // SAFETY: `wake_by_ref` borrows the MinissWaker without consuming the Rc
-    // strong ref represented by `data`.
-    let waker = &*(data as *const MinissWaker);
-    waker.wake_impl();
-}
-
-unsafe fn waker_drop(data: *const ()) {
-    // SAFETY: `drop` consumes exactly one Rc strong ref encoded in `data`.
-    let _ = Rc::from_raw(data as *const MinissWaker);
-    // Rc dropped here — non-atomic refcount decrement, may free MinissWaker
 }
 
 /// Create a dummy waker for simple polling scenarios
 /// This is used when we don't need proper task scheduling
 pub fn dummy_waker() -> Waker {
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-
-    fn dummy_clone(_: *const ()) -> RawWaker {
-        dummy_raw_waker()
-    }
-    fn dummy_wake(_: *const ()) {}
-    fn dummy_wake_by_ref(_: *const ()) {}
-    fn dummy_drop(_: *const ()) {}
-
-    fn dummy_raw_waker() -> RawWaker {
-        RawWaker::new(
-            std::ptr::null(),
-            &RawWakerVTable::new(dummy_clone, dummy_wake, dummy_wake_by_ref, dummy_drop),
-        )
-    }
-
-    // SAFETY: The dummy RawWaker vtable never dereferences the null data
-    // pointer and implements no-op wake/drop functions.
-    unsafe { Waker::from_raw(dummy_raw_waker()) }
+    futures::task::noop_waker()
 }
 
 #[cfg(test)]
@@ -137,25 +282,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_waker_creation() {
-        let mut queue = VecDeque::new();
-        let task_id = TaskId(42);
+    fn task_arena_rejects_stale_key_after_slot_reuse() {
+        let mut arena = TaskArena::with_capacity(7, 2, 1);
+        let old = arena.reserve().expect("first slot available");
+        assert!(arena.insert(old, "old"));
+        assert_eq!(arena.get(old), Some(&"old"));
+        assert_eq!(arena.remove(old), Some("old"));
 
-        let waker = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
+        let replacement = arena
+            .reserve()
+            .expect("slot returned after terminal cleanup");
+        assert_eq!(replacement.slot, old.slot);
+        assert_ne!(replacement.generation, old.generation);
+        assert!(arena.insert(replacement, "replacement"));
+        assert_eq!(arena.get(old), None);
+        assert_eq!(arena.remove(old), None);
+        assert_eq!(arena.get(replacement), Some(&"replacement"));
+    }
+
+    #[test]
+    fn task_arena_is_bounded_and_rejects_wrong_shard() {
+        let mut arena = TaskArena::<u8>::with_capacity(3, 1, 1);
+        let key = arena.reserve().unwrap();
+        assert!(arena.reserve().is_none());
+        assert!(!arena.insert(TaskKey::new(3, 2, key.slot, key.generation), 1));
+        assert!(arena.insert(key, 1));
+    }
+
+    #[test]
+    fn task_id_round_trip_preserves_full_identity() {
+        let key = TaskKey::new(19, 7, 513, 42);
+        let id = TaskId::from_key(key);
+        assert_eq!(id.key(), key);
+        assert_eq!(id.cpu_id(), 7);
+        assert_eq!(id.sequence(), 513);
+    }
+
+    #[test]
+    fn test_waker_creation() {
+        let queue = Arc::new(ArrayQueue::new(16));
+        let task_id = TaskId(42);
+        let waker = MinissWaker::create_waker(task_id, queue.clone());
 
         // Wake the task
         waker.wake();
 
         // Check that task was added to queue
-        assert_eq!(queue.pop_front(), Some(task_id));
+        assert_eq!(queue.pop(), Some(task_id));
     }
 
     #[test]
     fn test_waker_clone() {
-        let mut queue = VecDeque::new();
+        let queue = Arc::new(ArrayQueue::new(16));
         let task_id = TaskId(99);
 
-        let waker1 = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
+        let waker1 = MinissWaker::create_waker(task_id, queue.clone());
         let waker2 = waker1.clone();
 
         // Both wakers should work
@@ -163,36 +344,35 @@ mod tests {
         waker2.wake();
 
         // Should have two entries in queue
-        assert_eq!(queue.pop_front(), Some(task_id));
-        assert_eq!(queue.pop_front(), Some(task_id));
-        assert_eq!(queue.pop_front(), None);
+        assert_eq!(queue.pop(), Some(task_id));
+        assert_eq!(queue.pop(), None);
     }
 
     #[test]
     fn test_waker_wake_by_ref() {
-        let mut queue = VecDeque::new();
+        let queue = Arc::new(ArrayQueue::new(16));
         let task_id = TaskId(123);
 
-        let waker = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
+        let waker = MinissWaker::create_waker(task_id, queue.clone());
 
         // Wake by reference
         waker.wake_by_ref();
 
         // Task should be in queue
-        assert_eq!(queue.pop_front(), Some(task_id));
+        assert_eq!(queue.pop(), Some(task_id));
 
         // Waker should still be usable
         waker.wake();
-        assert_eq!(queue.pop_front(), Some(task_id));
+        assert_eq!(queue.pop(), None); // deduplicated while still scheduled
     }
 
-    /// Verify that Rc refcount is managed correctly — no leaks, no double-frees.
+    /// Verify cloned Arc-backed wakers drop cleanly.
     #[test]
     fn test_waker_drop_after_clone() {
-        let mut queue = VecDeque::new();
+        let queue = Arc::new(ArrayQueue::new(16));
         let task_id = TaskId(77);
 
-        let waker = MinissWaker::create_waker(task_id, &queue as *const VecDeque<_>);
+        let waker = MinissWaker::create_waker(task_id, queue.clone());
         let cloned = waker.clone();
 
         // Drop the original
@@ -200,9 +380,23 @@ mod tests {
 
         // The clone should still work (wake_by_ref doesn't consume)
         cloned.wake_by_ref();
-        assert_eq!(queue.pop_front(), Some(task_id));
+        assert_eq!(queue.pop(), Some(task_id));
 
         // Drop the clone (both should drop cleanly)
         drop(cloned);
+    }
+
+    #[test]
+    fn escaped_waker_wakes_from_other_thread_and_late_wake_is_harmless() {
+        let queue = Arc::new(ArrayQueue::new(16));
+        let (waker, state) = create_waker(TaskId(88), queue.clone());
+        let thread_waker = waker.clone();
+        std::thread::spawn(move || thread_waker.wake())
+            .join()
+            .unwrap();
+        assert_eq!(queue.pop(), Some(TaskId(88)));
+        state.deactivate();
+        waker.wake_by_ref();
+        assert_eq!(queue.pop(), None);
     }
 }

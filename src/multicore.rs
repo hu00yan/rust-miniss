@@ -9,8 +9,8 @@
 //! 3. **CPU Affinity**: Each core bound to physical CPU for optimal cache locality
 //! 4. **Independent IO**: Each core has its own io_uring/epoll instance
 
+use crossbeam_queue::ArrayQueue;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
@@ -30,7 +30,7 @@ use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
 use crate::task::{DetachedTaskFuture, Task};
 use crate::timer::TimerWheel;
-use crate::waker::TaskId;
+use crate::waker::{ReadyQueue, TaskId};
 
 /// Type alias for the IO backend completion type
 type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
@@ -208,8 +208,8 @@ pub struct CpuCore {
     /// Local task queue keyed by task sequence. Readiness is tracked separately.
     task_queue: Vec<Option<Task>>,
     /// Local ready queue populated by task wakers.
-    /// Box gives stable address for Waker raw pointer.
-    ready_queue: VecDeque<TaskId>,
+    /// Bounded Arc-backed queue receives wakes from escaped wakers.
+    ready_queue: ReadyQueue,
     /// Message inbox from other cores
     message_inbox: Receiver<CoreMessage>,
     /// Local timer wheel
@@ -229,8 +229,7 @@ pub struct CpuCore {
     /// Token for the armed wake poll, so the completion can be ignored.
     wakeup_poll_token: Option<IoToken>,
     /// Per-core I/O state — also holds the io_backend via `io_state.io_backend`.
-    /// NOT wrapped in Arc: access is exclusively through thread-local raw pointer,
-    /// so Arc provides zero benefit and adds atomic refcount overhead.
+    /// Owned directly by worker; never shared across shards.
     io_state: CpuIoState,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
@@ -271,7 +270,7 @@ impl CpuCore {
         Self {
             id,
             task_queue: Vec::with_capacity(256),
-            ready_queue: VecDeque::with_capacity(256),
+            ready_queue: Arc::new(ArrayQueue::new(65_536)),
             message_inbox,
             timer_wheel: TimerWheel::new(1024, 1),
             park_timeout,
@@ -576,11 +575,19 @@ impl CpuCore {
                         self.ready_queue.len()
                     );
                     let mut task = Task::from_pinned(id, future);
-                    let idx = id.sequence() as usize;
+                    let idx = id.key().slot as usize;
                     self.ensure_task_capacity(idx);
-                    task.ensure_waker(&self.ready_queue as *const VecDeque<TaskId>);
+                    if self.task_queue[idx]
+                        .as_ref()
+                        .is_some_and(|existing| existing.id() != id)
+                    {
+                        tracing::warn!("Core {} rejected task {:?}: slot occupied", self.id, id);
+                        processed += 1;
+                        continue;
+                    }
+                    task.ensure_waker(self.ready_queue.clone());
+                    task.schedule();
                     self.task_queue[idx] = Some(task);
-                    self.ready_queue.push_back(id);
                     self.metrics.max_ready_queue_len =
                         self.metrics.max_ready_queue_len.max(self.ready_queue.len());
                     self.local_task_count += 1;
@@ -598,9 +605,11 @@ impl CpuCore {
                 }
                 Ok(CoreMessage::CancelTask(task_id)) => {
                     // Remove task from queue if it exists
-                    let idx = task_id.sequence() as usize;
+                    let idx = task_id.key().slot as usize;
                     if let Some(slot) = self.task_queue.get_mut(idx) {
-                        if slot.take().is_some() {
+                        if slot.as_ref().is_some_and(|task| task.id() == task_id)
+                            && slot.take().is_some()
+                        {
                             self.local_task_count = self.local_task_count.saturating_sub(1);
                             self.metrics.tasks_completed += 1;
                         }
@@ -630,7 +639,7 @@ impl CpuCore {
         let mut polled = 0;
 
         while polled < self.task_poll_budget {
-            let Some(task_id) = self.ready_queue.pop_front() else {
+            let Some(task_id) = self.ready_queue.pop() else {
                 break;
             };
             // Count every scheduled record, including stale wakes, against
@@ -640,11 +649,14 @@ impl CpuCore {
             let removed = {
                 // In-place poll: borrow task mutably from task_queue.
                 // Scope ensures the mutable borrow is released before remove().
-                let idx = task_id.sequence() as usize;
+                let idx = task_id.key().slot as usize;
                 let task = match self.task_queue.get_mut(idx).and_then(Option::as_mut) {
                     Some(t) => t,
                     None => continue, // stale wake after cancellation
                 };
+                if task.id() != task_id {
+                    continue; // stale wake after slot reuse
+                }
 
                 set_current_task_id(Some(task_id));
                 let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -673,7 +685,7 @@ impl CpuCore {
             };
 
             if removed {
-                let idx = task_id.sequence() as usize;
+                let idx = task_id.key().slot as usize;
                 if let Some(slot) = self.task_queue.get_mut(idx) {
                     *slot = None;
                 }
@@ -698,11 +710,17 @@ impl CpuCore {
 
             for (id, future) in queue.drain(..) {
                 let mut task = Task::from_pinned(id, future);
-                let idx = id.sequence() as usize;
+                let idx = id.key().slot as usize;
                 self.ensure_task_capacity(idx);
-                task.ensure_waker(&self.ready_queue as *const VecDeque<TaskId>);
+                if self.task_queue[idx]
+                    .as_ref()
+                    .is_some_and(|existing| existing.id() != id)
+                {
+                    continue;
+                }
+                task.ensure_waker(self.ready_queue.clone());
+                task.schedule();
                 self.task_queue[idx] = Some(task);
-                self.ready_queue.push_back(id);
                 self.metrics.max_ready_queue_len =
                     self.metrics.max_ready_queue_len.max(self.ready_queue.len());
                 self.local_task_count += 1;

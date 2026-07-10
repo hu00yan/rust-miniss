@@ -18,8 +18,8 @@
 //! JoinHandles return `TaskResult<T>` which is `Result<T, TaskError>` where
 //! `TaskError::Panic` contains the panic payload for analysis.
 
+use crossbeam_queue::ArrayQueue;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use std::task::{Context, Poll};
 use crate::cpu::CpuIoState;
 use crate::task::{DetachedTaskFuture, JoinHandle, JoinTaskFuture, Task};
 use crate::timer::TimerWheel;
-use crate::waker::TaskId;
+use crate::waker::{ReadyQueue, TaskId};
 
 type IoCompletion = (
     crate::io::IoToken,
@@ -248,7 +248,7 @@ impl Default for Runtime {
 /// The core executor that manages task scheduling
 pub struct Executor {
     tasks: Vec<Option<Task>>,
-    ready_queue: VecDeque<TaskId>,
+    ready_queue: ReadyQueue,
     next_task_id: AtomicU64,
     active_tasks: usize,
     park_timeout: std::time::Duration,
@@ -274,7 +274,7 @@ impl Executor {
     ) -> Self {
         Self {
             tasks: Vec::with_capacity(256),
-            ready_queue: VecDeque::with_capacity(256),
+            ready_queue: Arc::new(ArrayQueue::new(65_536)),
             next_task_id: AtomicU64::new(1),
             active_tasks: 0,
             park_timeout,
@@ -328,8 +328,9 @@ impl Executor {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
-        let idx = task_id.sequence() as usize;
+        let sequence = self.next_task_id.fetch_add(1, Ordering::Relaxed) as u32;
+        let task_id = TaskId::new(0, sequence);
+        let idx = task_id.key().slot as usize;
 
         let (handle, completer) = JoinHandle::new(task_id);
         let wrapped_future = JoinTaskFuture::new(future, completer);
@@ -339,9 +340,9 @@ impl Executor {
 
         // Add to our task list and ready queue
         self.ensure_task_capacity(idx);
-        task.ensure_waker(&self.ready_queue as *const VecDeque<_>);
+        task.ensure_waker(self.ready_queue.clone());
+        task.schedule();
         self.tasks[idx] = Some(task);
-        self.ready_queue.push_back(task_id);
         self.active_tasks += 1;
 
         handle
@@ -352,14 +353,15 @@ impl Executor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
-        let idx = task_id.sequence() as usize;
+        let sequence = self.next_task_id.fetch_add(1, Ordering::Relaxed) as u32;
+        let task_id = TaskId::new(0, sequence);
+        let idx = task_id.key().slot as usize;
 
         let mut task = Task::new(task_id, DetachedTaskFuture::new(future));
         self.ensure_task_capacity(idx);
-        task.ensure_waker(&self.ready_queue as *const VecDeque<_>);
+        task.ensure_waker(self.ready_queue.clone());
+        task.schedule();
         self.tasks[idx] = Some(task);
-        self.ready_queue.push_back(task_id);
         self.active_tasks += 1;
 
         task_id
@@ -371,29 +373,36 @@ impl Executor {
         let mut polled = 0;
 
         while polled < self.poll_budget {
-            let Some(task_id) = self.ready_queue.pop_front() else {
+            let Some(task_id) = self.ready_queue.pop() else {
                 break;
             };
             polled += 1;
-            let idx = task_id.sequence() as usize;
-            if let Some(mut task) = self.tasks.get_mut(idx).and_then(Option::take) {
-                // Reuse the task-local waker cache so the hot path does not
-                // allocate or clone a new Rc on every poll.
-                crate::cpu::set_current_task_id(Some(task_id));
-                let poll_result = task.poll_with_cached_waker();
-                crate::cpu::set_current_task_id(None);
+            let idx = task_id.key().slot as usize;
+            let is_current = self
+                .tasks
+                .get(idx)
+                .and_then(Option::as_ref)
+                .is_some_and(|task| task.id() == task_id);
+            if is_current {
+                if let Some(mut task) = self.tasks[idx].take() {
+                    // Reuse the task-local waker cache so the hot path does not
+                    // allocate or clone a new waker on every poll.
+                    crate::cpu::set_current_task_id(Some(task_id));
+                    let poll_result = task.poll_with_cached_waker();
+                    crate::cpu::set_current_task_id(None);
 
-                match poll_result {
-                    Poll::Ready(()) => {
-                        // Task completed successfully, don't put it back
-                        self.active_tasks = self.active_tasks.saturating_sub(1);
-                        made_progress = true;
-                    }
-                    Poll::Pending => {
-                        // Task is still pending, put it back
-                        self.ensure_task_capacity(idx);
-                        self.tasks[idx] = Some(task);
-                        made_progress = true;
+                    match poll_result {
+                        Poll::Ready(()) => {
+                            // Task completed successfully, don't put it back
+                            self.active_tasks = self.active_tasks.saturating_sub(1);
+                            made_progress = true;
+                        }
+                        Poll::Pending => {
+                            // Task is still pending, put it back
+                            self.ensure_task_capacity(idx);
+                            self.tasks[idx] = Some(task);
+                            made_progress = true;
+                        }
                     }
                 }
             }
@@ -521,20 +530,15 @@ mod tests {
         impl Future for SelfWaking {
             type Output = ();
 
-            fn poll(
-                self: std::pin::Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<Self::Output> {
+            fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 self.polls.fetch_add(1, Ordering::Relaxed);
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
         }
 
-        let mut executor = Executor::with_park_timeout_and_budget(
-            std::time::Duration::from_millis(1),
-            1,
-        );
+        let mut executor =
+            Executor::with_park_timeout_and_budget(std::time::Duration::from_millis(1), 1);
         let self_polls = Arc::new(AtomicU32::new(0));
         executor.spawn(SelfWaking {
             polls: self_polls.clone(),
