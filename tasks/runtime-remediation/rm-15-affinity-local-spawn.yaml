@@ -1,6 +1,6 @@
 ---
 id: rm-15-affinity-local-spawn
-status: TODO
+status: YELLOW
 batch: 4
 depends_on: [rm-02-local-driver-ownership, rm-05-poll-budget]
 parallel_wave: W4

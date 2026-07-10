@@ -162,6 +162,29 @@ fn test_spawn_local_runs_from_worker_core() {
 }
 
 #[test]
+fn test_spawn_local_accepts_non_send_future() {
+    init_tracing();
+    let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let rt = runtime.clone();
+    runtime
+        .spawn_on(0, async move {
+            // Rc makes this future !Send; it must remain on the accepting
+            // shard and never enter the cross-core message queue.
+            let local = std::rc::Rc::new(7_u32);
+            let tx_inner = tx.clone();
+            rt.spawn_local(async move {
+                tx_inner.send(*local).unwrap();
+            })
+            .unwrap();
+        })
+        .unwrap();
+
+    assert_eq!(rx.recv_timeout(Duration::from_millis(200)).unwrap(), 7);
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn test_spawn_wait_runs_task() {
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();

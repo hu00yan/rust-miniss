@@ -34,7 +34,11 @@ use crate::waker::{ReadyQueue, TaskId};
 
 /// Type alias for the IO backend completion type
 type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
-type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()> + Send>>);
+// Local tasks never cross the accepting worker boundary.  Keep this queue
+// explicitly `!Send` so the API cannot accidentally migrate shard-local
+// state through the cross-core message path.
+type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
+type LocalFuture = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -43,7 +47,7 @@ thread_local! {
     static LOCAL_SPAWN_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-fn push_local_spawn(task_id: TaskId, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+fn push_local_spawn(task_id: TaskId, future: Pin<Box<dyn Future<Output = ()>>>) {
     LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().push((task_id, future)));
     LOCAL_SPAWN_COUNT.with(|count| count.set(count.get() + 1));
 }
@@ -207,6 +211,9 @@ pub struct CpuCore {
     id: usize,
     /// Local task queue keyed by task sequence. Readiness is tracked separately.
     task_queue: Vec<Option<Task>>,
+    /// Futures submitted by `spawn_local`; these are polled only on this
+    /// worker and therefore intentionally do not require `Send`.
+    local_futures: Vec<LocalFuture>,
     /// Local ready queue populated by task wakers.
     /// Bounded Arc-backed queue receives wakes from escaped wakers.
     ready_queue: ReadyQueue,
@@ -270,6 +277,7 @@ impl CpuCore {
         Self {
             id,
             task_queue: Vec::with_capacity(256),
+            local_futures: Vec::new(),
             ready_queue: Arc::new(ArrayQueue::new(65_536)),
             message_inbox,
             timer_wheel: TimerWheel::new(1024, 1),
@@ -638,6 +646,34 @@ impl CpuCore {
         let mut executed = 0;
         let mut polled = 0;
 
+        // Local futures are shard-owned and may be !Send. Poll them on every
+        // turn with a no-op waker; their next poll is bounded by the same
+        // per-turn budget as regular tasks.
+        let local_budget = self.task_poll_budget;
+        let mut local_index = 0;
+        while local_index < self.local_futures.len() && polled < local_budget {
+            polled += 1;
+            let poll_result = {
+                let (_, future) = &mut self.local_futures[local_index];
+                let waker = futures::task::noop_waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    future.as_mut().poll(&mut cx)
+                }))
+            };
+            match poll_result {
+                Ok(Poll::Ready(())) | Err(_) => {
+                    let _ = self.local_futures.swap_remove(local_index);
+                    self.local_task_count = self.local_task_count.saturating_sub(1);
+                    self.metrics.tasks_completed += 1;
+                }
+                Ok(Poll::Pending) => {
+                    local_index += 1;
+                }
+            }
+            executed += 1;
+        }
+
         while polled < self.task_poll_budget {
             let Some(task_id) = self.ready_queue.pop() else {
                 break;
@@ -709,20 +745,7 @@ impl CpuCore {
             }
 
             for (id, future) in queue.drain(..) {
-                let mut task = Task::from_pinned(id, future);
-                let idx = id.key().slot as usize;
-                self.ensure_task_capacity(idx);
-                if self.task_queue[idx]
-                    .as_ref()
-                    .is_some_and(|existing| existing.id() != id)
-                {
-                    continue;
-                }
-                task.ensure_waker(self.ready_queue.clone());
-                task.schedule();
-                self.task_queue[idx] = Some(task);
-                self.metrics.max_ready_queue_len =
-                    self.metrics.max_ready_queue_len.max(self.ready_queue.len());
+                self.local_futures.push((id, future));
                 self.local_task_count += 1;
                 self.metrics.tasks_spawned += 1;
             }
@@ -1177,7 +1200,7 @@ impl MultiCoreRuntime {
     /// worker thread; outside the runtime use `spawn` or `spawn_on`.
     pub fn spawn_local<F>(&self, future: F) -> Result<TaskId>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + 'static,
     {
         let state = self.state.load(Ordering::Acquire);
         if state != RuntimeState::Running as u8 {
