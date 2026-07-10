@@ -25,9 +25,11 @@
 //! via the [`JoinHandle::cancel`] method.
 
 use crate::waker::{ReadyQueue, TaskId, WakerState};
+use futures::task::AtomicWaker;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -62,6 +64,8 @@ impl<T> JoinState<T> {
 /// Completes a [`JoinHandle`] from the task execution side.
 pub(crate) struct JoinCompleter<T> {
     state: Arc<parking_lot::Mutex<JoinState<T>>>,
+    cancel_requested: Arc<AtomicBool>,
+    task_waker: Arc<AtomicWaker>,
 }
 
 impl<T> JoinCompleter<T> {
@@ -93,6 +97,8 @@ where
 {
     future: Pin<Box<F>>,
     completer: Option<JoinCompleter<T>>,
+    cancel_requested: Arc<AtomicBool>,
+    task_waker: Arc<AtomicWaker>,
 }
 
 impl<F, T> JoinTaskFuture<F, T>
@@ -100,9 +106,13 @@ where
     F: Future<Output = T>,
 {
     pub(crate) fn new(future: F, completer: JoinCompleter<T>) -> Self {
+        let cancel_requested = completer.cancel_requested.clone();
+        let task_waker = completer.task_waker.clone();
         Self {
             future: Box::pin(future),
             completer: Some(completer),
+            cancel_requested,
+            task_waker,
         }
     }
 }
@@ -115,6 +125,13 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        this.task_waker.register(cx.waker());
+        if this.cancel_requested.load(Ordering::Acquire) {
+            if let Some(completer) = this.completer.take() {
+                completer.complete(Err(TaskError::Cancelled));
+            }
+            return Poll::Ready(());
+        }
         let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             this.future.as_mut().poll(cx)
         }));
@@ -339,17 +356,27 @@ impl Task {
 pub struct JoinHandle<T> {
     task_id: TaskId,
     state: Arc<parking_lot::Mutex<JoinState<T>>>,
+    cancel_requested: Arc<AtomicBool>,
+    task_waker: Arc<AtomicWaker>,
 }
 
 impl<T> JoinHandle<T> {
     /// Create a new join handle
     pub(crate) fn new(task_id: TaskId) -> (Self, JoinCompleter<T>) {
         let state = Arc::new(parking_lot::Mutex::new(JoinState::pending()));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let task_waker = Arc::new(AtomicWaker::new());
         let handle = Self {
             task_id,
             state: state.clone(),
+            cancel_requested: cancel_requested.clone(),
+            task_waker: task_waker.clone(),
         };
-        let completer = JoinCompleter { state };
+        let completer = JoinCompleter {
+            state,
+            cancel_requested,
+            task_waker,
+        };
         (handle, completer)
     }
 
@@ -378,14 +405,10 @@ impl<T> JoinHandle<T> {
             self.task_id
         );
 
-        let mut state = self.state.lock();
-        if !state.completed {
-            state.result = Some(Err(TaskError::Cancelled));
-            state.completed = true;
-            tracing::info!("Task {:?} marked as cancelled", self.task_id);
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
-            }
+        if !self.state.lock().completed {
+            self.cancel_requested.store(true, Ordering::Release);
+            self.task_waker.wake();
+            tracing::info!("Task {:?} cancellation requested", self.task_id);
         }
 
         Ok(())
@@ -602,6 +625,19 @@ mod tests {
 
         assert!(matches!(task.poll_with_cached_waker(), Poll::Ready(())));
         assert!(matches!(task.poll_with_cached_waker(), Poll::Ready(())));
+    }
+
+    #[test]
+    fn join_handle_cancel_waits_for_owner_poll_ack() {
+        let (handle, completer) = JoinHandle::new(TaskId::new(0, 1));
+        let mut task = Box::pin(JoinTaskFuture::new(std::future::pending::<()>(), completer));
+        let waker = dummy_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
+        handle.cancel().unwrap();
+        assert!(!handle.is_finished());
+        assert!(matches!(task.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(handle.is_finished());
     }
 
     #[test]
