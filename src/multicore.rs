@@ -264,7 +264,10 @@ impl CpuCore {
         }
     }
 
-    /// Create new CPU core
+    /// Create new CPU core. The platform-gated constructor keeps the driver,
+    /// wakeup fd, and ownership flags explicit; the argument count is kept
+    /// local rather than introducing a shared configuration object.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         id: usize,
         io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
