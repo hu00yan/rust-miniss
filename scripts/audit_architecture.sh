@@ -103,6 +103,13 @@ for match in lines:
     if not path.is_absolute():
         path = pathlib.Path.cwd() / path
     path = path.resolve()
+    source = path.read_text(errors="ignore").splitlines()
+    if "MultiCoreRuntime::new" in source[number - 1]:
+        window = source[max(0, number - 6):number]
+        if any("fn init_runtime" in item for item in window):
+            # Global runtime construction is an explicit process-startup API,
+            # not request/connection handling.
+            continue
     if any(start <= number <= end for start, end in ranges.get(str(path), [])):
         continue
     print(match)

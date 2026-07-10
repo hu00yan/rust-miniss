@@ -6,6 +6,7 @@
 |---|---------|------|------|--------------|-------------|-------|
 | EX-001 | `src/lib.rs:block_on` | `Runtime::new` / `block_on` | Public convenience wrapper for top-level callers. | Not used by worker hot path; creates a runtime only when user explicitly calls the crate-level helper. | Replace with documented startup API before production release. | pending |
 | EX-002 | `src/multicore.rs:MultiCoreRuntime::block_on` | `Runtime::new` / `block_on` | Compatibility wrapper for synchronous callers awaiting one future. | Not invoked by request handling unless user chooses this control-plane API; worker threads still create one backend at startup. | Replace with bounded core-dispatching `block_on_cpu` implementation. | pending |
+| EX-003 | `src/multicore.rs:init_runtime` | `MultiCoreRuntime::new` | Explicit process-startup constructor for the global runtime facade. | Called by application initialization, before request handling; never from a worker hot path. | Replace global facade with an owned startup handle. | pending |
 
 ## 模板
 
