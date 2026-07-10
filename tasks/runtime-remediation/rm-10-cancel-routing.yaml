@@ -1,6 +1,6 @@
 ---
 id: rm-10-cancel-routing
-status: TODO
+status: YELLOW
 batch: 2
 depends_on: [rm-03-task-key-arena, rm-04-safe-waker]
 parallel_wave: W3

@@ -15,6 +15,8 @@ authority for scope and acceptance.
 | rm-06 | GREEN | GREEN | Merged as `e28431f`. Orb Linux vectored tests cover 1–4/spilled metadata shapes plus delayed-submit kernel readv/writev under relocation pressure. |
 | rm-07 | YELLOW | YELLOW | Commit `4e25b39` acquires a dup-based `OwnedFd` lease before io_uring SQE construction, keeps it by slab slot, and releases it on terminal CQE/SQ-full rejection. Lease lifetime regression passes. Epoll/kqueue acceptance-time lease and fd-reuse stress remain. |
 | rm-08 | YELLOW | YELLOW | Commit `e3cc5db` containment path had missing backend coverage. Follow-up adds fallback file/TCP/readv/UDP tests and fixes empty-buffer `ReadVectored` capacity loss. macOS fallback tests pass 5/5; Orb full gate pending. |
+| rm-09 | YELLOW | YELLOW | Commit `4e25b39` removes the `u64::MAX` sentinel path and delivers real terminal completion errors for admission/SQ failures; regression test `af5199b` passes locally. Public `submit` remains token-returning rather than `Result`, so literal API acceptance is deferred. |
+| rm-10 | YELLOW | YELLOW | `cancel_task` now routes by full owner shard, propagates bounded-channel backpressure/disconnect, and rejects invalid owners; targeted regression passes. `JoinHandle::cancel` still lacks owner acknowledgement and future-drop completion. |
 
 ## Review boundary
 

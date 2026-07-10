@@ -1474,10 +1474,23 @@ impl MultiCoreRuntime {
         }
 
         tracing::info!("Task cancellation requested for task {:?}", task_id);
-        for (core_id, sender) in self.core_senders.iter().enumerate() {
-            let _ = sender.try_send(CoreMessage::CancelTask(task_id));
-            self.notify_core(core_id);
-        }
+        // TaskKey carries authoritative owner shard.  Route one bounded
+        // message there; broadcasting by sequence let neighboring shards
+        // accidentally cancel unrelated tasks and hid queue backpressure.
+        let core_id = task_id.cpu_id();
+        let sender = self.core_senders.get(core_id).ok_or_else(|| {
+            RuntimeError::TaskFailed(format!("Task owner shard {core_id} is unavailable"))
+        })?;
+        sender
+            .try_send(CoreMessage::CancelTask(task_id))
+            .map_err(|error| {
+                let reason = match error {
+                    TrySendError::Full(_) => "cancel queue backpressured",
+                    TrySendError::Disconnected(_) => "task owner shard stopped",
+                };
+                RuntimeError::TaskFailed(reason.to_string())
+            })?;
+        self.notify_core(core_id);
         Ok(())
     }
 
@@ -1719,6 +1732,19 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn test_shutdown() {
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+        runtime.shutdown().unwrap();
+        match Arc::try_unwrap(runtime) {
+            Ok(rt) => rt.join().unwrap(),
+            Err(_) => panic!("Failed to get unique ownership of runtime"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cancel_routes_to_owner_and_rejects_missing_shard() {
+        let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+        let foreign = TaskId::from_key(crate::waker::TaskKey::new(1, 7, 0, 1));
+        assert!(runtime.cancel_task(foreign).is_err());
         runtime.shutdown().unwrap();
         match Arc::try_unwrap(runtime) {
             Ok(rt) => rt.join().unwrap(),
