@@ -13,7 +13,7 @@ authority for scope and acceptance.
 | rm-04 | YELLOW | YELLOW | Safe Arc wake state, bounded queue, dedup, cross-thread/late wake tests pass. Queue-full sticky overflow recovery remains. |
 | rm-05 | YELLOW | YELLOW | Poll budgets and self-waker fairness test pass; rm-04 queue overflow recovery still gates final GREEN. |
 | rm-06 | GREEN | GREEN | Merged as `e28431f`. Orb Linux vectored tests cover 1–4/spilled metadata shapes plus delayed-submit kernel readv/writev under relocation pressure. |
-| rm-07 | TODO | TODO | No corresponding commits or source fixes on `main`. |
+| rm-07 | YELLOW | YELLOW | Commit `4e25b39` acquires a dup-based `OwnedFd` lease before io_uring SQE construction, keeps it by slab slot, and releases it on terminal CQE/SQ-full rejection. Lease lifetime regression passes. Epoll/kqueue acceptance-time lease and fd-reuse stress remain. |
 | rm-08 | YELLOW | YELLOW | Commit `e3cc5db` containment path had missing backend coverage. Follow-up adds fallback file/TCP/readv/UDP tests and fixes empty-buffer `ReadVectored` capacity loss. macOS fallback tests pass 5/5; Orb full gate pending. |
 
 ## Review boundary

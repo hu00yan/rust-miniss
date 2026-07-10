@@ -1,6 +1,6 @@
 ---
 id: rm-07-descriptor-lease
-status: TODO
+status: YELLOW
 batch: 1-C
 depends_on: [rm-06-stable-iovec]
 parallel_wave: W2
