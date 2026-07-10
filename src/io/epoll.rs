@@ -743,7 +743,13 @@ impl IoProvider for EpollBackend {
                         result
                     }
                     Op::ReadVectored { fd, buffers } => {
-                        let mut buffers = buffers.clone();
+                        // Buffer::clone copies logical bytes, not spare capacity. Read
+                        // destinations are often empty, so clone would create zero-length
+                        // iovecs and make readv report EOF without reading anything.
+                        let mut buffers: smallvec::SmallVec<[Buffer; 4]> = buffers
+                            .iter()
+                            .map(|buffer| Buffer::new_uninitialized(buffer.capacity()))
+                            .collect();
                         let iovecs: Vec<libc::iovec> = buffers
                             .iter_mut()
                             .map(|buf| libc::iovec {
