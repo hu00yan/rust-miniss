@@ -1429,7 +1429,11 @@ impl MultiCoreRuntime {
     pub fn install_signal_handler(&self) {
         use crate::signal::SignalHandler;
         let shutdown = Arc::new(AtomicBool::new(false));
-        let handler = SignalHandler::with_cpu_handles(shutdown, self.core_senders.clone());
+        let handler = SignalHandler::with_cpu_handles(
+            shutdown,
+            self.core_senders.clone(),
+            self.core_shutdowns.clone(),
+        );
         handler.start();
     }
 

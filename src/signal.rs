@@ -21,6 +21,7 @@ pub type SignalCallback = Arc<dyn Fn(i32) + Send + Sync>;
 pub struct SignalHandler {
     shutdown_flag: Arc<AtomicBool>,
     cpu_senders: Vec<Sender<CoreMessage>>,
+    core_shutdowns: Vec<Arc<AtomicBool>>,
     callbacks: HashMap<i32, Vec<SignalCallback>>,
 }
 
@@ -29,6 +30,7 @@ impl SignalHandler {
         Self {
             shutdown_flag,
             cpu_senders: Vec::new(),
+            core_shutdowns: Vec::new(),
             callbacks: HashMap::new(),
         }
     }
@@ -36,10 +38,12 @@ impl SignalHandler {
     pub fn with_cpu_handles(
         shutdown_flag: Arc<AtomicBool>,
         cpu_senders: Vec<Sender<CoreMessage>>,
+        core_shutdowns: Vec<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             shutdown_flag,
             cpu_senders,
+            core_shutdowns,
             callbacks: HashMap::new(),
         }
     }
@@ -57,6 +61,7 @@ impl SignalHandler {
     pub fn start(&self) {
         let shutdown_flag = self.shutdown_flag.clone();
         let cpu_senders = self.cpu_senders.clone();
+        let core_shutdowns = self.core_shutdowns.clone();
         let callbacks = self.callbacks.clone();
 
         thread::spawn(move || {
@@ -75,8 +80,11 @@ impl SignalHandler {
                         if !shutdown_flag.load(Ordering::Acquire) {
                             shutdown_flag.store(true, Ordering::Release);
 
+                            for flag in &core_shutdowns {
+                                flag.store(true, Ordering::Release);
+                            }
                             for sender in &cpu_senders {
-                                let _ = sender.send(CoreMessage::Shutdown);
+                                let _ = sender.try_send(CoreMessage::Shutdown);
                             }
 
                             if let Some(signal_callbacks) = callbacks.get(&sig) {
