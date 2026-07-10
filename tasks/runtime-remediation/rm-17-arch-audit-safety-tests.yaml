@@ -37,3 +37,10 @@ architecture_audit: |
 ## Problem
 
 June script only caught pseudo-sync; not lifetime/UB patterns.
+
+## Verification (2026-07-11)
+
+The audit hard-fails escaped raw-Rc/TLS/unsafe-backend patterns and filters
+cfg(test) control-path runtime calls; `just arch-audit` exits 0 with explicit
+unsafe justifications. Miri is unavailable on the stable host and Loom model
+targets remain to be added.

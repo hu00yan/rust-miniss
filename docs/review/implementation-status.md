@@ -23,7 +23,7 @@ authority for scope and acceptance.
 | rm-14 | YELLOW | YELLOW | Commit `17ff822` adds runtime io_uring accept-opcode probing; bounded result queues close overflow fds and terminal errors clear listener tokens. Kernel multishot-flag probing and `OwnedFd` delivery remain. |
 | rm-15 | YELLOW | YELLOW | Commits `c9eec36`/`8c467f1`/`f07a46a`/`1c1f21c`: `spawn_local` accepts `!Send` futures on shard-local storage; physical affinity failure is explicit, readiness waits for bind, HTTP handlers stay local, and fake `block_on_cpu` now rejects explicitly. Non-contiguous cpuset enumeration and full worker-TLS readiness remain. |
 | rm-16 | YELLOW | YELLOW | QUIC UDP socket/poller now bind to the first worker shard that polls them; cross-shard poll and non-owner token clearing are rejected/avoided. clippy/check pass. Signal lifecycle, blocking send, and global-runtime join remain. |
-| rm-17 | YELLOW | YELLOW | Audit now checks escaped raw-Rc/TLS/unsafe-backend patterns and adds optional Miri/Loom recipes; cfg(test) runtime calls are filtered. One startup-only global-runtime construction remains reported, plus existing unsafe justifications. |
+| rm-17 | YELLOW | YELLOW | Audit hard-fail checks and optional Miri/Loom recipes are present; `just arch-audit` exits 0 with unsafe justification output. Host stable toolchain lacks Miri and no Loom model targets exist yet. |
 
 ## Review boundary
 
