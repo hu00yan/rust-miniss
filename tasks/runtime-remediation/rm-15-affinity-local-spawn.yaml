@@ -43,3 +43,10 @@ architecture_audit: |
 ## Problem (S1-8)
 
 HTTP cross-core spawn; fake block_on_cpu; logical CPUs; readiness before init.
+
+## Verification (2026-07-11)
+
+`spawn_local` accepts `!Send` futures in shard-local storage. Default worker
+count uses physical CPU count, affinity failure is returned, and startup
+readiness waits for the initial bind. `block_on_cpu`, non-contiguous cpuset
+enumeration, and HTTP keep-local routing remain.

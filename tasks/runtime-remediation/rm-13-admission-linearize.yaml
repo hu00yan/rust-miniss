@@ -32,3 +32,9 @@ architecture_audit: |
 ## Problem (S1-6)
 
 Load Running then enqueue races shutdown independently.
+
+## Verification (2026-07-11)
+
+`MultiCoreRuntime` now closes an admission counter/bit before publishing
+shutdown and waits for in-flight bounded sends. Post-cutoff spawn regression
+passes on Orb Linux. Local-spawn queue ownership and explicit owner ack remain.
