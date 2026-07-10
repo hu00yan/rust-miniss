@@ -25,6 +25,18 @@ use threadpool::ThreadPool;
 type IoCompletion = (IoToken, Result<CompletionKind, IoError>);
 const COMPLETION_QUEUE_CAPACITY: usize = 4096;
 
+fn publish_read_len(buffer: &mut Buffer, bytes_read: usize) -> Result<(), IoError> {
+    buffer
+        .publish_read_len(bytes_read)
+        .then_some(())
+        .ok_or_else(|| {
+            IoError::Other(format!(
+                "read reported {bytes_read} bytes for {} byte buffer",
+                buffer.capacity()
+            ))
+        })
+}
+
 /// Safe file descriptor wrapper that ensures RAII compliance
 #[derive(Debug)]
 struct SafeFdFile {
@@ -150,7 +162,7 @@ impl IoProvider for EpollBackend {
         Self::ensure_slot_capacity(unsafe { &mut *self.udp_recv_buffers.get() }, slot);
 
         match op {
-            Op::UdpRecv { fd, buffer } => {
+            Op::UdpRecv { fd, mut buffer } => {
                 // Register the UDP socket for read events.
                 let mut source = mio::unix::SourceFd(&fd);
                 if let Err(e) =
@@ -161,6 +173,9 @@ impl IoProvider for EpollBackend {
                 }
                 // SAFETY: udp_recv_buffers is shard-local and only touched by
                 // the owning epoll runtime thread while submitting/draining.
+                // `recv_from` takes a safe `&mut [u8]`, so it must never see
+                // the uninitialized spare capacity supplied by rent buffers.
+                buffer.prepare_for_safe_read();
                 let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                 udp_recv_buffers[slot] = Some(buffer);
                 pending_ops[slot] = Some((
@@ -253,23 +268,23 @@ impl IoProvider for EpollBackend {
                                 .as_mut()
                                 .seek(SeekFrom::Start(offset_copy))
                                 .and_then(|_| {
-                                    let mut buf = Buffer::new_uninitialized(len_copy);
-                                    // SAFETY: read writes up to len_copy bytes
-                                    // into this owned buffer before contents are read.
-                                    unsafe {
-                                        buf.set_len(len_copy);
-                                    }
-                                    safe_file.as_mut().read(buf.as_mut()).map(|bytes_read| {
-                                        // SAFETY: File::read initialized exactly
-                                        // bytes_read bytes in this owned buffer.
-                                        unsafe {
-                                            buf.set_len(bytes_read);
-                                        }
-                                        CompletionKind::ReadFile {
-                                            bytes_read,
-                                            data: buf,
-                                        }
-                                    })
+                                    let mut buf = Buffer::new_zeroed(len_copy);
+                                    safe_file
+                                        .as_mut()
+                                        .read(buf.as_mut())
+                                        .and_then(|bytes_read| {
+                                            if buf.publish_read_len(bytes_read) {
+                                                Ok(CompletionKind::ReadFile {
+                                                    bytes_read,
+                                                    data: buf,
+                                                })
+                                            } else {
+                                                Err(io::Error::new(
+                                                    io::ErrorKind::InvalidData,
+                                                    "file read exceeded buffer capacity",
+                                                ))
+                                            }
+                                        })
                                 })
                                 .map_err(IoError::Io),
                             Err(err) => Err(IoError::Io(err)),
@@ -448,15 +463,15 @@ impl IoProvider for EpollBackend {
                                 break Err(IoError::Io(err));
                             } else {
                                 let bytes_read = ret as usize;
-                                // SAFETY: read initialized exactly bytes_read
-                                // bytes in the buffer.
-                                unsafe {
-                                    buffer.set_len(bytes_read);
+                                match publish_read_len(&mut buffer, bytes_read) {
+                                    Ok(()) => {
+                                        break Ok(CompletionKind::Read {
+                                            bytes_read,
+                                            data: buffer,
+                                        })
+                                    }
+                                    Err(error) => break Err(error),
                                 }
-                                break Ok(CompletionKind::Read {
-                                    bytes_read,
-                                    data: buffer,
-                                });
                             }
                         };
 
@@ -617,21 +632,18 @@ impl IoProvider for EpollBackend {
                         // into_raw_fd prevents closing so ownership stays outside.
                         let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
                         let result = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = Buffer::new_uninitialized(*len);
-                            // SAFETY: read writes up to len bytes into this
-                            // owned buffer before contents are read.
-                            unsafe {
-                                buf.set_len(*len);
-                            }
-                            file.read(buf.as_mut()).map(|bytes_read| {
-                                // SAFETY: read initialized exactly bytes_read
-                                // bytes in this owned buffer.
-                                unsafe {
-                                    buf.set_len(bytes_read);
-                                }
-                                CompletionKind::ReadFile {
-                                    bytes_read,
-                                    data: buf,
+                            let mut buf = Buffer::new_zeroed(*len);
+                            file.read(buf.as_mut()).and_then(|bytes_read| {
+                                if buf.publish_read_len(bytes_read) {
+                                    Ok(CompletionKind::ReadFile {
+                                        bytes_read,
+                                        data: buf,
+                                    })
+                                } else {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "file read exceeded buffer capacity",
+                                    ))
                                 }
                             })
                         });
@@ -662,23 +674,16 @@ impl IoProvider for EpollBackend {
                             // converted back with into_raw_fd before drop.
                             let socket = unsafe { std::net::UdpSocket::from_raw_fd(*fd) };
                             let mut retry = false;
-                            // SAFETY: recv_from writes into the full
-                            // requested capacity before any contents are read.
-                            unsafe {
-                                buffer.set_len(buffer.capacity());
-                            }
                             let result = match socket.recv_from(buffer.as_mut()) {
                                 Ok((bytes_read, addr)) => {
-                                    // SAFETY: recv_from initialized exactly
-                                    // bytes_read bytes in this buffer.
-                                    unsafe {
-                                        buffer.set_len(bytes_read);
+                                    match publish_read_len(&mut buffer, bytes_read) {
+                                        Ok(()) => Ok(CompletionKind::UdpRecv {
+                                            bytes_read,
+                                            buffer,
+                                            addr,
+                                        }),
+                                        Err(error) => Err(error),
                                     }
-                                    Ok(CompletionKind::UdpRecv {
-                                        bytes_read,
-                                        buffer,
-                                        addr,
-                                    })
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                     let mut mio_source = SourceFd(fd);
@@ -769,14 +774,19 @@ impl IoProvider for EpollBackend {
                                 });
                             } else {
                                 let bytes_read = ret as usize;
+                                let requested_capacity: usize =
+                                    iovecs.iter().map(|iov| iov.iov_len).sum();
+                                if bytes_read > requested_capacity {
+                                    break Err(IoError::Other(format!(
+                                        "readv reported {bytes_read} bytes for {requested_capacity} byte buffers"
+                                    )));
+                                }
                                 let mut remaining = bytes_read;
                                 for buf in buffers.iter_mut() {
                                     let can_read = std::cmp::min(remaining, buf.capacity());
-                                    // SAFETY: readv initialized this slice of
-                                    // the iovec output buffers.
-                                    unsafe {
-                                        buf.set_len(can_read);
-                                    }
+                                    // `can_read` is bounded by both the checked
+                                    // readv result and this buffer's capacity.
+                                    assert!(buf.publish_read_len(can_read));
                                     remaining -= can_read;
                                     if remaining == 0 {
                                         break;

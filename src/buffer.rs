@@ -154,6 +154,37 @@ impl Buffer {
         self.inner.capacity()
     }
 
+    /// Makes the complete allocation safe to expose as a mutable byte slice.
+    ///
+    /// This is the containment path for APIs such as `Read::read` and
+    /// `UdpSocket::recv_from`: those APIs require a `&mut [u8]`, which may not
+    /// cover uninitialized spare capacity. Call [`Self::publish_read_len`] with
+    /// the actual byte count after the operation completes.
+    // Only the epoll/kqueue fallback calls this. Linux io_uring builds do not
+    // compile that backend, but keep the containment API available to it.
+    #[allow(dead_code)]
+    pub(crate) fn prepare_for_safe_read(&mut self) {
+        let capacity = self.inner.capacity();
+        self.inner.resize(capacity, 0);
+    }
+
+    /// Publishes bytes written by a kernel read into this buffer.
+    ///
+    /// Returns `false` and leaves the logical length unchanged when `len`
+    /// exceeds the allocation capacity. Callers must only use this after the
+    /// kernel or a safe read API has initialized the reported range.
+    // Only fallback backend builds call this outside unit tests.
+    #[allow(dead_code)]
+    pub(crate) fn publish_read_len(&mut self, len: usize) -> bool {
+        if len > self.capacity() {
+            return false;
+        }
+        // SAFETY: the caller contract above ensures the newly exposed range
+        // was initialized; the capacity bound was checked immediately above.
+        unsafe { self.inner.set_len(len) };
+        true
+    }
+
     /// Resizes the buffer to the requested length, zero-filling new bytes.
     pub fn resize(&mut self, new_len: usize, value: u8) {
         self.inner.resize(new_len, value);
@@ -340,5 +371,58 @@ impl BufferPool {
 
     pub fn recycle(buffer: Buffer) {
         buffer.recycle();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Buffer;
+    use std::io::Read;
+
+    #[test]
+    fn safe_read_destination_is_initialized_before_slice_exposure() {
+        let mut buffer = Buffer::new_uninitialized(8);
+        buffer.prepare_for_safe_read();
+
+        assert_eq!(buffer.len(), 8);
+        assert_eq!(buffer.as_ref(), &[0; 8]);
+
+        let bytes_read = (&b"abc"[..]).read(buffer.as_mut()).unwrap();
+        assert_eq!(bytes_read, 3);
+        assert!(buffer.publish_read_len(bytes_read));
+        assert_eq!(buffer.as_ref(), b"abc");
+    }
+
+    #[test]
+    fn read_length_outside_capacity_is_rejected_without_publishing() {
+        let mut buffer = Buffer::new_uninitialized(4);
+        assert!(!buffer.publish_read_len(5));
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn eof_publishes_an_empty_logical_buffer() {
+        let mut buffer = Buffer::new_uninitialized(4);
+        buffer.prepare_for_safe_read();
+
+        let bytes_read = (&b""[..]).read(buffer.as_mut()).unwrap();
+        assert_eq!(bytes_read, 0);
+        assert!(buffer.publish_read_len(bytes_read));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn read_error_leaves_only_initialized_bytes_exposed() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _dst: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("expected read failure"))
+            }
+        }
+
+        let mut buffer = Buffer::new_uninitialized(4);
+        buffer.prepare_for_safe_read();
+        assert!(FailingReader.read(buffer.as_mut()).is_err());
+        assert_eq!(buffer.as_ref(), &[0; 4]);
     }
 }

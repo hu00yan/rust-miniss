@@ -1,6 +1,6 @@
 ---
 id: rm-08-buffer-init
-status: TODO
+status: GREEN
 batch: 1-D
 depends_on: [rm-00-gate-all-targets]
 parallel_wave: W1
