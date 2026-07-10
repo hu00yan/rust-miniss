@@ -75,6 +75,12 @@ impl AsyncTcpListener {
         if !supports_multishot {
             self.accept_token = None;
         }
+        // Terminal CQE/error disarms multishot operation.  Do not retain a
+        // dead token and wait forever on the next accept call; next call will
+        // issue a fresh operation (or use the synchronous fallback).
+        if result.is_err() {
+            self.accept_token = None;
+        }
         match result? {
             crate::io::CompletionKind::Accept { fd, addr } => {
                 // SAFETY: The accepted fd is newly returned by the OS/backend

@@ -104,6 +104,7 @@ struct SlotMeta {
 /// The completion type for the io_uring backend.
 pub(super) type Completion = (IoToken, Result<CompletionKind, IoError>);
 type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
+const ACCEPT_QUEUE_CAPACITY: usize = 256;
 
 /// A `io-uring` based `IoProvider`.
 /// Thread-local to ensure single-threaded access.
@@ -415,8 +416,19 @@ impl UringBackend {
                         })
                     };
                     let token_idx = token.slot_index();
-                    let queue = accept_results[token_idx].get_or_insert_with(VecDeque::new);
-                    queue.push_back(completion_result);
+                    let queue = accept_results[token_idx]
+                        .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
+                    if queue.len() >= ACCEPT_QUEUE_CAPACITY {
+                        // Drop surplus accepted descriptor rather than letting
+                        // an abandoned listener grow an unbounded queue.
+                        if result >= 0 {
+                            // SAFETY: this fd is a fresh accept result owned by
+                            // this branch and has not been transferred.
+                            unsafe { libc::close(result) };
+                        }
+                    } else {
+                        queue.push_back(completion_result);
+                    }
                     if let Some(waker) = io_state.take_waker(token) {
                         wakeups += 1;
                         waker.wake();
@@ -1458,8 +1470,17 @@ impl IoProvider for UringBackend {
                     res
                 };
                 let token_idx = token.slot_index();
-                let queue = accept_results[token_idx].get_or_insert_with(VecDeque::new);
-                queue.push_back(completion_result);
+                let queue = accept_results[token_idx]
+                    .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
+                if queue.len() >= ACCEPT_QUEUE_CAPACITY {
+                    if result >= 0 {
+                        // SAFETY: surplus accepted descriptor is still owned by
+                        // this backend and must be closed exactly once.
+                        unsafe { libc::close(result) };
+                    }
+                } else {
+                    queue.push_back(completion_result);
+                }
                 // SAFETY: token belongs to this shard and the waker slot is
                 // owned by the current io_state.
                 crate::cpu::with_io_state(|io_state| unsafe {

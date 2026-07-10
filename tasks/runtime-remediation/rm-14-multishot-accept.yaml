@@ -1,6 +1,6 @@
 ---
 id: rm-14-multishot-accept
-status: TODO
+status: YELLOW
 batch: 4
 depends_on: [rm-07-descriptor-lease, rm-09-fallible-submit]
 parallel_wave: W4
