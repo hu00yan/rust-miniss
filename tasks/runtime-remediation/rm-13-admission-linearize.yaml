@@ -29,6 +29,12 @@ architecture_audit: |
 
 # rm-13: Admission linearization
 
+## Verification (2026-07-11)
+
+The admission ticket still spans shutdown cutoff through shard-local spawn;
+`spawn_on` additionally waits for an owner reply after arena insertion. The
+other retrying spawn paths still need the same acknowledgement treatment.
+
 ## Problem (S1-6)
 
 Load Running then enqueue races shutdown independently.

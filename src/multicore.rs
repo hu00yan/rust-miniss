@@ -120,6 +120,7 @@ pub enum CoreMessage {
     Task {
         id: TaskId,
         future: Pin<Box<dyn Future<Output = ()> + Send>>,
+        reply: Option<std::sync::mpsc::Sender<TaskAdmissionOutcome>>,
     },
     /// Ping from another core (load balancing)
     Ping { from_core: usize },
@@ -134,6 +135,13 @@ pub enum CoreMessage {
     CollectMetrics {
         reply: std::sync::mpsc::Sender<CoreMetricsSnapshot>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskAdmissionOutcome {
+    Accepted,
+    Rejected,
+    RuntimeStopping,
 }
 
 /// Owner acknowledgement for a cancellation request.
@@ -655,7 +663,7 @@ impl CpuCore {
         // Process more messages when the shard is idle; back off when it is busy.
         while processed < max_messages {
             match self.message_inbox.try_recv() {
-                Ok(CoreMessage::Task { id, future }) => {
+                Ok(CoreMessage::Task { id, future, reply }) => {
                     tracing::debug!(
                         "Core {} got task {:?}, {} ready",
                         self.id,
@@ -664,6 +672,9 @@ impl CpuCore {
                     );
                     let task = Task::from_pinned(id, future);
                     if !self.task_queue.insert_external(id.key(), task) {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(TaskAdmissionOutcome::Rejected);
+                        }
                         tracing::warn!("Core {} rejected task {:?}: slot occupied", self.id, id);
                         processed += 1;
                         continue;
@@ -676,6 +687,9 @@ impl CpuCore {
                         self.metrics.max_ready_queue_len.max(self.ready_queue.len());
                     self.local_task_count += 1;
                     self.metrics.tasks_spawned += 1;
+                    if let Some(reply) = reply {
+                        let _ = reply.send(TaskAdmissionOutcome::Accepted);
+                    }
                     processed += 1;
                 }
                 Ok(CoreMessage::Ping { from_core }) => {
@@ -1475,10 +1489,12 @@ impl MultiCoreRuntime {
         F: Future<Output = ()> + Send + 'static,
     {
         let _admission = self.begin_admission()?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         // Send task to selected core
         let message = CoreMessage::Task {
             id: task_id,
             future: Box::pin(DetachedTaskFuture::new(future)),
+            reply: Some(reply_tx),
         };
 
         match self.core_senders[core_id].try_send(message) {
@@ -1496,7 +1512,15 @@ impl MultiCoreRuntime {
         }
 
         tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
-        Ok(task_id)
+        match reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or(TaskAdmissionOutcome::RuntimeStopping)
+        {
+            TaskAdmissionOutcome::Accepted => Ok(task_id),
+            outcome => Err(RuntimeError::TaskFailed(format!(
+                "task admission outcome: {outcome:?}"
+            ))),
+        }
     }
 
     fn spawn_on_any_core(
@@ -1513,6 +1537,7 @@ impl MultiCoreRuntime {
             let message = CoreMessage::Task {
                 id: task_id,
                 future: Box::pin(DetachedTaskFuture::new(future)),
+                reply: None,
             };
             match self.core_senders[core_id].try_send(message) {
                 Ok(()) => {
@@ -1565,6 +1590,7 @@ impl MultiCoreRuntime {
                 let message = CoreMessage::Task {
                     id: task_id,
                     future: Box::pin(DetachedTaskFuture::new(future)),
+                    reply: None,
                 };
                 match self.core_senders[core_id].try_send(message) {
                     Ok(()) => {
@@ -1614,6 +1640,7 @@ impl MultiCoreRuntime {
             let message = CoreMessage::Task {
                 id: task_id,
                 future: Box::pin(DetachedTaskFuture::new(future)),
+                reply: None,
             };
             match self.core_senders[core_id].try_send(message) {
                 Ok(()) => {
