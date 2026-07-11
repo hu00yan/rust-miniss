@@ -11,6 +11,13 @@ allowed_files:
   - src/io/epoll.rs
   - src/io/future.rs
   - src/cpu.rs
+  # Result-returning submit requires every operation owner to handle
+  # pre-admission failure; these are call-site migrations, not new ownership.
+  - src/fs.rs
+  - src/net.rs
+  - src/quic.rs
+  - src/multicore.rs
+  - examples/bench_nop.rs
   - tests/**
   - tasks/runtime-remediation/rm-09-fallible-submit.yaml
 forbidden_patterns:

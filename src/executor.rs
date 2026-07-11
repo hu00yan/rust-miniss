@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::cpu::CpuIoState;
+use crate::error::{Result, RuntimeError};
 use crate::task::{DetachedTaskFuture, JoinHandle, JoinTaskFuture, Task};
 use crate::timer::TimerWheel;
 use crate::waker::{ReadyQueue, TaskArena, TaskId};
@@ -226,7 +227,19 @@ impl Runtime {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.executor.borrow_mut().spawn(future) // Changed from lock().unwrap()
+        self.try_spawn(future)
+            .expect("executor task arena capacity exhausted")
+    }
+
+    /// Fallible spawn variant. Capacity exhaustion is reported before the
+    /// future is admitted, so callers can apply backpressure instead of
+    /// aborting the owner thread.
+    pub fn try_spawn<F, T>(&self, future: F) -> Result<JoinHandle<T>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.executor.borrow_mut().try_spawn(future)
     }
 
     /// Spawn a fire-and-forget task without creating a join handle.
@@ -234,7 +247,16 @@ impl Runtime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.executor.borrow_mut().spawn_detached(future);
+        self.try_spawn_detached(future)
+            .expect("executor task arena capacity exhausted");
+    }
+
+    /// Fallible detached spawn variant.
+    pub fn try_spawn_detached<F>(&self, future: F) -> Result<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.executor.borrow_mut().try_spawn_detached(future)
     }
 }
 
@@ -320,10 +342,19 @@ impl Executor {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let key = self
-            .tasks
-            .reserve()
-            .expect("executor task arena capacity exhausted");
+        self.try_spawn(future)
+            .expect("executor task arena capacity exhausted")
+    }
+
+    /// Fallible task admission for callers that need bounded backpressure.
+    pub fn try_spawn<F, T>(&mut self, future: F) -> crate::error::Result<JoinHandle<T>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let key = self.tasks.reserve().ok_or_else(|| {
+            RuntimeError::TaskFailed("executor task arena capacity exhausted".to_string())
+        })?;
         let task_id = TaskId::from_key(key);
 
         let (handle, completer) = JoinHandle::new(task_id);
@@ -338,7 +369,7 @@ impl Executor {
         assert!(self.tasks.insert(key, task));
         self.active_tasks += 1;
 
-        handle
+        Ok(handle)
     }
 
     /// Spawn a task without tracking a join handle.
@@ -346,10 +377,18 @@ impl Executor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let key = self
-            .tasks
-            .reserve()
-            .expect("executor task arena capacity exhausted");
+        self.try_spawn_detached(future)
+            .expect("executor task arena capacity exhausted")
+    }
+
+    /// Fallible detached task admission.
+    pub fn try_spawn_detached<F>(&mut self, future: F) -> crate::error::Result<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let key = self.tasks.reserve().ok_or_else(|| {
+            RuntimeError::TaskFailed("executor task arena capacity exhausted".to_string())
+        })?;
         let task_id = TaskId::from_key(key);
 
         let mut task = Task::new(task_id, DetachedTaskFuture::new(future));
@@ -358,7 +397,7 @@ impl Executor {
         assert!(self.tasks.insert(key, task));
         self.active_tasks += 1;
 
-        task_id
+        Ok(task_id)
     }
 
     /// Run all ready tasks once
@@ -442,6 +481,12 @@ mod tests {
     fn test_runtime_creation() {
         let _runtime = Runtime::new(); // arch-audit: allow unit test runtime creation
                                        // Runtime should be created successfully
+    }
+
+    #[test]
+    fn try_spawn_reports_admission_result_without_panicking() {
+        let runtime = Runtime::new();
+        assert!(runtime.try_spawn(async { 1u8 }).is_ok());
     }
 
     #[test]
