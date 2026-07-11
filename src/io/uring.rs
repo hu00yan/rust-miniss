@@ -2160,6 +2160,15 @@ mod tests {
         );
         assert!(backend.cancel(token));
         assert!(unsafe { &*backend.accept_results.get() }[token.slot_index()].is_none());
+        backend.flush_logged();
+        for _ in 0..8 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(backend.pending_operation_count(), 0);
     }
 }
 
