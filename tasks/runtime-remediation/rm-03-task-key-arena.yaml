@@ -1,6 +1,6 @@
 ---
 id: rm-03-task-key-arena
-status: YELLOW
+status: GREEN
 batch: 1-B
 depends_on: [rm-00-gate-all-targets]
 parallel_wave: W1
@@ -36,7 +36,9 @@ architecture_audit: |
 `Executor` and `CpuCore` live task storage now use bounded `TaskArena`; full
 keys validate stale wake/cancel ABA, external admission rejects wrong shard
 and out-of-capacity keys, and runtime generations are allocated per runtime.
-Capacity exhaustion still needs a fallible public spawn result before GREEN.
+`Executor::try_spawn` and `try_spawn_detached` return admission errors without
+panic; bounded-capacity regression passes. Local `!Send` storage remains a
+separate shard-local path.
 ---
 
 # rm-03: Generational TaskKey + arena

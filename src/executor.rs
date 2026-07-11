@@ -294,9 +294,27 @@ impl Executor {
         park_timeout: std::time::Duration,
         poll_budget: usize,
     ) -> Self {
+        Self::with_task_capacity_and_budget(65_536, park_timeout, poll_budget)
+    }
+
+    /// Create an executor with an explicit bounded task capacity.
+    pub fn with_task_capacity(capacity: usize) -> Self {
+        Self::with_task_capacity_and_budget(
+            capacity,
+            crate::config::park_timeout(),
+            crate::config::task_poll_budget(),
+        )
+    }
+
+    fn with_task_capacity_and_budget(
+        capacity: usize,
+        park_timeout: std::time::Duration,
+        poll_budget: usize,
+    ) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            tasks: TaskArena::with_capacity(crate::waker::next_runtime_generation(), 0, 65_536),
-            ready_queue: Arc::new(ArrayQueue::new(65_536)),
+            tasks: TaskArena::with_capacity(crate::waker::next_runtime_generation(), 0, capacity),
+            ready_queue: Arc::new(ArrayQueue::new(capacity)),
             active_tasks: 0,
             park_timeout,
             poll_budget: poll_budget.max(1),
@@ -487,6 +505,13 @@ mod tests {
     fn try_spawn_reports_admission_result_without_panicking() {
         let runtime = Runtime::new();
         assert!(runtime.try_spawn(async { 1u8 }).is_ok());
+    }
+
+    #[test]
+    fn try_spawn_rejects_full_bounded_arena() {
+        let mut executor = Executor::with_task_capacity(1);
+        assert!(executor.try_spawn(async {}).is_ok());
+        assert!(executor.try_spawn(async {}).is_err());
     }
 
     #[test]
