@@ -2131,6 +2131,9 @@ pub fn shutdown_global_with_timeout(timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static_assertions::assert_not_impl_any!(CpuCore: Send, Sync);
+    static_assertions::assert_impl_all!(MultiCoreRuntime: Send, Sync);
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 

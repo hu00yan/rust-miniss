@@ -101,6 +101,7 @@ pub struct EpollBackend {
     /// Completed operations from the file I/O thread pool.
     completed_tx: SyncSender<IoCompletion>,
     completed_rx: UnsafeCell<Receiver<IoCompletion>>,
+    _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl EpollBackend {
@@ -124,6 +125,7 @@ impl EpollBackend {
             completed_local: UnsafeCell::new(Vec::new()),
             completed_tx,
             completed_rx: UnsafeCell::new(completed_rx),
+            _local: std::marker::PhantomData,
         })
     }
 
@@ -1201,4 +1203,9 @@ impl AsRawFd for Op {
             Op::Nop => panic!("Nop has no file descriptor"),
         }
     }
+}
+
+#[cfg(test)]
+mod locality_contract_tests {
+    static_assertions::assert_not_impl_any!(super::EpollBackend: Send, Sync);
 }

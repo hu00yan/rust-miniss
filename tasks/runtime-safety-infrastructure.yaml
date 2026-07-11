@@ -1,0 +1,48 @@
+---
+id: runtime-safety-infrastructure
+status: GREEN
+goal: Add low-cost mechanical contracts that reject shard, identity, lifetime,
+  cancellation, and performance-regression mistakes without slowing the default loop.
+allowed_files:
+  - AGENTS.md
+  - Cargo.toml
+  - Cargo.lock
+  - justfile
+  - .github/workflows/ci.yml
+  - bench/scripts/compare_http_baseline.pl
+  - bench/scripts/bench_http.sh
+  - docs/DECISION_LOG.md
+  - docs/review/implementation-status.md
+  - docs/review/runtime-safety-contracts.md
+  - docs/review/runtime-safety-findings.md
+  - src/cpu.rs
+  - src/executor.rs
+  - src/io/epoll.rs
+  - src/io/uring.rs
+  - src/multicore.rs
+  - src/timer/mod.rs
+  - src/waker.rs
+  - scripts/linux_safety.sh
+  - tests/integration_concurrency.rs
+  - tests/cancellation_functionality.rs
+  - tests/simple_cancellation_test.rs
+  - tests/runtime_safety_models.rs
+  - tasks/runtime-remediation/rm-17-arch-audit-safety-tests.yaml
+  - tasks/runtime-safety-infrastructure.yaml
+test_commands:
+  - just test-fast
+  - cargo clippy --all-targets -- -D warnings
+  - just arch-audit
+architecture_audit: |
+  Adds no shared mutable state, locks, runtime creation, blocking hot-path calls,
+  or cross-core traffic. PhantomData<Rc<()>> only makes existing shard ownership
+  mechanically non-Send/non-Sync. Optional test dependencies stay outside runtime paths.
+verification: |
+  just test-fast passes 65 unit tests plus two 64-case property models.
+  Both property models also pass 4096-case stress runs. Strict clippy and
+  architecture audit pass. Full macOS integration exposed and removed two
+  obsolete cancellation tests; the remaining macOS HTTP/2 hang is recorded for
+  separate diagnosis. CI retains the existing full Linux all-target suite.
+  Benchmark comparator syntax and matching/mismatching metadata fixtures pass;
+  no new performance measurement is claimed in this task.
+---

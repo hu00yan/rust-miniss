@@ -25,6 +25,31 @@ BENCH_RUNTIMES=${BENCH_RUNTIMES:-"miniss-onecore,miniss-multicore,monoio,compio,
 
 mkdir -p "$OUT_DIR"
 
+HOST_NAME=$(uname -n)
+OS_NAME=$(uname -s)
+KERNEL_RELEASE=$(uname -r)
+if [[ -r /proc/cpuinfo ]]; then
+    CPU_MODEL=$(awk -F: '/^(model name|Hardware)[[:space:]]*:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' /proc/cpuinfo)
+elif command -v sysctl >/dev/null 2>&1; then
+    CPU_MODEL=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
+else
+    CPU_MODEL=$(uname -m)
+fi
+CPU_MODEL=${CPU_MODEL:-unknown}
+
+# Keep the benchmark result self-describing. The comparator requires every
+# field below to match, so a result from another host or load shape cannot be
+# presented as a same-machine regression baseline.
+perl -MJSON::PP=encode_json -e '
+    my ($path, @values) = @ARGV;
+    my @keys = qw(host os kernel cpu_model cores threads connections duration runtime);
+    my %metadata; @metadata{@keys} = @values;
+    open my $fh, ">", $path or die "cannot write $path: $!\n";
+    print {$fh} encode_json(\%metadata), "\n";
+' "$OUT_DIR/metadata.json" \
+    "$HOST_NAME" "$OS_NAME" "$KERNEL_RELEASE" "$CPU_MODEL" "$HTTP_CORES" \
+    "$THREADS" "$CONNECTIONS" "$DURATION" "$BENCH_RUNTIMES"
+
 if ! command -v wrk >/dev/null 2>&1; then
     echo "ERROR: wrk is not installed" >&2
     exit 1

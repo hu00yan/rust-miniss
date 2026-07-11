@@ -48,11 +48,18 @@ This repo uses a single-context domain docs layout. See `docs/agents/domain.md`.
 
 # Gate Definitions
 
-每个 gate 是一条 `just` recipe。串成 `just gate` 作为提交前检查。
+每个 gate 是一条 `just` recipe。默认开发与 CI 先跑 `just test-fast`；
+提交 gate 使用真实同机 baseline：`just gate BASELINE=<summary.csv>`。
+
+## `just test-fast`
+
+`cargo fmt --all -- --check` + crate 普通单测/静态断言 + 64-case bounded
+property models。不得运行 Loom、Miri、独立 Linux lifetime/stress jobs；property
+models 不得使用 socket、fd、thread、sleep 或 wall clock。
 
 ## `just check`
 
-`cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test --all-targets`
+`cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test --tests --examples`
 
 ## `just arch-audit`
 
@@ -68,7 +75,16 @@ This repo uses a single-context domain docs layout. See `docs/agents/domain.md`.
 
 ## `just bench-smoke`
 
-运行固定 microbench（`bench_nop`），输出 JSON：`{ bench, throughput_ops_per_sec, p50_us, p99_us, commit, baseline_commit }`。throughput 回退 >5% 标记警告。
+运行一次 5 秒 `miniss-onecore` HTTP smoke，与显式提供的同机
+`summary.csv` 比较并输出 JSON。throughput 回退 >5% 或 p99 增长 >10% 失败；
+无 baseline 时明确失败，不把 `HEAD~1` 冒充测量证据。
+
+## 专项安全命令
+
+- `just loom`：在生产同步 seam 尚未抽取时必须明确失败；不得用独立 bitset
+  reference model 冒充生产并发证据。
+- `just miri-safety`：仅 TLS、waker、buffer 的定名测试。
+- `just linux-safety`：仅 Linux/io_uring 生命周期回归；非 Linux 明确失败。
 
 ## `just review`
 
@@ -80,7 +96,7 @@ This repo uses a single-context domain docs layout. See `docs/agents/domain.md`.
 
 ## `just gate`
 
-`just check && just arch-audit && just diff-audit && just bench-smoke`。返回码：0=GREEN、1=YELLOW、2=RED(架构红线)、3=RED(越界改文件)。
+`just check && just arch-audit && just diff-audit && just bench-smoke BASELINE=...`。返回码：0=GREEN、1=YELLOW、2=RED(架构红线)、3=RED(越界改文件)。
 
 ---
 

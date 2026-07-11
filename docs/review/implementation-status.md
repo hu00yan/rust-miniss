@@ -12,7 +12,7 @@ authority for scope and acceptance.
 | rm-01 | GREEN | GREEN | Scoped closure-based TLS plus RAII restore covers panic/nesting; Orb Linux full test gate and strict check/clippy pass. |
 | rm-02 | GREEN | GREEN | Local and Orb Linux check/clippy pass. Drivers/state are local `Box` ownership, no unsafe Send/Sync impls; Runtime reuses one owned driver/timer pair across block_on. |
 | rm-03 | GREEN | GREEN | `Executor`/`CpuCore` live storage uses bounded generational `TaskArena`; full keys reject stale/wrong-shard/out-of-capacity admission, runtime generations are per-runtime, and `try_spawn`/`try_spawn_detached` report capacity errors. Orb Linux: 73 lib + 22 multicore tests pass; bounded-capacity regression passes locally. |
-| rm-04 | GREEN | GREEN | Commit `2a30856`: safe Arc wake state, bounded queue, dedup, cross-thread/late wake, sticky overflow marker, owner unpark, and arena-rescan retry tests pass; Orb Linux lib coverage passes. Loom remains a final rm-17 evidence item. |
+| rm-04 | GREEN | GREEN | Commit `2a30856`: safe Arc wake state, bounded queue, dedup, cross-thread/late wake, sticky overflow marker, owner unpark, and arena-rescan retry tests pass; Orb Linux lib coverage passes. A production-linked Loom seam remains unverified. |
 | rm-05 | GREEN | GREEN | Configurable poll budgets, self-waker fairness, and bounded ready-queue recovery pass in the Orb Linux lib/multicore suites. |
 | rm-06 | GREEN | GREEN | Merged as `e28431f`. Orb Linux vectored tests cover 1–4/spilled metadata shapes plus delayed-submit kernel readv/writev under relocation pressure. |
 | rm-07 | GREEN | GREEN | Dup-based `OwnedFd` leases are acquired before io_uring/fallback queueing and released only at terminal cleanup; user-future abandonment clears delivery only. Orb Linux fd-reuse stress proves a read remains on the original pipe after numeric fd reuse; fallback lease regression and rm-14 accepted-result ownership tests pass. |
@@ -25,14 +25,15 @@ authority for scope and acceptance.
 | rm-14 | GREEN | GREEN | Runtime io_uring accept-opcode/kernel-version capability checks, bounded result queues, `OwnedFd` delivery, and single-shot sockaddr-retaining fallback are implemented. Listener drop requests owner-backend cancellation; cancellation drops queued OwnedFd results, overflow and sockaddr-parse paths close exactly once, canceled multishot CQEs are terminal, and live slot identities are cleared. Orb accept regressions pass. |
 | rm-15 | GREEN | GREEN | `spawn_local` accepts `!Send` futures on shard-local storage; startup enumerates allowed physical package/core IDs (including non-contiguous cpusets), affinity failure is explicit, and readiness is acknowledged only after owner-thread TLS/driver context installation. HTTP handlers stay local and fake `block_on_cpu` rejects explicitly. Orb Linux multicore suite: 22/22. |
 | rm-16 | GREEN | GREEN | QUIC UDP socket/poller bind to the first worker shard that polls them; cross-shard poll and non-owner token clearing are rejected/avoided. Signal shutdown is bounded/non-blocking with owner flags as lifecycle point. `join_global` and bounded `shutdown_global_with_timeout` now join the process-global runtime; global join regression passes. |
-| rm-17 | GREEN | GREEN | Audit hard-fail checks and precise Miri/Loom recipes are present; `just arch-audit` exits 0 with unsafe justification output. Orb nightly Miri passes pure TLS/identity, waker (10), and buffer (4) targets; backend syscall tests are explicitly excluded because Miri cannot emulate io_uring. Orb Linux Loom models (2/2) pass. |
+| rm-17 | YELLOW | YELLOW | Audit hard-fail checks and precise Miri/Linux recipes are present; `just test-fast` adds static locality constraints and two 64-case lifecycle models. The previous full-runtime Loom tests were invalid and removed; `just loom` now fails explicitly until three production synchronization seams exist. Backend syscalls remain outside Miri. |
 
 ## Review boundary
 
 The worktree also contains an unrelated untracked `.codebase-memory/`
 directory; it is preserved.
 
-All remediation cards are currently recorded GREEN against the evidence
-above. The runtime remains explicitly non-production-safe where the authority
-document lists follow-up evidence (for example kernel-version matrix and
-benchmark baselines); no deferred API or lifecycle design was silently changed.
+All remediation cards except rm-17 remain recorded GREEN against the evidence
+above. rm-17 is YELLOW because production-linked Loom seams remain absent. The
+runtime remains explicitly non-production-safe where the authority document
+lists follow-up evidence; no deferred API or lifecycle design was silently
+changed.

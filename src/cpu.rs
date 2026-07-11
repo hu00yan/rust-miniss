@@ -99,6 +99,7 @@ pub struct CpuIoState {
     /// Per-token state packed into a single slot to avoid three separate table lookups.
     /// SAFETY: Single-threaded access only.
     pub io_slots: UnsafeCell<Vec<IoSlot>>,
+    _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[derive(Default)]
@@ -118,6 +119,7 @@ impl Default for CpuIoState {
             // Pre-fill to the default ring size so the common path can write
             // slots directly without growing the vector first.
             io_slots: UnsafeCell::new(io_slots),
+            _local: std::marker::PhantomData,
         }
     }
 }
@@ -566,6 +568,8 @@ pub(crate) fn cancel_timer_waker(id: TimerId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static_assertions::assert_not_impl_any!(CpuIoState: Send, Sync);
     use crate::io::{CompletionKind, IoError, IoProvider, Op};
     use std::task::Poll;
 
@@ -588,6 +592,7 @@ mod tests {
         let state = CpuIoState {
             io_backend: Box::new(DummyProvider),
             io_slots: Default::default(),
+            _local: std::marker::PhantomData,
         };
         let old = IoToken::from_id((1u64 << 32) | 7);
         let new = IoToken::from_id((2u64 << 32) | 7);

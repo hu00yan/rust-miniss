@@ -171,6 +171,7 @@ pub struct UringBackend {
     park_flush_total_us: Cell<u64>,
     max_park_flush_us: Cell<u64>,
     thread_id: std::thread::ThreadId,
+    _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 /// Minimum pending SQEs before flush() calls io_uring_enter submit.
@@ -285,6 +286,7 @@ impl UringBackend {
             park_flush_total_us: Cell::new(0),
             max_park_flush_us: Cell::new(0),
             thread_id: std::thread::current().id(),
+            _local: std::marker::PhantomData,
         })
     }
 
@@ -2026,6 +2028,9 @@ impl IoProvider for UringBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static_assertions::assert_not_impl_any!(UringBackend: Send, Sync);
+    static_assertions::assert_not_impl_any!(PendingOp: Clone);
     use std::os::fd::AsRawFd;
 
     #[test]
@@ -2182,19 +2187,24 @@ mod tests {
     }
 
     #[test]
-    fn overflow_accept_drop_does_not_double_close_reused_fd() {
+    fn overflow_accept_drop_closes_owned_fd_and_preserves_peer() {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        unsafe { libc::close(fds[1]) };
+        let accepted_raw = fds[0];
+        let peer_raw = fds[1];
         let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         discard_overflow_accept(Ok(CompletionKind::Accept {
             fd: accepted_fd,
             addr: None,
         }));
 
-        let replacement = std::fs::File::open("/dev/null").expect("replacement fd");
-        assert_eq!(replacement.as_raw_fd(), fds[0]);
-        assert!(unsafe { libc::fcntl(replacement.as_raw_fd(), libc::F_GETFD) } >= 0);
+        assert_eq!(unsafe { libc::fcntl(accepted_raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(unsafe { libc::fcntl(peer_raw, libc::F_GETFD) } >= 0);
+        unsafe { libc::close(peer_raw) };
     }
 }
 

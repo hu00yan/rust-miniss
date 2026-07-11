@@ -70,6 +70,7 @@ pub struct TimerWheel {
     current_tick: u64,
     start_time: Instant,
     pending_timers: usize,
+    _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Default for TimerWheel {
@@ -101,6 +102,7 @@ impl TimerWheel {
             current_tick: 0,
             start_time: Instant::now(),
             pending_timers: 0,
+            _local: std::marker::PhantomData,
         }
     }
 
@@ -229,6 +231,8 @@ impl TimerWheel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static_assertions::assert_not_impl_any!(TimerWheel: Send, Sync);
     use std::task::Waker;
     use std::time::Duration;
 

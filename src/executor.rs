@@ -51,17 +51,6 @@ pub struct Runtime {
     timer_wheel: RefCell<TimerWheel>,
 }
 
-// SAFETY: Runtime owns shard-local driver/timer state behind `RefCell` and
-// must never cross a thread boundary. See rm-01 work package A. `Runtime` is
-// `!Send + !Sync` because it contains `RefCell<Executor>` (and historically a
-// public `shutdown_flag` that implied unimplemented lifecycle semantics, now
-// removed). The `tls_context_restores_after_nesting_and_panic` and
-// `runtime_move_and_reentry_keeps_tls_valid` tests exercise the scoped guard.
-// A `static_assertions::assert_not_impl_any!(Runtime: Send, Sync)` is intentionally
-// omitted: the macro hits a type-inference ambiguity on this concrete type in
-// this crate, and the `RefCell` field already makes the type non-`Send` by
-// construction.
-
 impl Runtime {
     /// Create a new runtime
     pub fn new() -> Self {
@@ -492,6 +481,9 @@ impl Default for Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static_assertions::assert_not_impl_any!(Runtime: Send, Sync);
+    static_assertions::assert_not_impl_any!(Executor: Send, Sync);
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
 

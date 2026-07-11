@@ -57,6 +57,9 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Install just
+      uses: taiki-e/install-action@just
+
     - name: Cache cargo registry
       uses: actions/cache@v4
       with:
@@ -77,7 +80,10 @@ jobs:
     - name: Build (release)
       run: cargo build --release
 
-    - name: Run tests
+    - name: Run fast safety gate
+      run: just test-fast
+
+    - name: Run full Linux test suite
       run: cargo test --all-targets
 
     - name: Check documentation

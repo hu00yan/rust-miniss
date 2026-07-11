@@ -8,6 +8,8 @@
 
 use crossbeam_queue::ArrayQueue;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, Ordering},
     Arc,
@@ -66,6 +68,7 @@ pub struct TaskArena<T> {
     slots: Vec<Option<T>>,
     generations: Vec<u16>,
     free: VecDeque<u16>,
+    _local: PhantomData<Rc<()>>,
 }
 
 impl<T> TaskArena<T> {
@@ -84,6 +87,7 @@ impl<T> TaskArena<T> {
             slots: (0..capacity).map(|_| None).collect(),
             generations: vec![0; capacity],
             free,
+            _local: PhantomData,
         }
     }
 
@@ -381,6 +385,11 @@ pub fn dummy_waker() -> Waker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static_assertions::assert_not_impl_any!(TaskArena<()>: Send, Sync);
+    static_assertions::assert_impl_all!(WakerState: Send, Sync);
+    static_assertions::assert_impl_all!(TaskId: Copy, Send, Sync);
+    static_assertions::assert_impl_all!(ReadyQueue: Clone, Send, Sync);
 
     #[test]
     fn task_arena_rejects_stale_key_after_slot_reuse() {

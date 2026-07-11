@@ -1,6 +1,6 @@
 ---
 id: rm-17-arch-audit-safety-tests
-status: GREEN
+status: YELLOW
 batch: 5
 depends_on: [rm-04-safe-waker, rm-08-buffer-init]
 parallel_wave: W1-partial + final
@@ -17,12 +17,12 @@ allowed_files:
 forbidden_patterns:
   - Arc<Mutex
 test_commands:
+  - just test-fast
   - just arch-audit
-  - cargo test --locked --all-targets --all-features
 acceptance:
   - audit_architecture.sh hard-fails on: Rc::into_raw in waker path, io_state() -> &'static, unsafe impl Send for *Backend (allowlist documented)
   - Documented Miri target set for TLS/waker/buffer (run when toolchain available)
-  - Documented Loom target for wake/close/notify (optional CI)
+  - Loom obligations for wake/close/notify remain explicit until production seams exist
   - Linux-only tests gated cfg(target_os="linux") for delayed-submit / fd-reuse where implemented by prior cards
   - README epic status updated; no S0 marked closed without listed evidence
 review_questions:
@@ -42,6 +42,8 @@ June script only caught pseudo-sync; not lifetime/UB patterns.
 
 The audit hard-fails escaped raw-Rc/TLS/unsafe-backend patterns and filters
 cfg(test) control-path runtime calls; `just arch-audit` exits 0 with explicit
-unsafe justifications. The Miri recipe targets pure TLS/identity/waker/buffer
-tests and explicitly excludes backend syscall tests unsupported by Miri; Orb
-nightly Miri passes those targets and Orb Loom models pass.
+unsafe justifications. The Miri recipe targets pure TLS/waker/buffer tests and
+explicitly excludes backend syscalls. The previous full-runtime Loom tests and
+three independent bitset replacements were rejected as non-evidence.
+`just loom` fails clearly until production seams exist. Static assertions and
+two bounded property models run in `just test-fast`.
