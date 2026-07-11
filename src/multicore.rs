@@ -1512,11 +1512,19 @@ impl MultiCoreRuntime {
         }
 
         tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
+        self.await_task_admission(reply_rx)?;
+        Ok(task_id)
+    }
+
+    fn await_task_admission(
+        &self,
+        reply_rx: std::sync::mpsc::Receiver<TaskAdmissionOutcome>,
+    ) -> Result<()> {
         match reply_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap_or(TaskAdmissionOutcome::RuntimeStopping)
         {
-            TaskAdmissionOutcome::Accepted => Ok(task_id),
+            TaskAdmissionOutcome::Accepted => Ok(()),
             outcome => Err(RuntimeError::TaskFailed(format!(
                 "task admission outcome: {outcome:?}"
             ))),
@@ -1534,14 +1542,16 @@ impl MultiCoreRuntime {
         for offset in 0..self.num_cores {
             let core_id = (start_core + offset) % self.num_cores;
             let task_id = self.next_task_id_for_core(core_id);
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let message = CoreMessage::Task {
                 id: task_id,
                 future: Box::pin(DetachedTaskFuture::new(future)),
-                reply: None,
+                reply: Some(reply_tx),
             };
             match self.core_senders[core_id].try_send(message) {
                 Ok(()) => {
                     self.notify_core(core_id);
+                    self.await_task_admission(reply_rx)?;
                     return Ok(task_id);
                 }
                 Err(TrySendError::Full(CoreMessage::Task {
@@ -1587,14 +1597,16 @@ impl MultiCoreRuntime {
             for offset in 0..self.num_cores {
                 let core_id = (start_core + offset) % self.num_cores;
                 let task_id = self.next_task_id_for_core(core_id);
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 let message = CoreMessage::Task {
                     id: task_id,
                     future: Box::pin(DetachedTaskFuture::new(future)),
-                    reply: None,
+                    reply: Some(reply_tx),
                 };
                 match self.core_senders[core_id].try_send(message) {
                     Ok(()) => {
                         self.notify_core(core_id);
+                        self.await_task_admission(reply_rx)?;
                         tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
                         return Ok(task_id);
                     }
@@ -1637,14 +1649,16 @@ impl MultiCoreRuntime {
         let deadline = Instant::now() + timeout;
 
         loop {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let message = CoreMessage::Task {
                 id: task_id,
                 future: Box::pin(DetachedTaskFuture::new(future)),
-                reply: None,
+                reply: Some(reply_tx),
             };
             match self.core_senders[core_id].try_send(message) {
                 Ok(()) => {
                     self.notify_core(core_id);
+                    self.await_task_admission(reply_rx)?;
                     tracing::trace!("Task {:?} submitted to core {}", task_id, core_id);
                     return Ok(task_id);
                 }

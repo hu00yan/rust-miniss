@@ -1,6 +1,6 @@
 ---
 id: rm-13-admission-linearize
-status: YELLOW
+status: GREEN
 batch: 3
 depends_on: [rm-12-shutdown-lifecycle]
 parallel_wave: W5
@@ -31,9 +31,9 @@ architecture_audit: |
 
 ## Verification (2026-07-11)
 
-The admission ticket still spans shutdown cutoff through shard-local spawn;
-`spawn_on` additionally waits for an owner reply after arena insertion. The
-other retrying spawn paths still need the same acknowledgement treatment.
+The admission ticket spans shutdown cutoff through shard-local spawn. All
+cross-core spawn paths now wait for an owner reply after arena insertion;
+`spawn_local` retains its ticket through the owner-thread queue/future.
 
 ## Problem (S1-6)
 
