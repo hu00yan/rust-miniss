@@ -1,6 +1,6 @@
 ---
 id: rm-14-multishot-accept
-status: YELLOW
+status: GREEN
 batch: 4
 depends_on: [rm-07-descriptor-lease, rm-09-fallible-submit]
 parallel_wave: W4
@@ -38,6 +38,9 @@ Always AcceptMulti; unbounded VecDeque; raw fds; terminal hangs.
 ## Verification (2026-07-11)
 
 Accept completions now carry `OwnedFd` through the backend queue and into the
-stream conversion; dropping an overflowed or abandoned result closes it. The
-remaining work is runtime probing of the multishot flag itself and listener
-drop cancellation/drain.
+stream conversion; dropping an overflowed or abandoned result closes it. When
+the opcode or runtime kernel-version capability check is false, submission
+uses single-shot `Accept` with retained sockaddr storage; Orb covers that
+fallback. Listener drop now requests owner-backend cancellation; the target
+terminal CQE retains resources until drain. Direct flag probing remains a
+future refinement, but unsupported/old kernels do not assume multishot.

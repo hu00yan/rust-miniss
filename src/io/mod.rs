@@ -141,6 +141,17 @@ pub trait IoProvider: 'static {
         0
     }
 
+    /// Request owner-thread cancellation while retaining operation resources
+    /// until the backend publishes its terminal cancellation CQE.
+    fn cancel(&self, _token: IoToken) -> bool {
+        false
+    }
+
+    /// Request cancellation for every accepted operation during owner-local
+    /// escalation. Resources remain backend-owned until terminal drain or
+    /// backend destruction after the bounded escalation window.
+    fn cancel_all(&self) {}
+
     /// Park the thread, blocking for completions or timeout.
     /// Returns the number of available completions.
     fn park(&self, _timeout: Duration) -> usize {

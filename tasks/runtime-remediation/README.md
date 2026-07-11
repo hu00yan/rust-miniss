@@ -29,7 +29,7 @@
 | [rm-14](rm-14-multishot-accept.yaml) | Multishot accept bounds/OwnedFd | 4 | rm-07, rm-09 | W4 |
 | [rm-15](rm-15-affinity-local-spawn.yaml) | Affinity + local spawn + HTTP | 4 | rm-02, rm-05 | W4 |
 | [rm-16](rm-16-quic-signal-global.yaml) | QUIC token + signal + global join | 2/3 | rm-07, rm-12 | W5 |
-| [rm-17](rm-17-arch-audit-safety-tests.yaml) | Arch-audit hardening + Miri/Loom | 5 | rm-04, rm-08 (partial earlier OK) | W1+ final (YELLOW: hooks added; host audit has legacy control-path false positives) |
+| [rm-17](rm-17-arch-audit-safety-tests.yaml) | Arch-audit hardening + Miri/Loom | 5 | rm-04, rm-08 | W1+ final (GREEN: Orb Miri pure targets + Loom models pass) |
 
 ## Recommended execution order
 
@@ -53,7 +53,7 @@ W5:  rm-13 → after rm-12
 
 **Practical note:** true multi-agent parallel is only safe when `allowed_files` do not overlap. Prefer single-agent sequential waves when in doubt.
 
-## Explicit non-goals (until all GREEN)
+## Explicit non-goals (remain out of scope for this remediation)
 
 - Throughput optimization / monoio comparison claims
 - SQPOLL / registered buffers / IO_LINK

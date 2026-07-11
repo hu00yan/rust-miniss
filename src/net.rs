@@ -113,6 +113,19 @@ impl AsRawFd for AsyncTcpListener {
     }
 }
 
+impl Drop for AsyncTcpListener {
+    fn drop(&mut self) {
+        let Some(token) = self.accept_token.take() else {
+            return;
+        };
+        let _ = try_with_io_state(|state| {
+            if state.io_backend.cancel(token) {
+                state.io_backend.flush();
+            }
+        });
+    }
+}
+
 fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4

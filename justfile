@@ -136,10 +136,12 @@ clippy:
 # Optional safety-model hooks. These are explicit because Miri/Loom are not
 # available on every host; CI or a Linux toolchain can enable them.
 miri-safety:
-    cargo miri test --all-features --lib cpu
-    cargo miri test --all-features --lib executor
+    # Runtime executor tests that construct real backends are excluded: Miri
+    # cannot emulate io_uring syscalls. These exact tests cover TLS/identity.
+    cargo miri test --all-features --lib cpu::tests::cpu_io_slots_do_not_alias_different_token_generations -- --exact
+    cargo miri test --all-features --lib cpu::tests::runtime_context_guard_restores_timer_task_and_core_on_nesting -- --exact
     cargo miri test --all-features --lib waker
     cargo miri test --all-features --lib buffer
 
 loom-safety:
-    LOOM_MAX_PREEMPTIONS=3 cargo test --all-features --lib loom_
+    LOOM_MAX_PREEMPTIONS=3 cargo test --all-features --test integration_concurrency

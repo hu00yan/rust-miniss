@@ -105,6 +105,28 @@ struct SlotMeta {
 pub(super) type Completion = (IoToken, Result<CompletionKind, IoError>);
 type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
 const ACCEPT_QUEUE_CAPACITY: usize = 256;
+const INTERNAL_CANCEL_USER_DATA: u64 = u64::MAX;
+
+/// Multishot accept was added in Linux 5.19. The opcode probe alone cannot
+/// report SQE flag support, so gate the flag on the running kernel release and
+/// retain the single-shot fallback for unknown/malformed releases.
+fn kernel_supports_multishot_accept() -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .or_else(|_| std::fs::read_to_string("/proc/version"))
+        .ok();
+    let Some(release) = release else {
+        return false;
+    };
+    let mut numbers = release
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok());
+    let Some(major) = numbers.next() else {
+        return false;
+    };
+    let minor = numbers.next().unwrap_or(0);
+    major > 5 || (major == 5 && minor >= 19)
+}
 
 /// A `io-uring` based `IoProvider`.
 /// Thread-local to ensure single-threaded access.
@@ -232,7 +254,8 @@ impl UringBackend {
         let ring_entries = entries as usize;
         let mut probe = io_uring::Probe::new();
         let supports_multishot_accept = ring.submitter().register_probe(&mut probe).is_ok()
-            && probe.is_supported(opcode::Accept::CODE);
+            && probe.is_supported(opcode::Accept::CODE)
+            && kernel_supports_multishot_accept();
         let flush_high_watermark = std::cmp::max(1, ring_entries.saturating_mul(3) / 4);
         let capacity = std::cmp::max(entries, 64) as usize;
         let mut accept_results = Vec::with_capacity(capacity);
@@ -340,6 +363,9 @@ impl UringBackend {
         }
         for cqe in cq {
             let token_id = cqe.user_data();
+            if token_id == INTERNAL_CANCEL_USER_DATA {
+                continue;
+            }
             let result = cqe.result();
             let flags = cqe.flags();
             let has_more = cqueue::more(flags);
@@ -359,7 +385,9 @@ impl UringBackend {
             }
 
             // Multishot accept: stays armed, result goes into accept_results VecDeque.
-            if has_more {
+            // A negative CQE is terminal even if a canceled multishot op
+            // carries the MORE flag; route it through terminal cleanup.
+            if has_more && result >= 0 {
                 if let Some(PendingOp::Accept {
                     addr_storage,
                     addr_len,
@@ -786,17 +814,41 @@ impl IoProvider for UringBackend {
         let (entry, pending_op) = {
             match op {
                 Op::Accept { fd } => {
-                    let entry = opcode::AcceptMulti::new(types::Fd(leased_fd(fd)))
+                    if self.supports_multishot_accept {
+                        let entry = opcode::AcceptMulti::new(types::Fd(leased_fd(fd)))
+                            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+                            .build();
+                        (
+                            entry,
+                            PendingOp::Accept {
+                                op: Op::Accept { fd },
+                                addr_storage: None,
+                                addr_len: None,
+                            },
+                        )
+                    } else {
+                        // Safe single-shot fallback when multishot capability
+                        // is absent: retain sockaddr storage until CQE parse.
+                        let addr_storage =
+                            Box::new(unsafe { std::mem::zeroed::<sockaddr_storage>() });
+                        let addr_len =
+                            Box::new(std::mem::size_of::<sockaddr_storage>() as socklen_t);
+                        let entry = opcode::Accept::new(
+                            types::Fd(leased_fd(fd)),
+                            addr_storage.as_ref() as *const _ as *mut _,
+                            addr_len.as_ref() as *const _ as *mut _,
+                        )
                         .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
                         .build();
-                    (
-                        entry,
-                        PendingOp::Accept {
-                            op: Op::Accept { fd },
-                            addr_storage: None,
-                            addr_len: None,
-                        },
-                    )
+                        (
+                            entry,
+                            PendingOp::Accept {
+                                op: Op::Accept { fd },
+                                addr_storage: Some(addr_storage),
+                                addr_len: Some(addr_len),
+                            },
+                        )
+                    }
                 }
                 Op::Read { fd, offset, len } => {
                     let mut buf = Buffer::new_uninitialized(len);
@@ -1326,6 +1378,44 @@ impl IoProvider for UringBackend {
         pending + queued_accepts + completed + usize::from(self.pending_sqes.get() != 0)
     }
 
+    fn cancel(&self, token: IoToken) -> bool {
+        let ring = unsafe { &mut *self.ring.get() };
+        let slot_meta = unsafe { &*self.slot_meta.get() };
+        let Some((idx, meta)) = slot_meta
+            .iter()
+            .enumerate()
+            .find(|(_, meta)| meta.token_id == token.id())
+        else {
+            return false;
+        };
+        // CQE user_data is the packed slot/generation identity, not the
+        // public monotonic IoToken value.
+        let target = Self::pack_slot(idx, meta.generation);
+        let entry = opcode::AsyncCancel::new(target)
+            .build()
+            .user_data(INTERNAL_CANCEL_USER_DATA);
+        if unsafe { ring.submission().push(&entry) }.is_err() {
+            self.flush_logged();
+            if unsafe { ring.submission().push(&entry) }.is_err() {
+                return false;
+            }
+        }
+        self.pending_sqes.set(self.pending_sqes.get() + 1);
+        true
+    }
+
+    fn cancel_all(&self) {
+        let tokens = unsafe { &*self.slot_meta.get() }
+            .iter()
+            .filter(|meta| meta.token_id != 0)
+            .map(|meta| IoToken::from_id(meta.token_id))
+            .collect::<Vec<_>>();
+        for token in tokens {
+            let _ = self.cancel(token);
+        }
+        self.flush_logged();
+    }
+
     fn park(&self, timeout: Duration) -> usize {
         // SAFETY: UringBackend is thread-affine; the owning runtime thread is
         // the only code path mutating the ring.
@@ -1413,6 +1503,9 @@ impl IoProvider for UringBackend {
         let mut processed = 0usize;
         for cqe in cq {
             let token_id = cqe.user_data();
+            if token_id == INTERNAL_CANCEL_USER_DATA {
+                continue;
+            }
             let result = cqe.result();
             let flags = cqe.flags();
             let has_more = cqueue::more(flags);
@@ -1426,7 +1519,9 @@ impl IoProvider for UringBackend {
 
             let token = IoToken::from_id(slot_meta[idx].token_id);
 
-            if has_more {
+            // A negative CQE is terminal even if a canceled multishot op
+            // carries the MORE flag; route it through terminal cleanup.
+            if has_more && result >= 0 {
                 let Some(PendingOp::Accept {
                     op: _op,
                     addr_storage,
@@ -1892,6 +1987,7 @@ impl IoProvider for UringBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn failed_submission_is_reported_without_allocating_a_token() {
@@ -1958,6 +2054,54 @@ mod tests {
             libc::close(replacement);
             libc::close(fds[1]);
         }
+    }
+
+    #[test]
+    fn single_shot_accept_fallback_retains_address_storage() {
+        let Ok(mut backend) = UringBackend::new(8) else {
+            return;
+        };
+        backend.supports_multishot_accept = false;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let token = backend
+            .submit(Op::Accept {
+                fd: listener.as_raw_fd(),
+            })
+            .expect("accept admission");
+        let _client =
+            std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("client connect");
+        backend.flush_logged();
+        let _ = backend.park(Duration::from_secs(1));
+        let completions = match backend.drain_completions() {
+            Poll::Ready(completions) => completions,
+            Poll::Pending => panic!("single-shot accept did not complete"),
+        };
+        assert!(completions.into_iter().any(|(completed, result)| {
+            completed == token && matches!(result, Ok(CompletionKind::Accept { addr: Some(_), .. }))
+        }));
+    }
+
+    #[test]
+    fn multishot_accept_cancel_drains_terminal_cqe() {
+        let Ok(backend) = UringBackend::new(8) else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let token = backend
+            .submit(Op::Accept {
+                fd: listener.as_raw_fd(),
+            })
+            .expect("accept admission");
+        assert!(backend.cancel(token));
+        backend.flush_logged();
+        for _ in 0..8 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(backend.pending_operation_count(), 0);
     }
 }
 

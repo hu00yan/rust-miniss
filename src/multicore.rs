@@ -462,7 +462,18 @@ impl CpuCore {
         loop {
             if self.force_shutdown.load(Ordering::Acquire) {
                 // Escalated shutdown is intentionally owner-local: no control
-                // thread touches task futures, timers, or driver state.
+                // thread touches task futures, timers, or driver state. Ask
+                // the backend to cancel first, then give terminal CQEs a
+                // bounded owner-thread drain window before reclaiming tasks.
+                self.io_state.io_backend.cancel_all();
+                self.io_state.io_backend.flush();
+                for _ in 0..8 {
+                    if self.io_state.io_backend.pending_operation_count() == 0 {
+                        break;
+                    }
+                    let _ = self.io_state.io_backend.park(Duration::from_millis(1));
+                    let _ = self.process_io_completions(true);
+                }
                 self.task_queue.clear();
                 self.local_futures.clear();
                 while self.ready_queue.pop().is_some() {}
@@ -940,6 +951,19 @@ enum RuntimeState {
     Terminated = 3,
 }
 
+/// Control-plane shutdown lifecycle. Workers never mutate this value; the
+/// coordinator publishes each phase before handing ownership to the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShutdownPhase {
+    Running = 0,
+    Quiescing = 1,
+    Cancelling = 2,
+    DrainingIo = 3,
+    Joined = 4,
+    Failed = 5,
+}
+
 /// Multi-core runtime coordinator - minimal shared state
 pub struct MultiCoreRuntime {
     /// Number of CPU cores
@@ -969,6 +993,7 @@ pub struct MultiCoreRuntime {
     task_counters: Vec<AtomicU64>,
     /// Runtime state
     state: AtomicU8,
+    shutdown_phase: AtomicU8,
     /// Admission counter/close bit. Spawn owns one count until its bounded
     /// owner-shard send completes, so shutdown cannot cut across an in-flight
     /// admission.
@@ -1248,6 +1273,7 @@ impl MultiCoreRuntime {
             join_handles: parking_lot::Mutex::new(join_handles),
             task_counters,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
+            shutdown_phase: AtomicU8::new(ShutdownPhase::Running as u8),
             admission: Arc::new(AtomicUsize::new(0)),
             next_core: AtomicUsize::new(0),
         });
@@ -1721,6 +1747,8 @@ impl MultiCoreRuntime {
         // already past the gate is awaited, so no task can be enqueued after
         // this shutdown cutoff.
         self.close_admission_and_wait();
+        self.shutdown_phase
+            .store(ShutdownPhase::Quiescing as u8, Ordering::Release);
 
         // Try to transition to shutting down state
         if self
@@ -1758,6 +1786,9 @@ impl MultiCoreRuntime {
             self.notify_core(core_id);
         }
 
+        self.shutdown_phase
+            .store(ShutdownPhase::Cancelling as u8, Ordering::Release);
+
         tracing::info!("Shutdown signal sent to all cores");
         Ok(())
     }
@@ -1771,6 +1802,8 @@ impl MultiCoreRuntime {
     /// must still call [`MultiCoreRuntime::join`] to collect worker results.
     pub fn shutdown_with_timeout(&self, timeout: Duration) -> Result<()> {
         self.shutdown()?;
+        self.shutdown_phase
+            .store(ShutdownPhase::DrainingIo as u8, Ordering::Release);
         let deadline = Instant::now() + timeout;
         loop {
             if self
@@ -1927,8 +1960,12 @@ impl MultiCoreRuntime {
         // Set state to terminated
         self.state
             .store(RuntimeState::Terminated as u8, Ordering::Release);
+        self.shutdown_phase
+            .store(ShutdownPhase::Joined as u8, Ordering::Release);
 
         if !failures.is_empty() {
+            self.shutdown_phase
+                .store(ShutdownPhase::Failed as u8, Ordering::Release);
             return Err(RuntimeError::TaskFailed(format!(
                 "{} worker failures: {}",
                 failures.len(),
@@ -1972,6 +2009,14 @@ impl MultiCoreRuntime {
             self.num_cores,
             self.state.load(Ordering::Acquire) == RuntimeState::ShuttingDown as u8
                 || self.state.load(Ordering::Acquire) == RuntimeState::Terminated as u8,
+            match self.shutdown_phase.load(Ordering::Acquire) {
+                value if value == ShutdownPhase::Quiescing as u8 => ShutdownPhase::Quiescing,
+                value if value == ShutdownPhase::Cancelling as u8 => ShutdownPhase::Cancelling,
+                value if value == ShutdownPhase::DrainingIo as u8 => ShutdownPhase::DrainingIo,
+                value if value == ShutdownPhase::Joined as u8 => ShutdownPhase::Joined,
+                value if value == ShutdownPhase::Failed as u8 => ShutdownPhase::Failed,
+                _ => ShutdownPhase::Running,
+            },
         )
     }
 
@@ -1986,14 +2031,16 @@ impl MultiCoreRuntime {
 pub struct RuntimeStats {
     pub num_cores: usize,
     pub is_shutdown: bool,
+    pub shutdown_phase: ShutdownPhase,
 }
 
 impl RuntimeStats {
     /// Create new runtime statistics
-    fn new(num_cores: usize, is_shutdown: bool) -> Self {
+    fn new(num_cores: usize, is_shutdown: bool, shutdown_phase: ShutdownPhase) -> Self {
         Self {
             num_cores,
             is_shutdown,
+            shutdown_phase,
         }
     }
 }
@@ -2016,6 +2063,8 @@ impl Drop for MultiCoreRuntime {
         }
         self.state
             .store(RuntimeState::Terminated as u8, Ordering::Release);
+        self.shutdown_phase
+            .store(ShutdownPhase::Joined as u8, Ordering::Release);
     }
 }
 
@@ -2125,6 +2174,20 @@ mod tests {
             Ok(rt) => rt.join().unwrap(),
             Err(_) => panic!("Failed to get unique ownership of runtime"),
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shutdown_publishes_explicit_lifecycle_phases() {
+        let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+        assert_eq!(runtime.stats().shutdown_phase, ShutdownPhase::Running);
+        runtime.shutdown().unwrap();
+        assert!(matches!(
+            runtime.stats().shutdown_phase,
+            ShutdownPhase::Cancelling | ShutdownPhase::DrainingIo
+        ));
+        runtime.join().unwrap();
+        assert_eq!(runtime.stats().shutdown_phase, ShutdownPhase::Joined);
     }
 
     #[test]

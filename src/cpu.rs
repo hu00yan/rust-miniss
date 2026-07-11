@@ -10,8 +10,29 @@ use crate::timer::{TimerId, TimerWheel};
 
 type IoBackend = dyn IoProvider<Completion = (IoToken, Result<CompletionKind, IoError>)>;
 
+#[cfg(miri)]
+struct MiriProvider;
+
+#[cfg(miri)]
+impl IoProvider for MiriProvider {
+    type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+    fn submit(&self, _op: crate::io::Op) -> Result<IoToken, IoError> {
+        Err(IoError::Other("I/O backend unavailable under Miri".into()))
+    }
+
+    fn drain_completions(&self) -> std::task::Poll<Vec<Self::Completion>> {
+        std::task::Poll::Pending
+    }
+}
+
 pub(crate) fn create_default_io_backend() -> Box<IoBackend> {
-    #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+    #[cfg(miri)]
+    {
+        return Box::new(MiriProvider);
+    }
+
+    #[cfg(all(not(miri), target_os = "linux", io_backend = "io_uring"))]
     {
         Box::new(
             crate::io::uring::UringBackend::new(4096)

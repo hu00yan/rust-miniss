@@ -1,6 +1,6 @@
 ---
 id: rm-12-shutdown-lifecycle
-status: YELLOW
+status: GREEN
 batch: 3
 depends_on: [rm-02-local-driver-ownership, rm-07-descriptor-lease, rm-10-cancel-routing]
 parallel_wave: W4
@@ -42,6 +42,11 @@ architecture_audit: |
 Worker graceful exit now includes a backend-owned pending-operation count in
 addition to task, ready-queue, and inbox emptiness. This closes the early
 reclaim path for abandoned I/O; explicit driver cancellation/drain remains.
+
+The coordinator now publishes explicit `Quiescing -> Cancelling -> DrainingIo
+-> Joined/Failed` phases, with a regression covering phase publication. Forced
+shutdown requests backend-wide cancellation and performs a bounded owner-thread
+terminal drain before dropping task/driver state.
 
 ## Problem (S1-3)
 

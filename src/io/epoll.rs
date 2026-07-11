@@ -459,6 +459,44 @@ impl IoProvider for EpollBackend {
         pending + udp + completed
     }
 
+    fn cancel(&self, token: IoToken) -> bool {
+        let poll = unsafe { &mut *self.poll.get() };
+        let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        let Some((slot, entry)) = pending_ops
+            .iter_mut()
+            .enumerate()
+            .find(|(_, entry)| entry.as_ref().is_some_and(|(id, _)| *id == token))
+        else {
+            return false;
+        };
+        let op_fd = entry.as_ref().map(|(_, op)| op.as_raw_fd());
+        let fd = unsafe { &*self.descriptor_leases.get() }[slot]
+            .as_ref()
+            .map(DescriptorLease::as_raw_fd)
+            .or(op_fd)
+            .unwrap_or(-1);
+        let mut source = mio::unix::SourceFd(&fd);
+        let _ = poll.registry().deregister(&mut source);
+        pending_ops[slot] = None;
+        unsafe {
+            (&mut *self.udp_recv_buffers.get())[slot] = None;
+            (&mut *self.descriptor_leases.get())[slot] = None;
+            (&mut *self.descriptor_lease_tokens.get())[slot] = None;
+        }
+        true
+    }
+
+    fn cancel_all(&self) {
+        let tokens = unsafe { &*self.descriptor_lease_tokens.get() }
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        for token in tokens {
+            let _ = self.cancel(token);
+        }
+    }
+
     fn drain_completions(&self) -> TaskPoll<Vec<Self::Completion>> {
         // SAFETY: We have exclusive, single-threaded access.
         let poll = unsafe { &mut *self.poll.get() };

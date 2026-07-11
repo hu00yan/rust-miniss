@@ -1,6 +1,6 @@
 ---
 id: rm-17-arch-audit-safety-tests
-status: YELLOW
+status: GREEN
 batch: 5
 depends_on: [rm-04-safe-waker, rm-08-buffer-init]
 parallel_wave: W1-partial + final
@@ -42,5 +42,6 @@ June script only caught pseudo-sync; not lifetime/UB patterns.
 
 The audit hard-fails escaped raw-Rc/TLS/unsafe-backend patterns and filters
 cfg(test) control-path runtime calls; `just arch-audit` exits 0 with explicit
-unsafe justifications. Miri is unavailable on the stable host and Loom model
-targets remain to be added.
+unsafe justifications. The Miri recipe targets pure TLS/identity/waker/buffer
+tests and explicitly excludes backend syscall tests unsupported by Miri; Orb
+nightly Miri passes those targets and Orb Loom models pass.
