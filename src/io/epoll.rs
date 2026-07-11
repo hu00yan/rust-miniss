@@ -505,7 +505,9 @@ impl IoProvider for EpollBackend {
                         // The file descriptor is a listening socket, so we can accept a connection.
                         match syscall_accept(effective_fd) {
                             Ok((new_fd, addr)) => Ok(CompletionKind::Accept {
-                                fd: new_fd,
+                                // SAFETY: syscall_accept returns a fresh owned
+                                // descriptor on success.
+                                fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(new_fd) },
                                 addr: Some(addr),
                             }),
                             Err(e) => Err(IoError::Io(e)),

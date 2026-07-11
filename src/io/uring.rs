@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -403,14 +403,18 @@ impl UringBackend {
                         let _ = **addr_len;
                         match socket_addr {
                             Ok(sa) => Ok(CompletionKind::Accept {
-                                fd: result,
+                                // SAFETY: a successful accept CQE transfers a
+                                // fresh descriptor to this completion.
+                                fd: unsafe { OwnedFd::from_raw_fd(result) },
                                 addr: Some(sa),
                             }),
                             Err(e) => Err(e),
                         }
                     } else {
                         Ok(CompletionKind::Accept {
-                            fd: result,
+                            // SAFETY: a successful accept CQE transfers a
+                            // fresh descriptor to this completion.
+                            fd: unsafe { OwnedFd::from_raw_fd(result) },
                             addr: None,
                         })
                     };
@@ -485,14 +489,18 @@ impl UringBackend {
                             let _ = **addr_len;
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::Accept {
-                                    fd: result,
+                                    // SAFETY: a successful accept CQE transfers a
+                                    // fresh descriptor to this completion.
+                                    fd: unsafe { OwnedFd::from_raw_fd(result) },
                                     addr: Some(sa),
                                 }),
                                 Err(e) => Err(e),
                             }
                         } else {
                             Ok(CompletionKind::Accept {
-                                fd: result,
+                                // SAFETY: a successful accept CQE transfers a
+                                // fresh descriptor to this completion.
+                                fd: unsafe { OwnedFd::from_raw_fd(result) },
                                 addr: None,
                             })
                         }
@@ -1460,14 +1468,18 @@ impl IoProvider for UringBackend {
                         let _ = **addr_len;
                         match socket_addr {
                             Ok(sa) => Ok(CompletionKind::Accept {
-                                fd: result,
+                                // SAFETY: a successful accept CQE transfers a
+                                // fresh descriptor to this completion.
+                                fd: unsafe { OwnedFd::from_raw_fd(result) },
                                 addr: Some(sa),
                             }),
                             Err(e) => Err(e),
                         }
                     } else {
                         Ok(CompletionKind::Accept {
-                            fd: result,
+                            // SAFETY: a successful accept CQE transfers a
+                            // fresh descriptor to this completion.
+                            fd: unsafe { OwnedFd::from_raw_fd(result) },
                             addr: None,
                         })
                     };
@@ -1551,14 +1563,18 @@ impl IoProvider for UringBackend {
                             let _ = **addr_len;
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::Accept {
-                                    fd: result,
+                                    // SAFETY: a successful accept CQE transfers a
+                                    // fresh descriptor to this completion.
+                                    fd: unsafe { OwnedFd::from_raw_fd(result) },
                                     addr: Some(sa),
                                 }),
                                 Err(e) => Err(e),
                             }
                         } else {
                             Ok(CompletionKind::Accept {
-                                fd: result,
+                                // SAFETY: a successful accept CQE transfers a
+                                // fresh descriptor to this completion.
+                                fd: unsafe { OwnedFd::from_raw_fd(result) },
                                 addr: None,
                             })
                         }

@@ -34,3 +34,10 @@ architecture_audit: |
 ## Problem (S1-7)
 
 Always AcceptMulti; unbounded VecDeque; raw fds; terminal hangs.
+
+## Verification (2026-07-11)
+
+Accept completions now carry `OwnedFd` through the backend queue and into the
+stream conversion; dropping an overflowed or abandoned result closes it. The
+remaining work is runtime probing of the multishot flag itself and listener
+drop cancellation/drain.

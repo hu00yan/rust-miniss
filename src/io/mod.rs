@@ -329,10 +329,10 @@ impl IoToken {
 /// Describes the result of a successfully completed I/O operation.
 use std::net::SocketAddr;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum CompletionKind {
     Accept {
-        fd: i32,
+        fd: OwnedFd,
         addr: Option<SocketAddr>,
     },
     Read {

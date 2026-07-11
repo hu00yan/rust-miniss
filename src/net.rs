@@ -84,9 +84,9 @@ impl AsyncTcpListener {
         }
         match result? {
             crate::io::CompletionKind::Accept { fd, addr } => {
-                // SAFETY: The accepted fd is newly returned by the OS/backend
-                // and ownership is transferred into TcpStream exactly once.
-                let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                // `CompletionKind::Accept` owns the descriptor until this
+                // conversion; TcpStream takes ownership exactly once.
+                let stream = std::net::TcpStream::from(fd);
                 let async_stream = if streams_nonblocking {
                     AsyncTcpStream::from_nonblocking(stream)?
                 } else {
