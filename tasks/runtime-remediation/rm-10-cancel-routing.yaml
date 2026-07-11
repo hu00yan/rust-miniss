@@ -40,5 +40,4 @@ Broadcast cancel by sequence; JoinHandle lies.
 
 Owner-shard routing and full-key matching are implemented; bounded send errors
 are propagated. JoinHandle cancellation now wakes and waits for owner polling
-to publish `Cancelled`. Explicit outcome enum and terminal drop accounting
-remain.
+to publish `Cancelled`. Terminal drop accounting remains.

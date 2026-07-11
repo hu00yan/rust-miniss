@@ -126,11 +126,24 @@ pub enum CoreMessage {
     /// Shutdown signal
     Shutdown,
     /// Cancel a task
-    CancelTask(TaskId),
+    CancelTask {
+        task_id: TaskId,
+        reply: std::sync::mpsc::Sender<CancelOutcome>,
+    },
     /// Control-plane metrics snapshot request.
     CollectMetrics {
         reply: std::sync::mpsc::Sender<CoreMetricsSnapshot>,
     },
+}
+
+/// Owner acknowledgement for a cancellation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Accepted,
+    NotFound,
+    AlreadyTerminal,
+    Backpressured,
+    RuntimeStopping,
 }
 
 impl std::fmt::Debug for CoreMessage {
@@ -142,7 +155,7 @@ impl std::fmt::Debug for CoreMessage {
                 .field("from_core", from_core)
                 .finish(),
             Self::Shutdown => write!(f, "Shutdown"),
-            Self::CancelTask(task_id) => f
+            Self::CancelTask { task_id, .. } => f
                 .debug_struct("CancelTask")
                 .field("task_id", task_id)
                 .finish(),
@@ -660,9 +673,9 @@ impl CpuCore {
                     self.draining = true;
                     processed += 1;
                 }
-                Ok(CoreMessage::CancelTask(task_id)) => {
+                Ok(CoreMessage::CancelTask { task_id, reply }) => {
                     // Remove task from queue if it exists
-                    if self
+                    let outcome = if self
                         .task_queue
                         .get(task_id.key())
                         .is_some_and(|task| task.id() == task_id)
@@ -670,7 +683,11 @@ impl CpuCore {
                     {
                         self.local_task_count = self.local_task_count.saturating_sub(1);
                         self.metrics.tasks_completed += 1;
-                    }
+                        CancelOutcome::Accepted
+                    } else {
+                        CancelOutcome::NotFound
+                    };
+                    let _ = reply.send(outcome);
                     tracing::trace!("Cancelled task {:?}", task_id);
                     processed += 1;
                 }
@@ -1729,12 +1746,20 @@ impl MultiCoreRuntime {
 
     /// Cancel a task
     pub fn cancel_task(&self, task_id: TaskId) -> Result<()> {
+        match self.cancel_task_outcome(task_id)? {
+            CancelOutcome::Accepted => Ok(()),
+            outcome => Err(RuntimeError::TaskFailed(format!(
+                "task cancellation was not accepted: {outcome:?}"
+            ))),
+        }
+    }
+
+    /// Request cancellation and wait for the owner shard's acknowledgement.
+    pub fn cancel_task_outcome(&self, task_id: TaskId) -> Result<CancelOutcome> {
         // Check if runtime is running
         let state = self.state.load(Ordering::Acquire);
         if state != RuntimeState::Running as u8 {
-            return Err(RuntimeError::TaskFailed(
-                "Runtime is not running".to_string(),
-            ));
+            return Ok(CancelOutcome::RuntimeStopping);
         }
 
         tracing::info!("Task cancellation requested for task {:?}", task_id);
@@ -1742,20 +1767,23 @@ impl MultiCoreRuntime {
         // message there; broadcasting by sequence let neighboring shards
         // accidentally cancel unrelated tasks and hid queue backpressure.
         let core_id = task_id.cpu_id();
-        let sender = self.core_senders.get(core_id).ok_or_else(|| {
-            RuntimeError::TaskFailed(format!("Task owner shard {core_id} is unavailable"))
-        })?;
-        sender
-            .try_send(CoreMessage::CancelTask(task_id))
-            .map_err(|error| {
-                let reason = match error {
-                    TrySendError::Full(_) => "cancel queue backpressured",
-                    TrySendError::Disconnected(_) => "task owner shard stopped",
-                };
-                RuntimeError::TaskFailed(reason.to_string())
-            })?;
+        let Some(sender) = self.core_senders.get(core_id) else {
+            return Ok(CancelOutcome::NotFound);
+        };
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if let Err(error) = sender.try_send(CoreMessage::CancelTask {
+            task_id,
+            reply: reply_tx,
+        }) {
+            return Ok(match error {
+                TrySendError::Full(_) => CancelOutcome::Backpressured,
+                TrySendError::Disconnected(_) => CancelOutcome::RuntimeStopping,
+            });
+        }
         self.notify_core(core_id);
-        Ok(())
+        Ok(reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or(CancelOutcome::RuntimeStopping))
     }
 
     /// Send ping messages between all CPU cores
@@ -2053,6 +2081,22 @@ mod tests {
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let foreign = TaskId::from_key(crate::waker::TaskKey::new(1, 7, 0, 1));
         assert!(runtime.cancel_task(foreign).is_err());
+        runtime.shutdown().unwrap();
+        match Arc::try_unwrap(runtime) {
+            Ok(rt) => rt.join().unwrap(),
+            Err(_) => panic!("Failed to get unique ownership of runtime"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cancel_reports_owner_acknowledgement() {
+        let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+        let task = runtime
+            .spawn(async { std::future::pending::<()>().await })
+            .unwrap();
+        let outcome = runtime.cancel_task_outcome(task).unwrap();
+        assert_eq!(outcome, CancelOutcome::Accepted);
         runtime.shutdown().unwrap();
         match Arc::try_unwrap(runtime) {
             Ok(rt) => rt.join().unwrap(),
