@@ -261,6 +261,9 @@ pub struct CpuCore {
     ready_queue: ReadyQueue,
     /// Message inbox from other cores
     message_inbox: Receiver<CoreMessage>,
+    /// Startup acknowledgement held until owner-thread TLS/driver context is
+    /// installed by `run`.
+    ready_sender: Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
     /// Local timer wheel
     timer_wheel: TimerWheel,
     /// Idle park timeout, configured at runtime startup.
@@ -312,6 +315,7 @@ impl CpuCore {
         force_shutdown: Arc<AtomicBool>,
         #[cfg(target_os = "linux")] sleeping: Arc<AtomicBool>,
         message_inbox: Receiver<CoreMessage>,
+        ready_sender: std::sync::mpsc::Sender<std::result::Result<(), String>>,
         park_timeout: Duration,
         #[cfg(target_os = "linux")] wakeup_eventfd: RawFd,
     ) -> Self {
@@ -326,6 +330,7 @@ impl CpuCore {
             local_futures: Vec::new(),
             ready_queue: Arc::new(ArrayQueue::new(65_536)),
             message_inbox,
+            ready_sender: Some(ready_sender),
             timer_wheel: TimerWheel::new(1024, 1),
             park_timeout,
             #[cfg(target_os = "linux")]
@@ -414,7 +419,12 @@ impl CpuCore {
     /// Main event loop - shared-nothing execution
     fn run(&mut self) -> Result<()> {
         // Bind to CPU core for optimal cache locality
-        self.bind_to_cpu()?;
+        if let Err(err) = self.bind_to_cpu() {
+            if let Some(sender) = self.ready_sender.take() {
+                let _ = sender.send(Err(format!("{err:?}")));
+            }
+            return Err(err);
+        }
         // SAFETY: CpuCore owns both fields for the whole run invocation; the
         // context guard drops before CpuCore can be moved or destroyed.
         let _runtime_context = unsafe {
@@ -428,6 +438,9 @@ impl CpuCore {
             }
         }
         let _local_spawn_context = LocalSpawnContextGuard;
+        if let Some(sender) = self.ready_sender.take() {
+            let _ = sender.send(Ok(()));
+        }
 
         tracing::info!("CPU core {} started", self.id);
 
@@ -1147,6 +1160,7 @@ impl MultiCoreRuntime {
                             force_shutdown.clone(),
                             sleeping,
                             receiver,
+                            ready_sender,
                             crate::config::park_timeout(),
                             wakeup_fd_raw,
                         )
@@ -1159,15 +1173,9 @@ impl MultiCoreRuntime {
                         core_shutdown.clone(),
                         force_shutdown.clone(),
                         receiver,
+                        ready_sender,
                         crate::config::park_timeout(),
                     );
-                    // Readiness is acknowledged only after affinity succeeds;
-                    // `run` repeats the bind defensively before installing TLS.
-                    if let Err(err) = core.bind_to_cpu() {
-                        let _ = ready_sender.send(Err(format!("{err:?}")));
-                        return Err(err);
-                    }
-                    let _ = ready_sender.send(Ok(()));
                     let result = core.run();
                     // Set shutdown flag when core exits
                     // Publish worker teardown before the coordinator observes

@@ -1,6 +1,6 @@
 ---
 id: rm-15-affinity-local-spawn
-status: YELLOW
+status: GREEN
 batch: 4
 depends_on: [rm-02-local-driver-ownership, rm-05-poll-budget]
 parallel_wave: W4
@@ -46,8 +46,8 @@ HTTP cross-core spawn; fake block_on_cpu; logical CPUs; readiness before init.
 
 ## Verification (2026-07-11)
 
-`spawn_local` accepts `!Send` futures in shard-local storage. Default worker
-count uses physical CPU count, affinity failure is returned, startup readiness
-waits for the initial bind, and HTTP handlers stay local. `block_on_cpu` now
-rejects explicitly instead of creating a caller-thread runtime; non-contiguous
-cpuset enumeration and full worker-TLS readiness remain.
+`spawn_local` accepts `!Send` futures in shard-local storage. Startup enumerates
+allowed physical package/core IDs, affinity failure is returned, and readiness
+is acknowledged only after owner-thread TLS/driver installation. HTTP handlers
+stay local and `block_on_cpu` rejects explicitly instead of creating a
+caller-thread runtime.
