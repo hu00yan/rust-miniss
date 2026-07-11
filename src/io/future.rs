@@ -17,28 +17,70 @@ pub struct IoFuture {
     is_accept: bool,
     completed: bool,
     task_id: Option<TaskId>,
+    immediate: Option<Result<CompletionKind, IoError>>,
+}
+
+pub enum IoFutureInput {
+    Token(IoToken),
+    Error(IoError),
+}
+
+impl From<IoToken> for IoFutureInput {
+    fn from(token: IoToken) -> Self {
+        Self::Token(token)
+    }
+}
+
+impl From<Result<IoToken, IoError>> for IoFutureInput {
+    fn from(result: Result<IoToken, IoError>) -> Self {
+        match result {
+            Ok(token) => Self::Token(token),
+            Err(error) => Self::Error(error),
+        }
+    }
 }
 
 impl IoFuture {
     /// Creates a new `IoFuture` for a given `IoToken`.
     #[inline(always)]
-    pub fn new(token: IoToken) -> Self {
-        Self {
-            token,
-            is_accept: false,
-            completed: false,
-            task_id: crate::cpu::current_task_id(),
+    pub fn new<T: Into<IoFutureInput>>(input: T) -> Self {
+        match input.into() {
+            IoFutureInput::Token(token) => Self {
+                token,
+                is_accept: false,
+                completed: false,
+                task_id: crate::cpu::current_task_id(),
+                immediate: None,
+            },
+            IoFutureInput::Error(error) => Self::error(error),
         }
     }
 
     /// Creates an `IoFuture` for a multishot accept operation.
     #[inline(always)]
-    pub fn accept(token: IoToken) -> Self {
+    pub fn accept<T: Into<IoFutureInput>>(input: T) -> Self {
+        match input.into() {
+            IoFutureInput::Token(token) => Self {
+                token,
+                is_accept: true,
+                completed: false,
+                task_id: crate::cpu::current_task_id(),
+                immediate: None,
+            },
+            IoFutureInput::Error(error) => Self::error(error),
+        }
+    }
+
+    /// Creates a future that is already failed before an operation was
+    /// admitted to the backend. No token or slot is allocated in this path.
+    #[inline(always)]
+    pub fn error(error: IoError) -> Self {
         Self {
-            token,
-            is_accept: true,
-            completed: false,
-            task_id: crate::cpu::current_task_id(),
+            token: IoToken::from_id(0),
+            is_accept: false,
+            completed: true,
+            task_id: None,
+            immediate: Some(Err(error)),
         }
     }
 }
@@ -49,6 +91,9 @@ impl Future for IoFuture {
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        if let Some(result) = this.immediate.take() {
+            return Poll::Ready(result);
+        }
         with_io_state(|state| {
             // Check if the completion is already available in the standard map.
             // SAFETY: Single-threaded access.
@@ -86,5 +131,25 @@ impl Drop for IoFuture {
                 state.clear_slot(self.token);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IoFuture;
+    use crate::io::IoError;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn rejected_submit_future_returns_error_without_runtime_or_slot() {
+        let mut future = IoFuture::error(IoError::Other("rejected".into()));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut cx),
+            Poll::Ready(Err(IoError::Other(message))) if message == "rejected"
+        ));
     }
 }

@@ -231,8 +231,12 @@ struct CoreMetrics {
 
 /// Individual CPU core executor - completely independent
 pub struct CpuCore {
-    /// Core ID (matches physical CPU)
+    /// Stable shard identity used in TaskId/TaskKey.
     id: usize,
+    /// Host CPU selected during startup. This is deliberately separate from
+    /// the dense shard id because Linux cpusets may contain non-contiguous IDs.
+    #[cfg(target_os = "linux")]
+    affinity_cpu: usize,
     /// Fixed-capacity shard-local task arena. Readiness is tracked separately
     /// in `ready_queue`; full TaskKey validation rejects stale wakes.
     task_queue: TaskArena<Task>,
@@ -288,6 +292,7 @@ impl CpuCore {
     #[allow(clippy::too_many_arguments)]
     fn new(
         id: usize,
+        #[cfg(target_os = "linux")] affinity_cpu: usize,
         runtime_generation: u16,
         io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
@@ -302,6 +307,8 @@ impl CpuCore {
 
         Self {
             id,
+            #[cfg(target_os = "linux")]
+            affinity_cpu,
             task_queue: TaskArena::with_capacity(runtime_generation, id as u16, 65_536),
             local_futures: Vec::new(),
             ready_queue: Arc::new(ArrayQueue::new(65_536)),
@@ -372,11 +379,13 @@ impl CpuCore {
             return;
         }
 
-        let token = self.io_state.io_backend.submit(crate::io::Op::PollAdd {
+        let Ok(token) = self.io_state.io_backend.submit(crate::io::Op::PollAdd {
             fd: self.wakeup_eventfd,
             events: libc::POLLIN as u32,
             multishot: false,
-        });
+        }) else {
+            return;
+        };
         self.wakeup_poll_token = Some(token);
         self.wakeup_poll_armed = true;
         self.io_state.io_backend.flush();
@@ -573,16 +582,20 @@ impl CpuCore {
         unsafe {
             let mut cpuset: cpu_set_t = mem::zeroed();
             CPU_ZERO(&mut cpuset);
-            CPU_SET(self.id, &mut cpuset);
+            CPU_SET(self.affinity_cpu, &mut cpuset);
 
             let result = sched_setaffinity(0, mem::size_of::<cpu_set_t>(), &cpuset);
             if result != 0 {
                 return Err(RuntimeError::TaskFailed(format!(
-                    "Failed to bind CPU core {}: {}",
-                    self.id, result
+                    "Failed to bind CPU {} for shard {}: {}",
+                    self.affinity_cpu, self.id, result
                 )));
             } else {
-                tracing::debug!("CPU core {} bound to physical CPU", self.id);
+                tracing::debug!(
+                    "Shard {} bound to physical CPU {}",
+                    self.id,
+                    self.affinity_cpu
+                );
             }
         }
 
@@ -929,6 +942,65 @@ impl std::fmt::Debug for MultiCoreRuntime {
 }
 
 impl MultiCoreRuntime {
+    #[cfg(target_os = "linux")]
+    fn startup_cpu_plan(requested: Option<usize>) -> Result<Vec<usize>> {
+        use libc::{cpu_set_t, sched_getaffinity, CPU_ISSET, CPU_SETSIZE, CPU_ZERO};
+        use std::collections::HashSet;
+        use std::mem;
+
+        // SAFETY: the set is zeroed and libc writes only within its fixed ABI
+        // size. This runs once on the control thread before workers start.
+        let allowed = unsafe {
+            let mut set: cpu_set_t = mem::zeroed();
+            CPU_ZERO(&mut set);
+            if sched_getaffinity(0, mem::size_of::<cpu_set_t>(), &mut set) != 0 {
+                return Err(RuntimeError::TaskFailed(format!(
+                    "failed to enumerate allowed CPUs: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            (0..CPU_SETSIZE as usize)
+                .filter(|&cpu| CPU_ISSET(cpu, &set))
+                .collect::<Vec<_>>()
+        };
+
+        let mut physical = Vec::with_capacity(allowed.len());
+        let mut seen = HashSet::new();
+        for cpu in allowed {
+            let base = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+            let package = std::fs::read_to_string(format!("{base}/physical_package_id"));
+            let core = std::fs::read_to_string(format!("{base}/core_id"));
+            let key = match (package, core) {
+                (Ok(package), Ok(core)) => format!("{}:{}", package.trim(), core.trim()),
+                _ => format!("cpu:{cpu}"),
+            };
+            if seen.insert(key) {
+                physical.push(cpu);
+            }
+        }
+        let requested = requested.unwrap_or(physical.len());
+        if requested == 0 || requested > physical.len() {
+            return Err(RuntimeError::TaskFailed(format!(
+                "requested {requested} physical CPUs, but only {} are available in the cpuset",
+                physical.len()
+            )));
+        }
+        physical.truncate(requested);
+        Ok(physical)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn startup_cpu_plan(requested: Option<usize>) -> Result<Vec<usize>> {
+        let available = num_cpus::get_physical();
+        let requested = requested.unwrap_or(available);
+        if requested == 0 || requested > available {
+            return Err(RuntimeError::TaskFailed(format!(
+                "requested {requested} physical CPUs, but only {available} are available"
+            )));
+        }
+        Ok((0..requested).collect())
+    }
+
     fn begin_admission(&self) -> Result<AdmissionGuard> {
         let mut current = self.admission.load(Ordering::Acquire);
         loop {
@@ -982,7 +1054,8 @@ impl MultiCoreRuntime {
 
     /// Create new multi-core runtime
     pub fn new(num_cores: Option<usize>) -> Result<Arc<Self>> {
-        let num_cores = num_cores.unwrap_or_else(num_cpus::get_physical);
+        let cpu_plan = Self::startup_cpu_plan(num_cores)?;
+        let num_cores = cpu_plan.len();
         let runtime_generation = next_runtime_generation();
 
         if num_cores == 0 {
@@ -1007,6 +1080,8 @@ impl MultiCoreRuntime {
 
         // Create cores and start threads
         for core_id in 0..num_cores {
+            #[cfg(target_os = "linux")]
+            let affinity_cpu = cpu_plan[core_id];
             let core_shutdown = Arc::new(AtomicBool::new(false));
             let core_exited_flag = Arc::new(AtomicBool::new(false));
             let force_shutdown = Arc::new(AtomicBool::new(false));
@@ -1047,6 +1122,7 @@ impl MultiCoreRuntime {
                         let sleeping = core_sleeping_flag.clone();
                         CpuCore::new(
                             core_id,
+                            affinity_cpu,
                             runtime_generation,
                             io_backend,
                             core_shutdown.clone(),
@@ -1982,5 +2058,15 @@ mod tests {
             Ok(rt) => rt.join().unwrap(),
             Err(_) => panic!("Failed to get unique ownership of runtime"),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn startup_cpu_plan_uses_allowed_physical_cpu_ids() {
+        let plan = MultiCoreRuntime::startup_cpu_plan(Some(1)).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0] < libc::CPU_SETSIZE as usize);
+        let second = MultiCoreRuntime::startup_cpu_plan(Some(1)).unwrap();
+        assert_eq!(plan, second);
     }
 }

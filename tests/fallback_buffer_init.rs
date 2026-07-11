@@ -43,11 +43,13 @@ fn fallback_file_read_publishes_only_short_read_and_eof_lengths() {
     file.flush().expect("flush fixture");
     let backend = EpollBackend::new().expect("fallback backend");
 
-    let token = backend.submit(Op::ReadFile {
-        fd: file.as_raw_fd(),
-        offset: 0,
-        len: 32,
-    });
+    let token = backend
+        .submit(Op::ReadFile {
+            fd: file.as_raw_fd(),
+            offset: 0,
+            len: 32,
+        })
+        .expect("submit short file read");
     match completion(&backend, token).expect("short file read") {
         CompletionKind::ReadFile { bytes_read, data } => {
             assert_eq!(bytes_read, 3);
@@ -57,11 +59,13 @@ fn fallback_file_read_publishes_only_short_read_and_eof_lengths() {
         other => panic!("unexpected completion: {other:?}"),
     }
 
-    let eof = backend.submit(Op::ReadFile {
-        fd: file.as_raw_fd(),
-        offset: 3,
-        len: 32,
-    });
+    let eof = backend
+        .submit(Op::ReadFile {
+            fd: file.as_raw_fd(),
+            offset: 3,
+            len: 32,
+        })
+        .expect("submit EOF read");
     match completion(&backend, eof).expect("EOF read") {
         CompletionKind::ReadFile { bytes_read, data } => {
             assert_eq!(bytes_read, 0);
@@ -74,13 +78,15 @@ fn fallback_file_read_publishes_only_short_read_and_eof_lengths() {
 #[test]
 fn fallback_file_read_reports_error_without_a_buffer_completion() {
     let backend = EpollBackend::new().expect("fallback backend");
-    let token = backend.submit(Op::ReadFile {
-        fd: -1,
-        offset: 0,
-        len: 8,
-    });
+    let error = backend
+        .submit(Op::ReadFile {
+            fd: -1,
+            offset: 0,
+            len: 8,
+        })
+        .expect_err("invalid descriptor must fail admission");
 
-    assert!(matches!(completion(&backend, token), Err(IoError::Io(_))));
+    assert!(matches!(error, IoError::Io(_)));
 }
 
 #[test]
@@ -92,11 +98,13 @@ fn fallback_tcp_read_publishes_only_bytes_kernel_returned_and_eof_is_empty() {
     server.set_nonblocking(true).expect("nonblocking server");
     let backend = EpollBackend::new().expect("fallback backend");
 
-    let read = backend.submit(Op::Read {
-        fd: server.as_raw_fd(),
-        offset: 0,
-        len: 32,
-    });
+    let read = backend
+        .submit(Op::Read {
+            fd: server.as_raw_fd(),
+            offset: 0,
+            len: 32,
+        })
+        .expect("submit short TCP read");
     client.write_all(b"short").expect("write short payload");
     match completion(&backend, read).expect("short TCP read") {
         CompletionKind::Read { bytes_read, data } => {
@@ -108,11 +116,13 @@ fn fallback_tcp_read_publishes_only_bytes_kernel_returned_and_eof_is_empty() {
     }
 
     client.shutdown(Shutdown::Write).expect("close writer");
-    let eof = backend.submit(Op::Read {
-        fd: server.as_raw_fd(),
-        offset: 0,
-        len: 32,
-    });
+    let eof = backend
+        .submit(Op::Read {
+            fd: server.as_raw_fd(),
+            offset: 0,
+            len: 32,
+        })
+        .expect("submit TCP EOF");
     match completion(&backend, eof).expect("TCP EOF") {
         CompletionKind::Read { bytes_read, data } => {
             assert_eq!(bytes_read, 0);
@@ -134,10 +144,12 @@ fn fallback_tcp_readv_publishes_each_buffer_only_up_to_short_read() {
     server.set_nonblocking(true).expect("nonblocking server");
     let backend = EpollBackend::new().expect("fallback backend");
 
-    let readv = backend.submit(Op::ReadVectored {
-        fd: server.as_raw_fd(),
-        buffers: smallvec![Buffer::with_capacity(3), Buffer::with_capacity(5)],
-    });
+    let readv = backend
+        .submit(Op::ReadVectored {
+            fd: server.as_raw_fd(),
+            buffers: smallvec![Buffer::with_capacity(3), Buffer::with_capacity(5)],
+        })
+        .expect("submit readv");
     client.write_all(b"vector").expect("write vector payload");
     match completion(&backend, readv).expect("short readv") {
         CompletionKind::ReadVectored {
@@ -162,10 +174,12 @@ fn fallback_udp_read_zero_fills_before_safe_recv_and_publishes_datagram_length()
     let sender = UdpSocket::bind("127.0.0.1:0").expect("UDP sender");
     let backend = EpollBackend::new().expect("fallback backend");
 
-    let token = backend.submit(Op::UdpRecv {
-        fd: receiver.as_raw_fd(),
-        buffer: Buffer::new_uninitialized(32),
-    });
+    let token = backend
+        .submit(Op::UdpRecv {
+            fd: receiver.as_raw_fd(),
+            buffer: Buffer::new_uninitialized(32),
+        })
+        .expect("submit UDP receive");
     sender
         .send_to(b"udp", receiver.local_addr().expect("receiver address"))
         .expect("send datagram");

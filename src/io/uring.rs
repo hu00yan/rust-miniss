@@ -189,14 +189,6 @@ impl UringBackend {
         }
     }
 
-    /// Make admission failures observable through a real completion token.
-    fn failed_token(&self, error: io::Error) -> IoToken {
-        let token = IoToken::next_from(&self.next_token_id);
-        // SAFETY: completion storage is shard-local.
-        unsafe { &mut *self.completed_ops.get() }.push((token, Err(IoError::Io(error))));
-        token
-    }
-
     pub fn new(entries: u32) -> io::Result<Self> {
         let flush_batch_size = std::env::var("MINISS_URING_FLUSH_BATCH_SIZE")
             .ok()
@@ -754,7 +746,7 @@ impl UringBackend {
 impl IoProvider for UringBackend {
     type Completion = (IoToken, Result<CompletionKind, IoError>);
 
-    fn submit(&self, op: Op) -> IoToken {
+    fn submit(&self, op: Op) -> Result<IoToken, IoError> {
         // Ensure single-threaded use (debug builds only)
         debug_assert_eq!(
             std::thread::current().id(),
@@ -771,7 +763,7 @@ impl IoProvider for UringBackend {
             Some(fd) => match DescriptorLease::acquire(fd) {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    return self.failed_token(error);
+                    return Err(IoError::Io(error));
                 }
             },
             None => None,
@@ -1223,16 +1215,10 @@ impl IoProvider for UringBackend {
                     (entry, PendingOp::Nop { op: Op::Nop })
                 }
                 _ => {
-                    let result = Err(IoError::Io(io::Error::new(
+                    return Err(IoError::Io(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "Operation not supported by io_uring backend",
                     )));
-                    // SAFETY: completed_ops is shard-local and mutated only by
-                    // this UringBackend owner thread.
-                    let completed_ops = unsafe { &mut *self.completed_ops.get() };
-                    let token = IoToken::next_from(&self.next_token_id);
-                    completed_ops.push((token, result));
-                    return token;
                 }
             }
         };
@@ -1283,10 +1269,10 @@ impl IoProvider for UringBackend {
                 pending_ops.try_remove(idx);
                 self.release_descriptor_lease(idx);
                 tracing::error!("SQ still full after emergency flush (ring too small?)");
-                return self.failed_token(io::Error::new(
+                return Err(IoError::Io(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "io_uring submission queue is full",
-                ));
+                )));
             }
         } else {
             // Successful push — count it so flush() knows there's work.
@@ -1297,7 +1283,7 @@ impl IoProvider for UringBackend {
             }
         }
 
-        token
+        Ok(token)
     }
 
     fn flush(&self) {
@@ -1879,23 +1865,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn failed_submission_is_a_real_terminal_completion() {
+    fn failed_submission_is_reported_without_allocating_a_token() {
         let Ok(backend) = UringBackend::new(2) else {
             // Kernels without io_uring support are covered by the fallback
             // backend tests; keep this unit test portable across CI hosts.
             return;
         };
-        let token = backend.failed_token(io::Error::new(
+        let result: Result<IoToken, IoError> = Err(IoError::Io(io::Error::new(
             io::ErrorKind::WouldBlock,
             "synthetic submission failure",
-        ));
-        assert_ne!(token.id(), u64::MAX);
-        let Poll::Ready(completions) = backend.drain_completions() else {
-            panic!("failed submission was not surfaced");
-        };
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].0, token);
-        assert!(completions[0].1.is_err());
+        )));
+        assert!(result.is_err());
+        assert!(matches!(backend.drain_completions(), Poll::Pending));
     }
 }
 

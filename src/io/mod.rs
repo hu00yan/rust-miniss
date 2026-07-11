@@ -99,9 +99,10 @@ pub trait IoProvider: 'static {
 
     /// Submits an I/O operation to the backend.
     ///
-    /// This method is non-blocking and returns a unique `IoToken` to track
-    /// the operation.
-    fn submit(&self, op: Op) -> IoToken;
+    /// This method is non-blocking. A successful admission returns a unique
+    /// `IoToken` to track the operation; rejected operations return an error
+    /// without allocating a token or completion slot.
+    fn submit(&self, op: Op) -> Result<IoToken, IoError>;
 
     /// Drain completed I/O operations from the backend.
     ///

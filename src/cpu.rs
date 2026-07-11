@@ -553,8 +553,8 @@ mod tests {
     impl IoProvider for DummyProvider {
         type Completion = (IoToken, Result<CompletionKind, IoError>);
 
-        fn submit(&self, _op: Op) -> IoToken {
-            IoToken::from_id(1)
+        fn submit(&self, _op: Op) -> Result<IoToken, IoError> {
+            Ok(IoToken::from_id(1))
         }
 
         fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {

@@ -59,7 +59,8 @@ impl AsyncTcpListener {
                 let op = crate::io::Op::Accept {
                     fd: self.inner.as_raw_fd(),
                 };
-                let token = with_io_state(|state| state.io_backend.submit(op));
+                let token =
+                    with_io_state(|state| state.io_backend.submit(op)).map_err(io::Error::from)?;
                 self.accept_token = Some(token);
                 token
             }
@@ -508,7 +509,10 @@ impl AsyncRead for AsyncTcpStream {
                     offset: 0,
                     len: buf.len(),
                 };
-                let token = state.io_backend.submit(op);
+                let token = match state.io_backend.submit(op) {
+                    Ok(token) => token,
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                };
                 this.read_token = Some(token);
                 token
             };
@@ -584,7 +588,10 @@ impl AsyncRead for AsyncTcpStream {
                     fd: this.inner.as_raw_fd(),
                     buffers,
                 };
-                let token = state.io_backend.submit(op);
+                let token = match state.io_backend.submit(op) {
+                    Ok(token) => token,
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                };
                 this.read_token = Some(token);
                 token
             };
@@ -651,7 +658,10 @@ impl AsyncWrite for AsyncTcpStream {
                                 events: libc::POLLOUT as u32,
                                 multishot: false,
                             };
-                            let pollout_tok = state.io_backend.submit(pollout_op);
+                            let pollout_tok = match state.io_backend.submit(pollout_op) {
+                                Ok(token) => token,
+                                Err(error) => return Poll::Ready(Err(error.into())),
+                            };
                             this.pollout_token = Some(pollout_tok);
                             // SAFETY: pollout_tok was just submitted on this
                             // shard; waker/task association is shard-local.
@@ -674,7 +684,10 @@ impl AsyncWrite for AsyncTcpStream {
                     offset: 0,
                     data: Buffer::from_slice(buf),
                 };
-                let token = state.io_backend.submit(op);
+                let token = match state.io_backend.submit(op) {
+                    Ok(token) => token,
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                };
                 this.write_token = Some(token);
                 token
             };
@@ -740,7 +753,10 @@ impl AsyncWrite for AsyncTcpStream {
                                 events: libc::POLLOUT as u32,
                                 multishot: false,
                             };
-                            let pollout_tok = state.io_backend.submit(pollout_op);
+                            let pollout_tok = match state.io_backend.submit(pollout_op) {
+                                Ok(token) => token,
+                                Err(error) => return Poll::Ready(Err(error.into())),
+                            };
                             this.pollout_token = Some(pollout_tok);
                             // SAFETY: pollout_tok was just submitted on this
                             // shard; waker/task association is shard-local.
@@ -766,7 +782,10 @@ impl AsyncWrite for AsyncTcpStream {
                     fd: this.inner.as_raw_fd(),
                     buffers,
                 };
-                let token = state.io_backend.submit(op);
+                let token = match state.io_backend.submit(op) {
+                    Ok(token) => token,
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                };
                 this.write_token = Some(token);
                 token
             };
@@ -844,7 +863,10 @@ impl HyperRead for AsyncTcpStream {
                     offset: 0,
                     len: buf.remaining(),
                 };
-                let token = state.io_backend.submit(op);
+                let token = match state.io_backend.submit(op) {
+                    Ok(token) => token,
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                };
                 this.read_token = Some(token);
                 token
             };

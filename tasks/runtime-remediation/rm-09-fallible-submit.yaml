@@ -1,6 +1,6 @@
 ---
 id: rm-09-fallible-submit
-status: YELLOW
+status: GREEN
 batch: 2
 depends_on: [rm-07-descriptor-lease]
 parallel_wave: W3

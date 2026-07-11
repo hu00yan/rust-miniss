@@ -31,7 +31,7 @@ fn main() {
                 // Warmup: 2 batches
                 for _ in 0..2 {
                     for _ in 0..batch {
-                        state.io_backend.submit(rust_miniss::io::Op::Nop);
+                        let _ = state.io_backend.submit(rust_miniss::io::Op::Nop);
                     }
                     state.io_backend.flush();
                     let mut remaining: usize = batch;
@@ -54,7 +54,7 @@ fn main() {
 
                 for _ in 0..iterations {
                     for _ in 0..batch {
-                        state.io_backend.submit(rust_miniss::io::Op::Nop);
+                        let _ = state.io_backend.submit(rust_miniss::io::Op::Nop);
                     }
                     state.io_backend.flush();
                     let mut remaining: usize = batch;

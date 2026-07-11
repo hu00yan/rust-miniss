@@ -208,7 +208,10 @@ impl AsyncUdpSocket for MinissUdpSocket {
                         events: libc::POLLIN as u32,
                         multishot: false,
                     };
-                    let token = state.io_backend.submit(op);
+                    let token = match state.io_backend.submit(op) {
+                        Ok(token) => token,
+                        Err(error) => return Poll::Ready(Err(error.into())),
+                    };
                     self.store_recv_token(token);
                     unsafe {
                         state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
@@ -330,7 +333,10 @@ impl UdpPoller for MinissUdpPoller {
                 events: libc::POLLOUT as u32,
                 multishot: false,
             };
-            let token = state.io_backend.submit(op);
+            let token = match state.io_backend.submit(op) {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
             self.store_token(token);
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());

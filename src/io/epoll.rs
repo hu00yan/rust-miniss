@@ -145,7 +145,7 @@ impl EpollBackend {
 impl IoProvider for EpollBackend {
     type Completion = (IoToken, Result<CompletionKind, IoError>);
 
-    fn submit(&self, op: Op) -> IoToken {
+    fn submit(&self, op: Op) -> Result<IoToken, IoError> {
         let io_token = IoToken::next_from(&self.next_io_token);
 
         // SAFETY: We have exclusive, single-threaded access.
@@ -174,18 +174,16 @@ impl IoProvider for EpollBackend {
             match DescriptorLease::acquire(op.as_raw_fd()) {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    self.complete_local((io_token, Err(IoError::Io(error))));
-                    return io_token;
+                    return Err(IoError::Io(error));
                 }
             }
         };
         descriptor_leases[slot] = descriptor_lease;
         descriptor_lease_tokens[slot] = Some(io_token);
+        let mut registration_error = None;
         let leased_fd = descriptor_leases[slot]
             .as_ref()
             .map(DescriptorLease::as_raw_fd);
-        let is_threadpool_file = matches!(op, Op::ReadFile { .. } | Op::WriteFile { .. });
-
         match op {
             Op::UdpRecv { fd, mut buffer } => {
                 // Register the UDP socket for read events.
@@ -195,7 +193,7 @@ impl IoProvider for EpollBackend {
                     poll.registry()
                         .register(&mut source, mio_token, mio::Interest::READABLE)
                 {
-                    eprintln!("Failed to register UDP socket with epoll: {e}");
+                    registration_error = Some(e);
                 }
                 // SAFETY: udp_recv_buffers is shard-local and only touched by
                 // the owning epoll runtime thread while submitting/draining.
@@ -220,7 +218,7 @@ impl IoProvider for EpollBackend {
                         poll.registry()
                             .register(&mut source, mio_token, Interest::READABLE)
                     {
-                        eprintln!("Failed to register fd with mio: {e}");
+                        registration_error = Some(e);
                     } else {
                         pending_ops[slot] = Some((io_token, op));
                     }
@@ -232,7 +230,7 @@ impl IoProvider for EpollBackend {
                         poll.registry()
                             .register(&mut source, mio_token, Interest::READABLE)
                     {
-                        eprintln!("Failed to register fd with mio: {e}");
+                        registration_error = Some(e);
                     } else {
                         pending_ops[slot] = Some((io_token, op));
                     }
@@ -244,7 +242,7 @@ impl IoProvider for EpollBackend {
                         poll.registry()
                             .register(&mut source, mio_token, Interest::WRITABLE)
                     {
-                        eprintln!("Failed to register fd with mio: {e}");
+                        registration_error = Some(e);
                     } else {
                         pending_ops[slot] = Some((io_token, op));
                     }
@@ -256,7 +254,7 @@ impl IoProvider for EpollBackend {
                         poll.registry()
                             .register(&mut source, mio_token, Interest::READABLE)
                     {
-                        eprintln!("Failed to register fd with mio: {e}");
+                        registration_error = Some(e);
                     } else {
                         pending_ops[slot] = Some((io_token, op));
                     }
@@ -268,7 +266,7 @@ impl IoProvider for EpollBackend {
                         poll.registry()
                             .register(&mut source, mio_token, Interest::WRITABLE)
                     {
-                        eprintln!("Failed to register fd with mio: {e}");
+                        registration_error = Some(e);
                     } else {
                         pending_ops[slot] = Some((io_token, op));
                     }
@@ -280,7 +278,7 @@ impl IoProvider for EpollBackend {
                         poll.registry()
                             .register(&mut source, mio_token, Interest::WRITABLE)
                     {
-                        eprintln!("Failed to register fd for connect: {e}");
+                        registration_error = Some(e);
                     } else {
                         pending_ops[slot] = Some((io_token, op));
                     }
@@ -413,18 +411,16 @@ impl IoProvider for EpollBackend {
                         Interest::READABLE | Interest::WRITABLE
                     };
                     if let Err(e) = poll.registry().register(&mut source, mio_token, interest) {
-                        eprintln!("Failed to register fd with mio for poll: {e}");
+                        registration_error = Some(e);
                     } else {
                         pending_ops[slot] = Some((io_token, op));
                     }
                 }
                 _ => {
-                    // For unsupported operations, return an error immediately
-                    let result = Err(IoError::Io(io::Error::new(
+                    registration_error = Some(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "Operation not supported by epoll backend",
-                    )));
-                    self.complete_local((io_token, result));
+                    ));
                     descriptor_leases[slot] = None;
                     descriptor_lease_tokens[slot] = None;
                 }
@@ -434,12 +430,19 @@ impl IoProvider for EpollBackend {
         // Registration failures and unsupported/immediate operations do not
         // leave a pending slot.  Release their acceptance lease here; file
         // jobs retain theirs until the completion token is drained.
-        if pending_ops[slot].is_none() && !is_threadpool_file {
+        if let Some(error) = registration_error {
+            pending_ops[slot] = None;
+            // A failed UDP registration may have staged its buffer before the
+            // error was observed; discard that staged state with the lease.
+            unsafe {
+                (&mut *self.udp_recv_buffers.get())[slot] = None;
+            }
             descriptor_leases[slot] = None;
             descriptor_lease_tokens[slot] = None;
+            return Err(IoError::Io(error));
         }
 
-        io_token
+        Ok(io_token)
     }
 
     fn drain_completions(&self) -> TaskPoll<Vec<Self::Completion>> {
@@ -1024,6 +1027,7 @@ impl IoProvider for EpollBackend {
 mod descriptor_lease_acceptance_tests {
     use super::EpollBackend;
     use crate::io::{IoProvider, Op};
+    use smallvec::SmallVec;
 
     #[test]
     fn accepted_read_keeps_descriptor_lease_after_user_close() {
@@ -1031,11 +1035,13 @@ mod descriptor_lease_acceptance_tests {
         // SAFETY: fds points to two writable descriptor slots.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let backend = EpollBackend::new().expect("epoll backend");
-        let token = backend.submit(Op::Read {
-            fd: fds[0],
-            offset: 0,
-            len: 1,
-        });
+        let token = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("pipe read admitted");
         // SAFETY: the read end is still owned by this test and is closed once.
         unsafe { libc::close(fds[0]) };
         let leases = unsafe { &*backend.descriptor_leases.get() };
@@ -1047,6 +1053,26 @@ mod descriptor_lease_acceptance_tests {
         let _ = token;
         // SAFETY: write end remains owned by this test and is closed once.
         unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn unsupported_submit_returns_error_without_completion_token() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let backend = EpollBackend::new().expect("epoll backend");
+        let result = backend.submit(Op::UdpRecvVectored {
+            fd: fds[0],
+            iovecs: SmallVec::new(),
+        });
+        assert!(matches!(result, Err(crate::io::IoError::Io(_))));
+        assert!(matches!(
+            backend.drain_completions(),
+            std::task::Poll::Pending
+        ));
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 }
 
