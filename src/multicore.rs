@@ -524,6 +524,7 @@ impl CpuCore {
                 && self.local_task_count == 0
                 && self.ready_queue.is_empty()
                 && self.message_inbox.is_empty()
+                && self.io_state.io_backend.pending_operation_count() == 0
             {
                 break;
             }

@@ -445,6 +445,20 @@ impl IoProvider for EpollBackend {
         Ok(io_token)
     }
 
+    fn pending_operation_count(&self) -> usize {
+        // SAFETY: queried only by the owning fallback event-loop thread.
+        let pending = unsafe { &*self.pending_ops.get() }
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        let udp = unsafe { &*self.udp_recv_buffers.get() }
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        let completed = unsafe { &*self.completed_local.get() }.len();
+        pending + udp + completed
+    }
+
     fn drain_completions(&self) -> TaskPoll<Vec<Self::Completion>> {
         // SAFETY: We have exclusive, single-threaded access.
         let poll = unsafe { &mut *self.poll.get() };
@@ -1044,6 +1058,7 @@ mod descriptor_lease_acceptance_tests {
                 len: 1,
             })
             .expect("pipe read admitted");
+        assert!(backend.pending_operation_count() >= 1);
         // SAFETY: the read end is still owned by this test and is closed once.
         unsafe { libc::close(fds[0]) };
         let leases = unsafe { &*backend.descriptor_leases.get() };

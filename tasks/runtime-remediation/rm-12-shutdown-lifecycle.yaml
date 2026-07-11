@@ -37,6 +37,12 @@ architecture_audit: |
 
 # rm-12: Bounded shutdown lifecycle
 
+## Verification (2026-07-11)
+
+Worker graceful exit now includes a backend-owned pending-operation count in
+addition to task, ready-queue, and inbox emptiness. This closes the early
+reclaim path for abandoned I/O; explicit driver cancellation/drain remains.
+
 ## Problem (S1-3)
 
 Stop flags + wait task count; no kernel drain; Drop does not join.

@@ -135,6 +135,12 @@ pub trait IoProvider: 'static {
         0
     }
 
+    /// Number of accepted operations/results that still require owner-thread
+    /// drain before the driver can be reclaimed during graceful shutdown.
+    fn pending_operation_count(&self) -> usize {
+        0
+    }
+
     /// Park the thread, blocking for completions or timeout.
     /// Returns the number of available completions.
     fn park(&self, _timeout: Duration) -> usize {

@@ -1313,6 +1313,19 @@ impl IoProvider for UringBackend {
         self.pending_sqes.get()
     }
 
+    fn pending_operation_count(&self) -> usize {
+        // SAFETY: all operation storage is shard-local and queried only by
+        // the owner thread while deciding whether graceful shutdown may exit.
+        let pending = unsafe { &*self.pending_ops.get() }.len();
+        let queued_accepts = unsafe { &*self.accept_results.get() }
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(VecDeque::len)
+            .sum::<usize>();
+        let completed = unsafe { &*self.completed_ops.get() }.len();
+        pending + queued_accepts + completed + usize::from(self.pending_sqes.get() != 0)
+    }
+
     fn park(&self, timeout: Duration) -> usize {
         // SAFETY: UringBackend is thread-affine; the owning runtime thread is
         // the only code path mutating the ring.
