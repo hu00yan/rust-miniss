@@ -107,6 +107,17 @@ type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
 const ACCEPT_QUEUE_CAPACITY: usize = 256;
 const INTERNAL_CANCEL_USER_DATA: u64 = u64::MAX;
 
+fn discard_overflow_accept(result: Result<CompletionKind, IoError>, raw_fd: i32) {
+    // Successful accept results own the descriptor through `OwnedFd`; error
+    // results never construct that owner and must close the raw CQE fd here.
+    if raw_fd >= 0 && result.is_err() {
+        // SAFETY: raw_fd is the fresh accept result for this completion and no
+        // OwnedFd was created on the error path.
+        unsafe { libc::close(raw_fd) };
+    }
+    drop(result);
+}
+
 /// Multishot accept was added in Linux 5.19. The opcode probe alone cannot
 /// report SQE flag support, so gate the flag on the running kernel release and
 /// retain the single-shot fallback for unknown/malformed releases.
@@ -446,14 +457,18 @@ impl UringBackend {
                             }
                         };
                         let _ = **addr_len;
+                        // Own the accepted descriptor before address decoding;
+                        // parse failures must close it exactly once.
+                        let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                         match socket_addr {
                             Ok(sa) => Ok(CompletionKind::Accept {
-                                // SAFETY: a successful accept CQE transfers a
-                                // fresh descriptor to this completion.
-                                fd: unsafe { OwnedFd::from_raw_fd(result) },
+                                fd: accepted_fd,
                                 addr: Some(sa),
                             }),
-                            Err(e) => Err(e),
+                            Err(e) => {
+                                drop(accepted_fd);
+                                Err(e)
+                            }
                         }
                     } else {
                         Ok(CompletionKind::Accept {
@@ -469,11 +484,7 @@ impl UringBackend {
                     if queue.len() >= ACCEPT_QUEUE_CAPACITY {
                         // Drop surplus accepted descriptor rather than letting
                         // an abandoned listener grow an unbounded queue.
-                        if result >= 0 {
-                            // SAFETY: this fd is a fresh accept result owned by
-                            // this branch and has not been transferred.
-                            unsafe { libc::close(result) };
-                        }
+                        discard_overflow_accept(completion_result, result);
                     } else {
                         queue.push_back(completion_result);
                     }
@@ -1600,14 +1611,18 @@ impl IoProvider for UringBackend {
                             }
                         };
                         let _ = **addr_len;
+                        // Own the accepted descriptor before address decoding;
+                        // parse failures must close it exactly once.
+                        let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                         match socket_addr {
                             Ok(sa) => Ok(CompletionKind::Accept {
-                                // SAFETY: a successful accept CQE transfers a
-                                // fresh descriptor to this completion.
-                                fd: unsafe { OwnedFd::from_raw_fd(result) },
+                                fd: accepted_fd,
                                 addr: Some(sa),
                             }),
-                            Err(e) => Err(e),
+                            Err(e) => {
+                                drop(accepted_fd);
+                                Err(e)
+                            }
                         }
                     } else {
                         Ok(CompletionKind::Accept {
@@ -1623,11 +1638,7 @@ impl IoProvider for UringBackend {
                 let queue = accept_results[token_idx]
                     .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
                 if queue.len() >= ACCEPT_QUEUE_CAPACITY {
-                    if result >= 0 {
-                        // SAFETY: surplus accepted descriptor is still owned by
-                        // this backend and must be closed exactly once.
-                        unsafe { libc::close(result) };
-                    }
+                    discard_overflow_accept(completion_result, result);
                 } else {
                     queue.push_back(completion_result);
                 }
@@ -2169,6 +2180,25 @@ mod tests {
             }
         }
         assert_eq!(backend.pending_operation_count(), 0);
+    }
+
+    #[test]
+    fn overflow_accept_drop_does_not_double_close_reused_fd() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { libc::close(fds[1]) };
+        let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        discard_overflow_accept(
+            Ok(CompletionKind::Accept {
+                fd: accepted_fd,
+                addr: None,
+            }),
+            fds[0],
+        );
+
+        let replacement = std::fs::File::open("/dev/null").expect("replacement fd");
+        assert_eq!(replacement.as_raw_fd(), fds[0]);
+        assert!(unsafe { libc::fcntl(replacement.as_raw_fd(), libc::F_GETFD) } >= 0);
     }
 }
 
