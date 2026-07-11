@@ -42,5 +42,6 @@ stream conversion; dropping an overflowed or abandoned result closes it. When
 the opcode or runtime kernel-version capability check is false, submission
 uses single-shot `Accept` with retained sockaddr storage; Orb covers that
 fallback. Listener drop now requests owner-backend cancellation; the target
-terminal CQE retains resources until drain. Direct flag probing remains a
+terminal CQE retains resources until drain, and cancellation drops queued
+`OwnedFd` results while clearing the live operation identity. Direct flag probing remains a
 future refinement, but unsupported/old kernels do not assume multishot.

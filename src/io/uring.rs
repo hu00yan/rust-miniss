@@ -310,6 +310,20 @@ impl UringBackend {
         }
     }
 
+    fn discard_accept_results(&self, token: IoToken) {
+        let accept_results = unsafe { &mut *self.accept_results.get() };
+        let _ = accept_results
+            .get_mut(token.slot_index())
+            .and_then(Option::take);
+    }
+
+    fn discard_all_accept_results(&self) {
+        let accept_results = unsafe { &mut *self.accept_results.get() };
+        for queue in accept_results.iter_mut() {
+            let _ = queue.take();
+        }
+    }
+
     #[inline]
     fn pack_slot(idx: usize, generation: u32) -> u64 {
         debug_assert!(idx <= u32::MAX as usize);
@@ -339,7 +353,7 @@ impl UringBackend {
         let ring = &mut *self.ring.get();
         let pending_ops = &mut *self.pending_ops.get();
         let accept_results = &mut *self.accept_results.get();
-        let slot_meta = &*self.slot_meta.get();
+        let slot_meta = &mut *self.slot_meta.get();
         // SAFETY: this method is itself restricted to the owning shard turn.
         let io_state = unsafe { crate::cpu::current_io_state_unchecked() };
 
@@ -381,6 +395,9 @@ impl UringBackend {
             // Skip the wakeup poll token — caller handles it separately.
             if wakeup_poll_token == Some(token) {
                 saw_wakeup_poll_completion = true;
+                pending_ops.try_remove(idx);
+                self.release_descriptor_lease(idx);
+                slot_meta[idx].token_id = 0;
                 continue;
             }
 
@@ -471,6 +488,9 @@ impl UringBackend {
             // Normal completion: remove PendingOp, reconstruct result, store + wake.
             if let Some(pending_op) = pending_ops.try_remove(idx) {
                 self.release_descriptor_lease(idx);
+                if let Some(meta) = slot_meta.get_mut(idx) {
+                    meta.token_id = 0;
+                }
                 let completion_result = match pending_op {
                     PendingOp::Accept {
                         addr_storage,
@@ -1328,6 +1348,7 @@ impl IoProvider for UringBackend {
                 // Still full after flush — ring is too small, drop the op.
                 pending_ops.try_remove(idx);
                 self.release_descriptor_lease(idx);
+                slot_meta[idx].token_id = 0;
                 tracing::error!("SQ still full after emergency flush (ring too small?)");
                 return Err(IoError::Io(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -1381,13 +1402,15 @@ impl IoProvider for UringBackend {
     fn cancel(&self, token: IoToken) -> bool {
         let ring = unsafe { &mut *self.ring.get() };
         let slot_meta = unsafe { &*self.slot_meta.get() };
+        let pending_ops = unsafe { &*self.pending_ops.get() };
         let Some((idx, meta)) = slot_meta
             .iter()
             .enumerate()
-            .find(|(_, meta)| meta.token_id == token.id())
+            .find(|(idx, meta)| meta.token_id == token.id() && pending_ops.get(*idx).is_some())
         else {
             return false;
         };
+        self.discard_accept_results(token);
         // CQE user_data is the packed slot/generation identity, not the
         // public monotonic IoToken value.
         let target = Self::pack_slot(idx, meta.generation);
@@ -1405,14 +1428,17 @@ impl IoProvider for UringBackend {
     }
 
     fn cancel_all(&self) {
+        let pending_ops = unsafe { &*self.pending_ops.get() };
         let tokens = unsafe { &*self.slot_meta.get() }
             .iter()
-            .filter(|meta| meta.token_id != 0)
-            .map(|meta| IoToken::from_id(meta.token_id))
+            .enumerate()
+            .filter(|(idx, meta)| meta.token_id != 0 && pending_ops.get(*idx).is_some())
+            .map(|(_, meta)| IoToken::from_id(meta.token_id))
             .collect::<Vec<_>>();
         for token in tokens {
             let _ = self.cancel(token);
         }
+        self.discard_all_accept_results();
         self.flush_logged();
     }
 
@@ -1619,6 +1645,9 @@ impl IoProvider for UringBackend {
 
             if let Some(pending_op) = pending_op {
                 self.release_descriptor_lease(idx);
+                if let Some(meta) = slot_meta.get_mut(idx) {
+                    meta.token_id = 0;
+                }
                 let completion_result = match pending_op {
                     PendingOp::Accept {
                         op: _op,
@@ -2102,6 +2131,35 @@ mod tests {
             }
         }
         assert_eq!(backend.pending_operation_count(), 0);
+    }
+
+    #[test]
+    fn multishot_accept_cancel_discards_queued_owned_fds() {
+        let Ok(backend) = UringBackend::new(8) else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let token = backend
+            .submit(Op::Accept {
+                fd: listener.as_raw_fd(),
+            })
+            .expect("accept admission");
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        unsafe { libc::close(fds[1]) };
+        let accept_results = unsafe { &mut *backend.accept_results.get() };
+        accept_results[token.slot_index()] = Some(VecDeque::from([Ok(CompletionKind::Accept {
+            fd: accepted_fd,
+            addr: None,
+        })]));
+        assert!(
+            unsafe { &*backend.accept_results.get() }[token.slot_index()]
+                .as_ref()
+                .is_some_and(|queue| !queue.is_empty())
+        );
+        assert!(backend.cancel(token));
+        assert!(unsafe { &*backend.accept_results.get() }[token.slot_index()].is_none());
     }
 }
 

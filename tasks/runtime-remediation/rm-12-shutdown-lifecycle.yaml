@@ -46,7 +46,8 @@ reclaim path for abandoned I/O; explicit driver cancellation/drain remains.
 The coordinator now publishes explicit `Quiescing -> Cancelling -> DrainingIo
 -> Joined/Failed` phases, with a regression covering phase publication. Forced
 shutdown requests backend-wide cancellation and performs a bounded owner-thread
-terminal drain before dropping task/driver state.
+terminal drain before dropping task/driver state. Wakeup-poll operations are
+cancelled and removed before the zero-pending-operation exit predicate.
 
 ## Problem (S1-3)
 

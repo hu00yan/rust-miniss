@@ -424,6 +424,17 @@ impl CpuCore {
         drain_wakeup_eventfd(self.wakeup_eventfd);
     }
 
+    #[cfg(target_os = "linux")]
+    fn cancel_wakeup_poll(&mut self) {
+        let Some(token) = self.wakeup_poll_token.take() else {
+            return;
+        };
+        self.wakeup_poll_armed = false;
+        let _ = self.io_state.io_backend.cancel(token);
+        self.io_state.io_backend.flush();
+        drain_wakeup_eventfd(self.wakeup_eventfd);
+    }
+
     /// Main event loop - shared-nothing execution
     fn run(&mut self) -> Result<()> {
         // Bind to CPU core for optimal cache locality
@@ -605,10 +616,16 @@ impl CpuCore {
                 self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
             }
 
+            #[cfg(target_os = "linux")]
+            if self.draining {
+                self.cancel_wakeup_poll();
+            }
+
             if self.draining
                 && self.local_task_count == 0
                 && self.ready_queue.is_empty()
                 && self.message_inbox.is_empty()
+                && self.io_state.io_backend.pending_operation_count() == 0
             {
                 break;
             }
