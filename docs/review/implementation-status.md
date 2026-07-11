@@ -25,7 +25,7 @@ authority for scope and acceptance.
 | rm-14 | YELLOW | YELLOW | Commit `17ff822` adds runtime io_uring accept-opcode probing; bounded result queues close overflow fds and terminal errors clear listener tokens. `CompletionKind::Accept` now owns an `OwnedFd` until `TcpStream` conversion, so abandoned queued results close safely. Kernel multishot-flag probing and listener-drop cancellation remain; Orb accept regression passes. |
 | rm-15 | GREEN | GREEN | `spawn_local` accepts `!Send` futures on shard-local storage; startup enumerates allowed physical package/core IDs (including non-contiguous cpusets), affinity failure is explicit, and readiness is acknowledged only after owner-thread TLS/driver context installation. HTTP handlers stay local and fake `block_on_cpu` rejects explicitly. Orb Linux multicore suite: 22/22. |
 | rm-16 | YELLOW | YELLOW | QUIC UDP socket/poller now bind to the first worker shard that polls them; cross-shard poll and non-owner token clearing are rejected/avoided. clippy/check pass. Signal lifecycle, blocking send, and global-runtime join remain. |
-| rm-17 | YELLOW | YELLOW | Audit hard-fail checks and optional Miri/Loom recipes are present; `just arch-audit` exits 0 with unsafe justification output. Host stable toolchain lacks Miri and no Loom model targets exist yet. |
+| rm-17 | YELLOW | YELLOW | Audit hard-fail checks and optional Miri/Loom recipes are present; `just arch-audit` exits 0 with unsafe justification output. Orb Linux `integration_concurrency` Loom models (2/2) pass; host stable toolchain still lacks Miri. |
 
 ## Review boundary
 
