@@ -83,8 +83,18 @@ impl SignalHandler {
                             for flag in &core_shutdowns {
                                 flag.store(true, Ordering::Release);
                             }
-                            for sender in &cpu_senders {
-                                let _ = sender.try_send(CoreMessage::Shutdown);
+                            for (core_id, sender) in cpu_senders.iter().enumerate() {
+                                if let Err(error) = sender.try_send(CoreMessage::Shutdown) {
+                                    // The flag publication above is the
+                                    // lifecycle linearization point; a full
+                                    // inbox must be observable, never silently
+                                    // treated as a delivered shutdown message.
+                                    tracing::warn!(
+                                        core_id,
+                                        ?error,
+                                        "signal shutdown message was not queued; owner flag remains set"
+                                    );
+                                }
                             }
 
                             if let Some(signal_callbacks) = callbacks.get(&sig) {

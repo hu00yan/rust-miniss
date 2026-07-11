@@ -33,6 +33,12 @@ architecture_audit: |
 
 # rm-16: QUIC + signal + global runtime
 
+## Verification (2026-07-11)
+
+Signal delivery remains bounded/non-blocking; a full inbox is now logged as a
+delivery failure while per-core shutdown flags still publish the lifecycle
+transition. QUIC ownership tests pass; global owner join remains.
+
 ## Problem (S1-9.2–5)
 
 QUIC token races; signal bypass; global runtime cannot join.
