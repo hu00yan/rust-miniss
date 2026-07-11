@@ -962,8 +962,9 @@ pub struct MultiCoreRuntime {
     #[cfg(target_os = "linux")]
     /// Per-core eventfds used to wake parked workers when messages arrive.
     core_wakeup_fds: Vec<OwnedFd>,
-    /// Thread join handles
-    join_handles: Vec<thread::JoinHandle<Result<()>>>,
+    /// Thread join handles. This lock is control-plane only: worker hot paths
+    /// never access it, while it lets the global OnceLock owner join safely.
+    join_handles: parking_lot::Mutex<Vec<thread::JoinHandle<Result<()>>>>,
     /// Per-core task sequence counters.
     task_counters: Vec<AtomicU64>,
     /// Runtime state
@@ -1244,7 +1245,7 @@ impl MultiCoreRuntime {
             core_sleeping,
             #[cfg(target_os = "linux")]
             core_wakeup_fds,
-            join_handles,
+            join_handles: parking_lot::Mutex::new(join_handles),
             task_counters,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
             admission: Arc::new(AtomicUsize::new(0)),
@@ -1903,11 +1904,11 @@ impl MultiCoreRuntime {
     }
 
     /// Wait for all cores to complete
-    pub fn join(mut self) -> Result<()> {
+    pub fn join(&self) -> Result<()> {
         tracing::info!("Waiting for all cores to complete");
 
         let mut failures = Vec::new();
-        for (core_id, handle) in self.join_handles.drain(..).enumerate() {
+        for (core_id, handle) in self.join_handles.lock().drain(..).enumerate() {
             match handle.join() {
                 Ok(Ok(())) => {
                     tracing::debug!("Core {} completed successfully", core_id);
@@ -2000,7 +2001,7 @@ impl RuntimeStats {
 impl Drop for MultiCoreRuntime {
     fn drop(&mut self) {
         let state = self.state.load(Ordering::Acquire);
-        if state == RuntimeState::Terminated as u8 || self.join_handles.is_empty() {
+        if state == RuntimeState::Terminated as u8 || self.join_handles.lock().is_empty() {
             return;
         }
         if state == RuntimeState::Running as u8 {
@@ -2010,7 +2011,7 @@ impl Drop for MultiCoreRuntime {
         // Worker owns raw eventfd numbers borrowed from `core_wakeup_fds`;
         // always join before those OwnedFd values are dropped.  Drop is a
         // control-plane blocking path, never a data-plane operation.
-        for handle in self.join_handles.drain(..) {
+        for handle in self.join_handles.lock().drain(..) {
             let _ = handle.join();
         }
         self.state
@@ -2046,6 +2047,19 @@ where
 /// Shutdown global runtime
 pub fn shutdown() -> Result<()> {
     global_runtime()?.shutdown()
+}
+
+/// Join the process-global runtime's workers after a shutdown request.
+/// Unlike the old signal-only helper, this consumes no `Arc`; the owner keeps
+/// its join handles behind a control-plane-only lock until this call.
+pub fn join_global() -> Result<()> {
+    global_runtime()?.join()
+}
+
+/// Request and join the process-global runtime within a bounded deadline.
+pub fn shutdown_global_with_timeout(timeout: Duration) -> Result<()> {
+    global_runtime()?.shutdown_with_timeout(timeout)?;
+    global_runtime()?.join()
 }
 
 #[cfg(test)]

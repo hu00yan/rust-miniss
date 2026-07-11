@@ -1,6 +1,6 @@
 ---
 id: rm-16-quic-signal-global
-status: YELLOW
+status: GREEN
 batch: 2/3
 depends_on: [rm-07-descriptor-lease, rm-12-shutdown-lifecycle]
 parallel_wave: W5
@@ -35,9 +35,11 @@ architecture_audit: |
 
 ## Verification (2026-07-11)
 
-Signal delivery remains bounded/non-blocking; a full inbox is now logged as a
-delivery failure while per-core shutdown flags still publish the lifecycle
-transition. QUIC ownership tests pass; global owner join remains.
+Signal delivery remains bounded/non-blocking; a full inbox is logged while
+per-core shutdown flags publish the lifecycle transition. QUIC ownership tests
+pass. Global runtime now exposes `join_global` and bounded
+`shutdown_global_with_timeout`, joining worker handles held in a control-plane
+lock.
 
 ## Problem (S1-9.2–5)
 

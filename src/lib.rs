@@ -72,7 +72,10 @@ pub use http::{
 };
 pub use hyper_rt::{MinissHyperExecutor, MinissHyperTimer};
 pub use io::{CompletionKind, IoError, IoProvider, IoToken, Op};
-pub use multicore::{CoreMetricsSnapshot, MultiCoreRuntime, RuntimeMetrics};
+pub use multicore::{
+    join_global, shutdown_global_with_timeout, CoreMetricsSnapshot, MultiCoreRuntime,
+    RuntimeMetrics,
+};
 pub use net::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket};
 pub use quic::MinissQuicRuntime;
 pub use task::{Task, TaskError, TaskResult};
