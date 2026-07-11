@@ -391,6 +391,28 @@ pub enum CompletionKind {
     Nop,
 }
 
+#[cfg(all(test, unix))]
+mod accept_ownership_tests {
+    use super::CompletionKind;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[test]
+    fn accepted_descriptor_closes_when_completion_is_dropped() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned ownership of this descriptor to the test.
+        let accepted = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let raw = accepted.as_raw_fd();
+        drop(CompletionKind::Accept {
+            fd: accepted,
+            addr: None,
+        });
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        // SAFETY: the write end remains owned by this test.
+        unsafe { libc::close(fds[1]) };
+    }
+}
+
 /// Represents an error that can occur during an I/O operation.
 #[derive(Debug)]
 pub enum IoError {
