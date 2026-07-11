@@ -1,6 +1,8 @@
 # Runtime Remediation Implementation Status
 
-Verified on 2026-07-11. This is a review record, not a claim that the runtime
+Verified on 2026-07-11. Orb Ubuntu lib/integration tests (including 61 lib
+tests), local fmt/check/clippy, and `just arch-audit` were rerun successfully.
+This is a review record, not a claim that the runtime
 is production-safe. `docs/review/verified-remediation-plan.md` remains the
 authority for scope and acceptance.
 
@@ -29,3 +31,7 @@ authority for scope and acceptance.
 
 The worktree also contains an unrelated untracked `.codebase-memory/`
 directory; it is preserved.
+
+The remaining YELLOW cards are intentional and recorded in
+`docs/DECISION_LOG.md`; no deferred API or lifecycle design was silently
+reclassified as complete.
