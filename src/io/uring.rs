@@ -1907,6 +1907,58 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(backend.drain_completions(), Poll::Pending));
     }
+
+    #[test]
+    fn descriptor_lease_survives_numeric_fd_reuse() {
+        let Ok(backend) = UringBackend::new(8) else {
+            return;
+        };
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let token = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("pipe read admission");
+
+        // Drop the user's numeric descriptor, then deliberately reuse that
+        // number for an unrelated file. The accepted lease must keep the
+        // kernel operation attached to the original pipe.
+        let reused = fds[0];
+        unsafe { libc::close(fds[0]) };
+        let replacement = unsafe {
+            libc::open(
+                b"/dev/null\0".as_ptr().cast(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        assert_eq!(replacement, reused);
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+
+        backend.flush();
+        let _ = backend.park(Duration::from_secs(1));
+        let completions = match backend.drain_completions() {
+            Poll::Ready(completions) => completions,
+            Poll::Pending => panic!("leased read did not complete"),
+        };
+        let result = completions
+            .into_iter()
+            .find(|(completed, _)| *completed == token)
+            .expect("leased read completion");
+        match result.1.expect("read completion") {
+            CompletionKind::Read { bytes_read, data } => {
+                assert_eq!(bytes_read, 1);
+                assert_eq!(&data[..], b"x");
+            }
+            other => panic!("unexpected completion: {other:?}"),
+        }
+        unsafe {
+            libc::close(replacement);
+            libc::close(fds[1]);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -48,3 +48,9 @@ Raw fd integers; drop clears waiter only; reuse → wrong file.
 ## Out of scope
 
 Full cancel opcode state machine (rm-09/rm-12); multishot policy (rm-14).
+
+## Verification (2026-07-11)
+
+Orb Linux io_uring regression `descriptor_lease_survives_numeric_fd_reuse`
+submits a pipe read, closes/reuses the user fd for `/dev/null`, and verifies
+the completion still reads the original pipe through the accepted lease.
