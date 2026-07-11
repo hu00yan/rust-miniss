@@ -1937,7 +1937,7 @@ mod tests {
         assert_eq!(replacement, reused);
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
 
-        backend.flush();
+        backend.flush_logged();
         let _ = backend.park(Duration::from_secs(1));
         let completions = match backend.drain_completions() {
             Poll::Ready(completions) => completions,
