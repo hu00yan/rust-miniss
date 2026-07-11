@@ -107,14 +107,9 @@ type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
 const ACCEPT_QUEUE_CAPACITY: usize = 256;
 const INTERNAL_CANCEL_USER_DATA: u64 = u64::MAX;
 
-fn discard_overflow_accept(result: Result<CompletionKind, IoError>, raw_fd: i32) {
-    // Successful accept results own the descriptor through `OwnedFd`; error
-    // results never construct that owner and must close the raw CQE fd here.
-    if raw_fd >= 0 && result.is_err() {
-        // SAFETY: raw_fd is the fresh accept result for this completion and no
-        // OwnedFd was created on the error path.
-        unsafe { libc::close(raw_fd) };
-    }
+fn discard_overflow_accept(result: Result<CompletionKind, IoError>) {
+    // Every successful accept path transfers the descriptor into an OwnedFd
+    // and drops it on parse failure; dropping the result is the sole close.
     drop(result);
 }
 
@@ -484,7 +479,7 @@ impl UringBackend {
                     if queue.len() >= ACCEPT_QUEUE_CAPACITY {
                         // Drop surplus accepted descriptor rather than letting
                         // an abandoned listener grow an unbounded queue.
-                        discard_overflow_accept(completion_result, result);
+                        discard_overflow_accept(completion_result);
                     } else {
                         queue.push_back(completion_result);
                     }
@@ -546,14 +541,16 @@ impl UringBackend {
                                 }
                             };
                             let _ = **addr_len;
+                            let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::Accept {
-                                    // SAFETY: a successful accept CQE transfers a
-                                    // fresh descriptor to this completion.
-                                    fd: unsafe { OwnedFd::from_raw_fd(result) },
+                                    fd: accepted_fd,
                                     addr: Some(sa),
                                 }),
-                                Err(e) => Err(e),
+                                Err(e) => {
+                                    drop(accepted_fd);
+                                    Err(e)
+                                }
                             }
                         } else {
                             Ok(CompletionKind::Accept {
@@ -1638,7 +1635,7 @@ impl IoProvider for UringBackend {
                 let queue = accept_results[token_idx]
                     .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
                 if queue.len() >= ACCEPT_QUEUE_CAPACITY {
-                    discard_overflow_accept(completion_result, result);
+                    discard_overflow_accept(completion_result);
                 } else {
                     queue.push_back(completion_result);
                 }
@@ -1709,14 +1706,16 @@ impl IoProvider for UringBackend {
                                 }
                             };
                             let _ = **addr_len;
+                            let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::Accept {
-                                    // SAFETY: a successful accept CQE transfers a
-                                    // fresh descriptor to this completion.
-                                    fd: unsafe { OwnedFd::from_raw_fd(result) },
+                                    fd: accepted_fd,
                                     addr: Some(sa),
                                 }),
-                                Err(e) => Err(e),
+                                Err(e) => {
+                                    drop(accepted_fd);
+                                    Err(e)
+                                }
                             }
                         } else {
                             Ok(CompletionKind::Accept {
@@ -2188,13 +2187,10 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         unsafe { libc::close(fds[1]) };
         let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        discard_overflow_accept(
-            Ok(CompletionKind::Accept {
-                fd: accepted_fd,
-                addr: None,
-            }),
-            fds[0],
-        );
+        discard_overflow_accept(Ok(CompletionKind::Accept {
+            fd: accepted_fd,
+            addr: None,
+        }));
 
         let replacement = std::fs::File::open("/dev/null").expect("replacement fd");
         assert_eq!(replacement.as_raw_fd(), fds[0]);
