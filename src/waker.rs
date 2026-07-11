@@ -125,6 +125,20 @@ impl<T> TaskArena<T> {
     /// advance the arena generation, so a delayed old message cannot recreate
     /// a terminal occupant.
     pub fn insert_external(&mut self, key: TaskKey, value: T) -> bool {
+        if !self.can_insert_external(key) {
+            return false;
+        }
+        let slot_index = key.slot as usize;
+        self.generations[slot_index] = key.generation;
+        self.free.retain(|free_slot| *free_slot != key.slot);
+        self.slots[slot_index] = Some(value);
+        true
+    }
+
+    /// Check owner-side admission without consuming the task value. This lets
+    /// a bounded caller retain an already accepted task while its selected
+    /// slot is still occupied, then retry after terminal cleanup.
+    pub(crate) fn can_insert_external(&self, key: TaskKey) -> bool {
         if key.runtime_generation != self.runtime_generation
             || key.shard != self.shard
             || key.generation == 0
@@ -132,30 +146,12 @@ impl<T> TaskArena<T> {
             return false;
         }
         let slot_index = key.slot as usize;
-        if slot_index >= self.slots.len() {
-            return false;
-        }
-        if self
-            .slots
-            .get(slot_index)
-            .and_then(Option::as_ref)
-            .is_some()
-        {
+        if self.slots.get(slot_index).is_none_or(Option::is_some) {
             return false;
         }
         let current_generation = self.generations[slot_index];
-        let expected = if current_generation == 0 {
-            key.generation
-        } else {
-            current_generation.wrapping_add(1).max(1)
-        };
-        if expected != key.generation {
-            return false;
-        }
-        self.generations[slot_index] = key.generation;
-        self.free.retain(|free_slot| *free_slot != key.slot);
-        self.slots[slot_index] = Some(value);
-        true
+        let generation_delta = key.generation.wrapping_sub(current_generation);
+        current_generation == 0 || (generation_delta != 0 && generation_delta < 0x8000)
     }
 
     pub fn get(&self, key: TaskKey) -> Option<&T> {
@@ -431,6 +427,21 @@ mod tests {
         assert!(arena.insert_external(next, 8));
         assert_eq!(arena.get(first), None);
         assert_eq!(arena.get(next), Some(&8));
+    }
+
+    #[test]
+    fn task_arena_external_admission_can_skip_rejected_generation_without_reviving_it() {
+        let mut arena = TaskArena::<u8>::with_capacity(4, 3, 1);
+        let first = TaskKey::new(4, 3, 0, 1);
+        let skipped = TaskKey::new(4, 3, 0, 2);
+        let replacement = TaskKey::new(4, 3, 0, 3);
+
+        assert!(arena.insert_external(first, 7));
+        assert!(!arena.insert_external(skipped, 8));
+        assert_eq!(arena.remove(first), Some(7));
+        assert!(arena.insert_external(replacement, 9));
+        assert!(!arena.insert_external(skipped, 8));
+        assert_eq!(arena.get(replacement), Some(&9));
     }
 
     #[test]

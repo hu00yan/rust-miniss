@@ -7,7 +7,7 @@ parallel_wave: W0
 goal: Restore cargo check/test --all-targets so later cards have a real gate.
 allowed_files:
   - justfile
-  - examples/http_echo_onecore.rs
+  - examples/http_echo.rs
   - src/cpu.rs
   - src/http.rs
   - src/hyper_rt.rs

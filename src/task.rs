@@ -195,7 +195,10 @@ where
 /// A task wraps a future for execution in the runtime
 pub struct Task {
     id: TaskId,
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    // A Task is created and polled only by its owning shard. Cross-thread
+    // admission still requires Send before the future reaches the owner, but
+    // spawn_local may safely store a !Send future here.
+    future: Pin<Box<dyn Future<Output = ()>>>,
     /// Cached waker — created once and reused across polls.
     /// Reuses Arc-backed waker state across polls.
     waker: Option<Waker>,
@@ -215,7 +218,7 @@ impl Drop for Task {
 
 impl Task {
     /// Create a new task with the given future
-    pub fn new(id: TaskId, future: impl Future<Output = ()> + Send + 'static) -> Self {
+    pub fn new(id: TaskId, future: impl Future<Output = ()> + 'static) -> Self {
         Self {
             id,
             future: Box::pin(future),
@@ -226,7 +229,7 @@ impl Task {
     }
 
     /// Create a new task from a pinned boxed future
-    pub fn from_pinned(id: TaskId, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> Self {
+    pub fn from_pinned(id: TaskId, future: Pin<Box<dyn Future<Output = ()>>>) -> Self {
         Self {
             id,
             future,

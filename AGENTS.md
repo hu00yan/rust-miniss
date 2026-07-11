@@ -75,7 +75,7 @@ models 不得使用 socket、fd、thread、sleep 或 wall clock。
 
 ## `just bench-smoke`
 
-运行一次 5 秒 `miniss-onecore` HTTP smoke，与显式提供的同机
+运行一次 5 秒 `http_echo --cores 1` HTTP smoke，与显式提供的同机
 `summary.csv` 比较并输出 JSON。throughput 回退 >5% 或 p99 增长 >10% 失败；
 无 baseline 时明确失败，不把 `HEAD~1` 冒充测量证据。
 

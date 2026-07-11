@@ -1,0 +1,49 @@
+---
+id: perf-descriptor-lease
+status: GREEN
+goal: Remove per-operation descriptor duplication from the hottest TCP write
+  path without weakening terminal-CQE descriptor ownership.
+allowed_files:
+  - bench/scripts/bench_http.sh
+  - bench/scripts/compare_http_baseline.pl
+  - bench/scripts/bench_http_matrix.sh
+  - bench/scripts/run_bench_linux.sh
+  - bench/support/http_framing.rs
+  - bench/runtime_comparison/monoio_echo.rs
+  - bench/runtime_comparison/compio_echo.rs
+  - bench/runtime_comparison/tokio_echo.rs
+  - bench/runtime_comparison/glommio_echo.rs
+  - docs/DECISION_LOG.md
+  - docs/review/performance-baseline-2026-07-11.md
+  - scripts/linux_safety.sh
+  - examples/http_echo.rs
+  - Cargo.toml
+  - justfile
+  - AGENTS.md
+  - docs/benchmarks/http.md
+  - tasks/runtime-remediation/rm-00-gate-all-targets.yaml
+  - tasks/runtime-remediation/rm-15-affinity-local-spawn.yaml
+  - src/io/mod.rs
+  - src/io/uring.rs
+  - src/multicore.rs
+  - src/task.rs
+  - src/waker.rs
+  - src/net.rs
+  - tasks/perf-descriptor-lease.yaml
+test_commands:
+  - just test-fast
+  - cargo clippy --all-targets -- -D warnings
+  - sh scripts/linux_safety.sh
+architecture_audit: |
+  Adds no locks, runtime creation, blocking async calls, cross-core queue, or
+  mutable shared state. RegisteredDescriptor owns one immutable Arc of OwnedFd
+  so the existing Send-compatible stream interface remains intact.
+  Each WriteStatic operation pays an atomic Arc lease instead of dup and close
+  syscalls; UringBackend retains that lease until terminal CQE. epoll and kqueue
+  continue using their correctness-first per-operation lease path.
+  The multicore repair removes a shard-local busy-poll Vec and admits local
+  futures to the existing owner TaskArena/ready queue. Task is explicitly
+  non-Send; cross-core messages retain their Send bound. No lock, global queue,
+  runtime creation, blocking async syscall, or cross-shard mutable state was
+  added. Listener startup acknowledgement is control-plane-only.
+---

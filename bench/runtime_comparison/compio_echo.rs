@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::thread::available_parallelism;
 use std::time::Duration;
 
+#[path = "../support/http_framing.rs"]
+mod http_framing;
+use http_framing::RequestFramer;
+
 fn parse_cores() -> usize {
     let mut cores = available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut args = std::env::args().skip(1);
@@ -30,6 +34,7 @@ fn parse_cores() -> usize {
 
 async fn handle_client(mut stream: TcpStream, requests: Option<Arc<AtomicU64>>) {
     let mut buf = vec![0u8; 4096];
+    let mut framer = RequestFramer::new();
     let body = b"Hello from compio";
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
@@ -42,12 +47,18 @@ async fn handle_client(mut stream: TcpStream, requests: Option<Arc<AtomicU64>>) 
         buf = read_result.1;
         match read_result.0 {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if let Some(counter) = &requests {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                if stream.write_all(response.clone()).await.is_err() {
-                    break;
+            Ok(bytes_read) => {
+                let complete = match framer.push(&buf[..bytes_read]) {
+                    Ok(complete) => complete,
+                    Err(()) => break,
+                };
+                for _ in 0..complete {
+                    if let Some(counter) = &requests {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if stream.write_all(response.clone()).await.is_err() {
+                        return;
+                    }
                 }
             }
         }

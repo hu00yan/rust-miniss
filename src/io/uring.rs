@@ -104,13 +104,24 @@ struct SlotMeta {
 /// The completion type for the io_uring backend.
 pub(super) type Completion = (IoToken, Result<CompletionKind, IoError>);
 type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
-const ACCEPT_QUEUE_CAPACITY: usize = 256;
+const ACCEPT_QUEUE_CAPACITY: usize = crate::io::ACCEPT_BACKLOG_CAPACITY;
 const INTERNAL_CANCEL_USER_DATA: u64 = u64::MAX;
 
 fn discard_overflow_accept(result: Result<CompletionKind, IoError>) {
     // Every successful accept path transfers the descriptor into an OwnedFd
     // and drops it on parse failure; dropping the result is the sole close.
     drop(result);
+}
+
+fn queue_accept_result(
+    queue: &mut VecDeque<Result<CompletionKind, IoError>>,
+    result: Result<CompletionKind, IoError>,
+) {
+    if queue.len() >= ACCEPT_QUEUE_CAPACITY {
+        discard_overflow_accept(result);
+    } else {
+        queue.push_back(result);
+    }
 }
 
 /// Multishot accept was added in Linux 5.19. The opcode probe alone cannot
@@ -478,13 +489,7 @@ impl UringBackend {
                     let token_idx = token.slot_index();
                     let queue = accept_results[token_idx]
                         .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
-                    if queue.len() >= ACCEPT_QUEUE_CAPACITY {
-                        // Drop surplus accepted descriptor rather than letting
-                        // an abandoned listener grow an unbounded queue.
-                        discard_overflow_accept(completion_result);
-                    } else {
-                        queue.push_back(completion_result);
-                    }
+                    queue_accept_result(queue, completion_result);
                     if let Some(waker) = io_state.take_waker(token) {
                         wakeups += 1;
                         waker.wake();
@@ -809,10 +814,12 @@ impl UringBackend {
     }
 }
 
-impl IoProvider for UringBackend {
-    type Completion = (IoToken, Result<CompletionKind, IoError>);
-
-    fn submit(&self, op: Op) -> Result<IoToken, IoError> {
+impl UringBackend {
+    fn submit_inner(
+        &self,
+        op: Op,
+        provided_descriptor_lease: Option<DescriptorLease>,
+    ) -> Result<IoToken, IoError> {
         // Ensure single-threaded use (debug builds only)
         debug_assert_eq!(
             std::thread::current().id(),
@@ -825,14 +832,17 @@ impl IoProvider for UringBackend {
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
         // Acquire independent descriptor ownership before constructing or
         // queueing any SQE.  User-future abandonment cannot close this lease.
-        let descriptor_lease = match Self::descriptor_fd(&op) {
-            Some(fd) => match DescriptorLease::acquire(fd) {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    return Err(IoError::Io(error));
-                }
+        let descriptor_lease = match provided_descriptor_lease {
+            Some(lease) => Some(lease),
+            None => match Self::descriptor_fd(&op) {
+                Some(fd) => match DescriptorLease::acquire(fd) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        return Err(IoError::Io(error));
+                    }
+                },
+                None => None,
             },
-            None => None,
         };
         let leased_fd = |fd: RawFd| {
             descriptor_lease
@@ -1376,6 +1386,22 @@ impl IoProvider for UringBackend {
 
         Ok(token)
     }
+}
+
+impl IoProvider for UringBackend {
+    type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+    fn submit(&self, op: Op) -> Result<IoToken, IoError> {
+        self.submit_inner(op, None)
+    }
+
+    fn submit_with_descriptor(
+        &self,
+        op: Op,
+        descriptor: DescriptorLease,
+    ) -> Result<IoToken, IoError> {
+        self.submit_inner(op, Some(descriptor))
+    }
 
     fn flush(&self) {
         // Skip syscall entirely when no SQEs are pending — fast path for idle ticks.
@@ -1636,11 +1662,7 @@ impl IoProvider for UringBackend {
                 let token_idx = token.slot_index();
                 let queue = accept_results[token_idx]
                     .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
-                if queue.len() >= ACCEPT_QUEUE_CAPACITY {
-                    discard_overflow_accept(completion_result);
-                } else {
-                    queue.push_back(completion_result);
-                }
+                queue_accept_result(queue, completion_result);
                 // SAFETY: token belongs to this shard and the waker slot is
                 // owned by the current io_state.
                 crate::cpu::with_io_state(|io_state| unsafe {
@@ -2068,12 +2090,8 @@ mod tests {
         // kernel operation attached to the original pipe.
         let reused = fds[0];
         unsafe { libc::close(fds[0]) };
-        let replacement = unsafe {
-            libc::open(
-                b"/dev/null\0".as_ptr().cast(),
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            )
-        };
+        let replacement =
+            unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         assert_eq!(replacement, reused);
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
 
@@ -2187,17 +2205,27 @@ mod tests {
     }
 
     #[test]
-    fn overflow_accept_drop_closes_owned_fd_and_preserves_peer() {
+    fn accept_burst_is_bounded_to_listener_backlog_and_overflow_closes_fd() {
+        let mut queue = VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY);
+        for _ in 0..ACCEPT_QUEUE_CAPACITY {
+            queue_accept_result(&mut queue, Err(IoError::Other("queued".into())));
+        }
+        assert_eq!(queue.len(), crate::io::ACCEPT_BACKLOG_CAPACITY);
+
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let accepted_raw = fds[0];
         let peer_raw = fds[1];
         let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        discard_overflow_accept(Ok(CompletionKind::Accept {
-            fd: accepted_fd,
-            addr: None,
-        }));
+        queue_accept_result(
+            &mut queue,
+            Ok(CompletionKind::Accept {
+                fd: accepted_fd,
+                addr: None,
+            }),
+        );
 
+        assert_eq!(queue.len(), crate::io::ACCEPT_BACKLOG_CAPACITY);
         assert_eq!(unsafe { libc::fcntl(accepted_raw, libc::F_GETFD) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),

@@ -6,6 +6,10 @@ use glommio::net::{TcpListener, TcpStream};
 use glommio::PoolPlacement;
 use std::thread::available_parallelism;
 
+#[path = "../support/http_framing.rs"]
+mod http_framing;
+use http_framing::RequestFramer;
+
 fn parse_cores() -> usize {
     let mut cores = available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut args = std::env::args().skip(1);
@@ -32,13 +36,20 @@ async fn handle_client(mut stream: TcpStream) {
         body.len()
     );
     let response = [header.as_bytes(), body].concat();
+    let mut framer = RequestFramer::new();
 
     loop {
         match stream.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if stream.write_all(&response).await.is_err() {
-                    break;
+            Ok(bytes_read) => {
+                let complete = match framer.push(&buf[..bytes_read]) {
+                    Ok(complete) => complete,
+                    Err(()) => break,
+                };
+                for _ in 0..complete {
+                    if stream.write_all(&response).await.is_err() {
+                        return;
+                    }
                 }
             }
         }

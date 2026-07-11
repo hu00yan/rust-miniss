@@ -22,11 +22,17 @@ use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsRawFd as StdAsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
 use crate::buffer::Buffer;
 use smallvec::SmallVec;
+
+/// Kernel listen backlog and bounded multishot-accept delivery capacity.
+/// Keeping these equal prevents an accepted burst from being reset merely
+/// because user-space delivery is smaller than the advertised backlog.
+pub(crate) const ACCEPT_BACKLOG_CAPACITY: usize = 1024;
 
 /// A trait for I/O resources that can be represented by a raw file descriptor.
 pub trait AsRawFd {
@@ -43,20 +49,40 @@ pub trait AsRawFd {
 /// delivery.
 #[allow(dead_code)]
 #[derive(Debug)]
-pub(crate) struct DescriptorLease(OwnedFd);
+pub(crate) struct RegisteredDescriptor(Arc<OwnedFd>);
 
 #[allow(dead_code)]
-impl DescriptorLease {
-    /// Duplicate `fd`, acquiring ownership before an SQE is queued.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct DescriptorLease(Arc<OwnedFd>);
+
+#[allow(dead_code)]
+impl RegisteredDescriptor {
+    /// Import one descriptor identity into shard-local ownership.
     pub(crate) fn acquire(fd: RawFd) -> io::Result<Self> {
-        // SAFETY: `dup` returns a fresh descriptor owned by this call on
-        // success; `OwnedFd` takes ownership exactly once.
+        // SAFETY: dup returns a fresh descriptor owned by this call on
+        // success; OwnedFd takes ownership exactly once.
         let duplicate = unsafe { libc::dup(fd) };
         if duplicate < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: duplicate is newly created and exclusively owned here.
-        Ok(Self(unsafe { OwnedFd::from_raw_fd(duplicate) }))
+        let owned = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        Ok(Self(Arc::new(owned)))
+    }
+
+    /// Create one operation-local lease without another descriptor syscall.
+    #[inline]
+    pub(crate) fn lease(&self) -> DescriptorLease {
+        DescriptorLease(Arc::clone(&self.0))
+    }
+}
+
+#[allow(dead_code)]
+impl DescriptorLease {
+    /// Duplicate `fd`, acquiring ownership before an SQE is queued.
+    pub(crate) fn acquire(fd: RawFd) -> io::Result<Self> {
+        RegisteredDescriptor::acquire(fd).map(|registered| registered.lease())
     }
 
     #[inline]
@@ -67,7 +93,11 @@ impl DescriptorLease {
 
 #[cfg(all(test, unix))]
 mod descriptor_lease_tests {
-    use super::DescriptorLease;
+    use super::{DescriptorLease, RegisteredDescriptor};
+
+    static_assertions::assert_impl_all!(RegisteredDescriptor: Send, Sync);
+    static_assertions::assert_impl_all!(DescriptorLease: Send, Sync);
+    static_assertions::assert_not_impl_any!(DescriptorLease: Clone);
 
     #[test]
     fn lease_survives_user_fd_close_until_drop() {
@@ -83,6 +113,38 @@ mod descriptor_lease_tests {
         unsafe { libc::close(read_fd) };
         assert_ne!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, -1);
         drop(lease);
+        // SAFETY: write_fd is still owned by this test and closed exactly once.
+        unsafe { libc::close(write_fd) };
+    }
+
+    #[test]
+    fn registered_descriptor_shares_one_owned_identity_until_last_operation_lease() {
+        let (read_fd, write_fd) = {
+            let mut fds = [0; 2];
+            // SAFETY: fds points to two writable RawFd slots.
+            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            assert_eq!(rc, 0);
+            (fds[0], fds[1])
+        };
+        let registered = RegisteredDescriptor::acquire(read_fd).expect("register read end");
+        // SAFETY: read_fd is still owned by this test and closed exactly once.
+        unsafe { libc::close(read_fd) };
+
+        let first = registered.lease();
+        let second = registered.lease();
+        let leased_fd = first.as_raw_fd();
+        assert_eq!(leased_fd, second.as_raw_fd());
+
+        drop(registered);
+        drop(first);
+        assert_ne!(unsafe { libc::fcntl(leased_fd, libc::F_GETFD) }, -1);
+
+        drop(second);
+        assert_eq!(unsafe { libc::fcntl(leased_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
         // SAFETY: write_fd is still owned by this test and closed exactly once.
         unsafe { libc::close(write_fd) };
     }
@@ -103,6 +165,17 @@ pub trait IoProvider: 'static {
     /// `IoToken` to track the operation; rejected operations return an error
     /// without allocating a token or completion slot.
     fn submit(&self, op: Op) -> Result<IoToken, IoError>;
+
+    /// Submit using descriptor ownership already imported by a shard-local
+    /// resource. Backends that do not specialize this path retain the existing
+    /// correctness-first per-operation lease behavior.
+    fn submit_with_descriptor(
+        &self,
+        op: Op,
+        _descriptor: DescriptorLease,
+    ) -> Result<IoToken, IoError> {
+        self.submit(op)
+    }
 
     /// Drain completed I/O operations from the backend.
     ///

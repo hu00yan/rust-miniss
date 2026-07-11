@@ -65,7 +65,7 @@ bench-smoke baseline="":
     fi
     commit=$(git rev-parse --short HEAD)
     out=".scratch/bench-smoke-$commit-$(date +%Y%m%d-%H%M%S)"
-    BENCH_RUNTIMES=miniss-onecore BENCH_OUT_DIR="$out" ./bench/scripts/bench_http.sh 9090 5 32 1
+    HTTP_CORES=1 BENCH_RUNTIMES=miniss BENCH_OUT_DIR="$out" ./bench/scripts/bench_http.sh 9090 5 32 1
     perl bench/scripts/compare_http_baseline.pl "{{ baseline }}" "$out/summary.csv" "$commit"
 
 # ─── Review ─────────────────────────────────────────────────────

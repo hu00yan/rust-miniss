@@ -110,7 +110,7 @@ wrk -t2 -c50 -d10s http://127.0.0.1:8080/
 - Do not compare a single run against another single run.
 - Compare the same scenario set across at least one short-connection case and one keep-alive case.
 - Treat a win as temporary until `summary.csv` and `diagnostics.csv` agree across repeat runs.
-- Treat `miniss-onecore` as a diagnostic baseline only. Use it to catch regressions and isolate hot-path issues, not as the primary performance target.
+- Treat `http_echo --cores 1` as a diagnostic baseline only. It uses the same implementation as the multicore target; use it to isolate hot-path issues, not as the primary performance target.
 
 ## Environment Details
 

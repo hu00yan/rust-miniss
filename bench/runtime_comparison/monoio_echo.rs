@@ -11,6 +11,10 @@ use std::sync::Arc;
 use std::thread::available_parallelism;
 use std::time::Duration;
 
+#[path = "../support/http_framing.rs"]
+mod http_framing;
+use http_framing::RequestFramer;
+
 fn parse_cores() -> usize {
     let mut cores = available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut args = std::env::args().skip(1);
@@ -31,6 +35,7 @@ async fn handle_client(stream: TcpStream, requests: Option<Arc<AtomicU64>>) {
     let mut stream = stream;
     let _ = stream.set_nodelay(true);
     let mut buf = vec![0u8; 4096];
+    let mut framer = RequestFramer::new();
 
     let body = b"Hello from monoio";
     let header = format!(
@@ -44,12 +49,18 @@ async fn handle_client(stream: TcpStream, requests: Option<Arc<AtomicU64>>) {
         buf = buf2;
         match result {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if let Some(counter) = &requests {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                if stream.write_all(response.clone()).await.0.is_err() {
-                    break;
+            Ok(bytes_read) => {
+                let complete = match framer.push(&buf[..bytes_read]) {
+                    Ok(complete) => complete,
+                    Err(()) => break,
+                };
+                for _ in 0..complete {
+                    if let Some(counter) = &requests {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if stream.write_all(response.clone()).await.0.is_err() {
+                        return;
+                    }
                 }
             }
         }

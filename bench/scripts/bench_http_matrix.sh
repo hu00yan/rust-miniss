@@ -7,7 +7,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MATRIX_DIR=${BENCH_MATRIX_DIR:-"$ROOT/bench/results/http-matrix-$(date '+%Y%m%d-%H%M%S')"}
 LIGHT_MODE=${HTTP_MATRIX_LIGHT:-0}
 BASELINE_SCENARIO=${HTTP_MATRIX_BASELINE_SCENARIO:-"ka200:0:200:8:5"}
-BASELINE_RUNTIMES=${HTTP_MATRIX_BASELINE_RUNTIMES:-"miniss-onecore,miniss-multicore,monoio,compio"}
+BASELINE_RUNTIMES=${HTTP_MATRIX_BASELINE_RUNTIMES:-"miniss,monoio,compio"}
 
 # Format: name:connection_close:connections:threads:duration_seconds
 DEFAULT_SCENARIOS=(
@@ -83,11 +83,10 @@ for my $row (@rows) {
     print $m join(',', map { qq("$_") } ($scenario, @$row, $summary)), "\n";
 }
 
-my $miniss = $rps{'miniss-multicore'} // 0;
+my $miniss = $rps{'miniss'} // 0;
 my $monoio = $rps{'monoio'} // 0;
 my ($best_name, $best_rps) = ('', 0);
 for my $name (keys %rps) {
-    next if $name eq 'miniss-onecore';
     if ($rps{$name} > $best_rps) {
         ($best_name, $best_rps) = ($name, $rps{$name});
     }
@@ -138,11 +137,11 @@ if [[ "$LIGHT_MODE" = "1" ]]; then
         if [[ "$scenario" == "$BASELINE_SCENARIO" ]]; then
             continue
         fi
-        run_matrix_case "$scenario" "miniss-onecore,miniss-multicore"
+        run_matrix_case "$scenario" "miniss"
     done
 else
     for scenario in "${SCENARIOS[@]}"; do
-        run_matrix_case "$scenario" "miniss-onecore,miniss-multicore,monoio,compio,tokio,glommio"
+        run_matrix_case "$scenario" "miniss,monoio,compio,tokio,glommio"
     done
 fi
 

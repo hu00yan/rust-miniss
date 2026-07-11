@@ -1,5 +1,5 @@
 use crate::cpu::{current_task_id, try_with_io_state, with_io_state};
-use crate::io::IoToken;
+use crate::io::{IoToken, RegisteredDescriptor};
 use crate::{Buffer, RentBuffer};
 use futures::io::{AsyncRead, AsyncWrite};
 use hyper::rt::{Read as HyperRead, ReadBufCursor, Write as HyperWrite};
@@ -142,7 +142,7 @@ fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListen
     socket.set_recv_buffer_size(TCP_BUFFER_SIZE)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(1024)?;
+    socket.listen(crate::io::ACCEPT_BACKLOG_CAPACITY as i32)?;
     Ok(socket.into())
 }
 
@@ -150,6 +150,7 @@ fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListen
 #[derive(Debug)]
 pub struct AsyncTcpStream {
     inner: TcpStream,
+    descriptor: Option<RegisteredDescriptor>,
     read_token: Option<IoToken>,
     write_token: Option<IoToken>,
     /// Token for POLLOUT submitted after a Write returned EAGAIN.
@@ -168,8 +169,10 @@ impl AsyncTcpStream {
     /// Creates a new AsyncTcpStream from a TcpStream that is already non-blocking.
     fn from_nonblocking(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
+        let descriptor = RegisteredDescriptor::acquire(stream.as_raw_fd())?;
         Ok(Self {
             inner: stream,
+            descriptor: Some(descriptor),
             read_token: None,
             write_token: None,
             pollout_token: None,
@@ -333,7 +336,13 @@ impl AsyncTcpStream {
                 fd: self.inner.as_raw_fd(),
                 data,
             };
-            let token = with_io_state(|state| state.io_backend.submit(op));
+            let descriptor = self
+                .descriptor
+                .as_ref()
+                .expect("live stream must retain its descriptor registration")
+                .lease();
+            let token =
+                with_io_state(|state| state.io_backend.submit_with_descriptor(op, descriptor));
             let future = crate::io::future::IoFuture::new(token);
             match future.await? {
                 crate::io::CompletionKind::Write { bytes_written } => {
@@ -442,7 +451,7 @@ impl AsRawFd for AsyncTcpStream {
 }
 
 impl IntoRawFd for AsyncTcpStream {
-    fn into_raw_fd(self) -> RawFd {
+    fn into_raw_fd(mut self) -> RawFd {
         let fd = self.inner.as_raw_fd();
         with_io_state(|state| unsafe {
             // SAFETY: Single-threaded access.
@@ -456,6 +465,7 @@ impl IntoRawFd for AsyncTcpStream {
                 state.clear_slot(token);
             }
         });
+        drop(self.descriptor.take());
         std::mem::forget(self);
         fd
     }

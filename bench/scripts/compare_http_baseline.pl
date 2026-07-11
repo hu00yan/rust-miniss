@@ -4,6 +4,7 @@ use warnings;
 use File::Basename qw(dirname);
 use File::Spec;
 use JSON::PP qw(decode_json encode_json);
+use Text::ParseWords qw(parse_line);
 
 my ($baseline_path, $current_path, $commit) = @ARGV;
 die "usage: compare_http_baseline.pl BASELINE.csv CURRENT.csv COMMIT\n"
@@ -13,16 +14,16 @@ sub read_row {
     my ($path) = @_;
     open my $fh, '<', $path or die "cannot read $path: $!\n";
     chomp(my $header = <$fh> // die "empty csv: $path\n");
-    my @keys = split /,/, $header, -1;
+    my @keys = parse_line(',', 0, $header);
     while (my $line = <$fh>) {
         chomp $line;
         next unless length $line;
-        my @values = split /,/, $line, -1;
+        my @values = parse_line(',', 0, $line);
         my %row;
         @row{@keys} = @values;
-        return \%row if ($row{name} // '') eq 'miniss-onecore';
+        return \%row if ($row{name} // '') eq 'miniss';
     }
-    die "missing miniss-onecore row in $path\n";
+    die "missing miniss row in $path\n";
 }
 
 sub read_metadata {

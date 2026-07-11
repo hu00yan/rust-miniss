@@ -21,7 +21,7 @@ detect_cores() {
 
 HTTP_CORES=${HTTP_CORES:-$(detect_cores)}
 DIAGNOSTICS_ENABLED=${HTTP_COLLECT_DIAGNOSTICS:-0}
-BENCH_RUNTIMES=${BENCH_RUNTIMES:-"miniss-onecore,miniss-multicore,monoio,compio,tokio,glommio"}
+BENCH_RUNTIMES=${BENCH_RUNTIMES:-"miniss,monoio,compio,tokio,glommio"}
 
 mkdir -p "$OUT_DIR"
 
@@ -69,7 +69,6 @@ if [[ "${HTTP_CONNECTION_CLOSE:-0}" = "1" ]]; then
 fi
 echo "runtimes=$BENCH_RUNTIMES"
 
-cargo build --release --example http_echo_onecore --all-features
 cargo build --release --example http_echo --all-features
 if [[ "$BENCH_RUNTIMES" == *"monoio"* || "$BENCH_RUNTIMES" == *"compio"* || "$BENCH_RUNTIMES" == *"tokio"* || "$BENCH_RUNTIMES" == *"glommio"* ]]; then
     cargo build --release --manifest-path bench/runtime_comparison/Cargo.toml --bins
@@ -354,12 +353,8 @@ runtime_enabled() {
 }
 
 port_offset=0
-if runtime_enabled "miniss-onecore"; then
-    run_benchmark "miniss-onecore" "$ROOT/target/release/examples/http_echo_onecore" "$((BASE_PORT + port_offset))"
-    port_offset=$((port_offset + 1))
-fi
-if runtime_enabled "miniss-multicore"; then
-    run_benchmark "miniss-multicore" "$ROOT/target/release/examples/http_echo" "$((BASE_PORT + port_offset))" --cores "$HTTP_CORES"
+if runtime_enabled "miniss"; then
+    run_benchmark "miniss" "$ROOT/target/release/examples/http_echo" "$((BASE_PORT + port_offset))" --cores "$HTTP_CORES"
     port_offset=$((port_offset + 1))
 fi
 if runtime_enabled "monoio"; then

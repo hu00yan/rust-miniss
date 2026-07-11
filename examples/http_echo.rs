@@ -8,18 +8,29 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+#[path = "../bench/support/http_framing.rs"]
+mod http_framing;
+use http_framing::RequestFramer;
+
 static RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 22\r\nConnection: keep-alive\r\n\r\nHello from rust-miniss";
 
 async fn handle_client(stream: AsyncTcpStream) {
     let mut buf = Buffer::with_capacity(4096);
+    let mut requests = RequestFramer::new();
 
     loop {
         match stream.read_rent(buf).await {
             Ok((0, _)) | Err(_) => break,
-            Ok((_, returned_buf)) => {
+            Ok((bytes_read, returned_buf)) => {
+                let complete = match requests.push(&returned_buf[..bytes_read]) {
+                    Ok(complete) => complete,
+                    Err(()) => break,
+                };
                 buf = returned_buf;
-                if stream.write_static_all(RESPONSE).await.is_err() {
-                    break;
+                for _ in 0..complete {
+                    if stream.write_static_all(RESPONSE).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -246,13 +257,20 @@ fn main() -> io::Result<()> {
             .map_err(|e| io::Error::other(format!("failed to spawn metrics reporter: {e}")))?;
     }
 
+    let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
     for core_id in 0..cores {
         let worker_runtime = runtime.clone();
+        let listener_ready_tx = listener_ready_tx.clone();
         runtime
             .spawn_on(core_id, async move {
                 let mut listener = match AsyncTcpListener::bind_reuse_port(addr) {
-                    Ok(listener) => listener,
+                    Ok(listener) => {
+                        let _ = listener_ready_tx.send(Ok(core_id));
+                        listener
+                    }
                     Err(e) => {
+                        let _ = listener_ready_tx
+                            .send(Err(format!("bind error on core {core_id}: {e}")));
                         eprintln!("bind error on core {core_id}: {e}");
                         return;
                     }
@@ -277,6 +295,29 @@ fn main() -> io::Result<()> {
                 }
             })
             .map_err(|e| io::Error::other(format!("failed to spawn accept loop: {e}")))?;
+    }
+    drop(listener_ready_tx);
+
+    let mut ready_cores = vec![false; cores];
+    for _ in 0..cores {
+        match listener_ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(core_id)) => ready_cores[core_id] = true,
+            Ok(Err(error)) => {
+                let _ = runtime.shutdown();
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, error));
+            }
+            Err(error) => {
+                let _ = runtime.shutdown();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for all worker listeners: {error}"),
+                ));
+            }
+        }
+    }
+    if ready_cores.iter().any(|ready| !ready) {
+        let _ = runtime.shutdown();
+        return Err(io::Error::other("duplicate or missing worker listener ack"));
     }
 
     runtime.block_on(futures::future::pending::<()>());

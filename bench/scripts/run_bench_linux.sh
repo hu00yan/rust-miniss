@@ -10,7 +10,7 @@ export PATH="/home/huyan00/.cargo/bin:$PATH"
 cd /Users/huyan00/mycode/rust-miniss
 
 # Kill any old servers
-pkill -f http_echo_onecore 2>/dev/null || true
+pkill -x http_echo 2>/dev/null || true
 pkill -f monoio_echo 2>/dev/null || true
 sleep 1
 
@@ -21,7 +21,7 @@ echo
 
 # ── 2. rust-miniss HTTP echo (30s, 100 conn) ──
 echo "=== rust-miniss HTTP echo (30s, 100 conn) ==="
-RUST_LOG=error ./target/release/examples/http_echo_onecore --addr 0.0.0.0:8080 &
+RUST_LOG=error ./target/release/examples/http_echo --cores 1 --addr 0.0.0.0:8080 &
 SERVER_PID=$!
 sleep 2
 
@@ -43,7 +43,7 @@ echo
 
 # ── 3. perf stat syscall counting ──
 echo "=== perf stat (syscalls) for 10s run ==="
-RUST_LOG=error ./target/release/examples/http_echo_onecore --addr 0.0.0.0:8080 &
+RUST_LOG=error ./target/release/examples/http_echo --cores 1 --addr 0.0.0.0:8080 &
 SERVER_PID=$!
 sleep 2
 

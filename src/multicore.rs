@@ -38,8 +38,8 @@ type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
 // explicitly `!Send` so the API cannot accidentally migrate shard-local
 // state through the cross-core message path.
 type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>, AdmissionTicket);
-type LocalFuture = (TaskId, Pin<Box<dyn Future<Output = ()>>>, AdmissionTicket);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
+const LOCAL_SPAWN_QUEUE_CAPACITY: usize = 65_536;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
 const ADMISSION_COUNT_MASK: usize = !ADMISSION_CLOSED;
@@ -71,9 +71,32 @@ fn push_local_spawn(
     task_id: TaskId,
     future: Pin<Box<dyn Future<Output = ()>>>,
     ticket: AdmissionTicket,
-) {
-    LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().push((task_id, future, ticket)));
+) -> bool {
+    let admitted = LOCAL_SPAWN_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if queue.len() >= LOCAL_SPAWN_QUEUE_CAPACITY {
+            return false;
+        }
+        queue.push((task_id, future, ticket));
+        true
+    });
+    if !admitted {
+        return false;
+    }
     LOCAL_SPAWN_COUNT.with(|count| count.set(count.get() + 1));
+    true
+}
+
+fn cancel_deferred_local_spawn(task_id: TaskId) -> bool {
+    LOCAL_SPAWN_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let Some(index) = queue.iter().position(|(id, _, _)| *id == task_id) else {
+            return false;
+        };
+        let _cancelled = queue.swap_remove(index);
+        LOCAL_SPAWN_COUNT.with(|count| count.set(queue.len()));
+        true
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -261,9 +284,6 @@ pub struct CpuCore {
     /// Fixed-capacity shard-local task arena. Readiness is tracked separately
     /// in `ready_queue`; full TaskKey validation rejects stale wakes.
     task_queue: TaskArena<Task>,
-    /// Futures submitted by `spawn_local`; these are polled only on this
-    /// worker and therefore intentionally do not require `Send`.
-    local_futures: Vec<LocalFuture>,
     /// Local ready queue populated by task wakers.
     /// Bounded Arc-backed queue receives wakes from escaped wakers.
     ready_queue: ReadyQueue,
@@ -335,7 +355,6 @@ impl CpuCore {
             #[cfg(target_os = "linux")]
             affinity_cpu,
             task_queue: TaskArena::with_capacity(runtime_generation, id as u16, 65_536),
-            local_futures: Vec::new(),
             ready_queue: Arc::new(ArrayQueue::new(65_536)),
             message_inbox,
             ready_sender: Some(ready_sender),
@@ -486,7 +505,6 @@ impl CpuCore {
                     let _ = self.process_io_completions(true);
                 }
                 self.task_queue.clear();
-                self.local_futures.clear();
                 while self.ready_queue.pop().is_some() {}
                 self.local_task_count = 0;
                 self.draining = true;
@@ -740,6 +758,8 @@ impl CpuCore {
                         self.local_task_count = self.local_task_count.saturating_sub(1);
                         self.metrics.tasks_completed += 1;
                         CancelOutcome::Accepted
+                    } else if cancel_deferred_local_spawn(task_id) {
+                        CancelOutcome::Accepted
                     } else {
                         CancelOutcome::NotFound
                     };
@@ -767,34 +787,6 @@ impl CpuCore {
     fn execute_tasks(&mut self) -> bool {
         let mut executed = 0;
         let mut polled = 0;
-
-        // Local futures are shard-owned and may be !Send. Poll them on every
-        // turn with a no-op waker; their next poll is bounded by the same
-        // per-turn budget as regular tasks.
-        let local_budget = self.task_poll_budget;
-        let mut local_index = 0;
-        while local_index < self.local_futures.len() && polled < local_budget {
-            polled += 1;
-            let poll_result = {
-                let (_, future, _) = &mut self.local_futures[local_index];
-                let waker = futures::task::noop_waker();
-                let mut cx = std::task::Context::from_waker(&waker);
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    future.as_mut().poll(&mut cx)
-                }))
-            };
-            match poll_result {
-                Ok(Poll::Ready(())) | Err(_) => {
-                    let _ = self.local_futures.swap_remove(local_index);
-                    self.local_task_count = self.local_task_count.saturating_sub(1);
-                    self.metrics.tasks_completed += 1;
-                }
-                Ok(Poll::Pending) => {
-                    local_index += 1;
-                }
-            }
-            executed += 1;
-        }
 
         while polled < self.task_poll_budget {
             let Some(task_id) = self.ready_queue.pop() else {
@@ -869,14 +861,29 @@ impl CpuCore {
                 return false;
             }
 
+            let mut deferred = Vec::new();
+            let mut inserted = false;
             for (id, future, ticket) in queue.drain(..) {
-                self.local_futures.push((id, future, ticket));
+                if !self.task_queue.can_insert_external(id.key()) {
+                    deferred.push((id, future, ticket));
+                    continue;
+                }
+                let wrapped: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
+                    future.await;
+                    drop(ticket);
+                });
+                let mut task = Task::from_pinned(id, wrapped);
+                task.ensure_waker(self.ready_queue.clone());
+                task.schedule();
+                assert!(self.task_queue.insert_external(id.key(), task));
                 self.local_task_count += 1;
                 self.metrics.tasks_spawned += 1;
+                inserted = true;
             }
-            LOCAL_SPAWN_COUNT.with(|count| count.set(0));
+            queue.extend(deferred);
+            LOCAL_SPAWN_COUNT.with(|count| count.set(queue.len()));
 
-            true
+            inserted
         })
     }
 
@@ -1167,9 +1174,9 @@ impl MultiCoreRuntime {
         let mut task_counters = Vec::with_capacity(num_cores);
 
         // Create cores and start threads
-        for core_id in 0..num_cores {
-            #[cfg(target_os = "linux")]
-            let affinity_cpu = cpu_plan[core_id];
+        for (core_id, affinity_cpu) in cpu_plan.iter().copied().enumerate() {
+            #[cfg(not(target_os = "linux"))]
+            let _ = affinity_cpu;
             let core_shutdown = Arc::new(AtomicBool::new(false));
             let core_exited_flag = Arc::new(AtomicBool::new(false));
             let force_shutdown = Arc::new(AtomicBool::new(false));
@@ -1488,18 +1495,31 @@ impl MultiCoreRuntime {
             RuntimeError::TaskFailed("spawn_local called outside a worker core".to_string())
         })?;
         let task_id = self.next_task_id_for_core(core_id);
-        push_local_spawn(
+        if !push_local_spawn(
             task_id,
             Box::pin(DetachedTaskFuture::new(future)),
             admission,
-        );
+        ) {
+            return Err(RuntimeError::TaskFailed(
+                "local task admission queue capacity exhausted".to_string(),
+            ));
+        }
         Ok(task_id)
     }
 
     #[inline]
     fn next_task_id_for_core(&self, core_id: usize) -> TaskId {
-        let sequence = self.task_counters[core_id].fetch_add(1, Ordering::Relaxed) as u32;
-        TaskId::new_for_runtime(self.runtime_generation, core_id, sequence)
+        let sequence = self.task_counters[core_id].fetch_add(1, Ordering::Relaxed);
+        let slot = sequence as u16;
+        // Zero is reserved as invalid. Cycle through all 65,535 live
+        // generations without the saturating tail of the legacy u32 helper.
+        let generation = ((sequence >> 16) % u16::MAX as u64 + 1) as u16;
+        TaskId::from_key(crate::waker::TaskKey::new(
+            self.runtime_generation,
+            core_id as u16,
+            slot,
+            generation,
+        ))
     }
 
     /// Pick the least-loaded core as the starting point for cross-core spawn.
@@ -2133,6 +2153,7 @@ mod tests {
     use super::*;
 
     static_assertions::assert_not_impl_any!(CpuCore: Send, Sync);
+    static_assertions::assert_not_impl_any!(Task: Send, Sync);
     static_assertions::assert_impl_all!(MultiCoreRuntime: Send, Sync);
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2170,6 +2191,64 @@ mod tests {
         }
 
         assert_eq!(counter.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn spawn_local_above_poll_budget_uses_ready_queue_without_starvation() {
+        const LOCAL_TASKS: usize = 256;
+        let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+        let worker_runtime = Arc::clone(&runtime);
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+
+        runtime
+            .spawn_on(0, async move {
+                for task_number in 0..LOCAL_TASKS {
+                    let local_only = std::rc::Rc::new(std::cell::Cell::new(false));
+                    let completed_tx = completed_tx.clone();
+                    worker_runtime
+                        .spawn_local(async move {
+                            local_only.set(true);
+                            completed_tx
+                                .send(task_number)
+                                .expect("completion receiver remains live");
+                        })
+                        .expect("local task admitted");
+                }
+            })
+            .unwrap();
+
+        let mut observed = vec![false; LOCAL_TASKS];
+        for _ in 0..LOCAL_TASKS {
+            let task_number = completed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("every local task must make progress");
+            observed[task_number] = true;
+        }
+        assert!(observed.into_iter().all(|completed| completed));
+
+        runtime.shutdown().unwrap();
+        match Arc::try_unwrap(runtime) {
+            Ok(rt) => rt.join().unwrap(),
+            Err(_) => panic!("Failed to get unique ownership of runtime"),
+        }
+    }
+
+    #[test]
+    fn deferred_local_spawn_can_be_cancelled_before_arena_installation() {
+        let task_id = TaskId::from_key(crate::waker::TaskKey::new(9, 0, 17, 1));
+        let admission = Arc::new(AtomicUsize::new(1));
+        let local_only = std::rc::Rc::new(std::cell::Cell::new(false));
+        assert!(push_local_spawn(
+            task_id,
+            Box::pin(async move { local_only.set(true) }),
+            AdmissionTicket(Arc::clone(&admission)),
+        ));
+
+        assert!(cancel_deferred_local_spawn(task_id));
+        assert_eq!(LOCAL_SPAWN_COUNT.with(Cell::get), 0);
+        assert_eq!(admission.load(Ordering::Acquire), 0);
+        assert!(!cancel_deferred_local_spawn(task_id));
     }
 
     #[test]
