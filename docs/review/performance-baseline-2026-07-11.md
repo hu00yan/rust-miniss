@@ -201,3 +201,11 @@ An isolated task-poll-budget probe used the existing startup setting
 measured 483,056 RPS / 54.03 ms p99 under the same nominal load. These are
 single noisy samples, so the default 64 remains unchanged; the result rejects
 the assumption that yielding more often automatically improves tail latency.
+
+The experimental `MINISS_IO_DRAIN_LIMIT` seam produced another explicit
+throughput/tail trade-off in one same-load sweep: limit 32 measured 633,151
+RPS / 24.04 ms p99, 128 measured 673,189 / 30.70 ms, and 256 measured 580,201
+/ 38.95 ms. The default phase-specific limit (61/128/256) remains unchanged;
+the 256 result rejects “larger completion batches are always faster,” while
+the 32 result suggests a possible p99-oriented profile that still needs
+alternating multi-run evidence before becoming a production setting.

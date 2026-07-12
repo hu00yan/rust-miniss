@@ -939,13 +939,15 @@ impl CpuCore {
         let wakeup_token: Option<IoToken> = None;
 
         // Empty or nearly-empty ready queues can afford a larger CQE drain batch.
-        let drain_limit = if after_park {
-            256
-        } else if self.ready_queue.len() < 8 {
-            128
-        } else {
-            61
-        };
+        let drain_limit = crate::config::io_drain_limit().unwrap_or_else(|| {
+            if after_park {
+                256
+            } else if self.ready_queue.len() < 8 {
+                128
+            } else {
+                61
+            }
+        });
         let drain_started = Instant::now();
         #[cfg(target_os = "linux")]
         let (count, saw_wakeup_poll, wakeups) = unsafe {

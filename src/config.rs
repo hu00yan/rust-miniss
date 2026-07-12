@@ -56,6 +56,15 @@ pub const DEFAULT_PARK_TIMEOUT_US: u64 = 100;
 /// I/O completions, timers, messages, and shutdown processing.
 pub const DEFAULT_TASK_POLL_BUDGET: usize = 64;
 
+/// Optional completion batch limit used for controlled performance probes.
+/// Zero means to retain the event-loop's phase-specific defaults.
+pub fn io_drain_limit() -> Option<usize> {
+    std::env::var("MINISS_IO_DRAIN_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 /// Resolve the I/O park timeout from `MINISS_PARK_TIMEOUT_US`.
 ///
 /// This is read at runtime startup only. Invalid or absent values fall back to
