@@ -1,0 +1,20 @@
+---
+id: perf-single-owned-descriptor
+status: GREEN
+goal: Remove the steady-state duplicate fd from AsyncTcpStream while retaining
+  operation ownership through terminal completion.
+allowed_files:
+  - src/io/mod.rs
+  - src/net.rs
+  - docs/DECISION_LOG.md
+  - docs/review/performance-baseline-2026-07-11.md
+  - tasks/perf-single-owned-descriptor.yaml
+test_commands:
+  - just test-fast
+  - cargo clippy --all-targets --all-features -- -D warnings
+  - sh scripts/linux_safety.sh
+architecture_audit: |
+  Reuses the existing immutable Arc-owned descriptor lease and transfers the
+  imported socket into it. No lock, shared mutable registry, runtime creation,
+  blocking async call, or cross-core queue is added.
+---

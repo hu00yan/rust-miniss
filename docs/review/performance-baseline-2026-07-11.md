@@ -114,3 +114,18 @@ doubles fd consumption: miniss reached `EMFILE` under perf's 1024 soft limit
 at 800 connections, while the comparison runtimes did not. Those invalid
 miniss runs are excluded above; removing the duplicate through a generation-
 safe shard registry/fixed-file design remains a capacity obligation.
+
+## Single owned stream descriptor
+
+`AsyncTcpStream` now transfers its original socket into the existing Arc lease
+instead of retaining both the original and a registered duplicate. All stream
+I/O operations lease that one identity until terminal completion. A raw-fd
+transfer duplicates only when an operation lease is still live.
+
+The exact 1024-soft-limit perf scenario that previously failed with `EMFILE`
+completed 800 connections without socket errors after the change (580,796 RPS,
+7.80 ms p99 over five seconds). Three alternating pairs against commit
+`3c17c08` showed throughput changes of +0.07%, +2.11%, and +1.57% (paired median
++1.57%). Overall medians were 557,616 vs 547,895 RPS; p99 medians were 7.41 vs
+8.46 ms. This is primarily a descriptor-capacity/lifetime improvement, with a
+small measured throughput benefit, not a major hot-path optimization.

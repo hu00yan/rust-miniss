@@ -1,5 +1,5 @@
 use crate::cpu::{current_task_id, try_with_io_state, with_io_state};
-use crate::io::{IoToken, RegisteredDescriptor};
+use crate::io::{DescriptorLease, IoToken, RegisteredDescriptor};
 use crate::{Buffer, RentBuffer};
 use futures::io::{AsyncRead, AsyncWrite};
 use hyper::rt::{Read as HyperRead, ReadBufCursor, Write as HyperWrite};
@@ -8,7 +8,8 @@ use smallvec::SmallVec;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::io::IoSlice;
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -149,7 +150,6 @@ fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListen
 /// An asynchronous TCP stream.
 #[derive(Debug)]
 pub struct AsyncTcpStream {
-    inner: TcpStream,
     descriptor: Option<RegisteredDescriptor>,
     read_token: Option<IoToken>,
     write_token: Option<IoToken>,
@@ -160,6 +160,14 @@ pub struct AsyncTcpStream {
 }
 
 impl AsyncTcpStream {
+    #[inline]
+    fn descriptor_lease(&self) -> DescriptorLease {
+        self.descriptor
+            .as_ref()
+            .expect("live stream must own its descriptor")
+            .lease()
+    }
+
     /// Creates a new AsyncTcpStream from a TcpStream.
     pub fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
@@ -169,9 +177,8 @@ impl AsyncTcpStream {
     /// Creates a new AsyncTcpStream from a TcpStream that is already non-blocking.
     fn from_nonblocking(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
-        let descriptor = RegisteredDescriptor::acquire(stream.as_raw_fd())?;
+        let descriptor = RegisteredDescriptor::from_owned(OwnedFd::from(stream));
         Ok(Self {
-            inner: stream,
             descriptor: Some(descriptor),
             read_token: None,
             write_token: None,
@@ -188,7 +195,7 @@ impl AsyncTcpStream {
     where
         T: RentBuffer,
     {
-        let fd = self.inner.as_raw_fd();
+        let fd = self.as_raw_fd();
         let mut buffer = buffer.into();
         // SAFETY: The owned buffer provides a writable region up to its full
         // capacity; the slice is only used for this synchronous syscall.
@@ -204,7 +211,9 @@ impl AsyncTcpStream {
             }
             Err(err) if is_wouldblock(&err) => {
                 let op = crate::io::Op::ReadRent { fd, buffer };
-                let token = with_io_state(|state| state.io_backend.submit(op));
+                let descriptor = self.descriptor_lease();
+                let token =
+                    with_io_state(|state| state.io_backend.submit_with_descriptor(op, descriptor));
                 let future = crate::io::future::IoFuture::new(token);
                 match future.await? {
                     crate::io::CompletionKind::ReadRent { buffer } => {
@@ -229,7 +238,7 @@ impl AsyncTcpStream {
     where
         T: RentBuffer,
     {
-        let fd = self.inner.as_raw_fd();
+        let fd = self.as_raw_fd();
         let data = data.into();
         match try_write(fd, &data) {
             Ok(bytes_written) => {
@@ -243,7 +252,9 @@ impl AsyncTcpStream {
             }
             Err(err) if is_wouldblock(&err) => {
                 let op = crate::io::Op::WriteRent { fd, data };
-                let token = with_io_state(|state| state.io_backend.submit(op));
+                let descriptor = self.descriptor_lease();
+                let token =
+                    with_io_state(|state| state.io_backend.submit_with_descriptor(op, descriptor));
                 let future = crate::io::future::IoFuture::new(token);
                 match future.await? {
                     crate::io::CompletionKind::WriteRent {
@@ -264,10 +275,11 @@ impl AsyncTcpStream {
     /// Returns the buffers so callers can recycle or reuse them.
     pub async fn write_buffers(&self, buffers: Vec<Buffer>) -> io::Result<(usize, Vec<Buffer>)> {
         let op = crate::io::Op::WriteVectored {
-            fd: self.inner.as_raw_fd(),
+            fd: self.as_raw_fd(),
             buffers: buffers.into(),
         };
-        let token = with_io_state(|state| state.io_backend.submit(op));
+        let descriptor = self.descriptor_lease();
+        let token = with_io_state(|state| state.io_backend.submit_with_descriptor(op, descriptor));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::WriteVectored {
@@ -333,7 +345,7 @@ impl AsyncTcpStream {
     pub async fn write_static_all(&self, mut data: &'static [u8]) -> io::Result<()> {
         while !data.is_empty() {
             let op = crate::io::Op::WriteStatic {
-                fd: self.inner.as_raw_fd(),
+                fd: self.as_raw_fd(),
                 data,
             };
             let descriptor = self
@@ -426,7 +438,8 @@ impl AsyncTcpStream {
         let stream = Self::new(std_stream)?;
 
         let op = crate::io::Op::Connect { fd, addr: resolved };
-        let token = with_io_state(|state| state.io_backend.submit(op));
+        let descriptor = stream.descriptor_lease();
+        let token = with_io_state(|state| state.io_backend.submit_with_descriptor(op, descriptor));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
             crate::io::CompletionKind::Connect => Ok(stream),
@@ -446,13 +459,15 @@ impl From<TcpStream> for AsyncTcpStream {
 
 impl AsRawFd for AsyncTcpStream {
     fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
+        self.descriptor
+            .as_ref()
+            .expect("live stream must own its descriptor")
+            .as_raw_fd()
     }
 }
 
 impl IntoRawFd for AsyncTcpStream {
     fn into_raw_fd(mut self) -> RawFd {
-        let fd = self.inner.as_raw_fd();
         with_io_state(|state| unsafe {
             // SAFETY: Single-threaded access.
             if let Some(token) = self.read_token {
@@ -465,9 +480,11 @@ impl IntoRawFd for AsyncTcpStream {
                 state.clear_slot(token);
             }
         });
-        drop(self.descriptor.take());
-        std::mem::forget(self);
-        fd
+        self.descriptor
+            .take()
+            .expect("live stream must own its descriptor")
+            .into_raw_fd()
+            .expect("failed to transfer stream descriptor")
     }
 }
 
@@ -501,7 +518,7 @@ impl AsyncRead for AsyncTcpStream {
             let this = unsafe { self.as_mut().get_unchecked_mut() };
 
             if this.read_token.is_none() {
-                match try_read(this.inner.as_raw_fd(), buf) {
+                match try_read(this.as_raw_fd(), buf) {
                     Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
                     Err(err) if is_wouldblock(&err) => {}
                     Err(err) => return Poll::Ready(Err(err)),
@@ -528,11 +545,14 @@ impl AsyncRead for AsyncTcpStream {
                 token
             } else {
                 let op = crate::io::Op::Read {
-                    fd: this.inner.as_raw_fd(),
+                    fd: this.as_raw_fd(),
                     offset: 0,
                     len: buf.len(),
                 };
-                let token = match state.io_backend.submit(op) {
+                let token = match state
+                    .io_backend
+                    .submit_with_descriptor(op, this.descriptor_lease())
+                {
                     Ok(token) => token,
                     Err(error) => return Poll::Ready(Err(error.into())),
                 };
@@ -564,7 +584,7 @@ impl AsyncRead for AsyncTcpStream {
             let this = unsafe { self.as_mut().get_unchecked_mut() };
 
             if !bufs.is_empty() && this.read_token.is_none() {
-                match try_read_vectored(this.inner.as_raw_fd(), bufs) {
+                match try_read_vectored(this.as_raw_fd(), bufs) {
                     Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
                     Err(err) if is_wouldblock(&err) => {}
                     Err(err) => return Poll::Ready(Err(err)),
@@ -608,10 +628,13 @@ impl AsyncRead for AsyncTcpStream {
                     buffers.push(crate::Buffer::with_capacity(buf.len()));
                 }
                 let op = crate::io::Op::ReadVectored {
-                    fd: this.inner.as_raw_fd(),
+                    fd: this.as_raw_fd(),
                     buffers,
                 };
-                let token = match state.io_backend.submit(op) {
+                let token = match state
+                    .io_backend
+                    .submit_with_descriptor(op, this.descriptor_lease())
+                {
                     Ok(token) => token,
                     Err(error) => return Poll::Ready(Err(error.into())),
                 };
@@ -652,7 +675,7 @@ impl AsyncWrite for AsyncTcpStream {
             }
 
             if this.write_token.is_none() {
-                match try_write(this.inner.as_raw_fd(), buf) {
+                match try_write(this.as_raw_fd(), buf) {
                     Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
                     Err(err) if is_wouldblock(&err) => {}
                     Err(err) => return Poll::Ready(Err(err)),
@@ -677,11 +700,14 @@ impl AsyncWrite for AsyncTcpStream {
                             // Then return Pending; the task will be woken by
                             // POLLOUT and retry the write with a fresh SQE.
                             let pollout_op = crate::io::Op::PollAdd {
-                                fd: this.inner.as_raw_fd(),
+                                fd: this.as_raw_fd(),
                                 events: libc::POLLOUT as u32,
                                 multishot: false,
                             };
-                            let pollout_tok = match state.io_backend.submit(pollout_op) {
+                            let pollout_tok = match state
+                                .io_backend
+                                .submit_with_descriptor(pollout_op, this.descriptor_lease())
+                            {
                                 Ok(token) => token,
                                 Err(error) => return Poll::Ready(Err(error.into())),
                             };
@@ -703,11 +729,14 @@ impl AsyncWrite for AsyncTcpStream {
                 token
             } else {
                 let op = crate::io::Op::Write {
-                    fd: this.inner.as_raw_fd(),
+                    fd: this.as_raw_fd(),
                     offset: 0,
                     data: Buffer::from_slice(buf),
                 };
-                let token = match state.io_backend.submit(op) {
+                let token = match state
+                    .io_backend
+                    .submit_with_descriptor(op, this.descriptor_lease())
+                {
                     Ok(token) => token,
                     Err(error) => return Poll::Ready(Err(error.into())),
                 };
@@ -750,7 +779,7 @@ impl AsyncWrite for AsyncTcpStream {
             }
 
             if !bufs.is_empty() && this.write_token.is_none() {
-                match try_write_vectored(this.inner.as_raw_fd(), bufs) {
+                match try_write_vectored(this.as_raw_fd(), bufs) {
                     Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
                     Err(err) if is_wouldblock(&err) => {}
                     Err(err) => return Poll::Ready(Err(err)),
@@ -772,11 +801,14 @@ impl AsyncWrite for AsyncTcpStream {
                         Err(ref e) if is_write_wouldblock(e) => {
                             // Same as poll_write: EAGAIN → POLLOUT → retry
                             let pollout_op = crate::io::Op::PollAdd {
-                                fd: this.inner.as_raw_fd(),
+                                fd: this.as_raw_fd(),
                                 events: libc::POLLOUT as u32,
                                 multishot: false,
                             };
-                            let pollout_tok = match state.io_backend.submit(pollout_op) {
+                            let pollout_tok = match state
+                                .io_backend
+                                .submit_with_descriptor(pollout_op, this.descriptor_lease())
+                            {
                                 Ok(token) => token,
                                 Err(error) => return Poll::Ready(Err(error.into())),
                             };
@@ -802,10 +834,13 @@ impl AsyncWrite for AsyncTcpStream {
                     buffers.push(crate::Buffer::from_slice(buf));
                 }
                 let op = crate::io::Op::WriteVectored {
-                    fd: this.inner.as_raw_fd(),
+                    fd: this.as_raw_fd(),
                     buffers,
                 };
-                let token = match state.io_backend.submit(op) {
+                let token = match state
+                    .io_backend
+                    .submit_with_descriptor(op, this.descriptor_lease())
+                {
                     Ok(token) => token,
                     Err(error) => return Poll::Ready(Err(error.into())),
                 };
@@ -826,7 +861,13 @@ impl AsyncWrite for AsyncTcpStream {
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        Poll::Ready(this.inner.shutdown(Shutdown::Write))
+        // SAFETY: the descriptor is live for the duration of this call.
+        let result = unsafe { libc::shutdown(this.as_raw_fd(), libc::SHUT_WR) };
+        if result == 0 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Ready(Err(io::Error::last_os_error()))
+        }
     }
 }
 
@@ -847,7 +888,7 @@ impl HyperRead for AsyncTcpStream {
                 unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
 
             if this.read_token.is_none() {
-                match try_read(this.inner.as_raw_fd(), read_buf) {
+                match try_read(this.as_raw_fd(), read_buf) {
                     Ok(bytes_read) => {
                         // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
                         unsafe {
@@ -882,11 +923,14 @@ impl HyperRead for AsyncTcpStream {
                 token
             } else {
                 let op = crate::io::Op::Read {
-                    fd: this.inner.as_raw_fd(),
+                    fd: this.as_raw_fd(),
                     offset: 0,
                     len: buf.remaining(),
                 };
-                let token = match state.io_backend.submit(op) {
+                let token = match state
+                    .io_backend
+                    .submit_with_descriptor(op, this.descriptor_lease())
+                {
                     Ok(token) => token,
                     Err(error) => return Poll::Ready(Err(error.into())),
                 };
@@ -917,7 +961,13 @@ impl HyperWrite for AsyncTcpStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        Poll::Ready(this.inner.shutdown(Shutdown::Write))
+        // SAFETY: the descriptor is live for the duration of this call.
+        let result = unsafe { libc::shutdown(this.as_raw_fd(), libc::SHUT_WR) };
+        if result == 0 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Ready(Err(io::Error::last_os_error()))
+        }
     }
 
     fn is_write_vectored(&self) -> bool {

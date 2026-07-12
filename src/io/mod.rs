@@ -20,7 +20,7 @@
 
 use std::cell::Cell;
 use std::io;
-use std::os::fd::{AsRawFd as StdAsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd as StdAsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::task::Poll;
@@ -58,6 +58,11 @@ pub struct DescriptorLease(Arc<OwnedFd>);
 
 #[allow(dead_code)]
 impl RegisteredDescriptor {
+    /// Transfer an already-owned descriptor into operation-safe ownership.
+    pub(crate) fn from_owned(owned: OwnedFd) -> Self {
+        Self(Arc::new(owned))
+    }
+
     /// Import one descriptor identity into shard-local ownership.
     pub(crate) fn acquire(fd: RawFd) -> io::Result<Self> {
         // SAFETY: dup returns a fresh descriptor owned by this call on
@@ -75,6 +80,29 @@ impl RegisteredDescriptor {
     #[inline]
     pub(crate) fn lease(&self) -> DescriptorLease {
         DescriptorLease(Arc::clone(&self.0))
+    }
+
+    #[inline]
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+
+    /// Transfer the descriptor to a raw-fd caller. If a kernel operation still
+    /// owns a lease, return a duplicate and let the original live to terminal
+    /// completion; otherwise transfer the original identity without a syscall.
+    pub(crate) fn into_raw_fd(self) -> io::Result<RawFd> {
+        match Arc::try_unwrap(self.0) {
+            Ok(owned) => Ok(owned.into_raw_fd()),
+            Err(shared) => {
+                // SAFETY: dup creates a new descriptor owned by the caller.
+                let duplicate = unsafe { libc::dup(shared.as_raw_fd()) };
+                if duplicate < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(duplicate)
+                }
+            }
+        }
     }
 }
 
@@ -94,6 +122,7 @@ impl DescriptorLease {
 #[cfg(all(test, unix))]
 mod descriptor_lease_tests {
     use super::{DescriptorLease, RegisteredDescriptor};
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     static_assertions::assert_impl_all!(RegisteredDescriptor: Send, Sync);
     static_assertions::assert_impl_all!(DescriptorLease: Send, Sync);
@@ -147,6 +176,31 @@ mod descriptor_lease_tests {
         );
         // SAFETY: write_fd is still owned by this test and closed exactly once.
         unsafe { libc::close(write_fd) };
+    }
+
+    #[test]
+    fn owned_registration_keeps_original_fd_and_duplicates_only_for_shared_transfer() {
+        let mut fds = [0; 2];
+        // SAFETY: fds points to two writable RawFd slots.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: ownership of the read end is transferred exactly once.
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let registered = RegisteredDescriptor::from_owned(owned);
+        assert_eq!(registered.as_raw_fd(), fds[0]);
+
+        let lease = registered.lease();
+        let transferred = registered
+            .into_raw_fd()
+            .expect("shared transfer duplicates for caller ownership");
+        assert_ne!(transferred, lease.as_raw_fd());
+        assert!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) } >= 0);
+
+        drop(lease);
+        // SAFETY: transferred and the pipe write end remain test-owned.
+        unsafe {
+            libc::close(transferred);
+            libc::close(fds[1]);
+        }
     }
 }
 
