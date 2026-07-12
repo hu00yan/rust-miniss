@@ -209,3 +209,9 @@ RPS / 24.04 ms p99, 128 measured 673,189 / 30.70 ms, and 256 measured 580,201
 the 256 result rejects “larger completion batches are always faster,” while
 the 32 result suggests a possible p99-oriented profile that still needs
 alternating multi-run evidence before becoming a production setting.
+
+Two alternating rounds of 32/61/128 reduced the uncertainty: medians were
+approximately 582,898 RPS / 24.05 ms p99 for 32, 616,544 / 24.36 ms for 61,
+and 614,265 / 32.45 ms for 128. The existing default 61 remains the best
+throughput/tail compromise in this small sample; no production default change
+is justified.
