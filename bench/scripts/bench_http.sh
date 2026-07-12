@@ -185,6 +185,7 @@ my ($task_clock_ms, $context_switches, $io_uring_enter,
 if (-s $perf_log) {
     my $recognized_events = 0;
     open my $pfh, '<', $perf_log or die "cannot read $perf_log: $!";
+    local $/ = "\n";
     while (my $line = <$pfh>) {
         chomp $line;
         next if $line =~ /^\s*#/;
