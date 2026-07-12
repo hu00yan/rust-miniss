@@ -23,7 +23,7 @@ fn hyper_http2_connection_runs_on_miniss() {
         let executor = MinissHyperExecutor::new(io_runtime.clone());
         let timer = MinissHyperTimer;
         let (served_tx, served_rx) = oneshot::channel();
-        let served_tx = Arc::new(std::sync::Mutex::new(Some(served_tx)));
+        let served_tx = Arc::new(parking_lot::Mutex::new(Some(served_tx)));
         let mut listener =
             AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
