@@ -9,7 +9,7 @@ What it is (today):
 - A minimal async runtime prototype with:
   - Thread-per-core architecture with shared-nothing design
   - Timer utilities (sleep, timeout, interval, periodic tasks)
-  - Async networking (TCP/UDP with non-blocking I/O using io-uring/epoll/kqueue)
+  - Async networking on the supported Linux (io-uring/epoll) and macOS (kqueue) targets
   - futures::io compatibility (AsyncRead/AsyncWrite traits)
   - HTTP echo server example with performance optimizations
 - Educational tool for understanding async runtime internals and high-performance I/O

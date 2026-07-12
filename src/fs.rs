@@ -24,8 +24,8 @@ use std::path::Path;
 ///
 /// # Platform Support
 ///
-/// - On Linux with kernel 5.10+: Uses io_uring for zero-copy operations
-/// - On Linux with older kernels: Uses epoll for event-driven I/O
+/// - On Linux with an io_uring-capable kernel: Uses io_uring for zero-copy operations
+/// - On Linux without io_uring support: Uses epoll for event-driven I/O
 /// - On macOS: Uses kqueue for BSD-style event notification
 ///
 /// # Examples

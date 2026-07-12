@@ -11,7 +11,7 @@ throughput claim. See [the current baseline](docs/review/performance-baseline-20
 
 - **thread-per-core**: Each CPU core runs independently with its own io_uring instance
 - **lock-free**: Zero shared mutable state between cores; SPSC queues for cross-core messages
-- **io_uring primary, epoll/kqueue dev only**: Linux 6.12+ required for io_uring; macOS/other Unix get epoll/kqueue but are never optimized
+- **io_uring primary**: Linux is the supported performance platform; macOS is a development platform using kqueue.
 - **HTTP/1.1 + HTTP/2 + QUIC/HTTP-3**: Integration under reconstruction — see [DESIGN.md](docs/DESIGN.md)
 
 ## Quick Start
@@ -124,8 +124,7 @@ cargo build
 | Platform | Backend | Notes |
 |----------|---------|-------|
 | Linux with io_uring support | io_uring | Performance path |
-| macOS | kqueue | Dev only, never optimized |
-| Other Unix | epoll | Dev only, never optimized |
+| macOS | kqueue | Development/testing only |
 
 ## HTTP Echo Benchmark (Linux)
 

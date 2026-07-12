@@ -121,8 +121,8 @@ cargo build --all-features
 # 在 macOS 上（通过 mio 使用 kqueue）
 cargo build
 
-# 在 Linux 上使用 epoll（默认）
-cargo build --features epoll
+# Linux 上 io-uring 不可用时会自动回退到 epoll
+cargo build --all-features
 ```
 
 ## I/O 后端选择
@@ -132,9 +132,8 @@ cargo build --features epoll
 | 平台 | 后端 | 备注 |
 |------|------|------|
 | 支持 io-uring 的 Linux | io-uring | 性能路径，自动选择 |
-| Linux/Unix 旧版 | epoll | 兼容路径 |
+| Linux（io-uring 不可用时） | epoll | 兼容路径 |
 | macOS | kqueue | 通过 mio |
-| 其他 Unix | epoll | 备选方案 |
 
 ## 示例
 

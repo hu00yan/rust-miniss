@@ -40,7 +40,7 @@ This document captures benchmark results for the minimal HTTP/1.1 echo server ac
 
 ```bash
 # Build with io-uring support (Linux)
-cargo build --release --example http_echo --features io_uring
+cargo build --release --example http_echo --all-features
 
 # Run the server
 ./target/release/examples/http_echo --addr 127.0.0.1:8080
@@ -95,7 +95,7 @@ wrk -t2 -c50 -d10s http://127.0.0.1:8080/
   - Low memory footprint
 
 - **I/O Backend Performance**:
-  - **io-uring (Linux 5.10+)**: Best performance with completion-based I/O
+  - **io-uring (supported Linux kernel)**: Best performance with completion-based I/O
   - **epoll/kqueue**: Good performance with readiness-based I/O
 
 ### Optimization Opportunities
