@@ -190,3 +190,8 @@ wrk threads / 5 seconds. The single pair measured 407,637 RPS / 52.44 ms p99
 at 100 us versus 390,758 RPS / 82.19 ms p99 at 1000 us. This is not enough to
 change the default, but it rejects the intuitive “wait longer to improve
 tail” direction for the next experiment.
+
+A follow-up single sample at `MINISS_PARK_TIMEOUT_US=10` measured 395,830 RPS
+and 68.74 ms p99. Across these isolated samples, 100 us is currently the
+least-bad point (10 us: 395,830 / 68.74 ms; 100 us: 407,637 / 52.44 ms;
+1000 us: 390,758 / 82.19 ms), but the runs are not enough to tune the default.
