@@ -183,3 +183,10 @@ five-second window it recorded roughly 7.36M task polls, 7.36M completions,
 the largest completion batch took 7.24ms. This points the next tail-latency
 investigation toward park/kernel scheduling and completion-batch variance,
 not a remaining cross-thread wake storm.
+
+An isolated park-timeout probe kept all other parameters fixed and compared
+`MINISS_PARK_TIMEOUT_US=100` with `1000` on 4 workers / 800 connections / 8
+wrk threads / 5 seconds. The single pair measured 407,637 RPS / 52.44 ms p99
+at 100 us versus 390,758 RPS / 82.19 ms p99 at 1000 us. This is not enough to
+change the default, but it rejects the intuitive “wait longer to improve
+tail” direction for the next experiment.
