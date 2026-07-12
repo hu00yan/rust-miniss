@@ -175,3 +175,11 @@ threads, 5 seconds) measured miniss at 619,447 RPS / 34.36 ms p99, Monoio at
 one sample, not a new baseline, but it changes the optimization priority:
 throughput is no longer the obvious primary gap; tail latency and scheduling
 variance deserve the next isolated measurements.
+
+The same miniss run with `MINISS_METRICS_INTERVAL_MS=1000` showed owner-local
+completion is active (`waker_wakes` stayed at 0–2 across four cores). Over the
+five-second window it recorded roughly 7.36M task polls, 7.36M completions,
+415k completion batches, 318k parks, and a maximum park interval of 47.9ms;
+the largest completion batch took 7.24ms. This points the next tail-latency
+investigation toward park/kernel scheduling and completion-batch variance,
+not a remaining cross-thread wake storm.
