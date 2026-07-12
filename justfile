@@ -135,6 +135,7 @@ test:
 # ignored stress tests, examples, and benchmarks.
 test-fast:
     cargo fmt --all -- --check
+    ./scripts/audit_architecture.sh
     cargo test --lib --test runtime_safety_models
 
 # Check formatting only
