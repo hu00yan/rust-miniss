@@ -60,9 +60,10 @@ For a faster pass, use `HTTP_MATRIX_LIGHT=1` to keep the baseline run and trim t
 The default matrix now includes `ka800` and `close800` as the high-concurrency stress points. Treat those
 as the main follow-up optimization indicators when comparing miniss, monoio, and compio.
 
-This writes:
-- `summary.csv` for requests/sec and latency percentiles
-- `diagnostics.csv` for CPU, memory, syscall, context-switch, and cache metrics
+This writes `summary.csv` for requests/sec and latency percentiles. With
+`HTTP_COLLECT_DIAGNOSTICS=1`, each runtime directory retains raw `*.perf.csv`,
+`*.rss.txt`, server, and wrk logs; the shell harness does not generate a
+derived diagnostics table.
 
 For shard-level runtime diagnostics, set `MINISS_METRICS_INTERVAL_MS=1000` when running `examples/http_echo`.
 It prints per-core `flushes`, `parks`, `park_timeouts`, `park_completions`, `busy_rounds`,
@@ -109,7 +110,8 @@ wrk -t2 -c50 -d10s http://127.0.0.1:8080/
 ### Baseline Rule
 - Do not compare a single run against another single run.
 - Compare the same scenario set across at least one short-connection case and one keep-alive case.
-- Treat a win as temporary until `summary.csv` and `diagnostics.csv` agree across repeat runs.
+- Treat a win as temporary until `summary.csv` and the retained raw perf/server
+  logs agree across repeat runs.
 - Treat `http_echo --cores 1` as a diagnostic baseline only. It uses the same implementation as the multicore target; use it to isolate hot-path issues, not as the primary performance target.
 
 ## Environment Details

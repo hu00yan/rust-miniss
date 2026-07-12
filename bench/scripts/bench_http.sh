@@ -77,11 +77,6 @@ fi
 csv="$OUT_DIR/summary.csv"
 printf 'name,port,threads,connections,duration,requests,rps,avg_latency,p50,p75,p90,p99,transfer,raw_log,server_log\n' > "$csv"
 
-diag_csv="$OUT_DIR/diagnostics.csv"
-if [[ "$DIAGNOSTICS_ENABLED" = "1" ]]; then
-    printf 'name,port,threads,connections,duration,requests,rps,p99,error_rate_pct,cpu_util_pct,max_rss_kb,io_uring_enter_per_sec,read_per_sec,write_per_sec,writev_per_sec,context_switches_per_sec,perf_status\n' > "$diag_csv"
-fi
-
 server_pid=""
 cleanup() {
     if [[ -n "${server_pid:-}" ]]; then
@@ -147,117 +142,6 @@ start_perf_stat() {
     "${perf_runner_args[@]}" stat -x, -e task-clock,context-switches,syscalls:sys_enter_io_uring_enter,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev \
         -p "$pid" -- sleep "$duration" >"$perf_log" 2>&1 &
     PERF_PID=$!
-}
-
-parse_diag_row() {
-    local name=$1
-    local port=$2
-    local raw_log=$3
-    local perf_log=$4
-    local rss_log=$5
-    local duration=$6
-
-    perl -0777 - "$name" "$port" "$THREADS" "$CONNECTIONS" "$duration" "$raw_log" "$perf_log" "$rss_log" "$HTTP_CORES" <<'PERL'
-use strict;
-use warnings;
-
-my ($name, $port, $threads, $connections, $duration, $raw_log, $perf_log, $rss_log, $http_cores) = @ARGV;
-
-open my $wrk, '<', $raw_log or die "cannot read $raw_log: $!";
-local $/;
-my $s = <$wrk>;
-
-my ($rps) = $s =~ /Requests\/sec:\s+(\S+)/;
-my ($p99) = $s =~ /^\s*99%\s+(\S+)/m;
-my ($requests) = $s =~ /(\d+)\s+requests in\s+\S+/;
-die "missing wrk fields in $raw_log\n" unless defined $rps && defined $p99 && defined $requests;
-
-my $error_rate = 0;
-if ($s =~ /Socket errors:\s*connect\s+(\d+),\s*read\s+(\d+),\s*write\s+(\d+),\s*timeout\s+(\d+)/) {
-    my $total = $1 + $2 + $3 + $4;
-    $error_rate = $requests > 0 ? ($total / $requests) * 100.0 : 0;
-}
-
-my %perf;
-my $perf_status = 'unavailable';
-my ($task_clock_ms, $context_switches, $io_uring_enter,
-    $read_syscalls, $write_syscalls, $writev_syscalls) = (0, 0, 0, 0, 0, 0);
-if (-s $perf_log) {
-    my $recognized_events = 0;
-    open my $pfh, '<', $perf_log or die "cannot read $perf_log: $!";
-    local $/ = "\n";
-    while (my $line = <$pfh>) {
-        chomp $line;
-        next if $line =~ /^\s*#/;
-        next unless $line =~ /,/;
-        my @fields = split /,/, $line, -1;
-        next unless @fields >= 3;
-        my $value = $fields[0];
-        my $event = $fields[2];
-        $value =~ s/[[:space:]]//g;
-        $event =~ s/^\s+|\s+$//g;
-        next unless $value =~ /^[0-9]+(?:\.[0-9]+)?$/;
-        $perf{$event} = 0 + $value;
-        $task_clock_ms = 0 + $value if $event eq 'task-clock';
-        $context_switches = 0 + $value if $event =~ /context-switches/;
-        $io_uring_enter = 0 + $value if $event =~ /io_uring_enter/;
-        $read_syscalls = 0 + $value if $event =~ /sys_enter_read\z/;
-        $write_syscalls = 0 + $value if $event =~ /sys_enter_write\z/;
-        $writev_syscalls = 0 + $value if $event =~ /sys_enter_writev\z/;
-        $recognized_events++;
-    }
-    $perf_status = $recognized_events > 0 ? 'ok' : 'unsupported';
-    # A tracepoint row can be present while the parser observes only the
-    # first flushed line. Never label that partial result as valid metrics.
-    if ($perf_status eq 'ok' && ($context_switches == 0 || $io_uring_enter == 0)) {
-        $perf_status = 'parse_error';
-    }
-}
-
-my $cpu_util_pct = 0;
-if ($duration > 0 && $http_cores > 0) {
-    $cpu_util_pct = ($task_clock_ms / ($duration * 1000.0)) * 100.0 / $http_cores;
-}
-
-my $io_uring_enter_per_sec = $duration > 0 ? $io_uring_enter / $duration : 0;
-my $read_per_sec = $duration > 0 ? $read_syscalls / $duration : 0;
-my $write_per_sec = $duration > 0 ? $write_syscalls / $duration : 0;
-my $writev_per_sec = $duration > 0 ? $writev_syscalls / $duration : 0;
-my $context_switches_per_sec = $duration > 0 ? $context_switches / $duration : 0;
-
-my $max_rss_kb = 0;
-if (-s $rss_log) {
-    open my $rfh, '<', $rss_log or die "cannot read $rss_log: $!";
-    my $rss = <$rfh>;
-    chomp $rss if defined $rss;
-    $max_rss_kb = 0 + ($rss // 0);
-}
-
-my @row = (
-    $name,
-    $port,
-    $threads,
-    $connections,
-    $duration,
-    $requests,
-    $rps,
-    $p99,
-    sprintf('%.4f', $error_rate),
-    sprintf('%.2f', $cpu_util_pct),
-    $max_rss_kb,
-    sprintf('%.2f', $io_uring_enter_per_sec),
-    sprintf('%.2f', $read_per_sec),
-    sprintf('%.2f', $write_per_sec),
-    sprintf('%.2f', $writev_per_sec),
-    sprintf('%.2f', $context_switches_per_sec),
-    $perf_status,
-);
-for (@row) {
-    s/"/""/g;
-    $_ = qq("$_");
-}
-print join(',', @row), "\n";
-PERL
 }
 
 parse_wrk() {
@@ -380,9 +264,6 @@ run_benchmark() {
     fi
 
     parse_wrk "$name" "$port" "$raw_log" "$server_log" | tee -a "$csv"
-    if [[ "$DIAGNOSTICS_ENABLED" = "1" ]]; then
-        parse_diag_row "$name" "$port" "$raw_log" "$perf_log" "$rss_log" "$DURATION" | tee -a "$diag_csv"
-    fi
 }
 
 runtime_enabled() {

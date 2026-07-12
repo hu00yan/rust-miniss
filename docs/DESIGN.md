@@ -704,7 +704,7 @@ perf report
 火焰图上如果 `_Atomic***` 或 `malloc`/`free` 在热点前几位，就是锁或分配器问题。
 
 基线优先用 `HTTP_COLLECT_DIAGNOSTICS=1 bench/scripts/bench_http_matrix.sh <base_port>` 跑同一组场景，
-把 `summary.csv` 和 `diagnostics.csv` 一起保存，避免只看单次吞吐。
+保存 `summary.csv`、原始 perf CSV 和 server/wrk 日志，避免只看单次吞吐。
 
 ### 关于 fsync 的基准测试
 

@@ -31,12 +31,10 @@ mkdir -p "$MATRIX_DIR"
 matrix_csv="$MATRIX_DIR/matrix.csv"
 ratio_csv="$MATRIX_DIR/ratios.csv"
 baseline_csv="$MATRIX_DIR/baseline.csv"
-diag_csv="$MATRIX_DIR/diagnostics.csv"
 
 printf 'scenario,name,rps,p50,p75,p90,p99,summary\n' >"$matrix_csv"
 printf 'scenario,name,rps,p50,p75,p90,p99,summary\n' >"$baseline_csv"
 printf 'scenario,miniss_rps,monoio_rps,best_runtime,best_rps,miniss_vs_monoio,miniss_vs_best,summary\n' >"$ratio_csv"
-printf 'scenario,name,port,threads,connections,duration,requests,rps,p99,error_rate_pct,cpu_util_pct,max_rss_kb,io_uring_enter_per_sec,context_switches_per_sec,cache_miss_rate,summary\n' >"$diag_csv"
 
 port=$BASE_PORT
 run_matrix_case() {
@@ -109,25 +107,6 @@ if ($is_baseline) {
 }
 PERL
 
-    if [[ -f "$out_dir/diagnostics.csv" ]]; then
-        perl - "$name" "$out_dir/diagnostics.csv" "$diag_csv" <<'PERL'
-use strict;
-use warnings;
-
-my ($scenario, $diag_in, $diag_out) = @ARGV;
-open my $fh, '<', $diag_in or die "cannot read $diag_in: $!";
-my $header = <$fh>;
-open my $out, '>>', $diag_out or die "cannot append $diag_out: $!";
-while (my $line = <$fh>) {
-    chomp $line;
-    $line =~ s/^"//;
-    $line =~ s/"$//;
-    my @fields = split /","/, $line;
-    print $out join(',', map { qq("$_") } ($scenario, @fields, $diag_in)), "\n";
-}
-PERL
-    fi
-
     port=$((port + 10))
 }
 
@@ -147,5 +126,4 @@ fi
 
 echo "matrix=$matrix_csv"
 echo "ratios=$ratio_csv"
-echo "diagnostics=$diag_csv"
 cat "$ratio_csv"
