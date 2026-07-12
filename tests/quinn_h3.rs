@@ -11,6 +11,7 @@ use rust_miniss::{MultiCoreRuntime, Runtime};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::UdpSocket;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn build_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -21,7 +22,10 @@ fn build_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 }
 
 #[test]
-#[ignore = "QUIC/H3 integration needs a bounded Linux-only harness; it can outlive the test runner on macOS"]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "QUIC/H3 integration currently requires the Linux io_uring backend"
+)]
 fn quinn_and_h3_quinn_run_on_miniss() {
     let io_runtime = MultiCoreRuntime::new(Some(1)).unwrap();
     let app_runtime = Runtime::new();
@@ -134,7 +138,12 @@ fn quinn_and_h3_quinn_run_on_miniss() {
             future::join(driver_task, request_task).await;
         };
 
-        future::join(server_task, client_task).await;
+        rust_miniss::timer::timeout(
+            Duration::from_secs(5),
+            future::join(server_task, client_task),
+        )
+        .await
+        .expect("QUIC/H3 exchange timed out");
     });
 
     shutdown_runtime.shutdown().unwrap();
