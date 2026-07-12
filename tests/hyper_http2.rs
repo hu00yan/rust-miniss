@@ -36,7 +36,7 @@ fn hyper_http2_connection_runs_on_miniss() {
                     assert_eq!(req.uri().path(), "/h2");
                     Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"hello h2"))))
                         .inspect(|_| {
-                            if let Some(sender) = served_tx.lock().unwrap().take() {
+                            if let Some(sender) = served_tx.lock().take() {
                                 let _ = sender.send(());
                             }
                         })

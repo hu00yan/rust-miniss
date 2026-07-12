@@ -45,9 +45,15 @@ impl QuinnRuntimeTrait for MinissQuicRuntime {
     }
 
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        self.runtime
-            .spawn(future)
-            .expect("quinn background task spawn failed");
+        if current_core_id().is_some() {
+            self.runtime
+                .spawn_local(future)
+                .expect("quinn local background task spawn failed");
+        } else {
+            self.runtime
+                .spawn(future)
+                .expect("quinn background task spawn failed");
+        }
     }
 
     fn wrap_udp_socket(&self, socket: UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
