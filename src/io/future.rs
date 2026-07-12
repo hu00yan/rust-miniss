@@ -95,6 +95,13 @@ impl Future for IoFuture {
             return Poll::Ready(result);
         }
         with_io_state(|state| {
+            // Owner-thread CQE delivery can hand the result directly to this
+            // future, avoiding a completed-slot write followed by a second
+            // token lookup. Remote/legacy paths continue below.
+            if let Some(result) = unsafe { state.take_owner_completion(this.token) } {
+                this.completed = true;
+                return Poll::Ready(result);
+            }
             // Check if the completion is already available in the standard map.
             // SAFETY: Single-threaded access.
             if let Some(result) = unsafe { state.take_completed(this.token) } {

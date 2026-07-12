@@ -99,7 +99,16 @@ pub struct CpuIoState {
     /// Per-token state packed into a single slot to avoid three separate table lookups.
     /// SAFETY: Single-threaded access only.
     pub io_slots: UnsafeCell<Vec<IoSlot>>,
+    /// Task identities completed on this owner thread.
+    pub(crate) owner_completions: UnsafeCell<Vec<OwnerCompletion>>,
+    pub(crate) owner_completion: UnsafeCell<Option<(IoToken, Result<CompletionKind, IoError>)>>,
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(crate) struct OwnerCompletion {
+    pub(crate) task_id: crate::waker::TaskId,
+    pub(crate) token: IoToken,
+    pub(crate) result: Result<CompletionKind, IoError>,
 }
 
 #[derive(Default)]
@@ -119,6 +128,8 @@ impl Default for CpuIoState {
             // Pre-fill to the default ring size so the common path can write
             // slots directly without growing the vector first.
             io_slots: UnsafeCell::new(io_slots),
+            owner_completions: UnsafeCell::new(Vec::with_capacity(256)),
+            owner_completion: UnsafeCell::new(None),
             _local: std::marker::PhantomData,
         }
     }
@@ -129,11 +140,62 @@ impl std::fmt::Debug for CpuIoState {
         f.debug_struct("CpuIoState")
             .field("io_backend", &"<IoBackend>")
             .field("io_slots", &"<UnsafeCell>")
+            .field("owner_completions", &"<UnsafeCell>")
             .finish()
     }
 }
 
 impl CpuIoState {
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) unsafe fn push_owner_completion(
+        &self,
+        task_id: crate::waker::TaskId,
+        token: IoToken,
+        result: Result<CompletionKind, IoError>,
+    ) {
+        unsafe { &mut *self.owner_completions.get() }.push(OwnerCompletion {
+            task_id,
+            token,
+            result,
+        });
+    }
+
+    #[inline]
+    /// Swap the owner completion batch with a caller-owned buffer. Both
+    /// vectors retain their allocations, so draining a busy shard does not
+    /// allocate a replacement vector or move each completion individually.
+    pub(crate) unsafe fn swap_owner_completions(&self, batch: &mut Vec<OwnerCompletion>) {
+        std::mem::swap(unsafe { &mut *self.owner_completions.get() }, batch);
+    }
+
+    pub(crate) unsafe fn set_owner_completion(
+        &self,
+        token: IoToken,
+        result: Result<CompletionKind, IoError>,
+    ) {
+        *unsafe { &mut *self.owner_completion.get() } = Some((token, result));
+    }
+
+    pub(crate) unsafe fn take_owner_completion(
+        &self,
+        token: IoToken,
+    ) -> Option<Result<CompletionKind, IoError>> {
+        let completion = unsafe { &mut *self.owner_completion.get() };
+        if completion
+            .as_ref()
+            .is_some_and(|(current, _)| *current == token)
+        {
+            Some(completion.take().expect("owner completion was present").1)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) unsafe fn clear_owner_completion(&self) {
+        unsafe { &mut *self.owner_completion.get() }.take();
+    }
+
     /// Ensure vec is large enough for the given index (grows by 64-slot chunks).
     ///
     /// # Safety
@@ -592,6 +654,8 @@ mod tests {
         let state = CpuIoState {
             io_backend: Box::new(DummyProvider),
             io_slots: Default::default(),
+            owner_completions: Default::default(),
+            owner_completion: Default::default(),
             _local: std::marker::PhantomData,
         };
         let old = IoToken::from_id((1u64 << 32) | 7);
@@ -611,6 +675,33 @@ mod tests {
             state.clear_slot(old);
             assert!(state.has_completed(new));
             assert!(state.take_completed(new).is_some());
+        }
+    }
+
+    #[test]
+    fn owner_completion_is_delivered_once_and_cleared_for_stale_tasks() {
+        let state = CpuIoState::default();
+        let task = crate::waker::TaskId::from_key(crate::waker::TaskKey::new(1, 2, 3, 4));
+        let token = IoToken::from_id(19);
+
+        // SAFETY: this test keeps the shard-local state on one thread.
+        unsafe {
+            state.push_owner_completion(task, token, Ok(CompletionKind::Nop));
+            let mut queued = Vec::new();
+            state.swap_owner_completions(&mut queued);
+            assert_eq!(queued.len(), 1);
+            let completion = queued.pop().expect("queued owner completion");
+            assert_eq!(completion.task_id, task);
+            state.set_owner_completion(completion.token, completion.result);
+            assert!(matches!(
+                state.take_owner_completion(token),
+                Some(Ok(CompletionKind::Nop))
+            ));
+            assert!(state.take_owner_completion(token).is_none());
+
+            state.set_owner_completion(token, Ok(CompletionKind::Nop));
+            state.clear_owner_completion();
+            assert!(state.take_owner_completion(token).is_none());
         }
     }
 

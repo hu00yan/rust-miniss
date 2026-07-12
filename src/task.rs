@@ -293,11 +293,52 @@ impl Task {
         }
     }
 
+    /// Poll a task whose completion was delivered directly by its owner
+    /// thread. No remote wake scheduled bit exists to clear on this path.
+    #[inline(always)]
+    pub fn poll_with_owner_waker(&mut self) -> Poll<()> {
+        if self.completed {
+            return Poll::Ready(());
+        }
+        let waker_ptr = self.waker.as_ref().expect("waker cached by ensure_waker") as *const Waker;
+        // SAFETY: the cached waker outlives this poll call.
+        let mut context = unsafe { Context::from_waker(&*waker_ptr) };
+        match self.future.as_mut().poll(&mut context) {
+            Poll::Ready(()) => {
+                self.completed = true;
+                if let Some(state) = &self.wake_state {
+                    state.deactivate();
+                }
+                self.waker = None;
+                self.wake_state = None;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
     /// Ensure a cached waker exists without cloning it back out.
     #[inline(always)]
     pub fn ensure_waker(&mut self, queue: ReadyQueue) {
         if self.waker.is_none() {
             let (waker, state) = crate::waker::create_waker(self.id, queue);
+            self.waker = Some(waker);
+            self.wake_state = Some(state);
+        }
+    }
+
+    /// Ensure a cached waker while publishing queue-overflow state to the
+    /// owning shard. The hint is only a fast-path gate; the per-task marker
+    /// remains authoritative when the owner retries overflowed wakes.
+    #[inline(always)]
+    pub(crate) fn ensure_waker_with_overflow_hint(
+        &mut self,
+        queue: ReadyQueue,
+        overflow_hint: crate::waker::OverflowHint,
+    ) {
+        if self.waker.is_none() {
+            let (waker, state) =
+                crate::waker::create_waker_with_overflow_hint(self.id, queue, Some(overflow_hint));
             self.waker = Some(waker);
             self.wake_state = Some(state);
         }

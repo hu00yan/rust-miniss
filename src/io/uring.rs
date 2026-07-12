@@ -398,10 +398,12 @@ impl UringBackend {
         // Deliver locally failed submissions before polling the kernel CQ.
         let failed = unsafe { &mut *self.completed_ops.get() };
         for (token, result) in failed.drain(..) {
-            if let Some(task_id) = io_state.take_pending_task_and_store_completed(token, result) {
-                let _ = task_id;
-            }
-            if let Some(waker) = io_state.take_waker(token) {
+            if let Some(task_id) = unsafe { io_state.take_pending_task(token) } {
+                io_state.push_owner_completion(task_id, token, result);
+                let _ = io_state.take_waker(token);
+            } else if let Some(waker) =
+                unsafe { io_state.insert_completed_and_take_waker(token, result) }
+            {
                 wakeups += 1;
                 waker.wake();
             }
@@ -807,12 +809,12 @@ impl UringBackend {
                 };
 
                 // Store result in slot and wake the task — no intermediate Vec.
-                if let Some(task_id) =
-                    io_state.take_pending_task_and_store_completed(token, completion_result)
+                if let Some(task_id) = unsafe { io_state.take_pending_task(token) } {
+                    io_state.push_owner_completion(task_id, token, completion_result);
+                    let _ = io_state.take_waker(token);
+                } else if let Some(waker) =
+                    unsafe { io_state.insert_completed_and_take_waker(token, completion_result) }
                 {
-                    let _ = task_id;
-                }
-                if let Some(waker) = io_state.take_waker(token) {
                     wakeups += 1;
                     waker.wake();
                 }
@@ -1259,12 +1261,16 @@ impl UringBackend {
                 }
                 Op::ReadRent { fd, buffer } => {
                     let mut buf = buffer;
-                    let entry = opcode::Read::new(
+                    // ReadRent is the socket-facing rented-buffer API used by
+                    // AsyncTcpStream. Use RECV so the kernel follows the
+                    // native socket completion path; file reads continue to
+                    // use the separate Read operation below.
+                    let entry = opcode::Recv::new(
                         types::Fd(leased_fd(fd)),
                         buf.as_mut_ptr(),
                         buf.capacity() as u32,
                     )
-                    .offset(0)
+                    .flags(0)
                     .build();
                     (
                         entry,
@@ -1403,6 +1409,10 @@ impl UringBackend {
 
 impl IoProvider for UringBackend {
     type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+    fn uses_completion_io(&self) -> bool {
+        true
+    }
 
     fn submit(&self, op: Op) -> Result<IoToken, IoError> {
         self.submit_inner(op, None)

@@ -25,12 +25,14 @@ use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cpu::{current_core_id, set_current_task_id, CpuIoState, RuntimeContextGuard};
+use crate::cpu::{
+    current_core_id, set_current_task_id, CpuIoState, OwnerCompletion, RuntimeContextGuard,
+};
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
 use crate::task::{DetachedTaskFuture, Task};
 use crate::timer::TimerWheel;
-use crate::waker::{next_runtime_generation, ReadyQueue, TaskArena, TaskId};
+use crate::waker::{next_runtime_generation, OverflowHint, ReadyQueue, TaskArena, TaskId};
 
 /// Type alias for the IO backend completion type
 type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
@@ -287,6 +289,8 @@ pub struct CpuCore {
     /// Local ready queue populated by task wakers.
     /// Bounded Arc-backed queue receives wakes from escaped wakers.
     ready_queue: ReadyQueue,
+    overflow_hint: OverflowHint,
+    owner_ready_queue: Vec<OwnerCompletion>,
     /// Message inbox from other cores
     message_inbox: Receiver<CoreMessage>,
     /// Startup acknowledgement held until owner-thread TLS/driver context is
@@ -356,6 +360,8 @@ impl CpuCore {
             affinity_cpu,
             task_queue: TaskArena::with_capacity(runtime_generation, id as u16, 65_536),
             ready_queue: Arc::new(ArrayQueue::new(65_536)),
+            overflow_hint: Arc::new(AtomicBool::new(false)),
+            owner_ready_queue: Vec::with_capacity(256),
             message_inbox,
             ready_sender: Some(ready_sender),
             timer_wheel: TimerWheel::new(1024, 1),
@@ -726,7 +732,10 @@ impl CpuCore {
                         continue;
                     }
                     if let Some(task) = self.task_queue.get_mut(id.key()) {
-                        task.ensure_waker(self.ready_queue.clone());
+                        task.ensure_waker_with_overflow_hint(
+                            self.ready_queue.clone(),
+                            self.overflow_hint.clone(),
+                        );
                         task.schedule();
                     }
                     self.metrics.max_ready_queue_len =
@@ -789,9 +798,21 @@ impl CpuCore {
         let mut polled = 0;
 
         while polled < self.task_poll_budget {
-            let Some(task_id) = self.ready_queue.pop() else {
+            let owner_completion = self.owner_ready_queue.pop();
+            let owner_ready = owner_completion.is_some();
+            let task_id = owner_completion
+                .as_ref()
+                .map(|completion| completion.task_id)
+                .or_else(|| self.ready_queue.pop());
+            let Some(task_id) = task_id else {
                 break;
             };
+            if let Some(completion) = owner_completion {
+                unsafe {
+                    self.io_state
+                        .set_owner_completion(completion.token, completion.result);
+                }
+            }
             // Count every scheduled record, including stale wakes, against
             // the turn budget. Otherwise a wake storm for cancelled tasks
             // could drain the queue without returning to I/O/messages/timers.
@@ -799,17 +820,28 @@ impl CpuCore {
             let removed = {
                 // In-place poll: borrow task mutably from task_queue.
                 // Scope ensures the mutable borrow is released before remove().
-                let task = match self.task_queue.get_mut(task_id.key()) {
-                    Some(t) => t,
-                    None => continue, // stale wake after cancellation
+                let Some(task) = self.task_queue.get_mut(task_id.key()) else {
+                    if owner_ready {
+                        // A completion can race cancellation/slot retirement;
+                        // never retain its result for a later task poll.
+                        unsafe { self.io_state.clear_owner_completion() };
+                    }
+                    continue; // stale wake after cancellation
                 };
                 if task.id() != task_id {
+                    if owner_ready {
+                        unsafe { self.io_state.clear_owner_completion() };
+                    }
                     continue; // stale wake after slot reuse
                 }
 
                 set_current_task_id(Some(task_id));
                 let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    task.poll_with_cached_waker()
+                    if owner_ready {
+                        task.poll_with_owner_waker()
+                    } else {
+                        task.poll_with_cached_waker()
+                    }
                 }));
                 set_current_task_id(None);
                 executed += 1;
@@ -836,13 +868,18 @@ impl CpuCore {
             if removed {
                 self.task_queue.remove(task_id.key());
             }
+            if owner_ready {
+                unsafe { self.io_state.clear_owner_completion() };
+            }
         }
 
         // Re-enqueue wakes that observed a full bounded ready queue. This
         // owner-side retry preserves one-shot wake delivery without an
         // unbounded overflow queue or cross-core mutable state.
-        for task in self.task_queue.iter().flatten() {
-            executed += usize::from(task.retry_overflowed_wake());
+        if self.overflow_hint.swap(false, Ordering::AcqRel) {
+            for task in self.task_queue.iter().flatten() {
+                executed += usize::from(task.retry_overflowed_wake());
+            }
         }
 
         let spawned_local = self.drain_local_spawns();
@@ -873,7 +910,10 @@ impl CpuCore {
                     drop(ticket);
                 });
                 let mut task = Task::from_pinned(id, wrapped);
-                task.ensure_waker(self.ready_queue.clone());
+                task.ensure_waker_with_overflow_hint(
+                    self.ready_queue.clone(),
+                    self.overflow_hint.clone(),
+                );
                 task.schedule();
                 assert!(self.task_queue.insert_external(id.key(), task));
                 self.local_task_count += 1;
@@ -927,6 +967,10 @@ impl CpuCore {
 
         let drain_elapsed_ns = drain_started.elapsed().as_nanos() as u64;
         self.metrics.io_completion_total_ns += drain_elapsed_ns;
+        unsafe {
+            self.io_state
+                .swap_owner_completions(&mut self.owner_ready_queue)
+        };
         self.metrics.max_io_completion_batch_ns = self
             .metrics
             .max_io_completion_batch_ns

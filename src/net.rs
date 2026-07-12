@@ -199,9 +199,14 @@ impl AsyncTcpStream {
         let mut buffer = buffer.into();
         // SAFETY: The owned buffer provides a writable region up to its full
         // capacity; the slice is only used for this synchronous syscall.
-        match try_read(fd, unsafe {
-            std::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.capacity())
-        }) {
+        let direct = with_io_state(|state| state.io_backend.uses_completion_io());
+        match if direct {
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        } else {
+            try_read(fd, unsafe {
+                std::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.capacity())
+            })
+        } {
             Ok(bytes_read) => {
                 // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
                 unsafe {

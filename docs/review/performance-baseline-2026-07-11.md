@@ -129,3 +129,42 @@ completed 800 connections without socket errors after the change (580,796 RPS,
 +1.57%). Overall medians were 557,616 vs 547,895 RPS; p99 medians were 7.41 vs
 8.46 ms. This is primarily a descriptor-capacity/lifetime improvement, with a
 small measured throughput benefit, not a major hot-path optimization.
+
+## Unmeasured copy and owner-local fast paths (2026-07-12)
+
+The current worktree contains several deliberately isolated changes whose
+performance effect is not yet claimed because the Orb VM cannot complete
+startup in the current environment:
+
+* io_uring `read_rent` skips the synchronous read probe and submits socket
+  `RECV` directly; the owner completion path delivers CQEs through a
+  shard-local queue instead of cross-thread waker notification.
+* owner completion batches reuse their `Vec` storage by swapping buffers;
+  normal ready-queue turns skip the full task-arena overflow scan and only scan
+  after a real bounded-queue overflow; owner-thread wakes skip `unpark`.
+* the benchmark HTTP framer tracks a logical prefix and compacts only when
+  append capacity is exhausted, avoiding a per-request `Vec::drain` memmove.
+
+Local evidence is limited to lifecycle and framer tests. These changes must be
+compared one at a time on Linux, with at least three alternating runs and the
+following counters retained: RPS, p99, task-clock/request,
+context-switch/request, `read`/request, `write`/request, `writev`/request, and
+`io_uring_enter`/request. No throughput or tail-latency improvement should be
+inferred until that A/B evidence exists.
+
+Three live Orb samples were collected after accessing the manually started VM
+through the privileged Orb socket. Current worktree, 4 workers, 800
+connections, 8 wrk threads, 5 seconds:
+
+| Run | Requests | RPS | p99 |
+|---:|---:|---:|---:|
+| 1 | 1,323,684 | 259,766 | 114.23 ms |
+| 2 | 2,575,368 | 509,678 | 35.98 ms |
+| 3 | 2,687,079 | 532,779 | 34.70 ms |
+
+The median is 509,678 RPS and 35.98 ms p99, but run 1 is a retained noisy
+outlier rather than silently discarded. A privileged perf sample recorded
+25,564 `io_uring_enter` and 11,303 context-switch events over five seconds;
+the raw perf file is authoritative. The derived diagnostics row was marked
+`parse_error` while its tracepoint fields are being fixed, so its zero values
+must not be used.

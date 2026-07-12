@@ -163,17 +163,31 @@ mod descriptor_lease_tests {
         let second = registered.lease();
         let leased_fd = first.as_raw_fd();
         assert_eq!(leased_fd, second.as_raw_fd());
+        let mut before_drop = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { libc::fstat(leased_fd, &mut before_drop) }, 0);
 
         drop(registered);
         drop(first);
         assert_ne!(unsafe { libc::fcntl(leased_fd, libc::F_GETFD) }, -1);
 
         drop(second);
-        assert_eq!(unsafe { libc::fcntl(leased_fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        // Another test may reuse the numeric fd immediately after the last
+        // lease closes it. Distinguish that valid reuse from an unexpectedly
+        // retained descriptor instead of asserting on the number alone.
+        let mut after_drop = unsafe { std::mem::zeroed::<libc::stat>() };
+        let rc = unsafe { libc::fstat(leased_fd, &mut after_drop) };
+        if rc == 0 {
+            assert_ne!(
+                (before_drop.st_dev, before_drop.st_ino),
+                (after_drop.st_dev, after_drop.st_ino),
+                "last lease still retained the original descriptor"
+            );
+        } else {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
         // SAFETY: write_fd is still owned by this test and closed exactly once.
         unsafe { libc::close(write_fd) };
     }
@@ -219,6 +233,10 @@ pub trait IoProvider: 'static {
     /// `IoToken` to track the operation; rejected operations return an error
     /// without allocating a token or completion slot.
     fn submit(&self, op: Op) -> Result<IoToken, IoError>;
+
+    fn uses_completion_io(&self) -> bool {
+        false
+    }
 
     /// Submit using descriptor ownership already imported by a shard-local
     /// resource. Backends that do not specialize this path retain the existing

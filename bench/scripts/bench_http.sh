@@ -79,7 +79,7 @@ printf 'name,port,threads,connections,duration,requests,rps,avg_latency,p50,p75,
 
 diag_csv="$OUT_DIR/diagnostics.csv"
 if [[ "$DIAGNOSTICS_ENABLED" = "1" ]]; then
-    printf 'name,port,threads,connections,duration,requests,rps,p99,error_rate_pct,cpu_util_pct,max_rss_kb,io_uring_enter_per_sec,context_switches_per_sec,cache_miss_rate\n' > "$diag_csv"
+    printf 'name,port,threads,connections,duration,requests,rps,p99,error_rate_pct,cpu_util_pct,max_rss_kb,io_uring_enter_per_sec,read_per_sec,write_per_sec,writev_per_sec,context_switches_per_sec,perf_status\n' > "$diag_csv"
 fi
 
 server_pid=""
@@ -123,8 +123,11 @@ start_rss_sampler() {
         done
         printf '%s\n' "$max_rss" >"$rss_log"
     ) &
-    echo $!
+    RSS_PID=$!
 }
+
+RSS_PID=""
+PERF_PID=""
 
 start_perf_stat() {
     local pid=$1
@@ -133,13 +136,17 @@ start_perf_stat() {
 
     if ! command -v perf >/dev/null 2>&1; then
         : >"$perf_log"
-        echo ""
+        PERF_PID=""
         return 0
     fi
 
-    perf stat -x, -e task-clock,context-switches,cache-misses,cache-references,syscalls:sys_enter_io_uring_enter \
+    # Avoid PMU-only events: Orb VMs expose software counters and syscall
+    # tracepoints even when cache-miss sampling is unavailable.
+    local perf_runner=${BENCH_PERF_RUNNER:-perf}
+    read -r -a perf_runner_args <<<"$perf_runner"
+    "${perf_runner_args[@]}" stat -x, -e task-clock,context-switches,syscalls:sys_enter_io_uring_enter,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev \
         -p "$pid" -- sleep "$duration" >"$perf_log" 2>&1 &
-    echo $!
+    PERF_PID=$!
 }
 
 parse_diag_row() {
@@ -172,7 +179,11 @@ if ($s =~ /Socket errors:\s*connect\s+(\d+),\s*read\s+(\d+),\s*write\s+(\d+),\s*
 }
 
 my %perf;
+my $perf_status = 'unavailable';
+my ($task_clock_ms, $context_switches, $io_uring_enter,
+    $read_syscalls, $write_syscalls, $writev_syscalls) = (0, 0, 0, 0, 0, 0);
 if (-s $perf_log) {
+    my $recognized_events = 0;
     open my $pfh, '<', $perf_log or die "cannot read $perf_log: $!";
     while (my $line = <$pfh>) {
         chomp $line;
@@ -183,16 +194,24 @@ if (-s $perf_log) {
         my $value = $fields[0];
         my $event = $fields[2];
         $value =~ s/[[:space:]]//g;
+        $event =~ s/^\s+|\s+$//g;
         next unless $value =~ /^[0-9]+(?:\.[0-9]+)?$/;
         $perf{$event} = 0 + $value;
+        $task_clock_ms = 0 + $value if $event eq 'task-clock';
+        $context_switches = 0 + $value if $event =~ /context-switches/;
+        $io_uring_enter = 0 + $value if $event =~ /io_uring_enter/;
+        $read_syscalls = 0 + $value if $event =~ /sys_enter_read\z/;
+        $write_syscalls = 0 + $value if $event =~ /sys_enter_write\z/;
+        $writev_syscalls = 0 + $value if $event =~ /sys_enter_writev\z/;
+        $recognized_events++;
+    }
+    $perf_status = $recognized_events > 0 ? 'ok' : 'unsupported';
+    # A tracepoint row can be present while the parser observes only the
+    # first flushed line. Never label that partial result as valid metrics.
+    if ($perf_status eq 'ok' && ($context_switches == 0 || $io_uring_enter == 0)) {
+        $perf_status = 'parse_error';
     }
 }
-
-my $task_clock_ms = $perf{'task-clock'} // 0;
-my $context_switches = $perf{'context-switches'} // 0;
-my $cache_misses = $perf{'cache-misses'} // 0;
-my $cache_refs = $perf{'cache-references'} // 0;
-my $io_uring_enter = $perf{'syscalls:sys_enter_io_uring_enter'} // 0;
 
 my $cpu_util_pct = 0;
 if ($duration > 0 && $http_cores > 0) {
@@ -200,8 +219,10 @@ if ($duration > 0 && $http_cores > 0) {
 }
 
 my $io_uring_enter_per_sec = $duration > 0 ? $io_uring_enter / $duration : 0;
+my $read_per_sec = $duration > 0 ? $read_syscalls / $duration : 0;
+my $write_per_sec = $duration > 0 ? $write_syscalls / $duration : 0;
+my $writev_per_sec = $duration > 0 ? $writev_syscalls / $duration : 0;
 my $context_switches_per_sec = $duration > 0 ? $context_switches / $duration : 0;
-my $cache_miss_rate = $cache_refs > 0 ? $cache_misses / $cache_refs : 0;
 
 my $max_rss_kb = 0;
 if (-s $rss_log) {
@@ -224,8 +245,11 @@ my @row = (
     sprintf('%.2f', $cpu_util_pct),
     $max_rss_kb,
     sprintf('%.2f', $io_uring_enter_per_sec),
+    sprintf('%.2f', $read_per_sec),
+    sprintf('%.2f', $write_per_sec),
+    sprintf('%.2f', $writev_per_sec),
     sprintf('%.2f', $context_switches_per_sec),
-    sprintf('%.6f', $cache_miss_rate),
+    $perf_status,
 );
 for (@row) {
     s/"/""/g;
@@ -327,8 +351,10 @@ run_benchmark() {
     local perf_pid=""
     local rss_pid=""
     if [[ "$DIAGNOSTICS_ENABLED" = "1" ]]; then
-        perf_pid=$(start_perf_stat "$server_pid" "$DURATION" "$perf_log")
-        rss_pid=$(start_rss_sampler "$server_pid" "$DURATION" "$rss_log")
+        start_perf_stat "$server_pid" "$DURATION" "$perf_log"
+        perf_pid=$PERF_PID
+        start_rss_sampler "$server_pid" "$DURATION" "$rss_log"
+        rss_pid=$RSS_PID
     fi
 
     wrk --latency -t1 -c10 -d3s --timeout 5s "${wrk_headers[@]}" "$addr" >/dev/null
@@ -336,6 +362,14 @@ run_benchmark() {
 
     if [[ -n "$perf_pid" && "$perf_pid" != "0" ]]; then
         wait "$perf_pid" >/dev/null 2>&1 || true
+        # perf may flush its CSV in stages after the child exits. Wait for the
+        # final requested event row before parsing so a partial file cannot
+        # become fake zeroes.
+        for _ in $(seq 1 50); do
+            grep -q 'syscalls:sys_enter_writev' "$perf_log" 2>/dev/null && break
+            sleep 0.02
+        done
+        sleep 0.1
     fi
     if [[ -n "$rss_pid" ]]; then
         wait "$rss_pid" >/dev/null 2>&1 || true

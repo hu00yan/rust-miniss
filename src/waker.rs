@@ -280,6 +280,7 @@ impl TaskId {
 
 /// Bounded, cross-thread-safe ready queue retained by each waker.
 pub type ReadyQueue = Arc<ArrayQueue<TaskId>>;
+pub(crate) type OverflowHint = Arc<AtomicBool>;
 
 pub(crate) struct WakerState {
     task_id: TaskId,
@@ -289,17 +290,23 @@ pub(crate) struct WakerState {
     /// Set when the bounded queue was full. The owner retries this marker
     /// after draining the queue so a one-shot wake cannot be lost.
     overflowed: AtomicBool,
+    overflow_hint: Option<OverflowHint>,
     active: AtomicBool,
 }
 
 impl WakerState {
-    pub(crate) fn new(task_id: TaskId, queue: ReadyQueue) -> Arc<Self> {
+    pub(crate) fn new_with_overflow_hint(
+        task_id: TaskId,
+        queue: ReadyQueue,
+        overflow_hint: Option<OverflowHint>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             task_id,
             queue,
             owner_thread: std::thread::current(),
             scheduled: AtomicBool::new(false),
             overflowed: AtomicBool::new(false),
+            overflow_hint,
             active: AtomicBool::new(true),
         })
     }
@@ -313,15 +320,26 @@ impl WakerState {
             // one-shot future observes a full queue; the owner-side retry
             // closes that lost-wake window without growing the queue.
             self.overflowed.store(true, Ordering::Release);
+            if let Some(hint) = &self.overflow_hint {
+                hint.store(true, Ordering::Release);
+            }
             self.scheduled.store(false, Ordering::Release);
             // Wake the owner even when the queue is full: the owner-side
             // retry path is what makes the sticky marker observable before
             // the worker parks.
-            self.owner_thread.unpark();
+            if std::thread::current().id() != self.owner_thread.id() {
+                self.owner_thread.unpark();
+            }
             return;
         }
         self.overflowed.store(false, Ordering::Release);
-        self.owner_thread.unpark();
+        // A wake originating on the owner thread cannot be racing that
+        // thread's park: the thread is currently executing this call. Avoid
+        // the unnecessary futex/unpark path while retaining the cross-thread
+        // wake needed by escaped wakers.
+        if std::thread::current().id() != self.owner_thread.id() {
+            self.owner_thread.unpark();
+        }
     }
 
     /// Retry a previously failed enqueue after the owner made queue capacity
@@ -352,7 +370,15 @@ impl futures::task::ArcWake for ArcWakeImpl {
 }
 
 pub(crate) fn create_waker(task_id: TaskId, queue: ReadyQueue) -> (Waker, Arc<WakerState>) {
-    let state = WakerState::new(task_id, queue);
+    create_waker_with_overflow_hint(task_id, queue, None)
+}
+
+pub(crate) fn create_waker_with_overflow_hint(
+    task_id: TaskId,
+    queue: ReadyQueue,
+    overflow_hint: Option<OverflowHint>,
+) -> (Waker, Arc<WakerState>) {
+    let state = WakerState::new_with_overflow_hint(task_id, queue, overflow_hint);
     (
         futures::task::waker(Arc::new(ArcWakeImpl(state.clone()))),
         state,
@@ -538,12 +564,15 @@ mod tests {
     #[test]
     fn full_ready_queue_retries_sticky_wake_after_drain() {
         let queue = Arc::new(ArrayQueue::new(1));
+        let overflow_hint = Arc::new(AtomicBool::new(false));
         let occupied = TaskId::new(0, 1);
         let pending = TaskId::new(0, 2);
         queue.push(occupied).unwrap();
 
-        let (_waker, state) = create_waker(pending, queue.clone());
+        let (_waker, state) =
+            create_waker_with_overflow_hint(pending, queue.clone(), Some(overflow_hint.clone()));
         state.schedule();
+        assert!(overflow_hint.load(Ordering::Acquire));
         assert_eq!(queue.pop(), Some(occupied));
 
         // No second wake is issued: owner-side retry must deliver the
