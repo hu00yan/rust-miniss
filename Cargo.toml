@@ -93,10 +93,6 @@ name = "udp_buffered"
 path = "examples/udp_buffered.rs"
 
 [[example]]
-name = "bench_single"
-path = "examples/bench_single.rs"
-
-[[example]]
 name = "spawn_micro"
 path = "examples/spawn_micro.rs"
 

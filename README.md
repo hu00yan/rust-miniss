@@ -148,7 +148,6 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080
 - `examples/http_echo.rs` — HTTP/1.1 echo server (the primary benchmark)
 - `examples/udp_buffered.rs` — UDP socket with buffered I/O
 - `examples/metrics_server.rs` — Prometheus metrics exporter
-- `examples/bench_single.rs` — Single-core throughput test
 - `examples/spawn_micro.rs` — Task spawn latency microbenchmark
 
 ## Goals

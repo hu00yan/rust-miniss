@@ -2064,7 +2064,9 @@ impl MultiCoreRuntime {
     where
         F: Future,
     {
-        crate::executor::Runtime::new().block_on(future) // arch-audit: allow control-plane compatibility wrapper
+        // This compatibility helper must not construct a second runtime.
+        // Callers needing shard I/O should use spawn_on/spawn_local instead.
+        futures::executor::block_on(future) // arch-audit: allow control-plane compatibility wrapper
     }
 
     /// Block on a future on a specific CPU core

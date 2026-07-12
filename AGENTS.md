@@ -61,6 +61,11 @@ models 不得使用 socket、fd、thread、sleep 或 wall clock。
 
 `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test --tests --examples`
 
+`cargo test --all-targets` is intentionally not the default check: Cargo treats
+benchmark binaries as test targets, and some of them start listener processes or
+long-running workloads. Run benchmarks only through an explicit `just bench-*`
+recipe and stop/clean every server and client started by that recipe.
+
 ## `just arch-audit`
 
 运行 `scripts/audit_architecture.sh`。扫描 `src/`、`tests/`、`benches/`。
@@ -97,6 +102,24 @@ models 不得使用 socket、fd、thread、sleep 或 wall clock。
 ## `just gate`
 
 `just check && just arch-audit && just diff-audit && just bench-smoke BASELINE=...`。返回码：0=GREEN、1=YELLOW、2=RED(架构红线)、3=RED(越界改文件)。
+
+## Test and process hygiene
+
+- Every network/integration test must have a bounded wait for readiness and
+  completion. A test that can leave a worker, server, `wrk`, or benchmark
+  process behind is not acceptable in the default test path.
+- Prefer `shutdown_with_timeout`/explicit join in cleanup paths. Cleanup must
+  run before an assertion can panic, or use a guard that owns the process and
+  shuts it down on drop.
+- Long-running, Linux-only, QUIC, io_uring, stress, Miri, and Loom tests must be
+  ignored or separately gated with a documented command. They must not be
+  pulled into `just test-fast` by `--all-targets`.
+- When a test times out, record the exact test and backend in
+  `docs/review/runtime-safety-findings.md`; do not increase the timeout merely
+  to make the suite green.
+- Before handoff, inspect and stop any process started by the current task and
+  remove only task-owned temporary output. Do not leave benchmark servers or
+  clients running in the workspace.
 
 ---
 

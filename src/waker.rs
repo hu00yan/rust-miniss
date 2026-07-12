@@ -268,7 +268,12 @@ impl TaskId {
         // splitting sequence into bounded slot + generation fields. This
         // prevents the old u32 truncation from silently aliasing a live slot.
         let slot = sequence as u16;
-        let generation = (sequence >> 16).saturating_add(1).min(u16::MAX as u32) as u16;
+        let generation_raw = (sequence >> 16).saturating_add(1);
+        assert!(
+            generation_raw <= u16::MAX as u32,
+            "task sequence exceeds the representable generation space"
+        );
+        let generation = generation_raw as u16;
         Self::from_key(TaskKey::new(
             runtime_generation,
             core_id as u16,
@@ -579,5 +584,11 @@ mod tests {
         // original one-shot wake once capacity is available.
         assert!(state.retry_overflowed());
         assert_eq!(queue.pop(), Some(pending));
+    }
+
+    #[test]
+    #[should_panic(expected = "task sequence exceeds the representable generation space")]
+    fn task_id_rejects_generation_saturation_instead_of_aliasing() {
+        let _ = TaskId::new_for_runtime(1, 0, u32::MAX);
     }
 }

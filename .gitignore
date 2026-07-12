@@ -34,6 +34,7 @@ tarpaulin-report.html
 .aider*
 .claude/
 **/.claude/
+.codebase-memory/
 .scratch/
 .serena/
 *.data.old

@@ -52,7 +52,7 @@ wrk -t2 -c50 -d10s http://127.0.0.1:8080/
 For baseline runs on Linux, prefer:
 
 ```bash
-HTTP_COLLECT_DIAGNOSTICS=1 bench/scripts/bench_http_matrix.sh 15000
+bench/scripts/bench_http_matrix.sh 15000
 ```
 
 For a faster pass, use `HTTP_MATRIX_LIGHT=1` to keep the baseline run and trim the rest to miniss-only scenarios.
@@ -60,20 +60,17 @@ For a faster pass, use `HTTP_MATRIX_LIGHT=1` to keep the baseline run and trim t
 The default matrix now includes `ka800` and `close800` as the high-concurrency stress points. Treat those
 as the main follow-up optimization indicators when comparing miniss, monoio, and compio.
 
-This writes `summary.csv` for requests/sec and latency percentiles. With
-`HTTP_COLLECT_DIAGNOSTICS=1`, each runtime directory retains raw `*.perf.csv`,
-`*.rss.txt`, server, and wrk logs; the shell harness does not generate a
-derived diagnostics table.
+This writes `summary.csv` for requests/sec and latency percentiles. Each runtime
+directory retains raw perf, RSS, server, and wrk logs; the shell harness does
+not generate a derived diagnostics table.
 
 For shard-level runtime diagnostics, set `MINISS_METRICS_INTERVAL_MS=1000` when running `examples/http_echo`.
 It prints per-core `flushes`, `parks`, `park_timeouts`, `park_completions`, `busy_rounds`,
 `message_batches`, `max_ready_queue_len`, `max_message_inbox_len`, and completion-wake split counts.
 
-For a second protocol baseline, use:
+Set `HTTP_COLLECT_METRICS=1` only when you need syscall and RSS samples; it adds
+observer processes and is intentionally off for normal throughput measurements.
 
-```bash
-bench/scripts/bench_tcp_pingpong.sh 19080
-```
 
 ### Running on macOS
 
@@ -131,7 +128,7 @@ cargo bench --bench perf_benchmark
 cargo bench --bench memory_perf
 
 # Use the HTTP matrix to validate end-to-end impact after a micro-bench change
-HTTP_COLLECT_DIAGNOSTICS=1 bench/scripts/bench_http_matrix.sh 15000
+bench/scripts/bench_http_matrix.sh 15000
 
 # Build the glommio baseline (if available)
 cargo build --manifest-path bench/runtime_comparison/Cargo.toml --release --bin glommio_echo

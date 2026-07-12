@@ -12,7 +12,6 @@ allowed_files:
   - examples/http_echo.rs
   - examples/http_echo.rs
   - examples/http_echo_rent.rs
-  - examples/http_echo_st.rs
   - docs/ARCHITECTURE_EXCEPTIONS.md
   - docs/DECISION_LOG.md
   - docs/DESIGN.md

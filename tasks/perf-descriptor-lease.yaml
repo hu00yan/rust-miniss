@@ -7,7 +7,6 @@ allowed_files:
   - bench/scripts/bench_http.sh
   - bench/scripts/compare_http_baseline.pl
   - bench/scripts/bench_http_matrix.sh
-  - bench/scripts/run_bench_linux.sh
   - bench/support/http_framing.rs
   - bench/runtime_comparison/monoio_echo.rs
   - bench/runtime_comparison/compio_echo.rs

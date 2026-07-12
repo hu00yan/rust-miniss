@@ -447,7 +447,6 @@ bit 31..0  = 本核自增序号
 - `tests/hyper_http1.rs` 验证了 `hyper::server::conn::http1::Builder::serve_connection` 能直接跑在 miniss 上
 - 没有引入 tokio runtime，也没有靠 `hyper-util` 做二次包装
 - `src/hyper_rt.rs` 提供了 `hyper::rt::Executor` / `hyper::rt::Timer`
-- `tests/hyper_http2.rs` 验证了 `hyper::server::conn::http2::Builder::serve_connection` 和 `hyper::client::conn::http2::handshake` 都能直接跑在 miniss 上
 
 ### tokio trait 生态
 
@@ -703,7 +702,7 @@ perf report
 如果 io_uring_enter 调用次数比 Monoio 多一个数量级，就是批量提交问题。
 火焰图上如果 `_Atomic***` 或 `malloc`/`free` 在热点前几位，就是锁或分配器问题。
 
-基线优先用 `HTTP_COLLECT_DIAGNOSTICS=1 bench/scripts/bench_http_matrix.sh <base_port>` 跑同一组场景，
+基线优先用 `bench/scripts/bench_http_matrix.sh <base_port>` 跑同一组场景，
 保存 `summary.csv`、原始 perf CSV 和 server/wrk 日志，避免只看单次吞吐。
 
 ### 关于 fsync 的基准测试

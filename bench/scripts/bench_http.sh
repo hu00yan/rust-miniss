@@ -20,7 +20,7 @@ detect_cores() {
 }
 
 HTTP_CORES=${HTTP_CORES:-$(detect_cores)}
-DIAGNOSTICS_ENABLED=${HTTP_COLLECT_DIAGNOSTICS:-0}
+METRICS_ENABLED=${HTTP_COLLECT_METRICS:-0}
 BENCH_RUNTIMES=${BENCH_RUNTIMES:-"miniss,monoio,compio,tokio,glommio"}
 
 mkdir -p "$OUT_DIR"
@@ -79,6 +79,16 @@ printf 'name,port,threads,connections,duration,requests,rps,avg_latency,p50,p75,
 
 server_pid=""
 cleanup() {
+    if [[ -n "${PERF_PID:-}" && "${PERF_PID}" != "0" ]]; then
+        kill "$PERF_PID" >/dev/null 2>&1 || true
+        wait "$PERF_PID" >/dev/null 2>&1 || true
+        PERF_PID=""
+    fi
+    if [[ -n "${RSS_PID:-}" && "${RSS_PID}" != "0" ]]; then
+        kill "$RSS_PID" >/dev/null 2>&1 || true
+        wait "$RSS_PID" >/dev/null 2>&1 || true
+        RSS_PID=""
+    fi
     if [[ -n "${server_pid:-}" ]]; then
         kill "$server_pid" >/dev/null 2>&1 || true
         wait "$server_pid" >/dev/null 2>&1 || true
@@ -235,7 +245,7 @@ run_benchmark() {
 
     local perf_pid=""
     local rss_pid=""
-    if [[ "$DIAGNOSTICS_ENABLED" = "1" ]]; then
+    if [[ "$METRICS_ENABLED" = "1" ]]; then
         start_perf_stat "$server_pid" "$DURATION" "$perf_log"
         perf_pid=$PERF_PID
         start_rss_sampler "$server_pid" "$DURATION" "$rss_log"

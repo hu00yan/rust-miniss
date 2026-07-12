@@ -1,6 +1,6 @@
 # Runtime Safety Contracts
 
-Status: design and enforcement map, verified against `de6f937` on 2026-07-11.
+Status: design and enforcement map, verified against the current worktree on 2026-07-12.
 Passing these tests is not a proof that the runtime is safe. The contracts below
 state only what is mechanically checked and what remains a Linux/kernel obligation.
 

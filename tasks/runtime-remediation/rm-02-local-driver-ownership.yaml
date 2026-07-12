@@ -47,7 +47,6 @@ architecture_audit: |
   implementations; shard driver ownership uses `Box`.
 - `Runtime` constructs and owns one driver/timer pair, reused across block_on.
 - Compile-fail docs cover `CpuIoState: !Send`; local and Orb Linux check/clippy
-  pass. `bench_single` now constructs Runtime on its owner thread.
 ---
 
 # rm-02: Local-only driver ownership

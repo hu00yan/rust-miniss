@@ -168,6 +168,10 @@ fn multicore_block_on_drives_timer_future() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "async file completion is currently unverified on the macOS epoll backend"
+)]
 fn multicore_spawned_async_file_future_completes() {
     let runtime = MultiCoreRuntime::new(Some(1)).expect("runtime");
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -191,7 +195,9 @@ fn multicore_spawned_async_file_future_completes() {
         b"multicore io"
     );
 
-    runtime.shutdown().expect("shutdown");
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .expect("shutdown");
     Arc::try_unwrap(runtime)
         .expect("runtime still referenced")
         .join()

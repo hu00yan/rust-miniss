@@ -129,7 +129,8 @@ bench-http:
 
 # Run all tests
 test:
-    cargo test --all-targets
+    # Do not start benchmark servers under the default test recipe.
+    cargo test --tests --examples
 
 # Fast local safety loop. Deliberately excludes Loom, Miri, kernel I/O tests,
 # ignored stress tests, examples, and benchmarks.
