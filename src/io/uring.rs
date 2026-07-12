@@ -240,14 +240,14 @@ impl UringBackend {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(MAX_COMPLETIONS_PER_DRAIN);
-        fn base_builder() -> io_uring::Builder {
+        fn base_builder(enable_coop_taskrun: bool) -> io_uring::Builder {
             let mut builder = IoUring::builder();
-            // Match monoio's default posture: leave the builder mostly plain
-            // unless a benchmark explicitly asks for extra flags.
+            // Keep optional flags explicit so each one has an isolated
+            // benchmark and an unsupported-kernel fallback.
             if std::env::var_os("MINISS_URING_SINGLE_ISSUER").is_some() {
                 builder.setup_single_issuer();
             }
-            if std::env::var_os("MINISS_URING_COOP_TASKRUN").is_some() {
+            if enable_coop_taskrun {
                 builder.setup_coop_taskrun();
             }
             if std::env::var_os("MINISS_URING_DEFER_TASKRUN").is_some() {
@@ -256,18 +256,31 @@ impl UringBackend {
             builder
         }
 
+        // COOP_TASKRUN lets the kernel run deferred io_uring work at natural
+        // ring transitions instead of forcing extra task-work interrupts. It
+        // is safe to request on modern kernels and falls back cleanly when the
+        // running kernel rejects the setup flag.
+        let enable_coop_taskrun = std::env::var_os("MINISS_URING_NO_COOP_TASKRUN").is_none();
+
         let (ring, sqpoll_enabled) = if std::env::var_os("MINISS_URING_SQPOLL").is_some() {
-            let mut builder = base_builder();
+            let mut builder = base_builder(enable_coop_taskrun);
             builder.setup_sqpoll(1000);
             match builder.build(entries) {
                 Ok(ring) => (ring, true),
                 Err(err) => {
                     tracing::warn!("io_uring SQPOLL unavailable, falling back: {err}");
-                    (base_builder().build(entries)?, false)
+                    (base_builder(false).build(entries)?, false)
                 }
             }
         } else {
-            (base_builder().build(entries)?, false)
+            match base_builder(enable_coop_taskrun).build(entries) {
+                Ok(ring) => (ring, false),
+                Err(error) if enable_coop_taskrun => {
+                    tracing::warn!("io_uring COOP_TASKRUN unavailable, using plain ring: {error}");
+                    (base_builder(false).build(entries)?, false)
+                }
+                Err(error) => return Err(error),
+            }
         };
         let ring_entries = entries as usize;
         let mut probe = io_uring::Probe::new();

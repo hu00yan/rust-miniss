@@ -75,3 +75,42 @@ not be compared with the corrected unified-server results.
    time with A/B evidence.
 4. Only then evaluate io_uring registered/fixed files with explicit capability
    probing and generation-safe slot reuse.
+
+## io_uring task-run flag experiments
+
+Four-worker, 800-connection, three-run medians against the corrected default
+baseline of 428,153 RPS / 6.70 ms p99:
+
+| Ring flags | RPS | p99 | RPS change | Decision |
+|---|---:|---:|---:|---|
+| `SINGLE_ISSUER` | 463,885 | 6.00 ms | +8.3% | reject as inferior |
+| `COOP_TASKRUN` | 479,504 | 5.24 ms | +12.0% | enable with fallback |
+| `SINGLE_ISSUER+COOP_TASKRUN` | 469,167 | 6.56 ms | +9.6% | reject as inferior |
+| `SINGLE_ISSUER+DEFER_TASKRUN` | 26–28k | 12–13 ms | about -94% | reject; timeouts observed |
+
+Raw data: `.scratch/http-uring-{single,coop,single-coop,defer}-r*`.
+`DEFER_TASKRUN` is not compatible with the current GETEVENTS/park protocol and
+must not be enabled merely because the kernel supports the setup flag.
+
+An alternating production-default A/B gave paired throughput changes of
++8.35%, -0.46%, and +3.34% (paired median +3.34%). Across the three runs,
+COOP on/off medians were 497,011 and 466,650 RPS. Raw data:
+`.scratch/http-coop-ab-{on,off}-r{1,2,3}/`.
+
+Privileged perf tracepoint measurements with a raised 65,536 fd limit showed
+that kernel-entry frequency is not the remaining gap:
+
+| Runtime | Requests | `io_uring_enter` | requests/enter |
+|---|---:|---:|---:|
+| miniss COOP | 5,450,303 | 128,457 | 42.4 |
+| miniss plain | 5,407,957 | 120,237 | 45.0 |
+| Monoio | 7,957,365 | 189,269 | 42.0 |
+| Compio | 7,677,354 | 240,649 | 31.9 |
+
+COOP improves task-work timing, not syscall count. Further submission batching
+is therefore lower priority than completion-to-task wake overhead. The first
+perf attempt also exposed that the connection-scoped duplicate descriptor
+doubles fd consumption: miniss reached `EMFILE` under perf's 1024 soft limit
+at 800 connections, while the comparison runtimes did not. Those invalid
+miniss runs are excluded above; removing the duplicate through a generation-
+safe shard registry/fixed-file design remains a capacity obligation.
