@@ -369,7 +369,10 @@ run_benchmark() {
             grep -q 'syscalls:sys_enter_writev' "$perf_log" 2>/dev/null && break
             sleep 0.02
         done
-        sleep 0.1
+        # Orb's shared mount can expose the final append slightly after the
+        # producer has exited; keep diagnostics off the request hot path and
+        # allow that last write to become visible before Perl opens the file.
+        sleep 1
     fi
     if [[ -n "$rss_pid" ]]; then
         wait "$rss_pid" >/dev/null 2>&1 || true

@@ -168,3 +168,10 @@ outlier rather than silently discarded. A privileged perf sample recorded
 the raw perf file is authoritative. The derived diagnostics row was marked
 `parse_error` while its tracepoint fields are being fixed, so its zero values
 must not be used.
+
+One same-host runtime comparison (same 4 workers, 800 connections, 8 wrk
+threads, 5 seconds) measured miniss at 619,447 RPS / 34.36 ms p99, Monoio at
+579,773 RPS / 28.95 ms p99, and Compio at 551,641 RPS / 24.93 ms p99. This is
+one sample, not a new baseline, but it changes the optimization priority:
+throughput is no longer the obvious primary gap; tail latency and scheduling
+variance deserve the next isolated measurements.
