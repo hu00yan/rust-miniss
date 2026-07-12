@@ -8,10 +8,12 @@ use smallvec::SmallVec;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::io::IoSlice;
+use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 const TCP_BUFFER_SIZE: usize = 256 * 1024;
@@ -157,6 +159,9 @@ pub struct AsyncTcpStream {
     /// The task is woken when the socket becomes writable, then
     /// a fresh Write is submitted.
     pollout_token: Option<IoToken>,
+    /// Stream I/O tokens and TLS state belong to the creating shard. The
+    /// marker prevents accidental migration through an `Arc<OwnedFd>` lease.
+    _owner_local: PhantomData<Rc<()>>,
 }
 
 impl AsyncTcpStream {
@@ -183,6 +188,7 @@ impl AsyncTcpStream {
             read_token: None,
             write_token: None,
             pollout_token: None,
+            _owner_local: PhantomData,
         })
     }
 
@@ -1317,4 +1323,11 @@ impl IntoRawFd for AsyncUdpSocket {
         std::mem::forget(self);
         fd
     }
+}
+
+#[cfg(test)]
+mod locality_contract_tests {
+    use super::AsyncTcpStream;
+
+    static_assertions::assert_not_impl_any!(AsyncTcpStream: Send, Sync);
 }
