@@ -218,6 +218,7 @@ impl AsyncUdpSocket for MinissUdpSocket {
                     unsafe {
                         state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
                     }
+                    state.io_backend.flush();
                     Poll::Pending
                 }
                 Err(err) => Poll::Ready(Err(err)),
@@ -343,6 +344,7 @@ impl UdpPoller for MinissUdpPoller {
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
+            state.io_backend.flush();
             Poll::Pending
         })
     }
