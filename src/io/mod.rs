@@ -12,7 +12,7 @@
 //! - **Linux with kernel 6.12+**: Uses `io_uring` for optimal performance
 //! - **Linux (older kernels)**: Uses `epoll` via mio
 //! - **macOS**: Uses `kqueue` via mio (reuses epoll implementation)
-//! Other Unix targets are not supported or tested by this project.
+//!   Other Unix targets are not supported or tested by this project.
 //!
 //! This selection is handled by the build script (`build.rs`) which detects the
 //! target platform and kernel version, and sets the appropriate `io_backend`
