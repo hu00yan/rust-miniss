@@ -134,9 +134,7 @@ impl Drop for IoFuture {
 
         try_with_io_state(|state| {
             // SAFETY: Single-threaded access.
-            unsafe {
-                state.clear_slot(self.token);
-            }
+            unsafe { state.cancel_and_discard(self.token) }
         });
     }
 }

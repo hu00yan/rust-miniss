@@ -398,6 +398,9 @@ impl UringBackend {
         // Deliver locally failed submissions before polling the kernel CQ.
         let failed = unsafe { &mut *self.completed_ops.get() };
         for (token, result) in failed.drain(..) {
+            if unsafe { io_state.take_discarded(token) } {
+                continue;
+            }
             if let Some(task_id) = unsafe { io_state.take_pending_task(token) } {
                 io_state.push_owner_completion(task_id, token, result);
                 let _ = io_state.take_waker(token);
@@ -809,6 +812,9 @@ impl UringBackend {
                 };
 
                 // Store result in slot and wake the task — no intermediate Vec.
+                if unsafe { io_state.take_discarded(token) } {
+                    continue;
+                }
                 if let Some(task_id) = unsafe { io_state.take_pending_task(token) } {
                     io_state.push_owner_completion(task_id, token, completion_result);
                     let _ = io_state.take_waker(token);

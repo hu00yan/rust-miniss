@@ -482,13 +482,13 @@ impl IntoRawFd for AsyncTcpStream {
         with_io_state(|state| unsafe {
             // SAFETY: Single-threaded access.
             if let Some(token) = self.read_token {
-                state.clear_slot(token);
+                state.cancel_and_discard(token);
             }
             if let Some(token) = self.write_token {
-                state.clear_slot(token);
+                state.cancel_and_discard(token);
             }
             if let Some(token) = self.pollout_token {
-                state.clear_slot(token);
+                state.cancel_and_discard(token);
             }
         });
         self.descriptor
@@ -504,13 +504,13 @@ impl Drop for AsyncTcpStream {
         try_with_io_state(|state| unsafe {
             // SAFETY: Single-threaded access.
             if let Some(token) = self.read_token {
-                state.clear_slot(token);
+                state.cancel_and_discard(token);
             }
             if let Some(token) = self.write_token {
-                state.clear_slot(token);
+                state.cancel_and_discard(token);
             }
             if let Some(token) = self.pollout_token {
-                state.clear_slot(token);
+                state.cancel_and_discard(token);
             }
         });
     }

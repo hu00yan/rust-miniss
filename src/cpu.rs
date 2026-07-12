@@ -117,6 +117,7 @@ pub struct IoSlot {
     waker: Option<Waker>,
     completed: Option<Result<CompletionKind, IoError>>,
     pending_task: Option<crate::waker::TaskId>,
+    discarded: bool,
 }
 
 impl Default for CpuIoState {
@@ -226,6 +227,7 @@ impl CpuIoState {
             slot.waker = None;
             slot.completed = None;
             slot.pending_task = None;
+            slot.discarded = false;
         }
         slot
     }
@@ -440,6 +442,38 @@ impl CpuIoState {
         slot.waker.take()
     }
 
+    /// Mark an operation as abandoned while retaining its slot until the
+    /// backend publishes terminal completion. The completion handler then
+    /// drops the result and clears the slot instead of resurrecting it.
+    pub(crate) unsafe fn cancel_and_discard(&self, token: IoToken) {
+        let _cancel_requested = self.io_backend.cancel(token);
+        let slots = &mut *self.io_slots.get();
+        let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
+            return;
+        };
+        slot.waker = None;
+        slot.pending_task = None;
+        slot.completed = None;
+        // A failed enqueue does not prove that the kernel operation is gone;
+        // retain the discard marker until a terminal CQE arrives.
+        slot.discarded = true;
+    }
+
+    /// Consume a terminal completion for an abandoned operation.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn take_discarded(&self, token: IoToken) -> bool {
+        let slots = &mut *self.io_slots.get();
+        let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
+            return false;
+        };
+        if !slot.discarded {
+            return false;
+        }
+        slot.token_id = 0;
+        slot.discarded = false;
+        true
+    }
+
     /// Clear the per-token slot in one lookup.
     ///
     /// # Safety
@@ -456,6 +490,7 @@ impl CpuIoState {
         slot.waker = None;
         slot.completed = None;
         slot.pending_task = None;
+        slot.discarded = false;
     }
 }
 
@@ -702,6 +737,20 @@ mod tests {
             state.set_owner_completion(token, Ok(CompletionKind::Nop));
             state.clear_owner_completion();
             assert!(state.take_owner_completion(token).is_none());
+        }
+    }
+
+    #[test]
+    fn abandoned_slot_discards_late_completion_even_when_cancel_request_is_rejected() {
+        let state = CpuIoState::default();
+        let token = IoToken::from_id(23);
+        // SAFETY: the test owns this shard-local state.
+        unsafe {
+            let waker = futures::task::noop_waker();
+            state.store_waker(token, &waker);
+            state.cancel_and_discard(token);
+            assert!(state.take_discarded(token));
+            assert!(!state.has_completed(token));
         }
     }
 
