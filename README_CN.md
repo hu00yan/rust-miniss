@@ -2,10 +2,6 @@
 
 [![CI](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml)
 [![Docs](https://github.com/hu00yan/rust-miniss/actions/workflows/docs.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/docs.yml)
-[![Benchmarks](https://github.com/hu00yan/rust-miniss/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/benchmarks.yml)
-[![Nightly](https://github.com/hu00yan/rust-miniss/actions/workflows/nextest-nightly.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/nextest-nightly.yml)
-[![Sanitizers](https://github.com/hu00yan/rust-miniss/actions/workflows/memory-sanitizers.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/memory-sanitizers.yml)
-[![Diff Coverage](https://github.com/hu00yan/rust-miniss/actions/workflows/diff-coverage.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/diff-coverage.yml)
 [![Typos](https://github.com/hu00yan/rust-miniss/actions/workflows/typos.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/typos.yml)
 [![Container Image](https://img.shields.io/badge/ghcr.io-rust--miniss-blue?logo=docker)](https://github.com/hu00yan/rust-miniss/pkgs/container/rust-miniss)
 
@@ -17,7 +13,7 @@ rust-miniss 是一个最小化的异步运行时，展示了高性能服务器�
 
 - **线程每核架构**：每个 CPU 核心独立运行自己的事件循环
 - **无锁通信**：通过 SPSC 队列进行跨 CPU 消息传递
-- **多后端 I/O**：io-uring (Linux 5.10+)、epoll (Linux/Unix)、kqueue (macOS)
+- **多后端 I/O**：io-uring（Linux，按内核能力自动选择）、epoll、kqueue（macOS）
 - **futures::io 兼容性**：实现 `AsyncRead`/`AsyncWrite` traits 以支持生态系统集成
 - **Panic 隔离**：任务 panic 不会影响其他任务
 
@@ -120,7 +116,7 @@ fn main() {
 
 ```bash
 # 在 Linux 上使用 io-uring 支持（推荐性能最佳）
-cargo build --features io_uring
+cargo build --all-features
 
 # 在 macOS 上（通过 mio 使用 kqueue）
 cargo build
@@ -133,19 +129,18 @@ cargo build --features epoll
 
 运行时根据平台和内核版本自动选择最佳 I/O 后端：
 
-| 平台 | 后端 | 特性标志 | 备注 |
-|------|------|----------|------|
-| Linux 5.10+ | io-uring | `io_uring` | 最佳性能 |
-| Linux (旧版) | epoll | `epoll` | Linux 默认 |
-| macOS | kqueue | `kqueue` | 通过 mio |
-| 其他 Unix | epoll | `epoll` | 备选方案 |
+| 平台 | 后端 | 备注 |
+|------|------|------|
+| 支持 io-uring 的 Linux | io-uring | 性能路径，自动选择 |
+| Linux/Unix 旧版 | epoll | 兼容路径 |
+| macOS | kqueue | 通过 mio |
+| 其他 Unix | epoll | 备选方案 |
 
 ## 示例
 
 - `examples/hello_world.rs` – 单线程运行时入门
 - `examples/http_echo.rs` – HTTP/1.1 回声服务器
 - `examples/udp_buffered.rs` – 带缓冲 I/O 的 UDP 套接字
-- `examples/metrics_server.rs` – Prometheus 指标导出器
 
 ### HTTP 回声服务器
 

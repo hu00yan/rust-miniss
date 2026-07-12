@@ -1,13 +1,11 @@
 # rust-miniss
 
 [![CI](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml)
-[![Nightly](https://github.com/hu00yan/rust-miniss/actions/workflows/nextest-nightly.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/nextest-nightly.yml)
-[![Sanitizers](https://github.com/hu00yan/rust-miniss/actions/workflows/memory-sanitizers.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/memory-sanitizers.yml)
 
 A thread-per-core async runtime for Linux, built on **io_uring**. Inspired by [Seastar](https://github.com/scylladb/seastar) and [Monoio](https://github.com/bytedance/monoio).
 
-**Target: 650K+ req/s HTTP echo on 1 core (Monoio-class).**
-(Current: ~239K, debugging in progress.)
+Performance is tracked as reproducible Linux snapshots, not as a permanent
+throughput claim. See [the current baseline](docs/review/performance-baseline-2026-07-11.md).
 
 ## Overview
 
@@ -114,8 +112,8 @@ See [DESIGN.md](docs/DESIGN.md) for full design rationale.
 ## Building
 
 ```bash
-# Linux (io_uring) — requires kernel 6.12+
-cargo build --features io_uring
+# Linux (io_uring is selected automatically when available)
+cargo build --all-features
 
 # macOS (kqueue, dev only)
 cargo build
@@ -125,11 +123,11 @@ cargo build
 
 | Platform | Backend | Notes |
 |----------|---------|-------|
-| Linux 6.12+ | io_uring | Performance target |
+| Linux with io_uring support | io_uring | Performance path |
 | macOS | kqueue | Dev only, never optimized |
 | Other Unix | epoll | Dev only, never optimized |
 
-## HTTP Echo Benchmark (Linux, io_uring, 1 core)
+## HTTP Echo Benchmark (Linux)
 
 ```bash
 cargo build --release --example http_echo
@@ -137,17 +135,14 @@ cargo build --release --example http_echo
 wrk -t4 -c100 -d30s http://127.0.0.1:8080
 ```
 
-| Runtime | Requests/sec | Notes |
-|---------|--------------|-------|
-| rust-miniss | ~100K | Current baseline; targets 650K+ |
-| glommio    | ~100K | Same level (benchmarked for reference) |
+Do not infer performance from this README. Run the documented benchmark matrix
+and retain host, kernel, workload, throughput, and p99 metadata.
 
 ## Available Examples
 
 - `examples/hello_world.rs` — Single-threaded runtime primer
 - `examples/http_echo.rs` — HTTP/1.1 echo server (the primary benchmark)
 - `examples/udp_buffered.rs` — UDP socket with buffered I/O
-- `examples/metrics_server.rs` — Prometheus metrics exporter
 - `examples/spawn_micro.rs` — Task spawn latency microbenchmark
 
 ## Goals

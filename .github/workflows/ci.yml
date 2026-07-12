@@ -83,8 +83,9 @@ jobs:
     - name: Run fast safety gate
       run: just test-fast
 
-    - name: Run full Linux test suite
-      run: cargo test --all-targets
+    - name: Run integration test suite
+      # Do not execute benchmark binaries as tests; some are listener programs.
+      run: cargo test --tests --examples --all-features
 
     - name: Check documentation
       run: cargo doc --all-features --no-deps
