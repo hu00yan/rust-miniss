@@ -159,7 +159,7 @@ impl Drop for MinissUdpSocket {
         if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
             if let Some(token) = self.load_recv_token() {
                 with_io_state(|state| unsafe {
-                    state.clear_slot(token);
+                    state.cancel_and_discard(token);
                 });
             }
         }
@@ -172,6 +172,7 @@ impl AsyncUdpSocket for MinissUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        self.ensure_owner()?;
         self.state.try_send(UdpSockRef::from(&self.inner), transmit)
     }
 
@@ -298,7 +299,7 @@ impl Drop for MinissUdpPoller {
         if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
             if let Some(token) = self.load_token() {
                 with_io_state(|state| unsafe {
-                    state.clear_slot(token);
+                    state.cancel_and_discard(token);
                 });
             }
         }

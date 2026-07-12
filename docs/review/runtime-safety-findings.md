@@ -40,3 +40,6 @@ are not silently mixed into the implementation batch.
     starts a listening HTTP server and can consume a full CPU while waiting for
     clients. The default `just test` recipe now uses `--tests --examples` and
     leaves benchmarks opt-in.
+11. The bounded QUIC/H3 exchange still times out on macOS kqueue after five
+    seconds. The test remains ignored on macOS and active on Linux; this is an
+    integration defect, not evidence that QUIC/H3 is portable yet.

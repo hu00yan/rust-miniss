@@ -24,7 +24,7 @@ fn build_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
-    ignore = "QUIC/H3 integration currently requires the Linux io_uring backend"
+    ignore = "QUIC/H3 kqueue path times out; Linux io_uring remains the active gate"
 )]
 fn quinn_and_h3_quinn_run_on_miniss() {
     let io_runtime = MultiCoreRuntime::new(Some(1)).unwrap();
