@@ -195,3 +195,9 @@ A follow-up single sample at `MINISS_PARK_TIMEOUT_US=10` measured 395,830 RPS
 and 68.74 ms p99. Across these isolated samples, 100 us is currently the
 least-bad point (10 us: 395,830 / 68.74 ms; 100 us: 407,637 / 52.44 ms;
 1000 us: 390,758 / 82.19 ms), but the runs are not enough to tune the default.
+
+An isolated task-poll-budget probe used the existing startup setting
+`MINISS_TASK_POLL_BUDGET`: 32 measured 328,491 RPS / 94.13 ms p99, while 128
+measured 483,056 RPS / 54.03 ms p99 under the same nominal load. These are
+single noisy samples, so the default 64 remains unchanged; the result rejects
+the assumption that yielding more often automatically improves tail latency.
