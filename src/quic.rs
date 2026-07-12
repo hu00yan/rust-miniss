@@ -108,6 +108,7 @@ const UNOWNED_CORE: usize = usize::MAX;
 
 impl MinissUdpSocket {
     fn new(socket: UdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
         let state = quinn::udp::UdpSocketState::new((&socket).into())?;
         Ok(Self {
             inner: socket,

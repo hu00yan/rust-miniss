@@ -43,3 +43,6 @@ are not silently mixed into the implementation batch.
 11. The bounded QUIC/H3 exchange still times out after five seconds on both
     macOS kqueue and Linux io_uring. The test remains explicitly ignored on all
     platforms; this is an integration defect, not evidence that QUIC/H3 works.
+    The UDP wrapper now sets sockets nonblocking before handing them to Quinn,
+    removing one confirmed blocking-I/O defect while the driver wakeup path
+    remains unresolved.
