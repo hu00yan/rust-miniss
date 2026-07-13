@@ -4,7 +4,8 @@
 //! It supports basic HTTP/1.1 request parsing and response generation.
 
 use crate::net::AsyncTcpStream;
-use futures::io::AsyncReadExt;
+#[cfg(target_os = "linux")]
+use crate::Buffer;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt;
@@ -325,15 +326,31 @@ impl HttpConnection {
                 ));
             }
 
-            let mut buffer = [0u8; 4096];
-            let n = self.stream.read(&mut buffer).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed before a complete HTTP request",
-                ));
+            #[cfg(target_os = "linux")]
+            {
+                let buffer = Buffer::with_capacity(4096);
+                let (n, buffer) = self.stream.read_rent(buffer).await?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed before a complete HTTP request",
+                    ));
+                }
+                self.read_buf.extend_from_slice(&buffer[..n]);
+                buffer.recycle();
             }
-            self.read_buf.extend_from_slice(&buffer[..n]);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mut buffer = [0u8; 4096];
+                let n = futures::io::AsyncReadExt::read(&mut self.stream, &mut buffer).await?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed before a complete HTTP request",
+                    ));
+                }
+                self.read_buf.extend_from_slice(&buffer[..n]);
+            }
         }
     }
 

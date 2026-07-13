@@ -1,7 +1,29 @@
-use futures::io::AsyncReadExt;
-use rust_miniss::{net::AsyncTcpListener, HttpConnection, Request, Response, Runtime, StatusCode};
+use futures::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use rust_miniss::Buffer;
+use rust_miniss::{
+    net::{AsyncTcpListener, AsyncTcpStream},
+    HttpConnection, Request, Response, Runtime, StatusCode,
+};
+use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
+
+async fn read_response(stream: &mut AsyncTcpStream) -> io::Result<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        let (n, response) = stream.read_rent(Buffer::with_capacity(4096)).await?;
+        let bytes = response[..n].to_vec();
+        response.recycle();
+        Ok(bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut response = [0u8; 4096];
+        let n = stream.read(&mut response).await?;
+        Ok(response[..n].to_vec())
+    }
+}
 
 #[test]
 fn test_http_echo_integration() {
@@ -59,17 +81,21 @@ fn test_http_send_response_vectored() {
             let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
                 .await
                 .unwrap();
-            use futures::io::AsyncWriteExt;
             stream
-                .write_all(
-                    b"POST /one HTTP/1.1\r\nhost: localhost\r\ncontent-length: 3\r\n\r\nabcGET /two HTTP/1.1\r\nhost: localhost\r\n\r\n",
-                )
+                .write_all(b"POST /one HTTP/1.1\r\nhost: localhost\r\ncontent-length: 3\r\n\r\nabc")
                 .await
                 .unwrap();
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.unwrap();
-            assert!(buf.starts_with(b"HTTP/1.1 200 OK\r\n"));
-            assert!(buf.ends_with(b"\r\n\r\nhello"));
+            let response = read_response(&mut stream).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            assert!(response.ends_with(b"\r\n\r\nhello"));
+
+            stream
+                .write_all(b"GET /two HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let response = read_response(&mut stream).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            assert!(response.ends_with(b"\r\n\r\nhello"));
         };
 
         futures::future::join(server, client).await;
