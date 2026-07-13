@@ -78,9 +78,11 @@ if [[ "$(uname -s)" == "Linux" && ( "$BENCH_RUNTIMES" == *"monoio"* || "$BENCH_R
 fi
 
 csv="$OUT_DIR/summary.csv"
-printf 'name,port,threads,connections,duration,requests,rps,avg_latency,p50,p75,p90,p99,transfer,raw_log,server_log\n' > "$csv"
+printf 'name,port,threads,connections,duration,requests,rps,avg_latency,p50,p75,p90,p99,transfer,socket_errors,http_errors,server_exit,process_leaks,raw_log,server_log\n' > "$csv"
 
 server_pid=""
+LAST_SERVER_EXIT=0
+LAST_PROCESS_LEAKS=0
 cleanup() {
     if [[ -n "${PERF_PID:-}" && "${PERF_PID}" != "0" ]]; then
         kill "$PERF_PID" >/dev/null 2>&1 || true
@@ -99,6 +101,27 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+stop_server() {
+    LAST_SERVER_EXIT=0
+    LAST_PROCESS_LEAKS=0
+    [[ -n "${server_pid:-}" ]] || return 0
+    local pid=$server_pid
+    local was_alive=1
+    kill -0 "$pid" >/dev/null 2>&1 || was_alive=0
+    kill "$pid" >/dev/null 2>&1 || true
+    local wait_status=0
+    wait "$pid" >/dev/null 2>&1 || wait_status=$?
+    # SIGTERM is the expected benchmark cleanup path. Preserve a non-zero
+    # status only when the server had already exited before cleanup.
+    [[ "$was_alive" = "0" ]] && LAST_SERVER_EXIT=$wait_status
+    if kill -0 "$pid" >/dev/null 2>&1; then
+        LAST_PROCESS_LEAKS=1
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+        wait "$pid" >/dev/null 2>&1 || true
+    fi
+    server_pid=""
+}
 
 wait_for_port() {
     local port=$1
@@ -162,12 +185,14 @@ parse_wrk() {
     local port=$2
     local raw_log=$3
     local server_log=$4
+    local server_exit=${5:-0}
+    local process_leaks=${6:-0}
 
-    perl -0777 - "$name" "$port" "$THREADS" "$CONNECTIONS" "$DURATION" "$raw_log" "$server_log" <<'PERL'
+    perl -0777 - "$name" "$port" "$THREADS" "$CONNECTIONS" "$DURATION" "$raw_log" "$server_log" "$server_exit" "$process_leaks" <<'PERL'
 use strict;
 use warnings;
 
-my ($name, $port, $threads, $connections, $duration, $raw_log, $server_log) = @ARGV;
+my ($name, $port, $threads, $connections, $duration, $raw_log, $server_log, $server_exit, $process_leaks) = @ARGV;
 open my $fh, '<', $raw_log or die "cannot read $raw_log: $!";
 local $/;
 my $s = <$fh>;
@@ -186,6 +211,12 @@ if ($s =~ /Non-2xx or 3xx responses:\s*(\d+)/) {
 }
 
 my ($avg) = $s =~ /Latency\s+(\S+)/;
+my ($socket_connect, $socket_read, $socket_write, $socket_timeout) = (0, 0, 0, 0);
+if ($s =~ /Socket errors:\s*connect\s+(\d+),\s*read\s+(\d+),\s*write\s+(\d+),\s*timeout\s+(\d+)/) {
+    ($socket_connect, $socket_read, $socket_write, $socket_timeout) = ($1, $2, $3, $4);
+}
+my ($http_errors) = $s =~ /Non-2xx or 3xx responses:\s*(\d+)/;
+$http_errors //= 0;
 my ($p50) = $s =~ /^\s*50%\s+(\S+)/m;
 my ($p75) = $s =~ /^\s*75%\s+(\S+)/m;
 my ($p90) = $s =~ /^\s*90%\s+(\S+)/m;
@@ -207,7 +238,8 @@ for my $field (
     die "missing $field->[0] in $raw_log\n" unless defined $field->[1];
 }
 
-my @row = ($name, $port, $threads, $connections, $duration, $requests, $rps, $avg, $p50, $p75, $p90, $p99, $transfer, $raw_log, $server_log);
+my @row = ($name, $port, $threads, $connections, $duration, $requests, $rps, $avg, $p50, $p75, $p90, $p99, $transfer,
+    $socket_connect + $socket_read + $socket_write + $socket_timeout, $http_errors, $server_exit, $process_leaks, $raw_log, $server_log);
 for (@row) {
     s/"/""/g;
     $_ = qq("$_");
@@ -279,7 +311,8 @@ run_benchmark() {
         wait "$rss_pid" >/dev/null 2>&1 || true
     fi
 
-    parse_wrk "$name" "$port" "$raw_log" "$server_log" | tee -a "$csv"
+    stop_server
+    parse_wrk "$name" "$port" "$raw_log" "$server_log" "$LAST_SERVER_EXIT" "$LAST_PROCESS_LEAKS" | tee -a "$csv"
 }
 
 runtime_enabled() {

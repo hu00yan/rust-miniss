@@ -25,7 +25,6 @@ impl RuntimeGuard {
     fn finish(mut self) {
         let runtime = self.runtime.take().expect("runtime guard is active");
         let shutdown = runtime.shutdown_with_timeout(self.timeout);
-        let runtime = Arc::try_unwrap(runtime).expect("test retained a runtime reference");
         let joined = runtime.join();
         shutdown.expect("runtime shutdown request");
         joined.expect("runtime workers joined");
@@ -38,9 +37,7 @@ impl Drop for RuntimeGuard {
             return;
         };
         let _ = runtime.shutdown_with_timeout(self.timeout);
-        if let Ok(runtime) = Arc::try_unwrap(runtime) {
-            let _ = runtime.join();
-        }
+        let _ = runtime.join();
     }
 }
 

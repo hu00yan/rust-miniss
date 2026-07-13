@@ -127,6 +127,14 @@ bench-nop:
 bench-http:
     ./bench/scripts/bench_http.sh
 
+# Evaluate one or more completed bench_http summaries mechanically. Set
+# BENCH_BASELINE to a same-shape summary.csv to enforce the 5% throughput
+# regression threshold. The command emits adjacent JSON and CSV verdicts and
+# returns non-zero on errors, leaked processes, excessive CV, too few rounds,
+# or baseline regression.
+bench-verdict output summaries:
+    BENCH_BASELINE="${BENCH_BASELINE:-}" perl bench/scripts/bench_verdict.pl "{{output}}" {{summaries}}
+
 # Run all tests
 test:
     # Do not start benchmark servers under the default test recipe.
