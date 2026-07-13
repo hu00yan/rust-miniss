@@ -12,6 +12,8 @@ use std::io;
 use std::str;
 use std::sync::Arc;
 
+const MAX_HTTP_HEADER_SIZE: usize = 64 * 1024;
+
 /// HTTP request method
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Method {
@@ -287,19 +289,52 @@ impl Response {
 /// HTTP server connection handler
 pub struct HttpConnection {
     stream: AsyncTcpStream,
+    read_buf: Vec<u8>,
 }
 
 impl HttpConnection {
     pub fn new(stream: AsyncTcpStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            read_buf: Vec::with_capacity(4096),
+        }
     }
 
     /// Read and parse HTTP request from the connection
     pub async fn read_request(&mut self) -> io::Result<Request> {
-        let mut buffer = [0u8; 4096];
-        let n = self.stream.read(&mut buffer).await?;
-        let buffer = &buffer[..n];
-        Request::parse(buffer)
+        loop {
+            if let Some(header_end) = find_header_end(&self.read_buf) {
+                let body_len = content_length(&self.read_buf[..header_end])?;
+                let request_len = header_end
+                    .checked_add(4)
+                    .and_then(|length| length.checked_add(body_len))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "HTTP request is too large")
+                    })?;
+                if self.read_buf.len() >= request_len {
+                    let request = Request::parse(&self.read_buf[..request_len]);
+                    self.read_buf.drain(..request_len);
+                    return request;
+                }
+            }
+
+            if self.read_buf.len() > MAX_HTTP_HEADER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP headers exceed the maximum size",
+                ));
+            }
+
+            let mut buffer = [0u8; 4096];
+            let n = self.stream.read(&mut buffer).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before a complete HTTP request",
+                ));
+            }
+            self.read_buf.extend_from_slice(&buffer[..n]);
+        }
     }
 
     /// Send HTTP response to the connection
@@ -307,6 +342,27 @@ impl HttpConnection {
         let header = response.build_headers();
         self.stream.write_all_slices(&header, &response.body).await
     }
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn content_length(headers: &[u8]) -> io::Result<usize> {
+    let text = str::from_utf8(headers)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP headers"))?;
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length"));
+        }
+    }
+    Ok(0)
 }
 
 /// Simple HTTP server trait for handling requests

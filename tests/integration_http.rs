@@ -37,17 +37,33 @@ fn test_http_send_response_vectored() {
         let server = async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut conn = HttpConnection::new(stream);
-            conn.send_response(
-                Response::new(StatusCode::OK)
-                    .with_header("content-type", "text/plain")
-                    .with_body("hello"),
-            )
-            .await
-            .unwrap();
+            for index in 0..2 {
+                let request = conn.read_request().await.unwrap();
+                if index == 0 {
+                    assert_eq!(request.path, "/one");
+                    assert_eq!(request.body, b"abc");
+                } else {
+                    assert_eq!(request.path, "/two");
+                }
+                conn.send_response(
+                    Response::new(StatusCode::OK)
+                        .with_header("content-type", "text/plain")
+                        .with_body("hello"),
+                )
+                .await
+                .unwrap();
+            }
         };
 
         let client = async move {
             let mut stream = rust_miniss::net::AsyncTcpStream::connect(addr)
+                .await
+                .unwrap();
+            use futures::io::AsyncWriteExt;
+            stream
+                .write_all(
+                    b"POST /one HTTP/1.1\r\nhost: localhost\r\ncontent-length: 3\r\n\r\nabcGET /two HTTP/1.1\r\nhost: localhost\r\n\r\n",
+                )
                 .await
                 .unwrap();
             let mut buf = Vec::new();

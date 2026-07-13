@@ -92,3 +92,11 @@ RPS and median p99 10.03 ms (one 16.77 ms outlier); 96 reached 855,202 RPS and
 Finally, a six-sample interleaved `MINISS_PARK_TIMEOUT_US=50` versus the
 default 100 probe showed no latency win: 100 had median 855,914 RPS / 9.52 ms
 p99, while 50 had 850,638 RPS / 9.68 ms p99. The timeout remains 100us.
+
+An isolated high-level HTTP probe was intentionally discarded after exposing
+a correctness gap: `HttpConnection::read_request` reads once into a fixed
+buffer and parses the whole read. When keep-alive traffic coalesces a second
+request into that read, the parser can reject the combined data and close the
+connection. The probe produced only 18--399 requests/sec at 10--800
+connections, so it is not a valid latency baseline. A keep-alive buffering
+regression test is required before using the high-level HTTP path for tuning.
