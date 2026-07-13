@@ -39,6 +39,17 @@ sub number {
     return 0 + $1 if $_[0] =~ /^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))/;
     die "non-numeric benchmark value: $_[0]\n";
 }
+sub latency_us {
+    return 0 unless defined($_[0]) && $_[0] ne '';
+    my $value = $_[0];
+    $value =~ /^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(us|µs|ms|s)?/i
+        or die "non-numeric latency value: $value\n";
+    my ($n, $unit) = ($1 + 0, lc($2 // 'us'));
+    return $n if $unit eq 'us' || $unit eq 'µs';
+    return $n * 1_000 if $unit eq 'ms';
+    return $n * 1_000_000 if $unit eq 's';
+    die "unsupported latency unit: $unit\n";
+}
 
 my $max_cv = 0 + ($ENV{BENCH_MAX_CV} // 0.10);
 my $max_p99_mad_ratio = 0 + ($ENV{BENCH_MAX_P99_MAD_RATIO} // 0.20);
@@ -54,7 +65,7 @@ if (defined $baseline && length $baseline) {
         my @v = parse_line(',', 0, $line); my %r; @r{@k} = @v;
         if (defined $r{name}) {
             $baseline_rps{$r{name}} = number($r{rps});
-            $baseline_p99{$r{name}} = number($r{p99_us} // $r{p99});
+            $baseline_p99{$r{name}} = latency_us($r{p99_us} // $r{p99});
         }
     }
 }
@@ -63,7 +74,7 @@ my @verdict_rows; my $passed = 1;
 for my $name (sort keys %rows) {
     my @r = @{$rows{$name}};
     my @rps = map { number($_->{rps}) } @r;
-    my @p99 = map { number($_->{p99_us} // $_->{p99}) } @r;
+    my @p99 = map { latency_us($_->{p99_us} // $_->{p99}) } @r;
     my $rps_median = median(@rps);
     my $p99_median = median(@p99);
     my $rps_mean = @rps ? sum(@rps) / @rps : 0;
