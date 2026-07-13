@@ -1,4 +1,6 @@
-use futures::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(target_os = "linux"))]
+use futures::io::AsyncReadExt;
+use futures::io::AsyncWriteExt;
 #[cfg(target_os = "linux")]
 use rust_miniss::Buffer;
 use rust_miniss::{
