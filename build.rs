@@ -8,7 +8,7 @@
 //! - **Linux with kernel 6.12+**: Enables `io_uring` backend
 //! - **Linux with older kernels**: **Error** — kernel must be 6.12+
 //! - **macOS**: Enables `kqueue` backend (development only, not optimized)
-//! - **Other Unix systems**: Enables `epoll` backend (development only, not optimized)
+//! - **Other Unix systems**: Unsupported (the runtime currently targets Linux and macOS)
 //!
 //! ## Assumptions
 //!
@@ -51,13 +51,8 @@ fn main() {
     } else if cfg!(target_os = "macos") {
         eprintln!("Enabling kqueue backend (macOS development only)");
         println!("cargo:rustc-cfg=io_backend=\"kqueue\"");
-    } else if cfg!(all(
-        unix,
-        not(target_os = "linux"),
-        not(target_os = "macos")
-    )) {
-        eprintln!("Enabling epoll backend (other Unix, development only)");
-        println!("cargo:rustc-cfg=io_backend=\"epoll\"");
+    } else if cfg!(unix) {
+        panic!("unsupported Unix target: rust-miniss currently supports Linux and macOS only");
     }
 }
 

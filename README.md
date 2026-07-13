@@ -9,7 +9,7 @@ throughput claim. See [the current baseline](docs/review/performance-baseline-20
 
 - **thread-per-core**: Each CPU core runs independently with its own io_uring instance
 - **lock-free**: Zero shared mutable state between cores; SPSC queues for cross-core messages
-- **I/O backends**: Linux uses io_uring (with epoll fallback); macOS uses kqueue.
+- **I/O backends**: Linux requires kernel 6.12+ and uses io_uring; macOS uses kqueue.
 - **HTTP/1.1 + HTTP/2 + QUIC/HTTP-3**: Bounded integration tests run on both supported platforms.
 
 ## Quick Start

@@ -8,7 +8,7 @@ rust-miniss 是一个最小化的异步运行时，展示了高性能服务器�
 
 - **线程每核架构**：每个 CPU 核心独立运行自己的事件循环
 - **无锁通信**：通过 SPSC 队列进行跨 CPU 消息传递
-- **多后端 I/O**：io-uring（Linux 性能路径，按内核能力自动选择）、epoll、kqueue（macOS 正确性路径）
+- **I/O 后端**：Linux 需要 6.12+ 内核并使用 io-uring；macOS 使用 kqueue 正确性路径。
 - **futures::io 兼容性**：实现 `AsyncRead`/`AsyncWrite` traits 以支持生态系统集成
 - **Panic 隔离**：任务 panic 不会影响其他任务
 
@@ -116,7 +116,7 @@ cargo build --all-features
 # 在 macOS 上（通过 mio 使用 kqueue）
 cargo build
 
-# Linux 上 io-uring 不可用时会自动回退到 epoll
+# Linux 需要 6.12+ 内核；当前不会在 Linux 上自动回退到 epoll
 cargo build --all-features
 ```
 
@@ -126,8 +126,7 @@ cargo build --all-features
 
 | 平台 | 后端 | 备注 |
 |------|------|------|
-| 支持 io-uring 的 Linux | io-uring | 性能路径，自动选择 |
-| Linux（io-uring 不可用时） | epoll | 兼容路径 |
+| Linux（内核 6.12+） | io-uring | 性能路径 |
 | macOS | kqueue | 通过 mio |
 
 ## 示例

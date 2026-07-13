@@ -121,7 +121,7 @@ gate task="" baseline="":
 
 # Run bench_nop manually
 bench-nop:
-    cargo run --release --features io_uring --example bench_nop
+    cargo run --release --example bench_nop
 
 # Run HTTP echo benchmark
 bench-http:
