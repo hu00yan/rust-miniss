@@ -343,24 +343,16 @@ poll_read(user_buf):
 
 **方案 B：thread-local queue，无 Arc，无 Mutex。**
 
-```
-MinissWaker {
-    task_id: TaskId,
-    queue: *const SegQueue<TaskId>,    // 指向本核的 ready_queue
-}
+当前 waker 使用有界的 owner-aware 状态和 ready queue；不得按旧的裸指针
+或 `Rc` 模型推导生命周期。跨线程 wake 只允许通过显式的 bounded queue 和
+owner shard 通知进入，任务身份必须经过完整 `TaskKey` 校验。
 
-wake():
-    queue.push(task_id)     // crossbeam::SegQueue，lock-free push
-```
+**I/O future 生命周期：**
 
-- Waker 的 `Rc` 是 `std::rc::Rc`（非 atomic），因为所有 clone/wake/drop 在同线程
-- `*const SegQueue` 代替 `Arc<SegQueue>` 避免 atomic refcount
-- 没有 per-waker 的 Mutex 或 Atomic 状态机
-
-**Waker 生命周期：**
-- `IoFuture::poll()` → `state.store_waker(token, cx.waker().clone())`
-- CQE 到达 → `poll_io()` → `state.take_waker(token).map(|w| w.wake())`
-- `IoFuture::drop()` → `state.take_waker(token)` 清理
+- `IoFuture::poll()` 保存 token、waker 和 pending owner task。
+- 终端 completion 进入 owner completion 或 completed slot 后唤醒 owner task。
+- `IoFuture::drop()` 只撤销投递和清除交付状态；backend 仍保留资源直到终端
+  completion，再依据 discarded 标记回收，不能提前释放 kernel 参数或 descriptor。
 
 ---
 
@@ -378,16 +370,16 @@ sequenceDiagram
     loop 每个 CQE
         CQ->>poll_io: token_id, result, flags
         poll_io->>poll_io: process_cqe(token_id)
-        Note over poll_io: slab.try_remove(idx) O(1)
-        poll_io->>poll_io: state.take_pending_task(token)
+        Note over poll_io: validate token generation and ownership
+        poll_io->>poll_io: route owner completion or completed slot
         alt 有 pending_task
-            poll_io->>Task: inline poll（同一循环内立即调用 task.poll()）
-            Task->>SQ: 可能 push 新 SQE
-            poll_io->>poll_io: flush() 提交新 SQE
+            poll_io->>Task: owner ready queue receives task
+            Task->>SQ: owner task may submit a new SQE
+            poll_io->>poll_io: flush() at event-loop boundary
         else 没有 pending_task
             poll_io->>poll_io: state.insert_completed(token, result)
-            poll_io->>poll_io: state.take_waker(token).wake()
-            Note over poll_io: waker 将 task_id 压入 ready_queue
+            poll_io->>poll_io: take stored waker and wake owner task
+            Note over poll_io: stale/discarded tokens are ignored safely
             execute_tasks 后续会 poll 这个 task
         end
     end
@@ -398,12 +390,12 @@ sequenceDiagram
 | 步骤 | 数据结构 | 复杂度 |
 |------|---------|--------|
 | CQE 匹配 PendingOp | Slab index → `try_remove()` | O(1) |
-| PendingOp → Task | `FxHashMap<IoToken, TaskId>` | O(1) |
-| Task → Waker | `FxHashMap<IoToken, Waker>` | O(1) |
-| Waker → ready_queue | `SegQueue::push()` | O(1) amortized |
+| PendingOp → Task | owner task field in the I/O slot | O(1) |
+| Task → Waker | waker field in the I/O slot | O(1) |
+| Waker → ready_queue | bounded ready queue push | O(1) amortized |
 
-Inline completion 跳过最后两步：CQE → PendingOp → TaskId → 直接 `task.poll()`，
-回到事件循环的当前迭代，减少一次对 ready_queue 的 push/pop roundtrip。
+Owner completion keeps the task identity and result together until the owner
+event loop polls it; no cross-thread task migration is implied by a wake.
 
 ---
 
@@ -419,7 +411,8 @@ pub struct Task {
 }
 ```
 
-- Task 持有缓存的 Waker。Waker 首次 `get_or_create_waker()` 创建，后续 poll 时克隆（Rc refcount bump，无堆分配）。
+- Task 持有缓存的 owner-aware Waker。跨线程 wake 只能入 bounded ready queue，
+  由 owner shard 校验完整 TaskKey 后执行。
 - Task 的 re-schedule 通过 `ready_queue.push(task_id)` 触发
 - JoinHandle 的 completion 通过 `Arc<parking_lot::Mutex<JoinState<T>>>` 通信（这是唯一需要轻量锁的地方，因为 JoinHandle 可能被跨 task await）
 

@@ -358,6 +358,12 @@ impl UdpPoller for MinissUdpPoller {
             if ready < 0 {
                 return Poll::Ready(Err(io::Error::last_os_error()));
             }
+            if (poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "macOS UDP socket reported a write readiness error",
+                )));
+            }
             if ready > 0 && (poll_fd.revents & libc::POLLOUT) != 0 {
                 this.retry_timer = None;
                 Poll::Ready(Ok(()))
