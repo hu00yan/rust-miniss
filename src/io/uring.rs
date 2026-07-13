@@ -2270,7 +2270,7 @@ mod stable_iovec_tests {
     use super::*;
     use smallvec::SmallVec;
 
-    /// Structural proof for S0-4 / rm-06: `Box<[iovec]>` pointees stay fixed
+    /// Structural proof: `Box<[iovec]>` pointees stay fixed
     /// after the owning Box is moved (as happens when inserting PendingOp into
     /// the slab and while the SQE remains unsubmitted / delayed-submit).
     ///

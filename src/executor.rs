@@ -39,7 +39,7 @@ type IoCompletion = (
 ///
 /// `Runtime` owns its I/O driver and timer wheel directly. It is not `Send`
 /// or `Sync` and must only be used from the thread that created it. The
-/// `RefCell` field is what makes the type non-`Send` (rm-01).
+/// `RefCell` field is what makes the type non-`Send`.
 ///
 /// ```compile_fail
 /// fn requires_send<T: Send>(_: T) {}
@@ -870,7 +870,7 @@ mod tests {
         );
     }
 
-    // rm-01: moving a `Runtime` and re-entering `block_on` must not invalidate
+    // Moving a `Runtime` and re-entering `block_on` must not invalidate
     // the scoped TLS addresses installed by `RuntimeContextGuard`.
     #[test]
     fn runtime_move_and_reentry_keeps_tls_valid() {
@@ -889,7 +889,7 @@ mod tests {
         assert!(crate::cpu::try_with_io_state(|_| ()).is_none());
     }
 
-    // rm-01: a panic inside `block_on` must leave no stale TLS, and a fresh
+    // A panic inside `block_on` must leave no stale TLS, and a fresh
     // runtime must be able to install context and run afterwards.
     #[test]
     fn panic_in_block_on_allows_fresh_io_afterwards() {

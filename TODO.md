@@ -1,29 +1,7 @@
-# rust-miniss Task Tracker
+# rust-miniss Roadmap
 
-> 每个任务用唯一 ID 标记。修改后必须通过 `just gate` 方可提交。
-> 违反 MUST/MUST NOT 的任务直接标记 RED → 丢弃，记录到 `docs/FAILED_ATTEMPTS.md`。
-
-## 任务卡模板
-
-```yaml
----
-id: <唯一 ID>
-status: TODO | IN_PROGRESS | GREEN | YELLOW | RED
-goal: 一句话目标
-allowed_files:
-  - 允许修改的文件路径
-forbidden_patterns:
-  - 禁止引入的代码模式
-test_commands:
-  - cargo test
-benchmark_commands:
-  - 性能测量命令
-acceptance:
-  - 通过标准
-review_questions:
-  - 审查时重点关注的问题
----
-```
+提交前门禁是 `just test-fast`；Linux 性能实验使用独立的 benchmark 命令，
+不把长时间运行的服务塞进默认测试。
 
 ## Future / Exploration
 
@@ -36,12 +14,10 @@ review_questions:
 | Multi-shot recv | 6.10 | 减少 recv SQE 数量 |
 | DMA-BUF zero-copy recv | 6.16 | 真正零拷贝网络接收 |
 
-## Known Architectural Issues
+## Current verification
 
-| Issue | Impact | Fix |
-|-------|--------|-----|
-| memcpy in Read/Write | ~3-4x on echo | Rent 路径修复（`read_rent`/`write_rent`） |
-| No registered files | ~5-10% | Post-accept `IORING_REGISTER_FILES` |
-| No multi-shot accept | Per-connect syscall | `IORING_OP_ACCEPT_MULTI` |
-| No SQPOLL | Per-flush syscall | `IORING_SETUP_SQPOLL`（需 root） |
-| No registered buffers | Per-I/O page pin | `IORING_REGISTER_BUFFERS` |
+- HTTP/1.1、HTTP/2、QUIC/HTTP-3 integration tests pass on macOS/kqueue and
+  Linux/io_uring.
+- `just test-fast` is the default correctness gate.
+- Performance claims require fresh Linux measurements with throughput, p99,
+  syscall counts, and host/kernel metadata.

@@ -42,3 +42,7 @@ are not silently mixed into the implementation batch.
     non-Linux completion routing, explicit `PollAdd` completion handling in the
     mio backend, nonblocking UDP sockets, and macOS UDP write-readiness
     handling that avoids unsupported kqueue write filters.
+    The current manual evidence is recorded in
+    `docs/review/protocol-integration-2026-07-13.md`; there is no GitHub CI
+    workflow in this repository, so these platform checks must be rerun when
+    the protocol or backend changes.

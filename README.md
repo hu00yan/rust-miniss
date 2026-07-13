@@ -1,8 +1,6 @@
 # rust-miniss
 
-[![CI](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml)
-
-A thread-per-core async runtime for Linux, built on **io_uring**. Inspired by [Seastar](https://github.com/scylladb/seastar) and [Monoio](https://github.com/bytedance/monoio).
+A thread-per-core async runtime for Linux and macOS. Linux uses **io_uring** for the performance path; macOS uses kqueue for the correctness and development path. Inspired by [Seastar](https://github.com/scylladb/seastar) and [Monoio](https://github.com/bytedance/monoio).
 
 Performance is tracked as reproducible Linux snapshots, not as a permanent
 throughput claim. See [the current baseline](docs/review/performance-baseline-2026-07-11.md).
@@ -11,8 +9,8 @@ throughput claim. See [the current baseline](docs/review/performance-baseline-20
 
 - **thread-per-core**: Each CPU core runs independently with its own io_uring instance
 - **lock-free**: Zero shared mutable state between cores; SPSC queues for cross-core messages
-- **io_uring primary**: Linux is the supported performance platform; macOS is a development platform using kqueue.
-- **HTTP/1.1 + HTTP/2 + QUIC/HTTP-3**: Integration under reconstruction — see [DESIGN.md](docs/DESIGN.md)
+- **I/O backends**: Linux uses io_uring (with epoll fallback); macOS uses kqueue.
+- **HTTP/1.1 + HTTP/2 + QUIC/HTTP-3**: Bounded integration tests run on both supported platforms.
 
 ## Quick Start
 
@@ -115,7 +113,7 @@ See [DESIGN.md](docs/DESIGN.md) for full design rationale.
 # Linux (io_uring is selected automatically when available)
 cargo build --all-features
 
-# macOS (kqueue, dev only)
+# macOS (kqueue)
 cargo build
 ```
 
@@ -124,7 +122,7 @@ cargo build
 | Platform | Backend | Notes |
 |----------|---------|-------|
 | Linux with io_uring support | io_uring | Performance path |
-| macOS | kqueue | Development/testing only |
+| macOS | kqueue | Correctness/testing path |
 
 ## HTTP Echo Benchmark (Linux)
 

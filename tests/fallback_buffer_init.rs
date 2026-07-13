@@ -1,4 +1,4 @@
-//! rm-08 fallback-backend regressions.
+//! Fallback-backend buffer initialization regressions.
 //!
 //! These deliberately drive `EpollBackend` rather than `Runtime`: Linux
 //! runtime builds normally select io_uring, while this test must exercise the

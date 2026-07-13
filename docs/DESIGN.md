@@ -78,9 +78,9 @@
 
 | 层面 | 决策 | 理由 |
 |------|------|------|
-| **目标平台** | Linux only | io_uring 是唯一目标 |
+| **目标平台** | Linux + macOS | Linux 是 io_uring 性能路径；macOS 是 kqueue 正确性/开发路径 |
 | **内核基线** | Linux 6.12 LTS | 需 multi-shot accept/recv、provided buffer ring inc、IORING_OP_SENDZC、min timeout |
-| **epoll/kqueue** | 保留，不改，不优化 | macOS/旧内核用于开发，不作为性能目标 |
+| **epoll/kqueue** | 保留并验证正确性 | Linux 无法使用 io_uring 时回退 epoll；macOS 使用 kqueue |
 | **硬件** | x86_64 / ARM64 | 线程 pin 到物理核 |
 
 构建时如果内核 < 6.12，编译直接报错要求升级内核。
@@ -537,7 +537,7 @@ Apache Iggy（2026年2月公开迁移）完整评估了 Monoio、Glommio、compi
 | Buffer 模型 | `IoBuf`/`IoBufMut` trait | owned buffer trait | 当前 Rent 路径思路正确，需修复 bug |
 | I/O 请求分配 | 堆分配（mimalloc 弥补） | Slab allocator | 当前 Slab 设计是正确的，保持 |
 | io_uring 特性覆盖 | 广（multi-shot、buf ring、注册文件...） | 基础覆盖，更新滞后 | 本运行时的 6.12 基线给了更多空间 |
-| 跨平台 | Linux + Windows (IOCP) | Linux only | 不需要跨平台，专注 Linux 即可 |
+| 跨平台 | Linux + macOS | Linux io_uring 与 macOS kqueue 均有协议集成测试；Windows/IOCP 不在支持范围 |
 
 #### Driver/Executor 解耦
 

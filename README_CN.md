@@ -1,10 +1,5 @@
 # rust-miniss
 
-[![CI](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/ci.yml)
-[![Docs](https://github.com/hu00yan/rust-miniss/actions/workflows/docs.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/docs.yml)
-[![Typos](https://github.com/hu00yan/rust-miniss/actions/workflows/typos.yml/badge.svg)](https://github.com/hu00yan/rust-miniss/actions/workflows/typos.yml)
-[![Container Image](https://img.shields.io/badge/ghcr.io-rust--miniss-blue?logo=docker)](https://github.com/hu00yan/rust-miniss/pkgs/container/rust-miniss)
-
 一个最小的线程每核异步运行时，最初受 [Seastar](https://github.com/scylladb/seastar) 启发，但已演变为 Rust 特定的实现。
 
 ## 概览
@@ -13,7 +8,7 @@ rust-miniss 是一个最小化的异步运行时，展示了高性能服务器�
 
 - **线程每核架构**：每个 CPU 核心独立运行自己的事件循环
 - **无锁通信**：通过 SPSC 队列进行跨 CPU 消息传递
-- **多后端 I/O**：io-uring（Linux，按内核能力自动选择）、epoll、kqueue（macOS）
+- **多后端 I/O**：io-uring（Linux 性能路径，按内核能力自动选择）、epoll、kqueue（macOS 正确性路径）
 - **futures::io 兼容性**：实现 `AsyncRead`/`AsyncWrite` traits 以支持生态系统集成
 - **Panic 隔离**：任务 panic 不会影响其他任务
 

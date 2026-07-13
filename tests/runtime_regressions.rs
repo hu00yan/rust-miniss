@@ -49,7 +49,7 @@ fn async_file_sync_all_completes_after_write() {
 }
 
 // Token-generation slot aliasing is covered by the crate-private unit test
-// `cpu::tests::cpu_io_slots_do_not_alias_different_token_generations` (rm-00):
+// `cpu::tests::cpu_io_slots_do_not_alias_different_token_generations`:
 // integration tests cannot call `IoToken::from_id` without exposing a public footgun.
 
 #[test]

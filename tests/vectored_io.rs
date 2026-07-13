@@ -12,7 +12,7 @@ struct FakeIovec {
     len: usize,
 }
 
-/// Structural proof (S0-4 / rm-06): kernel-visible iovec metadata must live in
+/// Structural proof: kernel-visible iovec metadata must live in
 /// immovable heap storage. `Box<[T]>` keeps `as_ptr()` stable across moves that
 /// mimic PendingOp construction + slab insertion. Covers counts that would have
 /// been inline (1–4) and spilled (5+) under `SmallVec<[_; 4]>`.
@@ -49,7 +49,7 @@ fn test_boxed_iovec_stable_across_owner_move() {
 /// Documents why inline array storage is unsafe for SQE arguments: the storage
 /// relocates when the owning struct is moved into heap containers (slab-like),
 /// invalidating any previously captured `as_ptr()`.
-/// (Mirrors the SmallVec<[_; 4]> inline hazard fixed in rm-06.)
+/// (Mirrors the former SmallVec<[_; 4]> inline hazard.)
 #[test]
 fn test_inline_array_iovec_ptr_moves_with_owner() {
     struct InlineOwner {

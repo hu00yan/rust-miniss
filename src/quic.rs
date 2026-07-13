@@ -16,6 +16,8 @@ use std::sync::{
     Arc,
 };
 use std::task::{Context, Poll};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -260,6 +262,8 @@ struct MinissUdpPoller {
     socket: Arc<MinissUdpSocket>,
     #[cfg(not(target_os = "macos"))]
     token: AtomicU64,
+    #[cfg(target_os = "macos")]
+    retry_timer: Option<MinissSleep>,
     owner_core: AtomicUsize,
 }
 
@@ -269,6 +273,8 @@ impl MinissUdpPoller {
             socket,
             #[cfg(not(target_os = "macos"))]
             token: AtomicU64::new(0),
+            #[cfg(target_os = "macos")]
+            retry_timer: None,
             owner_core: AtomicUsize::new(UNOWNED_CORE),
         }
     }
@@ -339,8 +345,33 @@ impl UdpPoller for MinissUdpPoller {
         // Quinn attempt the send and handle an actual WouldBlock itself.
         #[cfg(target_os = "macos")]
         {
-            let _ = cx;
-            Poll::Ready(Ok(()))
+            let this = self.get_mut();
+            let mut poll_fd = libc::pollfd {
+                fd: this.socket.inner.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // UDP write filters are not reliable through mio/kqueue on macOS,
+            // but a zero-timeout poll accurately samples send-buffer pressure.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+            if ready < 0 {
+                return Poll::Ready(Err(io::Error::last_os_error()));
+            }
+            if ready > 0 && (poll_fd.revents & libc::POLLOUT) != 0 {
+                this.retry_timer = None;
+                Poll::Ready(Ok(()))
+            } else {
+                let timer = this.retry_timer.get_or_insert_with(|| {
+                    MinissSleep::new(Instant::now() + Duration::from_millis(1))
+                });
+                match Future::poll(Pin::new(timer), cx) {
+                    Poll::Ready(()) => {
+                        this.retry_timer = None;
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {

@@ -726,6 +726,12 @@ impl CpuCore {
                     if !self.task_queue.insert_external(id.key(), task) {
                         if let Some(reply) = reply {
                             let _ = reply.send(TaskAdmissionOutcome::Rejected);
+                        } else {
+                            tracing::error!(
+                                "Core {} rejected detached task {:?}: slot occupied",
+                                self.id,
+                                id
+                            );
                         }
                         tracing::warn!("Core {} rejected task {:?}: slot occupied", self.id, id);
                         processed += 1;
