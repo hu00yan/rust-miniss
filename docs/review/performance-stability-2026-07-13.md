@@ -107,3 +107,9 @@ zero errors and p99 values of 9.20, 8.90, and 9.79 ms (RPS 849,176 / 812,857 /
 843,113). This is within the previously observed VM spread and is not claimed
 as a latency improvement; the raw run is retained at
 `/tmp/miniss-http-regression-20260713` on Orb.
+
+A follow-up response-path probe using explicit `Connection: close` reached about
+28--36k requests/sec but had 82--98ms p99 under 800 concurrent connections.
+Because every request includes connection setup/teardown, this is not
+comparable with the frozen keep-alive static benchmark and is retained only as
+a warning that high-level response latency needs a purpose-built client model.
