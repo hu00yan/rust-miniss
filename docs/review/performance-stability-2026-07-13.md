@@ -99,7 +99,8 @@ buffer and parses the whole read. When keep-alive traffic coalesces a second
 request into that read, the parser can reject the combined data and close the
 connection. The probe produced only 18--399 requests/sec at 10--800
 connections, so it is not a valid latency baseline. A keep-alive buffering
-regression test is required before using the high-level HTTP path for tuning.
+regression test now covers this case in `tests/integration_http.rs`, but the
+high-level path still needs a purpose-built load client before tuning.
 
 After the buffering fix, the frozen static runner was rerun for three pinned
 rounds at 4 workers / 800 connections / 8 client threads. It completed with
