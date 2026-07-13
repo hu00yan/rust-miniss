@@ -39,9 +39,11 @@ conditions occurs:
 
 Record RPS, p50/p99/p99.9, errors, server/client CPU, task-clock, context
 switches, CPU migrations, RSS, `io_uring_enter` per request, and VM steal/load
-signals. The existing `bench_http.sh` remains the per-case runner; the matrix
-driver should add CPU pinning, client placement, JSON verdicts, and explicit
-skip/failure reasons.
+signals. The existing `bench_http.sh` remains the per-case runner. The new
+`just bench-verdict` consumes three or more summary files and emits JSON/CSV,
+rejecting errors, leaks, too few rounds, excessive CV/MAD, and baseline
+regressions. CPU pinning, client placement, and explicit skip/failure reasons
+remain the next matrix-driver extension.
 
 ## Regression-test rule
 
