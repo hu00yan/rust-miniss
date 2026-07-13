@@ -1472,6 +1472,37 @@ impl MultiCoreRuntime {
         self.spawn_on_any_core(start_core, Box::pin(future))
     }
 
+    /// Enqueue a cross-thread task without synchronously waiting for the
+    /// owner shard to acknowledge admission. This is for foreign runtimes
+    /// whose `spawn` contract cannot return an admission result (for example,
+    /// Quinn's runtime trait). The bounded inbox still provides backpressure;
+    /// this only avoids blocking the caller while a parked shard is waking.
+    pub fn spawn_detached<F>(&self, future: F) -> Result<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let _admission = self.begin_admission()?;
+        let start_core = self.select_spawn_core();
+        let task_id = self.next_task_id_for_core(start_core);
+        let message = CoreMessage::Task {
+            id: task_id,
+            future: Box::pin(DetachedTaskFuture::new(future)),
+            reply: None,
+        };
+        match self.core_senders[start_core].try_send(message) {
+            Ok(()) => {
+                self.notify_core(start_core);
+                Ok(task_id)
+            }
+            Err(TrySendError::Full(_)) => Err(RuntimeError::TaskFailed(format!(
+                "Core {start_core} message queue is full"
+            ))),
+            Err(TrySendError::Disconnected(_)) => Err(RuntimeError::TaskFailed(
+                "worker core is not running".to_string(),
+            )),
+        }
+    }
+
     /// Spawn task on a specific core
     ///
     /// This preserves explicit affinity but may still cross a core boundary if

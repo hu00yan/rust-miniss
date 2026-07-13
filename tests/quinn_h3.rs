@@ -22,7 +22,6 @@ fn build_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 }
 
 #[test]
-#[ignore = "QUIC/H3 runtime driver does not complete the local UDP exchange yet"]
 fn quinn_and_h3_quinn_run_on_miniss() {
     let io_runtime = MultiCoreRuntime::new(Some(1)).unwrap();
     let app_runtime = Runtime::new();

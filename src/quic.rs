@@ -51,7 +51,7 @@ impl QuinnRuntimeTrait for MinissQuicRuntime {
                 .expect("quinn local background task spawn failed");
         } else {
             self.runtime
-                .spawn(future)
+                .spawn_detached(future)
                 .expect("quinn background task spawn failed");
         }
     }
@@ -258,6 +258,7 @@ impl AsyncUdpSocket for MinissUdpSocket {
 #[derive(Debug)]
 struct MinissUdpPoller {
     socket: Arc<MinissUdpSocket>,
+    #[cfg(not(target_os = "macos"))]
     token: AtomicU64,
     owner_core: AtomicUsize,
 }
@@ -266,11 +267,13 @@ impl MinissUdpPoller {
     fn new(socket: Arc<MinissUdpSocket>) -> Self {
         Self {
             socket,
+            #[cfg(not(target_os = "macos"))]
             token: AtomicU64::new(0),
             owner_core: AtomicUsize::new(UNOWNED_CORE),
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn load_token(&self) -> Option<IoToken> {
         let id = self.token.load(Ordering::Acquire);
         if id == 0 {
@@ -280,10 +283,12 @@ impl MinissUdpPoller {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn store_token(&self, token: IoToken) {
         self.token.store(token.id(), Ordering::Release);
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn clear_token(&self, token: IoToken) {
         let _ = self
             .token
@@ -310,6 +315,7 @@ impl MinissUdpPoller {
 
 impl Drop for MinissUdpPoller {
     fn drop(&mut self) {
+        #[cfg(not(target_os = "macos"))]
         if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
             if let Some(token) = self.load_token() {
                 with_io_state(|state| unsafe {
@@ -328,40 +334,51 @@ impl UdpPoller for MinissUdpPoller {
         if let Err(err) = self.ensure_owner() {
             return Poll::Ready(Err(err));
         }
-        with_io_state(|state| {
-            if let Some(token) = self.load_token() {
-                // See poll_recv: io_uring fused completions wake the owner
-                // task with a result that is not stored in the shared table.
-                if let Some(result) = unsafe { state.take_owner_completion(token) }
-                    .or_else(|| unsafe { state.take_completed(token) })
-                {
-                    self.clear_token(token);
-                    return match result {
-                        Ok(_) => Poll::Ready(Ok(())),
-                        Err(err) => Poll::Ready(Err(err.into())),
-                    };
+        // macOS/kqueue does not reliably deliver EVFILT_WRITE readiness for
+        // UDP sockets. Datagram sends are normally immediately writable; let
+        // Quinn attempt the send and handle an actual WouldBlock itself.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = cx;
+            Poll::Ready(Ok(()))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            with_io_state(|state| {
+                if let Some(token) = self.load_token() {
+                    // See poll_recv: io_uring fused completions wake the owner
+                    // task with a result that is not stored in the shared table.
+                    if let Some(result) = unsafe { state.take_owner_completion(token) }
+                        .or_else(|| unsafe { state.take_completed(token) })
+                    {
+                        self.clear_token(token);
+                        return match result {
+                            Ok(_) => Poll::Ready(Ok(())),
+                            Err(err) => Poll::Ready(Err(err.into())),
+                        };
+                    }
+                    unsafe {
+                        state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+                    }
+                    return Poll::Pending;
                 }
+
+                let op = crate::io::Op::PollAdd {
+                    fd: self.socket.inner.as_raw_fd(),
+                    events: libc::POLLOUT as u32,
+                    multishot: false,
+                };
+                let token = match state.io_backend.submit(op) {
+                    Ok(token) => token,
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                };
+                self.store_token(token);
                 unsafe {
                     state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
                 }
-                return Poll::Pending;
-            }
-
-            let op = crate::io::Op::PollAdd {
-                fd: self.socket.inner.as_raw_fd(),
-                events: libc::POLLOUT as u32,
-                multishot: false,
-            };
-            let token = match state.io_backend.submit(op) {
-                Ok(token) => token,
-                Err(error) => return Poll::Ready(Err(error.into())),
-            };
-            self.store_token(token);
-            unsafe {
-                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-            }
-            state.io_backend.flush();
-            Poll::Pending
-        })
+                state.io_backend.flush();
+                Poll::Pending
+            })
+        }
     }
 }

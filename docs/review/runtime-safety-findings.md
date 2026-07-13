@@ -29,17 +29,16 @@ are not silently mixed into the implementation batch.
    `multicore::tests::cancel_reports_owner_acknowledgement` and
    `task::tests::join_handle_cancel_waits_for_owner_poll_ack`.
 9. The HTTP/2 regression is covered by `tests/hyper_http2.rs` with a bounded
-   Hyper/h2 exchange. The QUIC/H3 test remains explicitly ignored while the
-   macOS kqueue path is repaired; Linux has a bounded passing exchange. The
-   async file regression remains ignored on macOS after its one-second bound
-   exposed a kqueue wakeup gap. `just test-fast` remains deterministic.
+   Hyper/h2 exchange. The QUIC/H3 exchange is now bounded and runs on both
+   macOS kqueue and Linux io_uring. The async file regression remains ignored
+   on macOS after its one-second bound exposed a separate kqueue wakeup gap.
+   `just test-fast` remains deterministic.
 10. `cargo test --all-targets` also launches benchmark binaries; one of them
     starts a listening HTTP server and can consume a full CPU while waiting for
     clients. The default `just test` recipe now uses `--tests --examples` and
     leaves benchmarks opt-in.
-11. The bounded QUIC/H3 exchange passes on Linux io_uring but still times out
-    on macOS kqueue. Two completion defects are fixed: QUIC readiness now
-    consumes owner-local fused completions, and non-Linux backends route their
-    completion queue through the owner-task protocol. The UDP wrapper also sets
-    sockets nonblocking. The remaining macOS issue is kqueue readiness delivery
-    and must not be treated as verified until the ignored test passes there.
+11. The bounded QUIC/H3 exchange passes on macOS kqueue and Linux io_uring.
+    The fixes include owner-local fused completion consumption, portable
+    non-Linux completion routing, explicit `PollAdd` completion handling in the
+    mio backend, nonblocking UDP sockets, and macOS UDP write-readiness
+    handling that avoids unsupported kqueue write filters.

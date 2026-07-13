@@ -539,7 +539,6 @@ impl IoProvider for EpollBackend {
                 TaskPoll::Ready(completions)
             };
         }
-
         // First, handle any events from mio
         for event in events.iter() {
             let mio_token = event.token();
@@ -1054,6 +1053,16 @@ impl IoProvider for EpollBackend {
 
                             result
                         }
+                    }
+                    Op::PollAdd { .. } => {
+                        let mut readiness = 0u32;
+                        if event.is_readable() {
+                            readiness |= libc::POLLIN as u32;
+                        }
+                        if event.is_writable() {
+                            readiness |= libc::POLLOUT as u32;
+                        }
+                        Ok(CompletionKind::PollAdd { events: readiness })
                     }
                     // Fsync and Close are not handled in this path currently.
                     _ => continue,
