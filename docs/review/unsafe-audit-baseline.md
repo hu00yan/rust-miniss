@@ -5,18 +5,22 @@ repository architecture scanner with Clippy's
 `clippy::undocumented_unsafe_blocks` lint and a small check for `unsafe fn`
 rustdoc contracts.
 
-Current inventory:
+Initial inventory before remediation:
 
 - 313 `unsafe` occurrences under `src/`; 9 under `tests/`.
-- 59 library unsafe blocks (72 including test targets) are currently rejected
-  by Clippy because they lack an immediately preceding `// SAFETY:` comment.
-- 8 unsafe functions lack a `# Safety` rustdoc section (`src/cpu.rs` and
+- 59 library unsafe blocks (72 including test targets) were rejected by Clippy
+  because they lacked an immediately preceding `// SAFETY:` comment.
+- 8 unsafe functions lacked a `# Safety` rustdoc section (`src/cpu.rs` and
   `src/io/uring.rs`).
 
-This is intentionally a visible failing gate rather than an allowlist. Existing
-violations must be documented in place; new `unsafe` code cannot be merged by
-silently extending a baseline. The fast loop (`just test-fast`) does not invoke
-this relatively slow Clippy gate yet. The submission gate (`just gate`) does.
+The initial inventory was remediated in commit `4245be1`. The current gate runs
+clean: all 294 unsafe blocks have a local explanation and all unsafe functions
+have a `# Safety` section.
+
+This is intentionally a blocking gate rather than an allowlist. New `unsafe`
+code cannot be merged without an explanation. The fast loop (`just test-fast`)
+does not invoke this relatively slow Clippy gate; the submission gate (`just
+gate`) does.
 
 Completion criteria:
 
