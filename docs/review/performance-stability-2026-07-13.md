@@ -132,6 +132,11 @@ figures incomparable. The raw files are under
 `/tmp/miniss-strace-flags-20260713` on Orb; this is supporting evidence for
 the opt-in knob, not a production performance claim.
 
+A six-round wakeup-PollAdd probe (three enabled, three temporarily disabled)
+also rejected removing the eventfd poll: disabled had only about 0.6% higher
+median throughput and about 0.4ms worse median p99. The experiment gate was
+removed; cross-core wakeup polling remains unconditional for correctness.
+
 A follow-up response-path probe using explicit `Connection: close` reached about
 28--36k requests/sec but had 82--98ms p99 under 800 concurrent connections.
 Because every request includes connection setup/teardown, this is not
