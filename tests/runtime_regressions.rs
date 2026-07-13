@@ -168,10 +168,6 @@ fn multicore_block_on_drives_timer_future() {
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "async file completion is currently unverified on the macOS epoll backend"
-)]
 fn multicore_spawned_async_file_future_completes() {
     let runtime = MultiCoreRuntime::new(Some(1)).expect("runtime");
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -188,18 +184,20 @@ fn multicore_spawned_async_file_future_completes() {
         })
         .expect("spawn");
 
-    rx.recv_timeout(Duration::from_secs(1))
-        .expect("async file task completed");
-    assert_eq!(
-        std::fs::read(&temp_path).expect("read back"),
-        b"multicore io"
-    );
-
-    runtime
-        .shutdown_with_timeout(Duration::from_secs(1))
-        .expect("shutdown");
+    // Always shut the runtime down before asserting.  A failed receive used
+    // to panic while the worker was still alive; dropping the runtime then
+    // waited indefinitely on a stuck I/O task and made this regression test
+    // look like an unbounded hang.
+    let completion = rx.recv_timeout(Duration::from_secs(1));
+    let shutdown = runtime.shutdown_with_timeout(Duration::from_secs(1));
     Arc::try_unwrap(runtime)
         .expect("runtime still referenced")
         .join()
         .expect("join");
+    completion.expect("async file task completed");
+    shutdown.expect("shutdown");
+    assert_eq!(
+        std::fs::read(&temp_path).expect("read back"),
+        b"multicore io"
+    );
 }
