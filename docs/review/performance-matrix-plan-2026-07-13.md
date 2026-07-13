@@ -37,6 +37,14 @@ conditions occurs:
 - compared with a locked baseline, throughput regression over 5% or p99
   regression over 10%.
 
+`bench_http.sh` accepts `BENCH_SERVER_CPUS` and `BENCH_CLIENT_CPUS` on Linux.
+When set, it validates the CPU lists, rejects overlap, requires enough server
+CPUs for `HTTP_CORES`, and applies `taskset` to both the server and `wrk`.
+macOS or a host without `taskset` fails explicitly when placement is requested;
+it never silently reports an unpinned run as pinned. `metadata.json` records
+both sets and the placement mode, and baseline comparison requires them to
+match. An unset set is recorded as `unbound` for contention diagnostics.
+
 Record RPS, p50/p99/p99.9, errors, server/client CPU, task-clock, context
 switches, CPU migrations, RSS, `io_uring_enter` per request, and VM steal/load
 signals. The existing `bench_http.sh` remains the per-case runner. The new

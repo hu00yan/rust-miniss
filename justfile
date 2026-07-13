@@ -108,6 +108,8 @@ gate task="" baseline="":
     just check || { echo "YELLOW: check failed"; exit 1; }; \
     echo "=== Gate: arch-audit ==="; \
     just arch-audit || { echo "RED: architecture violation"; exit 2; }; \
+    echo "=== Gate: unsafe-audit ==="; \
+    just unsafe-audit || { echo "RED: unsafe code lacks a safety explanation"; exit 2; }; \
     if [ -n "{{task}}" ]; then \
         echo "=== Gate: diff-audit ==="; \
         just diff-audit {{task}} || { echo "RED: out-of-bounds file change"; exit 3; }; \
@@ -125,6 +127,8 @@ bench-nop:
 
 # Run HTTP echo benchmark
 bench-http:
+    @echo "Optional Linux placement: BENCH_SERVER_CPUS=0-7 BENCH_CLIENT_CPUS=8-9 HTTP_CORES=8 just bench-http"
+    @echo "Unset placement is recorded as unbound and is only a contention diagnostic."
     ./bench/scripts/bench_http.sh
 
 # Evaluate one or more completed bench_http summaries mechanically. Set
@@ -147,6 +151,11 @@ test-fast:
     ./scripts/audit_architecture.sh
     cargo test --lib --test runtime_safety_models
     cargo test --test runtime_regressions
+
+# Explicit unsafe documentation gate. It is included in `just gate`, but not
+# the fast local loop until the existing baseline is fully documented.
+unsafe-audit:
+    ./scripts/check_unsafe_safety.sh
 
 # Check formatting only
 fmt:

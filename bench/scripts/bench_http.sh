@@ -22,6 +22,62 @@ detect_cores() {
 HTTP_CORES=${HTTP_CORES:-$(detect_cores)}
 METRICS_ENABLED=${HTTP_COLLECT_METRICS:-0}
 BENCH_RUNTIMES=${BENCH_RUNTIMES:-"miniss,monoio,compio,tokio,glommio"}
+SERVER_CPUS=${BENCH_SERVER_CPUS:-}
+CLIENT_CPUS=${BENCH_CLIENT_CPUS:-}
+
+# CPU placement is deliberately opt-in.  A same-host run without placement is
+# useful as a contention diagnostic, but must never be mistaken for an
+# isolated server result.  taskset is Linux-only; fail explicitly instead of
+# silently ignoring a requested placement on macOS or another Unix.
+validate_cpu_placement() {
+    if [[ -z "$SERVER_CPUS" && -z "$CLIENT_CPUS" ]]; then
+        AFFINITY_MODE="unbound"
+        return 0
+    fi
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        echo "ERROR: BENCH_SERVER_CPUS/BENCH_CLIENT_CPUS require Linux taskset; requested on $(uname -s)" >&2
+        exit 2
+    fi
+    if ! command -v taskset >/dev/null 2>&1; then
+        echo "ERROR: CPU placement requested but taskset is not installed" >&2
+        exit 2
+    fi
+    for cpu_set in "$SERVER_CPUS" "$CLIENT_CPUS"; do
+        [[ -z "$cpu_set" ]] && continue
+        if ! taskset -c "$cpu_set" true >/dev/null 2>&1; then
+            echo "ERROR: invalid or unavailable CPU set: $cpu_set" >&2
+            exit 2
+        fi
+    done
+    if [[ -n "$SERVER_CPUS" && -n "$CLIENT_CPUS" ]] && perl -e '
+        sub expand { my ($s) = @_; my %seen; for my $part (split /,/, $s) {
+            die "invalid" unless $part =~ /^(\d+)(?:-(\d+))?$/;
+            my ($a, $b) = ($1, defined($2) ? $2 : $1); die "invalid" if $b < $a;
+            $seen{$_} = 1 for $a .. $b;
+        } return \%seen; }
+        my ($a, $b) = (expand($ARGV[0]), expand($ARGV[1]));
+        exit scalar(grep { exists $b->{$_} } keys %$a) ? 0 : 1;
+    ' "$SERVER_CPUS" "$CLIENT_CPUS"; then
+        echo "ERROR: server and client CPU sets overlap ($SERVER_CPUS vs $CLIENT_CPUS)" >&2
+        exit 2
+    fi
+    if [[ -n "$SERVER_CPUS" ]]; then
+        local server_count
+        server_count=$(perl -e '
+            my $n = 0; for my $part (split /,/, $ARGV[0]) {
+                $part =~ /^(\d+)(?:-(\d+))?$/ or die "invalid cpu set\n";
+                $n += (defined($2) ? $2 : $1) - $1 + 1;
+            } print $n;
+        ' "$SERVER_CPUS")
+        if (( server_count < HTTP_CORES )); then
+            echo "ERROR: BENCH_SERVER_CPUS has $server_count CPUs but HTTP_CORES=$HTTP_CORES" >&2
+            exit 2
+        fi
+    fi
+    AFFINITY_MODE="taskset"
+}
+
+validate_cpu_placement
 
 mkdir -p "$OUT_DIR"
 
@@ -42,13 +98,14 @@ CPU_MODEL=${CPU_MODEL:-unknown}
 # presented as a same-machine regression baseline.
 perl -MJSON::PP=encode_json -e '
     my ($path, @values) = @ARGV;
-    my @keys = qw(host os kernel cpu_model cores threads connections duration runtime);
+    my @keys = qw(host os kernel cpu_model cores threads connections duration runtime server_cpus client_cpus affinity_mode);
     my %metadata; @metadata{@keys} = @values;
     open my $fh, ">", $path or die "cannot write $path: $!\n";
     print {$fh} encode_json(\%metadata), "\n";
 ' "$OUT_DIR/metadata.json" \
     "$HOST_NAME" "$OS_NAME" "$KERNEL_RELEASE" "$CPU_MODEL" "$HTTP_CORES" \
-    "$THREADS" "$CONNECTIONS" "$DURATION" "$BENCH_RUNTIMES"
+    "$THREADS" "$CONNECTIONS" "$DURATION" "$BENCH_RUNTIMES" \
+    "${SERVER_CPUS:-unbound}" "${CLIENT_CPUS:-unbound}" "$AFFINITY_MODE"
 
 if ! command -v wrk >/dev/null 2>&1; then
     echo "ERROR: wrk is not installed" >&2
@@ -64,6 +121,7 @@ cd "$ROOT"
 
 echo "output_dir=$OUT_DIR"
 echo "duration=${DURATION}s connections=$CONNECTIONS threads=$THREADS http_cores=$HTTP_CORES"
+echo "cpu_placement=$AFFINITY_MODE server=${SERVER_CPUS:-unbound} client=${CLIENT_CPUS:-unbound}"
 if [[ "${HTTP_CONNECTION_CLOSE:-0}" = "1" ]]; then
     echo "connection=close"
 fi
@@ -180,6 +238,14 @@ start_perf_stat() {
     PERF_PID=$!
 }
 
+run_wrk() {
+    if [[ -n "$CLIENT_CPUS" ]]; then
+        taskset -c "$CLIENT_CPUS" wrk "$@"
+    else
+        wrk "$@"
+    fi
+}
+
 parse_wrk() {
     local name=$1
     local port=$2
@@ -264,7 +330,11 @@ run_benchmark() {
     rm -f "$raw_log" "$server_log"
 
     echo "== $name =="
-    "$binary" --addr "127.0.0.1:$port" "${extra_args[@]}" >"$server_log" 2>&1 &
+    if [[ -n "$SERVER_CPUS" ]]; then
+        taskset -c "$SERVER_CPUS" "$binary" --addr "127.0.0.1:$port" "${extra_args[@]}" >"$server_log" 2>&1 &
+    else
+        "$binary" --addr "127.0.0.1:$port" "${extra_args[@]}" >"$server_log" 2>&1 &
+    fi
     server_pid=$!
 
     if ! wait_for_port "$port"; then
@@ -280,7 +350,7 @@ run_benchmark() {
 
     local perf_pid=""
     local rss_pid=""
-    wrk --latency -t1 -c10 -d3s --timeout 5s "${wrk_headers[@]}" "$addr" >/dev/null
+    run_wrk --latency -t1 -c10 -d3s --timeout 5s "${wrk_headers[@]}" "$addr" >/dev/null
 
     # Start diagnostics only after warmup so task-clock/syscall/RSS samples
     # describe the measured window rather than the server startup and warmup.
@@ -291,7 +361,7 @@ run_benchmark() {
         rss_pid=$RSS_PID
     fi
 
-    wrk --latency -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" --timeout 10s "${wrk_headers[@]}" "$addr" >"$raw_log" 2>&1
+    run_wrk --latency -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" --timeout 10s "${wrk_headers[@]}" "$addr" >"$raw_log" 2>&1
 
     if [[ -n "$perf_pid" && "$perf_pid" != "0" ]]; then
         wait "$perf_pid" >/dev/null 2>&1 || true

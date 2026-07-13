@@ -51,7 +51,7 @@ my $baseline = read_row($baseline_path);
 my $current = read_row($current_path);
 my ($baseline_metadata_path, $baseline_metadata) = read_metadata($baseline_path);
 my ($current_metadata_path, $current_metadata) = read_metadata($current_path);
-my @metadata_fields = qw(host os kernel cpu_model cores threads connections duration runtime);
+my @metadata_fields = qw(host os kernel cpu_model cores threads connections duration runtime server_cpus client_cpus affinity_mode);
 for my $field (@metadata_fields) {
     die "missing metadata field '$field' in $baseline_metadata_path\n"
         unless defined $baseline_metadata->{$field};
