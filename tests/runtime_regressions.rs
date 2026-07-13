@@ -2,6 +2,48 @@ use rust_miniss::{AsyncFile, Executor, MultiCoreRuntime, Runtime, TaskError};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Keep worker cleanup ahead of assertions.  Dropping a live runtime joins
+/// workers, so an assertion panic must first send the bounded force-shutdown
+/// signal instead of turning the failure into an unbounded hang.
+struct RuntimeGuard {
+    runtime: Option<Arc<MultiCoreRuntime>>,
+    timeout: Duration,
+}
+
+impl RuntimeGuard {
+    fn new(runtime: Arc<MultiCoreRuntime>) -> Self {
+        Self {
+            runtime: Some(runtime),
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn runtime(&self) -> &Arc<MultiCoreRuntime> {
+        self.runtime.as_ref().expect("runtime guard is active")
+    }
+
+    fn finish(mut self) {
+        let runtime = self.runtime.take().expect("runtime guard is active");
+        let shutdown = runtime.shutdown_with_timeout(self.timeout);
+        let runtime = Arc::try_unwrap(runtime).expect("test retained a runtime reference");
+        let joined = runtime.join();
+        shutdown.expect("runtime shutdown request");
+        joined.expect("runtime workers joined");
+    }
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let _ = runtime.shutdown_with_timeout(self.timeout);
+        if let Ok(runtime) = Arc::try_unwrap(runtime) {
+            let _ = runtime.join();
+        }
+    }
+}
+
 #[test]
 fn join_handle_is_finished_does_not_consume_result() {
     let mut executor = Executor::new();
@@ -131,10 +173,11 @@ fn tcp_accept_multishot_completes_after_delayed_connect() {
 
 #[test]
 fn multicore_spawned_timer_future_completes() {
-    let runtime = MultiCoreRuntime::new(Some(1)).expect("runtime");
+    let guard = RuntimeGuard::new(MultiCoreRuntime::new(Some(1)).expect("runtime"));
     let (tx, rx) = std::sync::mpsc::channel();
 
-    runtime
+    guard
+        .runtime()
         .spawn(async move {
             rust_miniss::sleep(Duration::from_millis(5)).await;
             tx.send(()).expect("send completion");
@@ -143,39 +186,32 @@ fn multicore_spawned_timer_future_completes() {
 
     rx.recv_timeout(Duration::from_secs(1))
         .expect("timer task completed");
-    runtime.shutdown().expect("shutdown");
-    Arc::try_unwrap(runtime)
-        .expect("runtime still referenced")
-        .join()
-        .expect("join");
+    guard.finish();
 }
 
 #[test]
 fn multicore_block_on_drives_timer_future() {
-    let runtime = MultiCoreRuntime::new(Some(1)).expect("runtime");
+    let guard = RuntimeGuard::new(MultiCoreRuntime::new(Some(1)).expect("runtime"));
 
-    let result = runtime.block_on(async {
+    let result = guard.runtime().block_on(async {
         rust_miniss::sleep(Duration::from_millis(5)).await;
         7
     });
 
     assert_eq!(result, 7);
-    runtime.shutdown().expect("shutdown");
-    Arc::try_unwrap(runtime)
-        .expect("runtime still referenced")
-        .join()
-        .expect("join");
+    guard.finish();
 }
 
 #[test]
 fn multicore_spawned_async_file_future_completes() {
-    let runtime = MultiCoreRuntime::new(Some(1)).expect("runtime");
+    let guard = RuntimeGuard::new(MultiCoreRuntime::new(Some(1)).expect("runtime"));
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let temp_path = temp_dir.path().join("multicore-io.txt");
     let task_path = temp_path.clone();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    runtime
+    guard
+        .runtime()
         .spawn(async move {
             let file = AsyncFile::create(&task_path).expect("create");
             file.write_at(0, b"multicore io").await.expect("write");
@@ -189,13 +225,8 @@ fn multicore_spawned_async_file_future_completes() {
     // waited indefinitely on a stuck I/O task and made this regression test
     // look like an unbounded hang.
     let completion = rx.recv_timeout(Duration::from_secs(1));
-    let shutdown = runtime.shutdown_with_timeout(Duration::from_secs(1));
-    Arc::try_unwrap(runtime)
-        .expect("runtime still referenced")
-        .join()
-        .expect("join");
+    guard.finish();
     completion.expect("async file task completed");
-    shutdown.expect("shutdown");
     assert_eq!(
         std::fs::read(&temp_path).expect("read back"),
         b"multicore io"

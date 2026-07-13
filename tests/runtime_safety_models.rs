@@ -555,6 +555,50 @@ fn op_action() -> impl Strategy<Value = OpAction> {
     ]
 }
 
+/// A named replay case complements shrinking: it documents the shortest
+/// lifecycle sequence that previously allowed a stale wake or token to affect
+/// a replacement task.  Keep this deterministic case small so it remains a
+/// useful smoke test when property tests are temporarily disabled.
+#[test]
+fn task_slot_stale_message_replay_is_harmless() {
+    let mut model = TaskSlotModel::default();
+    for action in [
+        TaskAction::Allocate,
+        TaskAction::Complete,
+        TaskAction::Cleanup,
+        TaskAction::Allocate,
+        TaskAction::Poll,
+        TaskAction::WakeStale,
+        TaskAction::CancelStale,
+    ] {
+        model.apply(action);
+        model.check();
+    }
+    assert!(model.live);
+    assert_eq!(model.generation, 1);
+    assert!(!model.cancel_requested);
+    assert!(!model.ready_pending);
+}
+
+#[test]
+fn operation_replay_reclaims_every_resource_after_waiter_abandonment() {
+    let mut model = OperationModel::default();
+    for action in [
+        OpAction::Allocate,
+        OpAction::Queue,
+        OpAction::Submit,
+        OpAction::AbandonWaiter,
+        OpAction::RequestCancel,
+        OpAction::CompleteCancelled,
+        OpAction::Discard,
+        OpAction::Reclaim,
+    ] {
+        model.apply(action);
+        model.check();
+    }
+    model.owner_shutdown_finalize();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
