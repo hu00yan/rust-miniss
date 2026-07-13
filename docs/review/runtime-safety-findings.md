@@ -30,8 +30,8 @@ are not silently mixed into the implementation batch.
    `task::tests::join_handle_cancel_waits_for_owner_poll_ack`.
 9. The HTTP/2 regression is covered by `tests/hyper_http2.rs` with a bounded
    Hyper/h2 exchange. The QUIC/H3 exchange is now bounded and runs on both
-   macOS kqueue and Linux io_uring. The async file regression remains ignored
-   on macOS after its one-second bound exposed a separate kqueue wakeup gap.
+   macOS kqueue and Linux io_uring. The async file regression is bounded and
+   runs on both supported backends.
    `just test-fast` remains deterministic.
 10. `cargo test --all-targets` also launches benchmark binaries; one of them
     starts a listening HTTP server and can consume a full CPU while waiting for

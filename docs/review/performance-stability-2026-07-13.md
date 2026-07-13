@@ -54,7 +54,6 @@ This is sufficient for the tested loopback and compatibility scenarios, but
 not a claim of complete protocol coverage. Still-open obligations include
 HTTP/2 flow-control/error matrices, QUIC migration/0-RTT/datagram/stream-reset
 coverage, multicore QUIC affinity, UDP ownership stress, and a Linux CI gate.
-One async-file regression remains explicitly ignored on the macOS backend.
 
 The supported-platform contract is intentionally narrow: Linux requires
 kernel 6.12+ for io_uring and macOS uses kqueue. There is no Linux epoll
