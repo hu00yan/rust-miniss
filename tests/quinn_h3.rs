@@ -30,6 +30,7 @@ fn quinn_and_h3_quinn_run_on_miniss() {
     let quic_runtime_source = io_runtime.clone();
     app_runtime.block_on(async move {
         let quic_runtime = Arc::new(MinissQuicRuntime::new(quic_runtime_source));
+        let (response_done_tx, response_done_rx) = futures::channel::oneshot::channel();
         let (cert, key) = build_certs();
 
         let mut server_crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -103,6 +104,7 @@ fn quinn_and_h3_quinn_run_on_miniss() {
                 .await
                 .unwrap();
             stream.finish().await.unwrap();
+            let _ = response_done_rx.await;
         };
 
         let client_task = async move {
@@ -128,6 +130,7 @@ fn quinn_and_h3_quinn_run_on_miniss() {
                 let body = request_stream.recv_data().await.unwrap().unwrap();
                 assert_eq!(body.chunk(), b"hello h3");
                 assert!(request_stream.recv_data().await.unwrap().is_none());
+                let _ = response_done_tx.send(());
             };
 
             let (_, _) = future::join(driver_task, request_task).await;

@@ -194,7 +194,13 @@ impl AsyncUdpSocket for MinissUdpSocket {
         }
         with_io_state(|state| {
             if let Some(token) = self.load_recv_token() {
-                if let Some(result) = unsafe { state.take_completed(token) } {
+                // Fused completions are delivered through the owner completion
+                // slot before the task is polled. Consume that slot first;
+                // falling back to the shared completion table covers backends
+                // which publish completion records there.
+                if let Some(result) = unsafe { state.take_owner_completion(token) }
+                    .or_else(|| unsafe { state.take_completed(token) })
+                {
                     self.clear_recv_token(token);
                     match result {
                         Ok(_) => {}
@@ -324,7 +330,11 @@ impl UdpPoller for MinissUdpPoller {
         }
         with_io_state(|state| {
             if let Some(token) = self.load_token() {
-                if let Some(result) = unsafe { state.take_completed(token) } {
+                // See poll_recv: io_uring fused completions wake the owner
+                // task with a result that is not stored in the shared table.
+                if let Some(result) = unsafe { state.take_owner_completion(token) }
+                    .or_else(|| unsafe { state.take_completed(token) })
+                {
                     self.clear_token(token);
                     return match result {
                         Ok(_) => Poll::Ready(Ok(())),

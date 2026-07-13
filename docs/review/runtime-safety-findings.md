@@ -28,21 +28,18 @@ are not silently mixed into the implementation batch.
    removed: owner acknowledgement is already covered deterministically by
    `multicore::tests::cancel_reports_owner_acknowledgement` and
    `task::tests::join_handle_cancel_waits_for_owner_poll_ack`.
-9. The former `hyper_http2_connection_runs_on_miniss` test encoded a
-   cross-thread `Send` requirement that conflicts with shard-local
-   `AsyncTcpStream`; it was removed rather than weakening the ownership
-   contract. The QUIC/H3 test is now explicitly ignored because it has no
-   bounded Linux-only harness and can outlive the macOS test runner. The async
-   file regression is also ignored on macOS after its one-second completion
-   bound exposed an epoll wakeup gap; Linux remains the required backend gate.
-   `just test-fast` remains deterministic.
+9. The HTTP/2 regression is covered by `tests/hyper_http2.rs` with a bounded
+   Hyper/h2 exchange. The QUIC/H3 test remains explicitly ignored while the
+   macOS kqueue path is repaired; Linux has a bounded passing exchange. The
+   async file regression remains ignored on macOS after its one-second bound
+   exposed a kqueue wakeup gap. `just test-fast` remains deterministic.
 10. `cargo test --all-targets` also launches benchmark binaries; one of them
     starts a listening HTTP server and can consume a full CPU while waiting for
     clients. The default `just test` recipe now uses `--tests --examples` and
     leaves benchmarks opt-in.
-11. The bounded QUIC/H3 exchange still times out after five seconds on both
-    macOS kqueue and Linux io_uring. The test remains explicitly ignored on all
-    platforms; this is an integration defect, not evidence that QUIC/H3 works.
-    The UDP wrapper now sets sockets nonblocking before handing them to Quinn,
-    removing one confirmed blocking-I/O defect while the driver wakeup path
-    remains unresolved.
+11. The bounded QUIC/H3 exchange passes on Linux io_uring but still times out
+    on macOS kqueue. Two completion defects are fixed: QUIC readiness now
+    consumes owner-local fused completions, and non-Linux backends route their
+    completion queue through the owner-task protocol. The UDP wrapper also sets
+    sockets nonblocking. The remaining macOS issue is kqueue readiness delivery
+    and must not be treated as verified until the ignored test passes there.

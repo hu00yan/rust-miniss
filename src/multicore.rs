@@ -936,7 +936,7 @@ impl CpuCore {
         #[cfg(target_os = "linux")]
         let wakeup_token = self.wakeup_poll_token;
         #[cfg(not(target_os = "linux"))]
-        let wakeup_token: Option<IoToken> = None;
+        let _wakeup_token: Option<IoToken> = None;
 
         // Empty or nearly-empty ready queues can afford a larger CQE drain batch.
         let drain_limit = crate::config::io_drain_limit().unwrap_or_else(|| {
@@ -956,10 +956,37 @@ impl CpuCore {
                 .drain_completions_fused(wakeup_token, drain_limit)
         };
         #[cfg(not(target_os = "linux"))]
-        let (count, saw_wakeup_poll, wakeups) = unsafe {
-            self.io_state
+        let (count, saw_wakeup_poll, wakeups) = {
+            // kqueue/mio uses the portable completion queue rather than the
+            // io_uring fused path. Route those completions through the same
+            // owner-task protocol before polling the ready queue; otherwise
+            // readiness CQEs remain invisible to shard-local futures.
+            let mut completions = Vec::with_capacity(drain_limit);
+            let drained = self
+                .io_state
                 .io_backend
-                .drain_completions_fused(wakeup_token, drain_limit)
+                .drain_completions_into(&mut completions);
+            if drained.is_pending() {
+                (0, false, 0)
+            } else {
+                let count = completions.len();
+                let mut wakeups = 0usize;
+                for (token, result) in completions {
+                    if unsafe { self.io_state.take_discarded(token) } {
+                        continue;
+                    }
+                    if let Some(task_id) = unsafe { self.io_state.take_pending_task(token) } {
+                        unsafe { self.io_state.push_owner_completion(task_id, token, result) };
+                        let _ = unsafe { self.io_state.take_waker(token) };
+                    } else if let Some(waker) =
+                        unsafe { self.io_state.insert_completed_and_take_waker(token, result) }
+                    {
+                        wakeups += 1;
+                        waker.wake();
+                    }
+                }
+                (count, false, wakeups)
+            }
         };
 
         #[cfg(target_os = "linux")]
@@ -1059,6 +1086,8 @@ pub struct MultiCoreRuntime {
     /// Thread join handles. This lock is control-plane only: worker hot paths
     /// never access it, while it lets the global OnceLock owner join safely.
     join_handles: parking_lot::Mutex<Vec<thread::JoinHandle<Result<()>>>>,
+    /// Control-plane handles used to wake parked workers after task admission.
+    core_threads: Vec<thread::Thread>,
     /// Per-core task sequence counters.
     task_counters: Vec<AtomicU64>,
     /// Runtime state
@@ -1216,6 +1245,7 @@ impl MultiCoreRuntime {
         #[cfg(target_os = "linux")]
         let mut core_wakeup_fds = Vec::with_capacity(num_cores);
         let mut join_handles = Vec::with_capacity(num_cores);
+        let mut core_threads = Vec::with_capacity(num_cores);
         let mut ready_receivers = Vec::with_capacity(num_cores);
         let mut task_counters = Vec::with_capacity(num_cores);
 
@@ -1298,6 +1328,7 @@ impl MultiCoreRuntime {
                     RuntimeError::TaskFailed(format!("Failed to spawn core thread: {e}"))
                 })?;
 
+            core_threads.push(handle.thread().clone());
             join_handles.push(handle);
         }
 
@@ -1341,6 +1372,7 @@ impl MultiCoreRuntime {
             #[cfg(target_os = "linux")]
             core_wakeup_fds,
             join_handles: parking_lot::Mutex::new(join_handles),
+            core_threads,
             task_counters,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
             shutdown_phase: AtomicU8::new(ShutdownPhase::Running as u8),
@@ -1356,17 +1388,16 @@ impl MultiCoreRuntime {
         Ok(runtime)
     }
 
-    #[cfg(target_os = "linux")]
     #[inline]
     fn notify_core(&self, core_id: usize) {
-        if self.core_sleeping[core_id].load(Ordering::Acquire) {
-            notify_wakeup_eventfd(self.core_wakeup_fds[core_id].as_raw_fd());
+        self.core_threads[core_id].unpark();
+        #[cfg(target_os = "linux")]
+        {
+            if self.core_sleeping[core_id].load(Ordering::Acquire) {
+                notify_wakeup_eventfd(self.core_wakeup_fds[core_id].as_raw_fd());
+            }
         }
     }
-
-    #[cfg(not(target_os = "linux"))]
-    #[inline]
-    fn notify_core(&self, _core_id: usize) {}
 
     /// Create IO backend for a specific core
     fn create_io_backend(core_id: usize) -> Result<Box<dyn IoProvider<Completion = IoCompletion>>> {
