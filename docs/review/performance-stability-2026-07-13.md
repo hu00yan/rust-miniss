@@ -100,3 +100,10 @@ request into that read, the parser can reject the combined data and close the
 connection. The probe produced only 18--399 requests/sec at 10--800
 connections, so it is not a valid latency baseline. A keep-alive buffering
 regression test is required before using the high-level HTTP path for tuning.
+
+After the buffering fix, the frozen static runner was rerun for three pinned
+rounds at 4 workers / 800 connections / 8 client threads. It completed with
+zero errors and p99 values of 9.20, 8.90, and 9.79 ms (RPS 849,176 / 812,857 /
+843,113). This is within the previously observed VM spread and is not claimed
+as a latency improvement; the raw run is retained at
+`/tmp/miniss-http-regression-20260713` on Orb.
