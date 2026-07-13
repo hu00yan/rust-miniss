@@ -137,6 +137,10 @@ also rejected removing the eventfd poll: disabled had only about 0.6% higher
 median throughput and about 0.4ms worse median p99. The experiment gate was
 removed; cross-core wakeup polling remains unconditional for correctness.
 
+For the static response path, a six-round probe forcing an immediate flush
+after every `WriteStatic` also regressed: median throughput fell about 0.5% and
+median p99 rose about 0.6ms. The batch flush policy remains unchanged.
+
 A follow-up response-path probe using explicit `Connection: close` reached about
 28--36k requests/sec but had 82--98ms p99 under 800 concurrent connections.
 Because every request includes connection setup/teardown, this is not
