@@ -74,3 +74,12 @@ the full HTTP response path: `HttpConnection::send_response` constructs header
 storage and its vectored EAGAIN path may copy body/header buffers. That is a
 separate, unverified latency hypothesis and must be measured with a workload
 that actually exercises partial writes before changing it.
+
+An additional six-sample Orb run compared `MINISS_URING_FLUSH_BATCH_SIZE=32`
+with the default 61 in alternating order (the same 4/4 CPU split, 800
+connections, 8 client threads, 5 seconds, and zero errors). The default had
+median 793,116 RPS and median p99 10.73 ms; 32 had median 715,791 RPS and
+median p99 10.31 ms. The small p99 difference is not worth the roughly 9.8%
+throughput loss, so no flush-batch change is justified. Orb's perf tracepoint
+permissions rejected `syscalls:sys_enter_io_uring_enter`; syscall counts remain
+an explicit measurement gap rather than an inferred value.
