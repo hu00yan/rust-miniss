@@ -117,6 +117,14 @@ default-versus-opt-in confirmation reversed the p99 ordering (9.23 ms versus
 promoted to a new default. The source remains COOP_TASKRUN-on with
 SINGLE_ISSUER/SQPOLL opt-in.
 
+Because Orb's perf tracepoint is unavailable, a separate `strace -f -c` probe
+measured syscall volume only (not latency). At 100 connections and 2 seconds,
+`SINGLE_ISSUER` produced 65,662 `io_uring_enter` calls versus 74,262 for the
+baseline (about 11.6% fewer), but strace changed scheduling and made its RPS
+figures incomparable. The raw files are under
+`/tmp/miniss-strace-flags-20260713` on Orb; this is supporting evidence for
+the opt-in knob, not a production performance claim.
+
 A follow-up response-path probe using explicit `Connection: close` reached about
 28--36k requests/sec but had 82--98ms p99 under 800 concurrent connections.
 Because every request includes connection setup/teardown, this is not
