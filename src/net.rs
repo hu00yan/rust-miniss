@@ -356,6 +356,26 @@ impl AsyncTcpStream {
     /// Write a static byte slice without copying it into an owned Buffer.
     pub async fn write_static_all(&self, mut data: &'static [u8]) -> io::Result<()> {
         while !data.is_empty() {
+            // Tiny static responses usually fit the socket send buffer. Use the
+            // nonblocking fast path first to avoid an avoidable SQE/CQE round
+            // trip; EAGAIN still falls back to the owner-thread io_uring path.
+            // Set MINISS_NO_STATIC_TRY_WRITE=1 for controlled comparison.
+            if std::env::var_os("MINISS_NO_STATIC_TRY_WRITE").is_none() {
+                match try_write(self.as_raw_fd(), data) {
+                    Ok(bytes_written) if bytes_written > 0 => {
+                        data = &data[bytes_written..];
+                        continue;
+                    }
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write_static_all wrote zero bytes",
+                        ));
+                    }
+                    Err(error) if is_wouldblock(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             let op = crate::io::Op::WriteStatic {
                 fd: self.as_raw_fd(),
                 data,

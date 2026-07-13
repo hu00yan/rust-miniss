@@ -141,6 +141,15 @@ For the static response path, a six-round probe forcing an immediate flush
 after every `WriteStatic` also regressed: median throughput fell about 0.5% and
 median p99 rose about 0.6ms. The batch flush policy remains unchanged.
 
+The successful latency change is a different fast path: `write_static_all`
+now attempts the existing nonblocking `try_write` before allocating an io_uring
+operation, and falls back to io_uring only on EAGAIN. In the final six-round
+interleaved confirmation, this default path had p99 7.50--7.61ms (median
+7.53ms) versus 8.92--9.88ms (median 9.76ms) with
+`MINISS_NO_STATIC_TRY_WRITE=1`; throughput was about 1.3% lower and all rounds
+had zero errors. Metrics showed roughly 47% fewer completions and 42% fewer
+parks. The fallback remains available for regression diagnosis.
+
 A follow-up response-path probe using explicit `Connection: close` reached about
 28--36k requests/sec but had 82--98ms p99 under 800 concurrent connections.
 Because every request includes connection setup/teardown, this is not
