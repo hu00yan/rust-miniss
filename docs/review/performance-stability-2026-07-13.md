@@ -108,6 +108,15 @@ zero errors and p99 values of 9.20, 8.90, and 9.79 ms (RPS 849,176 / 812,857 /
 as a latency improvement; the raw run is retained at
 `/tmp/miniss-http-regression-20260713` on Orb.
 
+io_uring feature probes were run with the same pinned load. In the initial
+three-round screen, disabling COOP_TASKRUN reduced p99 slightly but lost about
+8% throughput; SQPOLL lost about 6% throughput. A seven-round `SINGLE_ISSUER`
+versus baseline set was initially promising, but a final six-round interleaved
+default-versus-opt-in confirmation reversed the p99 ordering (9.23 ms versus
+8.97 ms median) while throughput varied with the VM. None of these flags is
+promoted to a new default. The source remains COOP_TASKRUN-on with
+SINGLE_ISSUER/SQPOLL opt-in.
+
 A follow-up response-path probe using explicit `Connection: close` reached about
 28--36k requests/sec but had 82--98ms p99 under 800 concurrent connections.
 Because every request includes connection setup/teardown, this is not

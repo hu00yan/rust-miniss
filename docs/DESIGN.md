@@ -239,10 +239,10 @@ draining
 
 | 开关 | 当前策略 | 观测结论 |
 |------|----------|----------|
-| `MINISS_URING_SINGLE_ISSUER` | 仅在实验时开启 | 800 keep-alive 的 10s 样本里 p99 有改善，但仍明显慢于 monoio / compio；不适合作为默认值。 |
+| `MINISS_URING_SINGLE_ISSUER` | 仅在实验时开启 | 多轮 800 keep-alive 交错样本中收益不稳定；不适合作为默认值。 |
 | `MINISS_URING_SQPOLL` | 仅在实验时开启 | 在 OrbStack VM 的 800 keep-alive 样本里 p99 优于 baseline，但尾延迟仍不及 monoio / compio；对 VM / 内核配置敏感。 |
 | `MINISS_URING_DEFER_TASKRUN` | 默认关闭 | 在当前 OrbStack 内核上启用时，runtime 直接报 `No suitable IO backend available`，说明这类 taskrun 语义不是所有环境都可用。 |
-| `MINISS_URING_COOP_TASKRUN` | 默认关闭 | 同上，当前 VM 上不能把它当成稳定默认项。 |
+| `MINISS_URING_COOP_TASKRUN` | 默认开启（失败时回退） | `MINISS_URING_NO_COOP_TASKRUN=1` 可禁用；当前内核可用，关闭会降低吞吐，不能仅凭较低单轮 p99 默认关闭。 |
 | `MINISS_URING_FLUSH_BATCH_SIZE` | 默认 61 | 已验证过把它调高并不总是更好；对 p99 的影响比吞吐更敏感。 |
 
 实测结论先记在这里：
