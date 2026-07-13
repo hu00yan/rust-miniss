@@ -101,11 +101,12 @@ connection. The probe produced only 18--399 requests/sec at 10--800
 connections, so it is not a valid latency baseline. A keep-alive buffering
 regression test now covers this case in `tests/integration_http.rs`, but the
 high-level path still needs a purpose-built load client before tuning. A
-purpose-built pinned Linux client then completed 1,000 keep-alive requests with
-zero errors after routing HTTP reads through the owned-buffer `read_rent` path;
-its p50 was 0.156ms and p99 0.664ms. This is a functional probe, not a
-cross-runtime benchmark. The earlier stack-buffer `AsyncRead` path stalled on
-the second request; using `read_rent` is the relevant production fix.
+purpose-built pinned Linux client completed three 1,000-request rounds with
+zero errors after routing HTTP reads through the owned-buffer `read_rent` path:
+p50/p99 were 0.158/0.617ms, 0.154/0.682ms, and 0.198/0.796ms. This is a
+functional probe, not a cross-runtime benchmark. The earlier stack-buffer
+`AsyncRead` path stalled on the second request; using `read_rent` is the
+relevant production fix.
 
 After the buffering fix, the frozen static runner was rerun for three pinned
 rounds at 4 workers / 800 connections / 8 client threads. It completed with
