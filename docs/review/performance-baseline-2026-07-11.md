@@ -4,6 +4,23 @@ Environment: Orb Ubuntu, Linux 7.0.11-orbstack, aarch64, 8 vCPU. HTTP results
 use 800 connections, 8 wrk threads, 10 seconds, and include throughput plus
 p99. This is a snapshot, not a production-safety claim.
 
+## Fresh smoke after the protocol/backend cleanup
+
+One non-alternating 3-second Orb run on the current tree used 4 server workers,
+800 connections, 8 wrk threads, and the same 22-byte response body for every
+runtime. It is a direction check, not a replacement for a three-run baseline:
+
+| Runtime | RPS | p99 |
+|---|---:|---:|
+| miniss | 721,774 | 23.33 ms |
+| monoio | 625,571 | 65.65 ms |
+| compio | 632,901 | 33.34 ms |
+| tokio | 569,529 | 96.62 ms |
+
+This is one ordered sample and is not sufficient to claim sustained parity.
+The comparison harness now rejects socket errors, starts diagnostics after
+warmup, and writes all matrix rows to one machine-readable CSV.
+
 ## Superseded exploratory comparison
 
 The first three-run medians were 173,967 RPS for miniss, 269,878 for Monoio,
