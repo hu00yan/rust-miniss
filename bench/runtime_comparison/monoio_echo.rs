@@ -37,7 +37,7 @@ async fn handle_client(stream: TcpStream, requests: Option<Arc<AtomicU64>>) {
     let mut buf = vec![0u8; 4096];
     let mut framer = RequestFramer::new();
 
-    let body = b"Hello from monoio";
+    let body = b"Hello from rust-miniss";
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         body.len()

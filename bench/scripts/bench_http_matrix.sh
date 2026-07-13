@@ -30,10 +30,8 @@ mkdir -p "$MATRIX_DIR"
 
 matrix_csv="$MATRIX_DIR/matrix.csv"
 ratio_csv="$MATRIX_DIR/ratios.csv"
-baseline_csv="$MATRIX_DIR/baseline.csv"
 
 printf 'scenario,name,rps,p50,p75,p90,p99,summary\n' >"$matrix_csv"
-printf 'scenario,name,rps,p50,p75,p90,p99,summary\n' >"$baseline_csv"
 printf 'scenario,miniss_rps,monoio_rps,best_runtime,best_rps,miniss_vs_monoio,miniss_vs_best,summary\n' >"$ratio_csv"
 
 port=$BASE_PORT
@@ -54,12 +52,12 @@ run_matrix_case() {
             "$ROOT/bench/scripts/bench_http.sh" "$port" "$duration" "$connections" "$threads"
     fi
 
-    perl -MList::Util=max - "$name" "$out_dir/summary.csv" "$matrix_csv" "$ratio_csv" "$baseline_csv" "$runtimes" <<'PERL'
+    perl -MList::Util=max - "$name" "$out_dir/summary.csv" "$matrix_csv" "$ratio_csv" "$runtimes" <<'PERL'
 use strict;
 use warnings;
 use List::Util qw(max);
 
-my ($scenario, $summary, $matrix_csv, $ratio_csv, $baseline_csv, $runtimes) = @ARGV;
+my ($scenario, $summary, $matrix_csv, $ratio_csv, $runtimes) = @ARGV;
 open my $fh, '<', $summary or die "cannot read $summary: $!";
 my $header = <$fh>;
 my %rps;
@@ -74,9 +72,8 @@ while (my $line = <$fh>) {
     push @rows, [$name, $rps, $p50, $p75, $p90, $p99];
 }
 
-my $is_baseline = index($runtimes, 'monoio') >= 0 || index($runtimes, 'compio') >= 0 || index($runtimes, 'tokio') >= 0 || index($runtimes, 'glommio') >= 0;
-my $target_csv = $is_baseline ? $baseline_csv : $matrix_csv;
-open my $m, '>>', $target_csv or die "cannot append $target_csv: $!";
+my $has_comparison = index($runtimes, 'monoio') >= 0 || index($runtimes, 'compio') >= 0 || index($runtimes, 'tokio') >= 0 || index($runtimes, 'glommio') >= 0;
+open my $m, '>>', $matrix_csv or die "cannot append $matrix_csv: $!";
 for my $row (@rows) {
     print $m join(',', map { qq("$_") } ($scenario, @$row, $summary)), "\n";
 }
@@ -90,7 +87,7 @@ for my $name (keys %rps) {
     }
 }
 
-if ($is_baseline) {
+if ($has_comparison) {
     my $vs_monoio = $monoio > 0 ? $miniss / $monoio : 0;
     my $vs_best = $best_rps > 0 ? $miniss / $best_rps : 0;
     open my $r, '>>', $ratio_csv or die "cannot append $ratio_csv: $!";

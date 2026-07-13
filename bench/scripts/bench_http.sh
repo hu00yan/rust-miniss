@@ -73,6 +73,9 @@ cargo build --release --example http_echo --all-features
 if [[ "$BENCH_RUNTIMES" == *"monoio"* || "$BENCH_RUNTIMES" == *"compio"* || "$BENCH_RUNTIMES" == *"tokio"* || "$BENCH_RUNTIMES" == *"glommio"* ]]; then
     cargo build --release --manifest-path bench/runtime_comparison/Cargo.toml --bins
 fi
+if [[ "$(uname -s)" == "Linux" && ( "$BENCH_RUNTIMES" == *"monoio"* || "$BENCH_RUNTIMES" == *"glommio"* ) ]]; then
+    cargo build --release --manifest-path bench/runtime_comparison/Cargo.toml --features linux-bench --bin monoio_echo --bin glommio_echo
+fi
 
 csv="$OUT_DIR/summary.csv"
 printf 'name,port,threads,connections,duration,requests,rps,avg_latency,p50,p75,p90,p99,transfer,raw_log,server_log\n' > "$csv"
@@ -171,11 +174,11 @@ my $s = <$fh>;
 
 die "wrk failed for $name: unable to connect\n" if $s =~ /unable to connect/i;
 
-if ($s =~ /Socket errors:\s*connect\s+(\d+),\s*read\s+(\d+),\s*write\s+(\d+),\s*timeout\s+(\d+)/) {
-    my $total = $1 + $2 + $3 + $4;
-    if ($total != 0) {
-        warn "wrk socket errors for $name: $&\n";
-    }
+    if ($s =~ /Socket errors:\s*connect\s+(\d+),\s*read\s+(\d+),\s*write\s+(\d+),\s*timeout\s+(\d+)/) {
+        my $total = $1 + $2 + $3 + $4;
+        if ($total != 0) {
+        die "wrk socket errors for $name: $&\n";
+        }
 }
 
 if ($s =~ /Non-2xx or 3xx responses:\s*(\d+)/) {
@@ -245,6 +248,10 @@ run_benchmark() {
 
     local perf_pid=""
     local rss_pid=""
+    wrk --latency -t1 -c10 -d3s --timeout 5s "${wrk_headers[@]}" "$addr" >/dev/null
+
+    # Start diagnostics only after warmup so task-clock/syscall/RSS samples
+    # describe the measured window rather than the server startup and warmup.
     if [[ "$METRICS_ENABLED" = "1" ]]; then
         start_perf_stat "$server_pid" "$DURATION" "$perf_log"
         perf_pid=$PERF_PID
@@ -252,7 +259,6 @@ run_benchmark() {
         rss_pid=$RSS_PID
     fi
 
-    wrk --latency -t1 -c10 -d3s --timeout 5s "${wrk_headers[@]}" "$addr" >/dev/null
     wrk --latency -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" --timeout 10s "${wrk_headers[@]}" "$addr" >"$raw_log" 2>&1
 
     if [[ -n "$perf_pid" && "$perf_pid" != "0" ]]; then
@@ -286,15 +292,15 @@ if runtime_enabled "miniss"; then
     run_benchmark "miniss" "$ROOT/target/release/examples/http_echo" "$((BASE_PORT + port_offset))" --cores "$HTTP_CORES"
     port_offset=$((port_offset + 1))
 fi
-if runtime_enabled "monoio"; then
+if runtime_enabled "monoio" && [[ -x "$ROOT/bench/runtime_comparison/target/release/monoio_echo" ]]; then
     run_benchmark "monoio" "$ROOT/bench/runtime_comparison/target/release/monoio_echo" "$((BASE_PORT + port_offset))" --cores "$HTTP_CORES"
     port_offset=$((port_offset + 1))
 fi
-if runtime_enabled "compio"; then
+if runtime_enabled "compio" && [[ -x "$ROOT/bench/runtime_comparison/target/release/compio_echo" ]]; then
     run_benchmark "compio" "$ROOT/bench/runtime_comparison/target/release/compio_echo" "$((BASE_PORT + port_offset))" --cores "$HTTP_CORES"
     port_offset=$((port_offset + 1))
 fi
-if runtime_enabled "tokio"; then
+if runtime_enabled "tokio" && [[ -x "$ROOT/bench/runtime_comparison/target/release/tokio_echo" ]]; then
     run_benchmark "tokio" "$ROOT/bench/runtime_comparison/target/release/tokio_echo" "$((BASE_PORT + port_offset))" --cores "$HTTP_CORES"
     port_offset=$((port_offset + 1))
 fi

@@ -11,7 +11,8 @@ and 192,660 for Compio. One run reported 509 read errors. Those results used
 the deleted independent onecore example and an incorrect one-read/one-request
 echo loop. They remain historical diagnostics, not a current baseline.
 
-Raw data: `.scratch/http-current-vs-mature-20260711{,-r2,-r3}/`.
+The one-off raw logs for this superseded comparison were pruned after the
+summary was recorded.
 
 ## Unified-server comparison after multicore scheduler repair
 
@@ -34,7 +35,8 @@ Three-run medians:
 | 8 | monoio | 662,529 | 11.01 ms | -44.7% |
 | 8 | compio | 762,589 | 11.07 ms | -51.9% |
 
-Raw data: `.scratch/http-unified-{1w,4w,8w}-r{1,2,3}/`.
+The one-off raw logs for this comparison were pruned after the summary was
+recorded; rerun `bench/scripts/bench_http_matrix.sh` for fresh evidence.
 
 The 8-worker case oversubscribes this 8-vCPU VM once the eight wrk client
 threads are included, so it measures whole-VM contention as well as server
@@ -62,8 +64,8 @@ The traced RPS is not a normal throughput measurement; it establishes syscall
 attribution. The remaining calls are primarily connection-lifecycle work.
 
 An alternating three-pair A/B against commit 6922a07 improved median RPS from
-219,055 to 226,156 (+3.2%) and p99 from 6.32 to 5.92 ms (-6.3%). Raw data:
-`.scratch/http-lease-ab-{base,opt}-{1,2,3}/`. This old-binary A/B remains valid
+219,055 to 226,156 (+3.2%) and p99 from 6.32 to 5.92 ms (-6.3%). The raw
+logs were pruned. This old-binary A/B remains valid
 only for narrow descriptor-syscall attribution; its absolute throughput must
 not be compared with the corrected unified-server results.
 
@@ -88,14 +90,13 @@ baseline of 428,153 RPS / 6.70 ms p99:
 | `SINGLE_ISSUER+COOP_TASKRUN` | 469,167 | 6.56 ms | +9.6% | reject as inferior |
 | `SINGLE_ISSUER+DEFER_TASKRUN` | 26–28k | 12–13 ms | about -94% | reject; timeouts observed |
 
-Raw data: `.scratch/http-uring-{single,coop,single-coop,defer}-r*`.
+The one-off raw logs for these kernel-option experiments were pruned.
 `DEFER_TASKRUN` is not compatible with the current GETEVENTS/park protocol and
 must not be enabled merely because the kernel supports the setup flag.
 
 An alternating production-default A/B gave paired throughput changes of
 +8.35%, -0.46%, and +3.34% (paired median +3.34%). Across the three runs,
-COOP on/off medians were 497,011 and 466,650 RPS. Raw data:
-`.scratch/http-coop-ab-{on,off}-r{1,2,3}/`.
+COOP on/off medians were 497,011 and 466,650 RPS. The raw logs were pruned.
 
 Privileged perf tracepoint measurements with a raised 65,536 fd limit showed
 that kernel-entry frequency is not the remaining gap:

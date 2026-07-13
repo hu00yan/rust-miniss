@@ -30,7 +30,7 @@ async fn handle_client(mut stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let mut buf = vec![0u8; 4096];
 
-    let body = b"Hello from glommio";
+    let body = b"Hello from rust-miniss";
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         body.len()
