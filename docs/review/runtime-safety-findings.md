@@ -46,3 +46,11 @@ are not silently mixed into the implementation batch.
     `docs/review/protocol-integration-2026-07-13.md`; there is no GitHub CI
     workflow in this repository, so these platform checks must be rerun when
     the protocol or backend changes.
+12. A stale Linux process was found running
+    `runtime_regressions::multicore_spawned_async_file_future_completes` for
+    more than 12 hours at nearly 100% CPU. The test used to panic directly on
+    its receive timeout; unwinding dropped the runtime before the
+    force-shutdown path and could block forever joining an io_uring worker.
+    Commit `671fd7d` now records the timeout, performs bounded
+    shutdown/escalation, and joins before asserting. The test remains ignored
+    on macOS until async-file completion is explicitly validated on kqueue.
