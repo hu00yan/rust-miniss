@@ -88,3 +88,7 @@ A four-round source-level probe of `MAX_BUSY_ROUNDS=48` versus the existing
 96 was also rejected. With the same pinned load, 48 reached a median 829,750
 RPS and median p99 10.03 ms (one 16.77 ms outlier); 96 reached 855,202 RPS and
 8.89 ms median p99. The constant is restored to 96.
+
+Finally, a six-sample interleaved `MINISS_PARK_TIMEOUT_US=50` versus the
+default 100 probe showed no latency win: 100 had median 855,914 RPS / 9.52 ms
+p99, while 50 had 850,638 RPS / 9.68 ms p99. The timeout remains 100us.
