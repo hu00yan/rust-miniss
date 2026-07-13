@@ -138,6 +138,7 @@ test-fast:
     cargo fmt --all -- --check
     ./scripts/audit_architecture.sh
     cargo test --lib --test runtime_safety_models
+    cargo test --test runtime_regressions
 
 # Check formatting only
 fmt:

@@ -52,5 +52,5 @@ are not silently mixed into the implementation batch.
     its receive timeout; unwinding dropped the runtime before the
     force-shutdown path and could block forever joining an io_uring worker.
     Commit `671fd7d` now records the timeout, performs bounded
-    shutdown/escalation, and joins before asserting. The test remains ignored
-    on macOS until async-file completion is explicitly validated on kqueue.
+    shutdown/escalation, and joins before asserting. The bounded test now runs
+    on both supported backends; the macOS run has been explicitly validated.
