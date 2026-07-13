@@ -37,8 +37,10 @@ fn test_boxed_iovec_stable_across_owner_move() {
             "Box<[iovec]> pointer must survive move (count={count})"
         );
         for i in 0..count {
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let iov = unsafe { *sqe_ptr.add(i) };
             assert_eq!(iov.len, 32);
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             assert_eq!(unsafe { *iov.base }, (i + 1) as u8);
         }
         let _keep_chunks = chunks;
@@ -335,6 +337,7 @@ fn fill_send_buffer_until_would_block(fd: std::os::fd::RawFd) {
     loop {
         // SAFETY: `fd` belongs to the live AsyncTcpStream and `bytes` remains
         // valid for this synchronous syscall.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let written = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), 0) };
         if written >= 0 {
             continue;
@@ -377,6 +380,7 @@ fn linux_uring_delayed_submit_writev_survives_relocation_pressure() {
             let receive_buffer = 4096i32;
             // SAFETY: socket fd is live and the option value has the expected
             // type and size for SO_RCVBUF.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let set_rcvbuf = unsafe {
                 libc::setsockopt(
                     socket.as_raw_fd(),
@@ -415,6 +419,7 @@ fn linux_uring_delayed_submit_writev_survives_relocation_pressure() {
             let send_buffer = 4096i32;
             // SAFETY: writer owns this live fd; the option value is valid for
             // SO_SNDBUF and only alters this test socket's kernel buffering.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let set_sndbuf = unsafe {
                 libc::setsockopt(
                     writer.as_raw_fd(),

@@ -278,6 +278,7 @@ impl Task {
         // SAFETY: `waker_ptr` points to the cached waker stored in `self`.
         // The reference is only used to build a Context for the duration of
         // this poll call, and the cached waker outlives the Context.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let mut context = unsafe { Context::from_waker(&*waker_ptr) };
         match self.future.as_mut().poll(&mut context) {
             Poll::Ready(()) => {

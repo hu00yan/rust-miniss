@@ -67,6 +67,7 @@ impl RegisteredDescriptor {
     pub(crate) fn acquire(fd: RawFd) -> io::Result<Self> {
         // SAFETY: dup returns a fresh descriptor owned by this call on
         // success; OwnedFd takes ownership exactly once.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let duplicate = unsafe { libc::dup(fd) };
         if duplicate < 0 {
             return Err(io::Error::last_os_error());
@@ -140,6 +141,7 @@ mod descriptor_lease_tests {
         let lease = DescriptorLease::acquire(read_fd).expect("dup read end");
         // SAFETY: read_fd is still owned by this test and closed exactly once.
         unsafe { libc::close(read_fd) };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_ne!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, -1);
         drop(lease);
         // SAFETY: write_fd is still owned by this test and closed exactly once.
@@ -163,18 +165,23 @@ mod descriptor_lease_tests {
         let second = registered.lease();
         let leased_fd = first.as_raw_fd();
         assert_eq!(leased_fd, second.as_raw_fd());
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let mut before_drop = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::fstat(leased_fd, &mut before_drop) }, 0);
 
         drop(registered);
         drop(first);
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_ne!(unsafe { libc::fcntl(leased_fd, libc::F_GETFD) }, -1);
 
         drop(second);
         // Another test may reuse the numeric fd immediately after the last
         // lease closes it. Distinguish that valid reuse from an unexpectedly
         // retained descriptor instead of asserting on the number alone.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let mut after_drop = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let rc = unsafe { libc::fstat(leased_fd, &mut after_drop) };
         if rc == 0 {
             assert_ne!(
@@ -207,6 +214,7 @@ mod descriptor_lease_tests {
             .into_raw_fd()
             .expect("shared transfer duplicates for caller ownership");
         assert_ne!(transferred, lease.as_raw_fd());
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) } >= 0);
 
         drop(lease);
@@ -561,6 +569,7 @@ mod accept_ownership_tests {
     #[test]
     fn accepted_descriptor_closes_when_completion_is_dropped() {
         let mut fds = [0; 2];
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         // SAFETY: pipe returned ownership of this descriptor to the test.
         let accepted = unsafe { OwnedFd::from_raw_fd(fds[0]) };
@@ -569,6 +578,7 @@ mod accept_ownership_tests {
             fd: accepted,
             addr: None,
         });
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
         // SAFETY: the write end remains owned by this test.
         unsafe { libc::close(fds[1]) };

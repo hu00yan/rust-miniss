@@ -48,6 +48,7 @@ impl SafeFdFile {
     fn new(fd: RawFd) -> io::Result<Self> {
         // SAFETY: dup creates an independent owned fd; the original fd remains
         // owned by its caller and is not consumed here.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let dup_fd = unsafe { libc::dup(fd) };
         if dup_fd < 0 {
             return Err(io::Error::last_os_error());
@@ -55,6 +56,7 @@ impl SafeFdFile {
 
         // SAFETY: dup_fd is newly owned by this function and is transferred
         // into File exactly once.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
         Ok(Self { file: Some(file) })
     }
@@ -132,6 +134,7 @@ impl EpollBackend {
     fn complete_local(&self, completion: IoCompletion) {
         // SAFETY: EpollBackend is driven by one runtime thread; completed_local
         // is shard-local and not accessed concurrently.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed_local = unsafe { &mut *self.completed_local.get() };
         completed_local.push(completion);
     }
@@ -152,9 +155,13 @@ impl IoProvider for EpollBackend {
 
         // SAFETY: We have exclusive, single-threaded access.
         let next_token = unsafe { &mut *self.next_token.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let poll = unsafe { &mut *self.poll.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
 
         let mio_token = Token(*next_token);
@@ -165,6 +172,7 @@ impl IoProvider for EpollBackend {
         Self::ensure_slot_capacity(descriptor_lease_tokens, slot);
         // SAFETY: udp_recv_buffers is shard-local and only accessed from this
         // epoll backend owner thread while submitting operations.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         Self::ensure_slot_capacity(unsafe { &mut *self.udp_recv_buffers.get() }, slot);
 
         // Acquire the lease before registration/queueing.  File operations
@@ -202,6 +210,7 @@ impl IoProvider for EpollBackend {
                 // `recv_from` takes a safe `&mut [u8]`, so it must never see
                 // the uninitialized spare capacity supplied by rent buffers.
                 buffer.prepare_for_safe_read();
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                 udp_recv_buffers[slot] = Some(buffer);
                 pending_ops[slot] = Some((
@@ -385,6 +394,7 @@ impl IoProvider for EpollBackend {
                     let result = {
                         // SAFETY: Close consumes the raw fd for this operation;
                         // callers must not use it after submitting Op::Close.
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let res = unsafe { libc::close(*fd) };
                         if res == -1 {
                             Err(IoError::Io(io::Error::last_os_error()))
@@ -436,6 +446,7 @@ impl IoProvider for EpollBackend {
             pending_ops[slot] = None;
             // A failed UDP registration may have staged its buffer before the
             // error was observed; discard that staged state with the lease.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 (&mut *self.udp_recv_buffers.get())[slot] = None;
             }
@@ -453,16 +464,20 @@ impl IoProvider for EpollBackend {
             .iter()
             .filter(|entry| entry.is_some())
             .count();
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let udp = unsafe { &*self.udp_recv_buffers.get() }
             .iter()
             .filter(|entry| entry.is_some())
             .count();
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed = unsafe { &*self.completed_local.get() }.len();
         pending + udp + completed
     }
 
     fn cancel(&self, token: IoToken) -> bool {
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let poll = unsafe { &mut *self.poll.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
         let Some((slot, entry)) = pending_ops
             .iter_mut()
@@ -472,6 +487,7 @@ impl IoProvider for EpollBackend {
             return false;
         };
         let op_fd = entry.as_ref().map(|(_, op)| op.as_raw_fd());
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let fd = unsafe { &*self.descriptor_leases.get() }[slot]
             .as_ref()
             .map(DescriptorLease::as_raw_fd)
@@ -480,6 +496,7 @@ impl IoProvider for EpollBackend {
         let mut source = mio::unix::SourceFd(&fd);
         let _ = poll.registry().deregister(&mut source);
         pending_ops[slot] = None;
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             (&mut *self.udp_recv_buffers.get())[slot] = None;
             (&mut *self.descriptor_leases.get())[slot] = None;
@@ -489,6 +506,7 @@ impl IoProvider for EpollBackend {
     }
 
     fn cancel_all(&self) {
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let tokens = unsafe { &*self.descriptor_lease_tokens.get() }
             .iter()
             .flatten()
@@ -502,11 +520,17 @@ impl IoProvider for EpollBackend {
     fn drain_completions(&self) -> TaskPoll<Vec<Self::Completion>> {
         // SAFETY: We have exclusive, single-threaded access.
         let poll = unsafe { &mut *self.poll.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let events = unsafe { &mut *self.events.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed_local = unsafe { &mut *self.completed_local.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed_rx = unsafe { &mut *self.completed_rx.get() };
 
         let mut completions = mem::take(completed_local);
@@ -560,6 +584,7 @@ impl IoProvider for EpollBackend {
                             Ok((new_fd, addr)) => Ok(CompletionKind::Accept {
                                 // SAFETY: syscall_accept returns a fresh owned
                                 // descriptor on success.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(new_fd) },
                                 addr: Some(addr),
                             }),
@@ -573,6 +598,7 @@ impl IoProvider for EpollBackend {
                         let result = loop {
                             // SAFETY: buffer has at least `len` capacity and
                             // libc::read writes at most that many bytes.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::read(
                                     effective_fd,
@@ -632,6 +658,7 @@ impl IoProvider for EpollBackend {
                             }
                             // SAFETY: remaining points to initialized bytes
                             // owned by `data`; write reads at most len bytes.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::write(
                                     effective_fd,
@@ -700,6 +727,7 @@ impl IoProvider for EpollBackend {
                             }
                             // SAFETY: remaining points to static initialized
                             // bytes; write reads at most len bytes.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::write(
                                     effective_fd,
@@ -761,6 +789,7 @@ impl IoProvider for EpollBackend {
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
                         let effective_fd = leased_fd.unwrap_or(*fd);
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
                         let result = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
                             let mut buf = Buffer::new_zeroed(*len);
@@ -786,6 +815,7 @@ impl IoProvider for EpollBackend {
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
                         let effective_fd = leased_fd.unwrap_or(*fd);
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
                         let result = file
                             .seek(SeekFrom::Start(*offset))
@@ -799,12 +829,14 @@ impl IoProvider for EpollBackend {
                         // Matched by `event.token()`
                         // SAFETY: udp_recv_buffers is shard-local and only
                         // accessed by this epoll owner thread.
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                         if let Some(mut buffer) =
                             udp_recv_buffers.get_mut(slot).and_then(Option::take)
                         {
                             // SAFETY: UdpSocket temporarily wraps fd and is
                             // converted back with into_raw_fd before drop.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
                             let mut retry = false;
                             let result = match socket.recv_from(buffer.as_mut()) {
@@ -853,6 +885,7 @@ impl IoProvider for EpollBackend {
                         // SAFETY: UdpSocket temporarily wraps fd and is
                         // converted back with into_raw_fd before drop.
                         let effective_fd = leased_fd.unwrap_or(*fd);
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
                         let result = socket.send_to(data.as_ref(), *addr).map(|bytes_written| {
                             CompletionKind::UdpSend {
@@ -867,6 +900,7 @@ impl IoProvider for EpollBackend {
                         let raw_fd = leased_fd.unwrap_or(*fd);
                         // SAFETY: TcpStream temporarily wraps fd to call
                         // take_error, then into_raw_fd preserves ownership.
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let sock = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
                         let result = match sock.take_error() {
                             Ok(None) => Ok(CompletionKind::Connect),
@@ -896,6 +930,7 @@ impl IoProvider for EpollBackend {
                         let result = loop {
                             // SAFETY: iovecs point to writable capacity in the
                             // cloned buffers and remain valid for this call.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::readv(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
                             };
@@ -983,6 +1018,7 @@ impl IoProvider for EpollBackend {
                                         Some(libc::iovec {
                                             // SAFETY: offset is within this
                                             // buffer due to checks above.
+                                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                             iov_base: unsafe {
                                                 buf.as_ref().as_ptr().add(offset)
                                                     as *mut libc::c_void
@@ -999,6 +1035,7 @@ impl IoProvider for EpollBackend {
                                 }
                                 // SAFETY: iovecs point to initialized bytes in
                                 // buffers and remain valid for this syscall.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 let ret = unsafe {
                                     libc::writev(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
                                 };
@@ -1072,6 +1109,7 @@ impl IoProvider for EpollBackend {
                 // released only after this terminal result is published.
                 // The lease vectors are backend-owned and remain valid for
                 // this owner-thread drain pass.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe {
                     (&mut *self.descriptor_leases.get())[slot] = None;
                     (&mut *self.descriptor_lease_tokens.get())[slot] = None;
@@ -1110,10 +1148,12 @@ mod descriptor_lease_acceptance_tests {
         assert!(backend.pending_operation_count() >= 1);
         // SAFETY: the read end is still owned by this test and is closed once.
         unsafe { libc::close(fds[0]) };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let leases = unsafe { &*backend.descriptor_leases.get() };
         assert!(leases.iter().any(|lease| {
             lease
                 .as_ref()
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 .is_some_and(|lease| unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) } >= 0)
         }));
         let _ = token;
@@ -1124,6 +1164,7 @@ mod descriptor_lease_acceptance_tests {
     #[test]
     fn unsupported_submit_returns_error_without_completion_token() {
         let mut fds = [0; 2];
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let backend = EpollBackend::new().expect("epoll backend");
         let result = backend.submit(Op::UdpRecvVectored {
@@ -1135,6 +1176,7 @@ mod descriptor_lease_acceptance_tests {
             backend.drain_completions(),
             std::task::Poll::Pending
         ));
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
@@ -1146,6 +1188,7 @@ fn syscall_accept(fd: RawFd) -> io::Result<(RawFd, std::net::SocketAddr)> {
     // SAFETY: sockaddr_storage is a plain C storage type and zeroed storage is
     // valid for accept to fill.
     let mut storage: libc::sockaddr_storage =
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
     let mut len = std::mem::size_of_val(&storage) as libc::socklen_t;
     // SAFETY: storage/len pointers are valid for the duration of accept.

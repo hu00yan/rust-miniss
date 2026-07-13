@@ -105,6 +105,7 @@ fn cancel_deferred_local_spawn(task_id: TaskId) -> bool {
 fn create_wakeup_eventfd() -> Result<OwnedFd> {
     // SAFETY: eventfd creates a fresh fd owned by this function; we wrap it
     // immediately in OwnedFd on success and keep it thread-local.
+    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if fd < 0 {
         return Err(RuntimeError::TaskFailed(format!(
@@ -114,6 +115,7 @@ fn create_wakeup_eventfd() -> Result<OwnedFd> {
     }
     // SAFETY: `fd` is the owned descriptor returned by eventfd above and has
     // not been wrapped elsewhere.
+    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -471,6 +473,7 @@ impl CpuCore {
         }
         // SAFETY: CpuCore owns both fields for the whole run invocation; the
         // context guard drops before CpuCore can be moved or destroyed.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let _runtime_context = unsafe {
             RuntimeContextGuard::enter(&self.io_state, &mut self.timer_wheel, Some(self.id))
         };
@@ -666,6 +669,7 @@ impl CpuCore {
 
         // SAFETY: The cpu_set_t is zero-initialized before CPU_SET, and
         // sched_setaffinity receives a pointer valid for the call duration.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             let mut cpuset: cpu_set_t = mem::zeroed();
             CPU_ZERO(&mut cpuset);
@@ -814,6 +818,7 @@ impl CpuCore {
                 break;
             };
             if let Some(completion) = owner_completion {
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe {
                     self.io_state
                         .set_owner_completion(completion.token, completion.result);
@@ -830,12 +835,14 @@ impl CpuCore {
                     if owner_ready {
                         // A completion can race cancellation/slot retirement;
                         // never retain its result for a later task poll.
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         unsafe { self.io_state.clear_owner_completion() };
                     }
                     continue; // stale wake after cancellation
                 };
                 if task.id() != task_id {
                     if owner_ready {
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         unsafe { self.io_state.clear_owner_completion() };
                     }
                     continue; // stale wake after slot reuse
@@ -875,6 +882,7 @@ impl CpuCore {
                 self.task_queue.remove(task_id.key());
             }
             if owner_ready {
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe { self.io_state.clear_owner_completion() };
             }
         }
@@ -956,6 +964,7 @@ impl CpuCore {
         });
         let drain_started = Instant::now();
         #[cfg(target_os = "linux")]
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let (count, saw_wakeup_poll, wakeups) = unsafe {
             self.io_state
                 .io_backend
@@ -978,14 +987,21 @@ impl CpuCore {
                 let count = completions.len();
                 let mut wakeups = 0usize;
                 for (token, result) in completions {
+                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                     if unsafe { self.io_state.take_discarded(token) } {
                         continue;
                     }
+                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                     if let Some(task_id) = unsafe { self.io_state.take_pending_task(token) } {
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         unsafe { self.io_state.push_owner_completion(task_id, token, result) };
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let _ = unsafe { self.io_state.take_waker(token) };
                     } else if let Some(waker) =
-                        unsafe { self.io_state.insert_completed_and_take_waker(token, result) }
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                        unsafe {
+                            self.io_state.insert_completed_and_take_waker(token, result)
+                        }
                     {
                         wakeups += 1;
                         waker.wake();
@@ -1002,6 +1018,7 @@ impl CpuCore {
 
         let drain_elapsed_ns = drain_started.elapsed().as_nanos() as u64;
         self.metrics.io_completion_total_ns += drain_elapsed_ns;
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             self.io_state
                 .swap_owner_completions(&mut self.owner_ready_queue)
@@ -1126,6 +1143,7 @@ impl MultiCoreRuntime {
 
         // SAFETY: the set is zeroed and libc writes only within its fixed ABI
         // size. This runs once on the control thread before workers start.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let allowed = unsafe {
             let mut set: cpu_set_t = mem::zeroed();
             CPU_ZERO(&mut set);

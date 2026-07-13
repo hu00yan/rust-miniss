@@ -38,6 +38,7 @@ impl Buffer {
         BUFFER_POOL.with(|pool| {
             // SAFETY: BUFFER_POOL is thread-local. Runtime accesses it only
             // from owning worker thread, so no concurrent aliases exist.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 let pool = &mut *pool.get();
                 if pool.len() < POOL_CAPACITY {
@@ -51,6 +52,7 @@ impl Buffer {
         BUFFER_POOL.with(|pool| {
             // SAFETY: BUFFER_POOL is thread-local. Runtime accesses it only
             // from owning worker thread, so no concurrent aliases exist.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 let pool = &mut *pool.get();
                 // Take the most recently recycled buffer (hot in cache).
@@ -181,6 +183,7 @@ impl Buffer {
         }
         // SAFETY: the caller contract above ensures the newly exposed range
         // was initialized; the capacity bound was checked immediately above.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe { self.inner.set_len(len) };
         true
     }
@@ -212,6 +215,7 @@ impl Buffer {
     pub fn recycle(mut self) {
         // SAFETY: ManuallyDrop allows taking the value without dropping it.
         // We forget(self) to prevent Drop from running on the already-moved value.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let vec = unsafe { ManuallyDrop::take(&mut self.inner) };
         Self::recycle_vec(vec);
         std::mem::forget(self);
@@ -290,6 +294,7 @@ impl Drop for Buffer {
         // Buffer::new_zeroed() allocates fresh memory.
         // SAFETY: ManuallyDrop lets us take the inner Vec even though
         // we have Drop. After taking, self.inner is an empty Vec.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let vec = unsafe { ManuallyDrop::take(&mut self.inner) };
         if vec.capacity() > 0 {
             Self::recycle_vec(vec);

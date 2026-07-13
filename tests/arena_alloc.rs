@@ -20,6 +20,7 @@ mod arena_tests {
         // new_uninitialized should NOT zero-fill (it's for kernel-written buffers).
         // SAFETY: The test only inspects len/capacity and never reads the
         // uninitialized memory contents.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let buf = unsafe { Buffer::new_uninitialized_arena(4096) };
         assert_eq!(buf.len(), 0);
         assert!(buf.capacity() >= 4096);

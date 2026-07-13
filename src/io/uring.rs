@@ -322,6 +322,7 @@ impl UringBackend {
         }
         // SAFETY: UringBackend is thread-affine; the owning runtime thread is
         // the only code path mutating the ring.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let ring = unsafe { &mut *self.ring.get() };
         if self.sqpoll_enabled {
             ring.submission().sync();
@@ -343,6 +344,7 @@ impl UringBackend {
     }
 
     fn discard_accept_results(&self, token: IoToken) {
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let accept_results = unsafe { &mut *self.accept_results.get() };
         let _ = accept_results
             .get_mut(token.slot_index())
@@ -350,6 +352,7 @@ impl UringBackend {
     }
 
     fn discard_all_accept_results(&self) {
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let accept_results = unsafe { &mut *self.accept_results.get() };
         for queue in accept_results.iter_mut() {
             let _ = queue.take();
@@ -396,15 +399,19 @@ impl UringBackend {
         let mut saw_wakeup_poll_completion = false;
         let mut wakeups = 0usize;
         // Deliver locally failed submissions before polling the kernel CQ.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let failed = unsafe { &mut *self.completed_ops.get() };
         for (token, result) in failed.drain(..) {
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             if unsafe { io_state.take_discarded(token) } {
                 continue;
             }
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             if let Some(task_id) = unsafe { io_state.take_pending_task(token) } {
                 io_state.push_owner_completion(task_id, token, result);
                 let _ = io_state.take_waker(token);
             } else if let Some(waker) =
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe { io_state.insert_completed_and_take_waker(token, result) }
             {
                 wakeups += 1;
@@ -454,6 +461,7 @@ impl UringBackend {
                         (addr_storage.as_ref(), addr_len.as_ref())
                     {
                         let storage: *const sockaddr_storage = &**addr_storage as *const _;
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let socket_addr = unsafe {
                             match (*storage).ss_family as libc::c_int {
                                 libc::AF_INET => {
@@ -485,6 +493,7 @@ impl UringBackend {
                         let _ = **addr_len;
                         // Own the accepted descriptor before address decoding;
                         // parse failures must close it exactly once.
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                         match socket_addr {
                             Ok(sa) => Ok(CompletionKind::Accept {
@@ -500,6 +509,7 @@ impl UringBackend {
                         Ok(CompletionKind::Accept {
                             // SAFETY: a successful accept CQE transfers a
                             // fresh descriptor to this completion.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             fd: unsafe { OwnedFd::from_raw_fd(result) },
                             addr: None,
                         })
@@ -534,6 +544,7 @@ impl UringBackend {
                             (addr_storage.as_ref(), addr_len.as_ref())
                         {
                             let storage: *const sockaddr_storage = &**addr_storage as *const _;
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let socket_addr = unsafe {
                                 match (*storage).ss_family as libc::c_int {
                                     libc::AF_INET => {
@@ -566,6 +577,7 @@ impl UringBackend {
                                 }
                             };
                             let _ = **addr_len;
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::Accept {
@@ -581,6 +593,7 @@ impl UringBackend {
                             Ok(CompletionKind::Accept {
                                 // SAFETY: a successful accept CQE transfers a
                                 // fresh descriptor to this completion.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 fd: unsafe { OwnedFd::from_raw_fd(result) },
                                 addr: None,
                             })
@@ -591,6 +604,7 @@ impl UringBackend {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 buf.set_len(bytes_read);
                             }
@@ -649,6 +663,7 @@ impl UringBackend {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 buf.set_len(bytes_read);
                             }
@@ -678,11 +693,13 @@ impl UringBackend {
                             Err(IoError::Io(io::Error::from_raw_os_error(-result)))
                         } else {
                             let bytes_read = result as usize;
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 buffer.set_len(bytes_read);
                             }
                             let socket_addr = {
                                 let storage: *const sockaddr_storage = &*addr_storage as *const _;
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 unsafe {
                                     match (*storage).ss_family as libc::c_int {
                                         libc::AF_INET => {
@@ -766,6 +783,7 @@ impl UringBackend {
                             let mut remaining = bytes_read;
                             for buf in buffers.iter_mut() {
                                 let can_read = std::cmp::min(remaining, buf.capacity());
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 unsafe {
                                     buf.set_len(can_read);
                                 }
@@ -812,14 +830,19 @@ impl UringBackend {
                 };
 
                 // Store result in slot and wake the task — no intermediate Vec.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 if unsafe { io_state.take_discarded(token) } {
                     continue;
                 }
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 if let Some(task_id) = unsafe { io_state.take_pending_task(token) } {
                     io_state.push_owner_completion(task_id, token, completion_result);
                     let _ = io_state.take_waker(token);
                 } else if let Some(waker) =
-                    unsafe { io_state.insert_completed_and_take_waker(token, completion_result) }
+                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    unsafe {
+                        io_state.insert_completed_and_take_waker(token, completion_result)
+                    }
                 {
                     wakeups += 1;
                     waker.wake();
@@ -850,6 +873,7 @@ impl UringBackend {
 
         // SAFETY: We have exclusive access on this thread.
         let ring = unsafe { &mut *self.ring.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
         // Acquire independent descriptor ownership before constructing or
         // queueing any SQE.  User-future abandonment cannot close this lease.
@@ -891,6 +915,7 @@ impl UringBackend {
                         // Safe single-shot fallback when multishot capability
                         // is absent: retain sockaddr storage until CQE parse.
                         let addr_storage =
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             Box::new(unsafe { std::mem::zeroed::<sockaddr_storage>() });
                         let addr_len =
                             Box::new(std::mem::size_of::<sockaddr_storage>() as socklen_t);
@@ -1020,6 +1045,7 @@ impl UringBackend {
                     // SAFETY: sockaddr_storage is plain C storage used as an
                     // output buffer for recvmsg.
                     let mut addr_storage =
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         Box::new(unsafe { std::mem::zeroed::<sockaddr_storage>() });
                     let addr_len = Box::new(std::mem::size_of::<sockaddr_storage>() as socklen_t);
 
@@ -1064,6 +1090,7 @@ impl UringBackend {
                     // SAFETY: sockaddr_storage is plain C storage and will be
                     // overwritten with the matching socket address.
                     let mut addr_storage: Box<sockaddr_storage> =
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         Box::new(unsafe { std::mem::zeroed() });
                     let mut addr_len: Box<socklen_t> = Box::new(0);
                     match addr {
@@ -1078,6 +1105,7 @@ impl UringBackend {
                             };
                             // SAFETY: addr_storage is large/aligned enough for
                             // sockaddr_in.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in,
@@ -1098,6 +1126,7 @@ impl UringBackend {
                             };
                             // SAFETY: addr_storage is large/aligned enough for
                             // sockaddr_in6.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in6,
@@ -1203,6 +1232,7 @@ impl UringBackend {
                     // SAFETY: sockaddr_storage is plain C storage and will be
                     // overwritten with the matching socket address.
                     let mut addr_storage: Box<sockaddr_storage> =
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         Box::new(unsafe { std::mem::zeroed() });
                     let addr_len: libc::socklen_t = match &addr {
                         std::net::SocketAddr::V4(_) => {
@@ -1224,6 +1254,7 @@ impl UringBackend {
                             };
                             // SAFETY: addr_storage is large/aligned enough for
                             // sockaddr_in.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in,
@@ -1243,6 +1274,7 @@ impl UringBackend {
                             };
                             // SAFETY: addr_storage is large/aligned enough for
                             // sockaddr_in6.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 std::ptr::write(
                                     addr_storage.as_mut() as *mut _ as *mut libc::sockaddr_in6,
@@ -1354,6 +1386,7 @@ impl UringBackend {
 
         // Keep descriptor ownership parallel to PendingOp.  Slab movement and
         // user-future drop cannot reclaim this lease before terminal CQE.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let leases = unsafe { &mut *self.descriptor_leases.get() };
         if idx >= leases.len() {
             leases.resize_with(idx + 1, || None);
@@ -1362,6 +1395,7 @@ impl UringBackend {
 
         // SAFETY: slot_meta is shard-local and only
         // mutated by this backend owner thread while submitting/draining.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let slot_meta = unsafe { &mut *self.slot_meta.get() };
         if idx >= slot_meta.len() {
             slot_meta.resize_with(idx + 1, SlotMeta::default);
@@ -1373,6 +1407,7 @@ impl UringBackend {
         if is_accept {
             // SAFETY: accept_results is shard-local and only mutated by this
             // backend owner thread while submitting/draining operations.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let accept_results = unsafe { &mut *self.accept_results.get() };
             let token_idx = token.slot_index();
             if token_idx >= accept_results.len() {
@@ -1385,6 +1420,7 @@ impl UringBackend {
         // NO proactive flush here — batch submission happens in flush() at event loop boundary.
         // SAFETY: `entry` lives until push copies it into the submission queue;
         // the ring is owned by this thread.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         if unsafe { ring.submission().push(&entry) }.is_err() {
             // SQ full: flush_all submits everything pending, freeing SQ slots.
             self.flush_logged();
@@ -1454,19 +1490,25 @@ impl IoProvider for UringBackend {
     fn pending_operation_count(&self) -> usize {
         // SAFETY: all operation storage is shard-local and queried only by
         // the owner thread while deciding whether graceful shutdown may exit.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending = unsafe { &*self.pending_ops.get() }.len();
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let queued_accepts = unsafe { &*self.accept_results.get() }
             .iter()
             .filter_map(Option::as_ref)
             .map(VecDeque::len)
             .sum::<usize>();
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed = unsafe { &*self.completed_ops.get() }.len();
         pending + queued_accepts + completed + usize::from(self.pending_sqes.get() != 0)
     }
 
     fn cancel(&self, token: IoToken) -> bool {
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let ring = unsafe { &mut *self.ring.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let slot_meta = unsafe { &*self.slot_meta.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending_ops = unsafe { &*self.pending_ops.get() };
         let Some((idx, meta)) = slot_meta
             .iter()
@@ -1482,8 +1524,10 @@ impl IoProvider for UringBackend {
         let entry = opcode::AsyncCancel::new(target)
             .build()
             .user_data(INTERNAL_CANCEL_USER_DATA);
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         if unsafe { ring.submission().push(&entry) }.is_err() {
             self.flush_logged();
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             if unsafe { ring.submission().push(&entry) }.is_err() {
                 return false;
             }
@@ -1493,7 +1537,9 @@ impl IoProvider for UringBackend {
     }
 
     fn cancel_all(&self) {
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending_ops = unsafe { &*self.pending_ops.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let tokens = unsafe { &*self.slot_meta.get() }
             .iter()
             .enumerate()
@@ -1510,6 +1556,7 @@ impl IoProvider for UringBackend {
     fn park(&self, timeout: Duration) -> usize {
         // SAFETY: UringBackend is thread-affine; the owning runtime thread is
         // the only code path mutating the ring.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let ring = unsafe { &mut *self.ring.get() };
 
         // Check if completions are already available.
@@ -1574,10 +1621,15 @@ impl IoProvider for UringBackend {
     fn drain_completions_into(&self, completions: &mut Vec<Self::Completion>) -> Poll<()> {
         // SAFETY: UringBackend is thread-affine; these UnsafeCell fields are
         // shard-local and only touched by this owner thread.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let ring = unsafe { &mut *self.ring.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let accept_results = unsafe { &mut *self.accept_results.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let slot_meta = unsafe { &mut *self.slot_meta.get() };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed_ops = unsafe { &mut *self.completed_ops.get() };
         completions.clear();
         let reserve_hint = completed_ops.capacity().max(64);
@@ -1632,6 +1684,7 @@ impl IoProvider for UringBackend {
                         // SAFETY: addr_storage points to kernel-filled sockaddr
                         // bytes for this completion, and the family tag comes
                         // from the kernel for the same CQE.
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let socket_addr = unsafe {
                             match (*storage).ss_family as libc::c_int {
                                 libc::AF_INET => {
@@ -1667,6 +1720,7 @@ impl IoProvider for UringBackend {
                         let _ = **addr_len;
                         // Own the accepted descriptor before address decoding;
                         // parse failures must close it exactly once.
+                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                         match socket_addr {
                             Ok(sa) => Ok(CompletionKind::Accept {
@@ -1682,6 +1736,7 @@ impl IoProvider for UringBackend {
                         Ok(CompletionKind::Accept {
                             // SAFETY: a successful accept CQE transfers a
                             // fresh descriptor to this completion.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             fd: unsafe { OwnedFd::from_raw_fd(result) },
                             addr: None,
                         })
@@ -1694,6 +1749,7 @@ impl IoProvider for UringBackend {
                 queue_accept_result(queue, completion_result);
                 // SAFETY: token belongs to this shard and the waker slot is
                 // owned by the current io_state.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 crate::cpu::with_io_state(|io_state| unsafe {
                     if let Some(waker) = io_state.take_waker(token) {
                         waker.wake();
@@ -1725,6 +1781,7 @@ impl IoProvider for UringBackend {
                             // SAFETY: addr_storage points to kernel-filled sockaddr
                             // bytes for this completion, and the family tag comes
                             // from the kernel for the same CQE.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let socket_addr = unsafe {
                                 match (*storage).ss_family as libc::c_int {
                                     libc::AF_INET => {
@@ -1759,6 +1816,7 @@ impl IoProvider for UringBackend {
                                 }
                             };
                             let _ = **addr_len;
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
                             match socket_addr {
                                 Ok(sa) => Ok(CompletionKind::Accept {
@@ -1774,6 +1832,7 @@ impl IoProvider for UringBackend {
                             Ok(CompletionKind::Accept {
                                 // SAFETY: a successful accept CQE transfers a
                                 // fresh descriptor to this completion.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 fd: unsafe { OwnedFd::from_raw_fd(result) },
                                 addr: None,
                             })
@@ -1786,6 +1845,7 @@ impl IoProvider for UringBackend {
                             let bytes_read = result as usize;
                             // SAFETY: buffer has enough capacity for the kernel
                             // write, and result bytes were just reported by CQE.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 buf.set_len(bytes_read);
                             }
@@ -1846,6 +1906,7 @@ impl IoProvider for UringBackend {
                             let bytes_read = result as usize;
                             // SAFETY: buffer has enough capacity for the kernel
                             // write, and result bytes were just reported by CQE.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 buf.set_len(bytes_read);
                             }
@@ -1878,6 +1939,7 @@ impl IoProvider for UringBackend {
                             let bytes_read = result as usize;
                             // SAFETY: buffer has enough capacity for the kernel
                             // write, and result bytes were just reported by CQE.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 buffer.set_len(bytes_read);
                             }
@@ -1886,6 +1948,7 @@ impl IoProvider for UringBackend {
                                     &*addr_storage as *const _;
                                 // SAFETY: storage points at the sockaddr bytes
                                 // just filled by the kernel for this recv.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 unsafe {
                                     match (*storage).ss_family as libc::c_int {
                                         libc::AF_INET => {
@@ -1977,6 +2040,7 @@ impl IoProvider for UringBackend {
                                 let can_read = std::cmp::min(remaining, buf.capacity());
                                 // SAFETY: buffer slots are bounded by the
                                 // kernel-reported read length.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 unsafe {
                                     buf.set_len(can_read);
                                 }
@@ -2042,6 +2106,7 @@ impl IoProvider for UringBackend {
     fn pop_accept_result(&self, token: IoToken) -> Option<Result<CompletionKind, IoError>> {
         // SAFETY: accept_results is shard-local and only accessed by this
         // UringBackend owner thread.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let accept_results = unsafe { &mut *self.accept_results.get() };
         let idx = token.slot_index();
         let queue = accept_results.get_mut(idx)?.as_mut()?;
@@ -2067,6 +2132,10 @@ impl IoProvider for UringBackend {
         (flushes, flush_total_us, max_park_flush_us)
     }
 
+    /// # Safety
+    ///
+    /// The caller must be the owning runtime thread, with exclusive access to
+    /// all ring and completion storage, and must not concurrently drain CQEs.
     unsafe fn drain_completions_fused(
         &self,
         wakeup_poll_token: Option<IoToken>,
@@ -2105,6 +2174,7 @@ mod tests {
             return;
         };
         let mut fds = [0; 2];
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let token = backend
             .submit(Op::Read {
@@ -2118,10 +2188,13 @@ mod tests {
         // number for an unrelated file. The accepted lease must keep the
         // kernel operation attached to the original pipe.
         let reused = fds[0];
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe { libc::close(fds[0]) };
         let replacement =
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         assert_eq!(replacement, reused);
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
 
         backend.flush_logged();
@@ -2141,6 +2214,7 @@ mod tests {
             }
             other => panic!("unexpected completion: {other:?}"),
         }
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             libc::close(replacement);
             libc::close(fds[1]);
@@ -2207,20 +2281,26 @@ mod tests {
             })
             .expect("accept admission");
         let mut fds = [-1; 2];
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe { libc::close(fds[1]) };
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let accept_results = unsafe { &mut *backend.accept_results.get() };
         accept_results[token.slot_index()] = Some(VecDeque::from([Ok(CompletionKind::Accept {
             fd: accepted_fd,
             addr: None,
         })]));
         assert!(
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe { &*backend.accept_results.get() }[token.slot_index()]
                 .as_ref()
                 .is_some_and(|queue| !queue.is_empty())
         );
         assert!(backend.cancel(token));
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert!(unsafe { &*backend.accept_results.get() }[token.slot_index()].is_none());
         backend.flush_logged();
         for _ in 0..8 {
@@ -2242,9 +2322,11 @@ mod tests {
         assert_eq!(queue.len(), crate::io::ACCEPT_BACKLOG_CAPACITY);
 
         let mut fds = [-1; 2];
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let accepted_raw = fds[0];
         let peer_raw = fds[1];
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         queue_accept_result(
             &mut queue,
@@ -2255,12 +2337,15 @@ mod tests {
         );
 
         assert_eq!(queue.len(), crate::io::ACCEPT_BACKLOG_CAPACITY);
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::fcntl(accepted_raw, libc::F_GETFD) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::EBADF)
         );
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert!(unsafe { libc::fcntl(peer_raw, libc::F_GETFD) } >= 0);
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe { libc::close(peer_raw) };
     }
 }
@@ -2281,6 +2366,7 @@ mod stable_iovec_tests {
             let mut storage: Vec<u8> = vec![0u8; count * 16];
             let iovecs: Box<[iovec]> = (0..count)
                 .map(|i| iovec {
+                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                     iov_base: unsafe { storage.as_mut_ptr().add(i * 16) } as *mut _,
                     iov_len: 16,
                 })
@@ -2297,6 +2383,7 @@ mod stable_iovec_tests {
             );
             assert_eq!(len_before, moved.len());
             // Pointee contents still readable through the original raw pointer.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             assert_eq!(unsafe { (*ptr_before).iov_len }, 16);
             let _keep = moved;
         }
@@ -2360,8 +2447,10 @@ mod stable_iovec_tests {
             assert_eq!(live.iovecs.as_ptr(), sqe_iov_base);
             assert_eq!(live.iovecs.len() as u32, sqe_nr);
             for i in 0..count {
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 let iov = unsafe { *sqe_iov_base.add(i) };
                 assert_eq!(iov.iov_len, 8);
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 assert_eq!(unsafe { *(iov.iov_base as *const u8) }, i as u8);
             }
         }

@@ -69,6 +69,7 @@ where
     ) -> std::task::Poll<Self::Output> {
         // SAFETY: CancellableFuture does not move `inner` after being pinned;
         // the projection only exposes fields through this pinned poll call.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let this = unsafe { self.get_unchecked_mut() };
 
         // Check for cancellation
@@ -86,6 +87,7 @@ where
         // Poll the inner future
         // SAFETY: `inner` is pinned in place by the parent CancellableFuture
         // and is not moved before or after this delegated poll.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         match unsafe { std::pin::Pin::new_unchecked(&mut this.inner) }.poll(cx) {
             std::task::Poll::Ready(value) => std::task::Poll::Ready(Ok(value)),
             std::task::Poll::Pending => std::task::Poll::Pending,

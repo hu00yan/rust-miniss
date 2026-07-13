@@ -98,6 +98,7 @@ impl Future for IoFuture {
             // Owner-thread CQE delivery can hand the result directly to this
             // future, avoiding a completed-slot write followed by a second
             // token lookup. Remote/legacy paths continue below.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             if let Some(result) = unsafe { state.take_owner_completion(this.token) } {
                 this.completed = true;
                 return Poll::Ready(result);

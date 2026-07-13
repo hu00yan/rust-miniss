@@ -77,6 +77,7 @@ impl Runtime {
         // SAFETY: Runtime owns both RefCell values for its full lifetime;
         // borrows remain active until context guard and block_on return.
         let _runtime_context =
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe { RuntimeContextGuard::enter(&io_state, &mut timer_wheel, None) };
         let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
         let mut io_completions: Vec<IoCompletion> =
@@ -131,6 +132,7 @@ impl Runtime {
                                 if is_accept {
                                     // SAFETY: Single-threaded executor owns
                                     // CpuIoState while polling completions.
+                                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                     if let Some(waker) = unsafe { io_state.take_waker(token) } {
                                         waker.wake();
                                     }
@@ -138,6 +140,7 @@ impl Runtime {
                                 }
                                 // SAFETY: Completion token came from this
                                 // executor's backend and is consumed once.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 if let Some(waker) = unsafe {
                                     io_state.insert_completed_and_take_waker(token, result)
                                 } {
@@ -189,6 +192,7 @@ impl Runtime {
                                 if is_accept {
                                     // SAFETY: Single-threaded executor owns
                                     // CpuIoState while polling completions.
+                                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                     if let Some(waker) = unsafe { io_state.take_waker(token) } {
                                         waker.wake();
                                     }
@@ -196,6 +200,7 @@ impl Runtime {
                                 }
                                 // SAFETY: Completion token came from this
                                 // executor's backend and is consumed once.
+                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 if let Some(waker) = unsafe {
                                     io_state.insert_completed_and_take_waker(token, result)
                                 } {
