@@ -56,7 +56,8 @@ validate_cpu_placement() {
             $seen{$_} = 1 for $a .. $b;
         } return \%seen; }
         my ($a, $b) = (expand($ARGV[0]), expand($ARGV[1]));
-        exit scalar(grep { exists $b->{$_} } keys %$a) ? 0 : 1;
+        my $overlap = scalar(grep { exists $b->{$_} } keys %$a);
+        exit($overlap ? 0 : 1);
     ' "$SERVER_CPUS" "$CLIENT_CPUS"; then
         echo "ERROR: server and client CPU sets overlap ($SERVER_CPUS vs $CLIENT_CPUS)" >&2
         exit 2
