@@ -51,10 +51,11 @@ impl QuinnRuntimeTrait for MinissQuicRuntime {
             self.runtime
                 .spawn_local(future)
                 .expect("quinn local background task spawn failed");
-        } else {
-            self.runtime
-                .spawn_detached(future)
-                .expect("quinn background task spawn failed");
+        } else if let Err(error) = self.runtime.spawn_detached(future) {
+            // Quinn's Runtime::spawn cannot return an admission error.
+            // Make bounded backpressure visible and let Quinn observe the
+            // resulting driver loss instead of panicking the process.
+            tracing::error!("quinn background task admission failed: {error}");
         }
     }
 

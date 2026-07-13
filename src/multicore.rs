@@ -1483,29 +1483,52 @@ impl MultiCoreRuntime {
     /// whose `spawn` contract cannot return an admission result (for example,
     /// Quinn's runtime trait). The bounded inbox still provides backpressure;
     /// this only avoids blocking the caller while a parked shard is waking.
+    /// The owner reports an impossible slot collision through tracing because
+    /// the foreign trait has no acknowledgement channel.
     pub fn spawn_detached<F>(&self, future: F) -> Result<TaskId>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let _admission = self.begin_admission()?;
         let start_core = self.select_spawn_core();
-        let task_id = self.next_task_id_for_core(start_core);
-        let message = CoreMessage::Task {
-            id: task_id,
-            future: Box::pin(DetachedTaskFuture::new(future)),
-            reply: None,
-        };
-        match self.core_senders[start_core].try_send(message) {
-            Ok(()) => {
-                self.notify_core(start_core);
-                Ok(task_id)
+        let mut future: Pin<Box<dyn Future<Output = ()> + Send>> =
+            Box::pin(DetachedTaskFuture::new(future));
+        let mut disconnected = 0usize;
+        for offset in 0..self.num_cores {
+            let core_id = (start_core + offset) % self.num_cores;
+            let task_id = self.next_task_id_for_core(core_id);
+            let message = CoreMessage::Task {
+                id: task_id,
+                future,
+                reply: None,
+            };
+            match self.core_senders[core_id].try_send(message) {
+                Ok(()) => {
+                    self.notify_core(core_id);
+                    return Ok(task_id);
+                }
+                Err(TrySendError::Full(CoreMessage::Task {
+                    future: returned_future,
+                    ..
+                })) => future = returned_future,
+                Err(TrySendError::Disconnected(CoreMessage::Task {
+                    future: returned_future,
+                    ..
+                })) => {
+                    future = returned_future;
+                    disconnected += 1;
+                }
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => unreachable!(),
             }
-            Err(TrySendError::Full(_)) => Err(RuntimeError::TaskFailed(format!(
-                "Core {start_core} message queue is full"
-            ))),
-            Err(TrySendError::Disconnected(_)) => Err(RuntimeError::TaskFailed(
-                "worker core is not running".to_string(),
-            )),
+        }
+        if disconnected == self.num_cores {
+            Err(RuntimeError::TaskFailed(
+                "all worker cores are disconnected".into(),
+            ))
+        } else {
+            Err(RuntimeError::TaskFailed(
+                "all worker inboxes are full".into(),
+            ))
         }
     }
 
