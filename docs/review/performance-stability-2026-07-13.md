@@ -58,3 +58,19 @@ coverage, multicore QUIC affinity, UDP ownership stress, and a Linux CI gate.
 The supported-platform contract is intentionally narrow: Linux requires
 kernel 6.12+ for io_uring and macOS uses kqueue. There is no Linux epoll
 fallback in the current build, and the documentation/build script now say so.
+
+## Latency investigation log
+
+The pinned six-round completion-drain A/B is retained at
+`/tmp/miniss-drain-32-vs-256-20260713` on Orb. A post-park limit of 32 had a
+slightly lower median p99 (10.39 ms versus 12.22 ms for 256), but 3.3% lower
+median throughput, higher variation, and 31 ms outliers. It was therefore not
+promoted to the production default; the source remains at the phase-specific
+256/128/61 limits.
+
+The static HTTP echo path submits a borrowed `WriteStatic` buffer directly to
+io_uring and does not copy the response payload. This does not generalize to
+the full HTTP response path: `HttpConnection::send_response` constructs header
+storage and its vectored EAGAIN path may copy body/header buffers. That is a
+separate, unverified latency hypothesis and must be measured with a workload
+that actually exercises partial writes before changing it.
