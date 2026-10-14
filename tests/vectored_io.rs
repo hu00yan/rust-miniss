@@ -232,15 +232,9 @@ fn test_tcp_vectored_write_read_five_iovecs_spill() {
 // SmallVec range (2--4) plus the first spilled count (5); the one-slice case is
 // covered by the boxed-storage structural test above.
 //
-// `Runtime::new()` currently panics when an io_uring-capable Linux build is
-// executed in a sandbox that denies `io_uring_setup`.  Catch that specific
-// availability boundary so this remains a Linux regression test rather than a
-// false negative for restricted CI containers.
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
-fn uring_runtime_or_skip() -> Option<Runtime> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(Runtime::new))
-        .map_err(|_| eprintln!("skipping io_uring delayed-submit regression: io_uring unavailable"))
-        .ok()
+fn uring_runtime() -> Runtime {
+    Runtime::new()
 }
 
 /// Allocator and Vec growth happen after the SQE has captured the iovec pointer
@@ -269,9 +263,7 @@ fn linux_uring_delayed_submit_readv_survives_relocation_pressure() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let Some(runtime) = uring_runtime_or_skip() else {
-        return;
-    };
+    let runtime = uring_runtime();
 
     for count in 2usize..=5 {
         let mut listener =
@@ -365,9 +357,7 @@ fn linux_uring_delayed_submit_writev_survives_relocation_pressure() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let Some(runtime) = uring_runtime_or_skip() else {
-        return;
-    };
+    let runtime = uring_runtime();
 
     for count in 2usize..=5 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer listener");

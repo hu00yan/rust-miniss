@@ -143,10 +143,26 @@ impl Drop for IoFuture {
 #[cfg(test)]
 mod tests {
     use super::IoFuture;
-    use crate::io::IoError;
+    use crate::cpu::{test_io_state, RuntimeContextGuard};
+    use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+    use crate::timer::TimerWheel;
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
+
+    struct TestProvider;
+
+    impl IoProvider for TestProvider {
+        type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+        fn submit(&self, _op: Op) -> Result<IoToken, IoError> {
+            Ok(IoToken::from_id(7))
+        }
+
+        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+            Poll::Pending
+        }
+    }
 
     #[test]
     fn rejected_submit_future_returns_error_without_runtime_or_slot() {
@@ -157,5 +173,77 @@ mod tests {
             Pin::new(&mut future).poll(&mut cx),
             Poll::Ready(Err(IoError::Other(message))) if message == "rejected"
         ));
+    }
+
+    #[test]
+    fn completion_is_delivered_once_through_the_real_future() {
+        let state = test_io_state(TestProvider);
+        let mut timers = TimerWheel::default();
+        // SAFETY: the test keeps the state and timer on this owner thread
+        // until the guard is dropped.
+        let guard = unsafe { RuntimeContextGuard::enter(&state, &mut timers, Some(0)) };
+        let token = state.io_backend.submit(Op::Nop).unwrap();
+        let mut future = Box::pin(IoFuture::new(token));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        // SAFETY: the test owns the shard-local state and token.
+        unsafe {
+            if let Some(waker) =
+                state.insert_completed_and_take_waker(token, Ok(CompletionKind::Nop))
+            {
+                drop(waker);
+            }
+        }
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(CompletionKind::Nop))
+        ));
+        // SAFETY: the test still owns the shard-local state.
+        assert!(!unsafe { state.has_completed(token) });
+        drop(guard);
+    }
+
+    #[test]
+    fn completion_before_poll_is_delivered_without_registering_a_waker() {
+        let state = test_io_state(TestProvider);
+        let mut timers = TimerWheel::default();
+        // SAFETY: the test owns the shard-local state and token.
+        let guard = unsafe { RuntimeContextGuard::enter(&state, &mut timers, Some(0)) };
+        let token = state.io_backend.submit(Op::Nop).unwrap();
+        // SAFETY: the completion belongs to the owner-local token.
+        unsafe {
+            state.insert_completed_and_take_waker(token, Ok(CompletionKind::Nop));
+        }
+        let mut future = Box::pin(IoFuture::new(token));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(CompletionKind::Nop))
+        ));
+        drop(guard);
+    }
+
+    #[test]
+    fn dropping_pending_future_marks_completion_for_discard() {
+        let state = test_io_state(TestProvider);
+        let mut timers = TimerWheel::default();
+        // SAFETY: the test keeps the state and timer on this owner thread
+        // until the guard is dropped.
+        let guard = unsafe { RuntimeContextGuard::enter(&state, &mut timers, Some(0)) };
+        let token = state.io_backend.submit(Op::Nop).unwrap();
+        let mut future = Box::pin(IoFuture::new(token));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        drop(future);
+        // SAFETY: the test owns the shard-local state and observes the owner
+        // discard protocol before the guard is dropped.
+        assert!(unsafe { state.take_discarded(token) });
+        drop(guard);
     }
 }

@@ -23,9 +23,16 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=MINISS_LOOM");
     // Emit check-cfg hints so `cfg(io_backend = "...")` is accepted by the compiler
     println!("cargo:rustc-check-cfg=cfg(io_backend, values(\"io_uring\", \"epoll\", \"kqueue\"))");
     println!("cargo:rustc-check-cfg=cfg(has_io_uring)");
+    println!("cargo:rustc-check-cfg=cfg(loom)");
+    if std::env::var_os("MINISS_LOOM").is_some() {
+        // This cfg is emitted only for rust-miniss.  RUSTFLAGS would also
+        // enable it in dependencies such as Tokio, changing their APIs.
+        println!("cargo:rustc-cfg=loom");
+    }
 
     if cfg!(target_os = "linux") {
         match get_kernel_version() {

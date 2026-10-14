@@ -157,6 +157,12 @@ impl Request {
                 "Invalid request line",
             ));
         }
+        if version != "HTTP/1.1" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported HTTP version",
+            ));
+        }
 
         let method = Method::from(method_str);
         let path = path.to_string();
@@ -170,12 +176,22 @@ impl Request {
                 break;
             }
 
-            if let Some(colon_pos) = line.find(':') {
-                let mut name = line[..colon_pos].trim().to_owned();
-                name.make_ascii_lowercase();
-                let value = line[colon_pos + 1..].trim().to_string();
-                headers.insert(name, value);
+            let Some(colon_pos) = line.find(':') else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid HTTP header",
+                ));
+            };
+            let mut name = line[..colon_pos].to_owned();
+            if !is_valid_header_name(&name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid HTTP header name",
+                ));
             }
+            name.make_ascii_lowercase();
+            let value = line[colon_pos + 1..].trim().to_string();
+            headers.insert(name, value);
         }
 
         let body = body.as_bytes().to_vec();
@@ -305,6 +321,12 @@ impl HttpConnection {
     pub async fn read_request(&mut self) -> io::Result<Request> {
         loop {
             if let Some(header_end) = find_header_end(&self.read_buf) {
+                if header_end > MAX_HTTP_HEADER_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "HTTP headers exceed the maximum size",
+                    ));
+                }
                 let body_len = content_length(&self.read_buf[..header_end])?;
                 let request_len = header_end
                     .checked_add(4)
@@ -368,18 +390,68 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 fn content_length(headers: &[u8]) -> io::Result<usize> {
     let text = str::from_utf8(headers)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP headers"))?;
+    let mut parsed = None;
     for line in text.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTP header",
+            ));
         };
+        if !is_valid_header_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTP header name",
+            ));
+        }
         if name.eq_ignore_ascii_case("content-length") {
-            return value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length"));
+            let length = value.trim().parse::<usize>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
+            })?;
+            if let Some(previous) = parsed {
+                if previous != length {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conflicting Content-Length headers",
+                    ));
+                }
+            }
+            parsed = Some(length);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") && !value.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Transfer-Encoding is unsupported",
+            ));
         }
     }
-    Ok(0)
+    Ok(parsed.unwrap_or(0))
+}
+
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
 }
 
 /// Simple HTTP server trait for handling requests
@@ -431,6 +503,170 @@ impl HttpHandler for StaticHandler {
             Response::new(StatusCode::OK)
                 .with_header("content-type", content_type.as_ref())
                 .with_body(content.as_bytes())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn request_parser_normalizes_method_and_header_names() {
+        let request =
+            Request::parse(b"gEt /health HTTP/1.1\r\nhOsT: localhost\r\nX-Trace: 42\r\n\r\nbody")
+                .unwrap();
+
+        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.path, "/health");
+        assert_eq!(request.version, "HTTP/1.1");
+        assert_eq!(request.headers.get("host"), Some(&"localhost".to_string()));
+        assert_eq!(request.headers.get("x-trace"), Some(&"42".to_string()));
+        assert_eq!(request.body, b"body");
+    }
+
+    #[test]
+    fn request_parser_rejects_invalid_utf8() {
+        let error = Request::parse(b"GET / HTTP/1.1\r\n\xff\r\n\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn request_parser_rejects_missing_request_line_parts() {
+        for request in [b"GET\r\n\r\n".as_slice(), b"GET /\r\n\r\n"] {
+            let error = Request::parse(request).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn request_parser_rejects_extra_request_line_parts() {
+        let error = Request::parse(b"GET / HTTP/1.1 extra\r\n\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn request_parser_rejects_unsupported_http_versions() {
+        for version in [b"HTTP/1.0".as_slice(), b"HTTP/2".as_slice()] {
+            let request = [b"GET / ", version, b"\r\n\r\n"].concat();
+            let error = Request::parse(&request).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn request_parser_rejects_malformed_headers() {
+        let error = Request::parse(b"GET / HTTP/1.1\r\nbroken-header\r\n\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn request_parser_rejects_invalid_header_names() {
+        for header in [
+            b"bad name: value".as_slice(),
+            b"bad\tname: value".as_slice(),
+            b"bad(name): value".as_slice(),
+            b" bad: value".as_slice(),
+        ] {
+            let request = [
+                b"GET / HTTP/1.1\r\n".as_slice(),
+                header,
+                b"\r\n\r\n".as_slice(),
+            ]
+            .concat();
+            let error = Request::parse(&request).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn content_length_parser_accepts_whitespace_and_rejects_invalid_values() {
+        assert_eq!(
+            content_length(b"POST / HTTP/1.1\r\nContent-Length: 7 \r\n").unwrap(),
+            7
+        );
+        let error = content_length(b"POST / HTTP/1.1\r\nContent-Length: nope\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn content_length_parser_rejects_conflicting_duplicates() {
+        let headers = b"POST / HTTP/1.1\r\nContent-Length: 7\r\ncontent-length: 8\r\n";
+        let error = content_length(headers).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn content_length_parser_rejects_unsupported_transfer_encoding() {
+        let error =
+            content_length(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn content_length_parser_rejects_invalid_header_names_before_framing() {
+        let error = content_length(b"POST / HTTP/1.1\r\nbad name: 1\r\n\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn response_serialization_has_matching_body_length() {
+        let response = Response::new(StatusCode::OK)
+            .with_header("X-Request-ID", "abc")
+            .with_body("hello");
+        let bytes = response.to_bytes();
+        let content_length = b"content-length: 5\r\n";
+
+        assert!(bytes.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(bytes
+            .windows(content_length.len())
+            .any(|line| line == content_length));
+        assert!(bytes.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn response_content_length_header_is_serialized_only_once() {
+        let response = Response::new(StatusCode::OK)
+            .with_header("Content-Length", "3")
+            .with_body("abc");
+        let bytes = response.to_bytes();
+        let content_length = b"content-length:";
+
+        assert_eq!(
+            bytes
+                .windows(content_length.len())
+                .filter(|part| *part == content_length)
+                .count(),
+            1
+        );
+        assert!(bytes.ends_with(b"\r\n\r\nabc"));
+    }
+
+    #[test]
+    fn request_parser_preserves_unknown_methods() {
+        let request = Request::parse(b"PURGE /cache HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(request.method, Method::Other("PURGE".to_owned()));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn request_parser_never_panics_on_arbitrary_bytes(
+            data in prop::collection::vec(any::<u8>(), 0..4096)
+        ) {
+            let _ = Request::parse(&data);
+        }
+
+        #[test]
+        fn response_serialization_preserves_arbitrary_body(
+            body in prop::collection::vec(any::<u8>(), 0..1024)
+        ) {
+            let bytes = Response::new(StatusCode::OK)
+                .with_body(body.clone())
+                .to_bytes();
+            prop_assert!(bytes.ends_with(&body));
         }
     }
 }

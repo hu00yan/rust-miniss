@@ -16,6 +16,11 @@ use std::sync::{
 };
 use std::task::Waker;
 
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU8 as ControlAtomicU8, Ordering as ControlOrdering};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicU8 as ControlAtomicU8, Ordering as ControlOrdering};
+
 /// Full generational identity for a task slot.
 ///
 /// `slot` is owned by `shard`; `generation` changes on every reuse.  Keeping
@@ -31,15 +36,24 @@ pub struct TaskKey {
 
 static NEXT_RUNTIME_GENERATION: AtomicU16 = AtomicU16::new(1);
 
-/// Allocate a non-zero runtime identity for task keys. Wraparound is
-/// unavoidable in the compact public key, but zero is reserved as invalid.
-pub(crate) fn next_runtime_generation() -> u16 {
-    let generation = NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed);
-    if generation == 0 {
-        1
-    } else {
-        generation
+fn allocate_runtime_generation(counter: &AtomicU16) -> u16 {
+    loop {
+        let current = counter.load(Ordering::Acquire);
+        assert_ne!(current, 0, "runtime generation space exhausted");
+        let next = current.wrapping_add(1);
+        if counter
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return current;
+        }
     }
+}
+
+/// Allocate a non-zero runtime identity for task keys. Once the compact key
+/// space is exhausted, fail closed instead of reusing a live identity.
+pub(crate) fn next_runtime_generation() -> u16 {
+    allocate_runtime_generation(&NEXT_RUNTIME_GENERATION)
 }
 
 impl TaskKey {
@@ -287,16 +301,78 @@ impl TaskId {
 pub type ReadyQueue = Arc<ArrayQueue<TaskId>>;
 pub(crate) type OverflowHint = Arc<AtomicBool>;
 
+/// Atomic lifecycle protocol shared by every production waker state.
+///
+/// Keeping liveness and scheduling in one CAS state prevents a remote wake
+/// from setting `scheduled` after the owner has deactivated the task. The
+/// queued task id may still be stale when the race is already in flight, but
+/// it can no longer leave the closed waker's state armed.
+struct WakeControl {
+    state: ControlAtomicU8,
+    overflowed: AtomicBool,
+}
+
+const WAKE_ACTIVE: u8 = 1;
+const WAKE_SCHEDULED: u8 = 2;
+const WAKE_CLOSED: u8 = 4;
+
+impl WakeControl {
+    fn new() -> Self {
+        Self {
+            state: ControlAtomicU8::new(WAKE_ACTIVE),
+            overflowed: AtomicBool::new(false),
+        }
+    }
+
+    fn try_schedule(&self) -> bool {
+        let previous = self.state.fetch_or(WAKE_SCHEDULED, ControlOrdering::AcqRel);
+        previous & WAKE_ACTIVE != 0 && previous & WAKE_SCHEDULED == 0 && previous & WAKE_CLOSED == 0
+    }
+
+    fn clear_scheduled(&self) {
+        self.state
+            .fetch_and(!WAKE_SCHEDULED, ControlOrdering::AcqRel);
+    }
+
+    #[cfg(loom)]
+    fn is_active(&self) -> bool {
+        let state = self.state.load(ControlOrdering::Acquire);
+        state & WAKE_ACTIVE != 0 && state & WAKE_CLOSED == 0
+    }
+
+    #[cfg(loom)]
+    fn is_scheduled(&self) -> bool {
+        let state = self.state.load(ControlOrdering::Acquire);
+        state & WAKE_SCHEDULED != 0 && state & WAKE_CLOSED == 0
+    }
+
+    fn set_overflowed(&self, value: bool) {
+        self.overflowed.store(value, Ordering::Release);
+    }
+
+    fn is_overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+
+    fn begin_poll(&self) {
+        self.clear_scheduled();
+        self.set_overflowed(false);
+    }
+
+    fn deactivate(&self) {
+        self.state.fetch_or(WAKE_CLOSED, ControlOrdering::AcqRel);
+        self.state
+            .fetch_and(!(WAKE_ACTIVE | WAKE_SCHEDULED), ControlOrdering::AcqRel);
+        self.set_overflowed(false);
+    }
+}
+
 pub(crate) struct WakerState {
     task_id: TaskId,
     queue: ReadyQueue,
     owner_thread: std::thread::Thread,
-    scheduled: AtomicBool,
-    /// Set when the bounded queue was full. The owner retries this marker
-    /// after draining the queue so a one-shot wake cannot be lost.
-    overflowed: AtomicBool,
+    control: WakeControl,
     overflow_hint: Option<OverflowHint>,
-    active: AtomicBool,
 }
 
 impl WakerState {
@@ -309,26 +385,24 @@ impl WakerState {
             task_id,
             queue,
             owner_thread: std::thread::current(),
-            scheduled: AtomicBool::new(false),
-            overflowed: AtomicBool::new(false),
+            control: WakeControl::new(),
             overflow_hint,
-            active: AtomicBool::new(true),
         })
     }
     #[inline]
     pub(crate) fn schedule(&self) {
-        if !self.active.load(Ordering::Acquire) || self.scheduled.swap(true, Ordering::AcqRel) {
+        if !self.control.try_schedule() {
             return;
         }
         if self.queue.push(self.task_id).is_err() {
             // Keep a sticky marker. There may be no later wake call after a
             // one-shot future observes a full queue; the owner-side retry
             // closes that lost-wake window without growing the queue.
-            self.overflowed.store(true, Ordering::Release);
+            self.control.set_overflowed(true);
             if let Some(hint) = &self.overflow_hint {
                 hint.store(true, Ordering::Release);
             }
-            self.scheduled.store(false, Ordering::Release);
+            self.control.clear_scheduled();
             // Wake the owner even when the queue is full: the owner-side
             // retry path is what makes the sticky marker observable before
             // the worker parks.
@@ -337,7 +411,7 @@ impl WakerState {
             }
             return;
         }
-        self.overflowed.store(false, Ordering::Release);
+        self.control.set_overflowed(false);
         // A wake originating on the owner thread cannot be racing that
         // thread's park: the thread is currently executing this call. Avoid
         // the unnecessary futex/unpark path while retaining the cross-thread
@@ -350,20 +424,17 @@ impl WakerState {
     /// Retry a previously failed enqueue after the owner made queue capacity
     /// available. Returns whether the retry successfully queued the task.
     pub(crate) fn retry_overflowed(&self) -> bool {
-        if !self.overflowed.load(Ordering::Acquire) {
+        if !self.control.is_overflowed() {
             return false;
         }
         self.schedule();
-        !self.overflowed.load(Ordering::Acquire)
+        !self.control.is_overflowed()
     }
     pub(crate) fn begin_poll(&self) {
-        self.scheduled.store(false, Ordering::Release);
-        self.overflowed.store(false, Ordering::Release);
+        self.control.begin_poll();
     }
     pub(crate) fn deactivate(&self) {
-        self.active.store(false, Ordering::Release);
-        self.scheduled.store(false, Ordering::Release);
-        self.overflowed.store(false, Ordering::Release);
+        self.control.deactivate();
     }
 }
 
@@ -586,9 +657,36 @@ mod tests {
         assert_eq!(queue.pop(), Some(pending));
     }
 
+    #[cfg(loom)]
+    #[test]
+    fn loom_wake_racing_with_deactivate_cannot_rearm_closed_state() {
+        loom::model(|| {
+            let control = loom::sync::Arc::new(WakeControl::new());
+            let remote = control.clone();
+            let thread = loom::thread::spawn(move || {
+                let _ = remote.try_schedule();
+            });
+
+            control.deactivate();
+            thread.join().expect("wake thread panicked");
+
+            assert!(!control.is_active());
+            assert!(!control.is_scheduled());
+        });
+    }
+
     #[test]
     #[should_panic(expected = "task sequence exceeds the representable generation space")]
     fn task_id_rejects_generation_saturation_instead_of_aliasing() {
         let _ = TaskId::new_for_runtime(1, 0, u32::MAX);
+    }
+
+    #[test]
+    fn runtime_generation_exhaustion_fails_closed_without_reuse() {
+        let counter = AtomicU16::new(u16::MAX - 1);
+        assert_eq!(allocate_runtime_generation(&counter), u16::MAX - 1);
+        assert_eq!(allocate_runtime_generation(&counter), u16::MAX);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert!(std::panic::catch_unwind(|| allocate_runtime_generation(&counter)).is_err());
     }
 }

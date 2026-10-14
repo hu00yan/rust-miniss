@@ -11,8 +11,12 @@
 
 check:
     cargo fmt --all -- --check
+    ./scripts/check_no_ignored_tests.sh
     cargo clippy --all-targets -- -D warnings
-    cargo test --tests --examples
+    cargo check --all-targets --all-features
+    # Include regular library/integration/example tests; long stress cases
+    # have their own explicit gate below.
+    just test-regular
 
 # ─── Architecture Audit ────────────────────────────────────────
 
@@ -131,6 +135,19 @@ bench-http:
     @echo "Unset placement is recorded as unbound and is only a contention diagnostic."
     ./bench/scripts/bench_http.sh
 
+# Explicit multi-round HTTP/runtime matrix. Set BENCH_SERVER_CPUS,
+# BENCH_CLIENT_CPUS, and HTTP_CORES on Linux when collecting isolated evidence.
+# Every round is retained; this recipe is intentionally outside the default gate.
+bench-matrix rounds="1" scenarios="":
+    BENCH_MATRIX_ROUNDS="{{rounds}}" HTTP_MATRIX_SCENARIOS="{{scenarios}}" \
+        ./bench/scripts/bench_http_matrix.sh
+
+# Explicit worker/client-thread topology matrix. Requires non-overlapping
+# BENCH_SERVER_CPUS and BENCH_CLIENT_CPUS; use BENCH_TOPOLOGY_* to narrow the
+# default 1/2/4/8 worker x 1/2/4 client-thread matrix.
+bench-topology rounds="1":
+    BENCH_MATRIX_ROUNDS="{{rounds}}" ./bench/scripts/bench_http_topology.sh
+
 # Evaluate one or more completed bench_http summaries mechanically. Set
 # BENCH_BASELINE to a same-shape summary.csv to enforce the 5% throughput
 # regression threshold. The command emits adjacent JSON and CSV verdicts and
@@ -142,12 +159,106 @@ bench-verdict output summaries:
 # Run all tests
 test:
     # Do not start benchmark servers under the default test recipe.
-    cargo test --tests --examples
+    ./scripts/check_no_ignored_tests.sh
+    just test-regular
+
+# Regular correctness tests. Stress and long-running lifecycle tests are run
+# once by `just stress`, rather than once per feature combination.
+test-regular:
+    cargo test --lib --tests --examples -- --test-threads=1 \
+        --skip test_long_running \
+        --skip test_udp_stress \
+        --skip test_udp_stress_multiple_senders \
+        --skip test_multicore_sustained_admission_pressure \
+        --skip test_multicore_loaded_shutdown_reclaims_all_state \
+        --skip test_multicore_loaded_shutdown_worker_and_task_matrix \
+        --skip test_multicore_pending_udp_shutdown_reclaims_socket_leases \
+        --skip test_multicore_udp_receive_close_race_reclaims_state \
+        --skip test_multicore_accepted_tcp_shutdown_reclaims_descriptor_leases \
+        --skip stress_timer_io
+
+# Bounded multi-core pressure loop. The default tests stay short; this explicit
+# recipe runs the same stress target for 30 seconds and verifies cleanup.
+stress:
+    ./scripts/check_no_ignored_tests.sh
+    MINISS_STRESS_DURATION_MS=30000 MINISS_SHUTDOWN_STRESS_DURATION_MS=10000 \
+        MINISS_SHUTDOWN_STRESS_ROUNDS=3 \
+        MINISS_MATRIX_STRESS_DURATION_MS=3000 \
+        MINISS_RETAINED_FD_ROUNDS=2 \
+        MINISS_TCP_RETAINED_FD_ROUNDS=2 \
+        cargo test --test stress_test -- --test-threads=1
+
+# Protocol/feature-complete test loop. This is explicit because it enables TLS,
+# QUIC/H3, and every optional backend feature; it is slower than the default
+# check and still excludes benchmark binaries.
+test-all-features:
+    cargo fmt --all -- --check
+    ./scripts/check_no_ignored_tests.sh
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-features --lib --tests --examples -- --test-threads=1 \
+        --skip test_long_running \
+        --skip test_udp_stress \
+        --skip test_udp_stress_multiple_senders \
+        --skip test_multicore_sustained_admission_pressure \
+        --skip test_multicore_loaded_shutdown_reclaims_all_state \
+        --skip test_multicore_loaded_shutdown_worker_and_task_matrix \
+        --skip test_multicore_pending_udp_shutdown_reclaims_socket_leases \
+        --skip test_multicore_udp_receive_close_race_reclaims_state \
+        --skip test_multicore_accepted_tcp_shutdown_reclaims_descriptor_leases \
+        --skip stress_timer_io
+
+# Exercise feature-off and feature-on compilation/test surfaces. Benchmark
+# binaries remain excluded because they launch live workloads. Each matrix
+# entry is serial so stress cases cannot contend with one another.
+test-feature-matrix:
+    ./scripts/check_no_ignored_tests.sh
+    cargo check --no-default-features --all-targets
+    cargo check --no-default-features --features arena --all-targets
+    cargo check --no-default-features --features rent-traits --all-targets
+    cargo check --no-default-features --features advanced --all-targets
+    cargo check --no-default-features --features tls --all-targets
+    cargo check --no-default-features --features signal --all-targets
+    cargo check --no-default-features --features debug --all-targets
+    just test-all-features
+
+# Run the complete correctness suite without starting benchmark binaries.
+# Kernel- and toolchain-specific gates are included when the host can run them;
+# skipped gates are reported explicitly instead of looking green.
+test-full:
+    #!/usr/bin/env sh
+    set -eu
+    just check
+    just test-feature-matrix
+    just test-differential
+    just loom
+    just stress
+    if [ "$(uname -s)" = "Linux" ]; then
+        just linux-safety
+    else
+        echo "SKIP: linux-safety requires Linux io_uring"
+    fi
+    if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+        if rustup run nightly cargo miri --version >/dev/null 2>&1; then
+            just miri-safety
+        else
+            echo "SKIP: nightly exists but cargo-miri is unavailable"
+        fi
+    else
+        echo "SKIP: nightly toolchain is unavailable for miri-safety"
+    fi
+
+# Reference-model and production-linked differential tests. The current slice
+# covers generational TaskArena behavior; operation/kernel protocols remain
+# split between pure models and backend-specific regression tests until a
+# deterministic fake backend is available.
+test-differential:
+    cargo test --test runtime_safety_models
 
 # Fast local safety loop. Deliberately excludes Loom, Miri, kernel I/O tests,
-# ignored stress tests, examples, and benchmarks.
+# examples, and benchmarks.
 test-fast:
     cargo fmt --all -- --check
+    ./scripts/check_no_ignored_tests.sh
     ./scripts/audit_architecture.sh
     cargo test --lib --test runtime_safety_models
     cargo test --test runtime_regressions
@@ -170,23 +281,22 @@ clippy:
 miri-safety:
     # Runtime executor tests that construct real backends are excluded: Miri
     # cannot emulate io_uring syscalls. These exact tests cover TLS/identity.
-    cargo +nightly miri test --lib cpu::tests::runtime_context_guard_restores_timer_task_and_core_on_nesting -- --exact
-    cargo +nightly miri test --lib executor::tests::tls_context_restores_after_nesting_and_panic -- --exact
-    cargo +nightly miri test --lib waker::tests::test_waker_clone -- --exact
-    cargo +nightly miri test --lib waker::tests::test_waker_wake_by_ref -- --exact
-    cargo +nightly miri test --lib waker::tests::test_waker_drop_after_clone -- --exact
-    cargo +nightly miri test --lib waker::tests::escaped_waker_wakes_from_other_thread_and_late_wake_is_harmless -- --exact
-    cargo +nightly miri test --lib buffer::tests::safe_read_destination_is_initialized_before_slice_exposure -- --exact
-    cargo +nightly miri test --lib buffer::tests::read_length_outside_capacity_is_rejected_without_publishing -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib cpu::tests::runtime_context_guard_restores_timer_task_and_core_on_nesting -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib executor::tests::tls_context_restores_after_nesting_and_panic -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib waker::tests::test_waker_clone -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib waker::tests::test_waker_wake_by_ref -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib waker::tests::test_waker_drop_after_clone -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib waker::tests::escaped_waker_wakes_from_other_thread_and_late_wake_is_harmless -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib buffer::tests::safe_read_destination_is_initialized_before_slice_exposure -- --exact
+    ./scripts/run_exact_test.sh rustup run nightly cargo miri test --lib buffer::tests::read_length_outside_capacity_is_rejected_without_publishing -- --exact
+
+no-ignored-tests:
+    ./scripts/check_no_ignored_tests.sh
 
 loom:
-    #!/usr/bin/env sh
-    echo "loom safety coverage is not implemented: production synchronization seams have not been extracted" >&2
-    echo "missing protocol 1: wake concurrent with task close or slot retirement" >&2
-    echo "missing protocol 2: cancellation concurrent with waiter registration" >&2
-    echo "missing protocol 3: notification concurrent with worker sleep transition" >&2
-    echo "independent reference models are not accepted as evidence for these production protocols" >&2
-    exit 1
+    MINISS_LOOM=1 ./scripts/run_exact_test.sh cargo test --lib cancellation::tests::loom_cancel_races_with_waiter_registration -- --exact --nocapture
+    MINISS_LOOM=1 ./scripts/run_exact_test.sh cargo test --lib multicore::tests::loom_worker_sleep_gate_cannot_lose_notification -- --exact --nocapture
+    MINISS_LOOM=1 ./scripts/run_exact_test.sh cargo test --lib waker::tests::loom_wake_racing_with_deactivate_cannot_rearm_closed_state -- --exact --nocapture
 
 # Real Linux/io_uring coverage. This is intentionally separate from test-fast.
 # These tests use sockets, descriptors, the kernel driver, and (for delayed

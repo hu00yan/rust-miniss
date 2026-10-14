@@ -48,11 +48,14 @@ impl QuinnRuntimeTrait for MinissQuicRuntime {
 
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
         if current_core_id().is_some() {
-            self.runtime
-                .spawn_local(future)
-                .expect("quinn local background task spawn failed");
+            if let Err(error) = self.runtime.spawn_local(future) {
+                // Quinn's Runtime::spawn cannot return an admission result.
+                // Runtime shutdown is allowed to race with Quinn dropping a
+                // driver, so a rejected background task must not panic here.
+                tracing::error!("quinn local background task admission failed: {error}");
+            }
         } else if let Err(error) = self.runtime.spawn_detached(future) {
-            // Quinn's Runtime::spawn cannot return an admission error.
+            // Quinn's Runtime::spawn cannot return an admission result.
             // Make bounded backpressure visible and let Quinn observe the
             // resulting driver loss instead of panicking the process.
             tracing::error!("quinn background task admission failed: {error}");
@@ -116,10 +119,27 @@ pub struct MinissUdpSocket {
 }
 
 const UNOWNED_CORE: usize = usize::MAX;
+const QUIC_UDP_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
 
 impl MinissUdpSocket {
     fn new(socket: UdpSocket) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
+        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            // SAFETY: the descriptor belongs to `socket`, and `size` remains
+            // valid for the duration of the synchronous setsockopt call.
+            let result = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    &QUIC_UDP_BUFFER_SIZE as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&QUIC_UDP_BUFFER_SIZE) as libc::socklen_t,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let state = quinn::udp::UdpSocketState::new((&socket).into())?;
         Ok(Self {
             inner: socket,
@@ -431,5 +451,133 @@ impl UdpPoller for MinissUdpPoller {
                 Poll::Pending
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::channel::oneshot;
+    use std::time::Duration;
+
+    #[test]
+    fn udp_socket_and_poller_reject_foreign_shards() {
+        let runtime = MultiCoreRuntime::new(Some(2)).expect("two worker shards");
+        let socket = Arc::new(
+            MinissUdpSocket::new(UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"))
+                .expect("create miniss UDP socket"),
+        );
+        let poller = Arc::new(MinissUdpPoller::new(socket.clone()));
+
+        let (socket_first_tx, socket_first_rx) = oneshot::channel();
+        runtime
+            .spawn_on(0, {
+                let socket = socket.clone();
+                async move {
+                    let _ = socket_first_tx.send(socket.ensure_owner());
+                }
+            })
+            .expect("admit socket owner task");
+        assert!(runtime
+            .block_on(socket_first_rx)
+            .expect("socket owner task")
+            .is_ok());
+
+        let (socket_foreign_tx, socket_foreign_rx) = oneshot::channel();
+        runtime
+            .spawn_on(1, {
+                let socket = socket.clone();
+                async move {
+                    let _ = socket_foreign_tx.send(socket.ensure_owner());
+                }
+            })
+            .expect("admit foreign socket task");
+        let socket_error = runtime
+            .block_on(socket_foreign_rx)
+            .expect("foreign socket task")
+            .expect_err("foreign shard acquired socket ownership");
+        assert!(socket_error.to_string().contains("owned by shard 0"));
+
+        let (poller_first_tx, poller_first_rx) = oneshot::channel();
+        runtime
+            .spawn_on(0, {
+                let poller = poller.clone();
+                async move {
+                    let _ = poller_first_tx.send(poller.ensure_owner());
+                }
+            })
+            .expect("admit poller owner task");
+        assert!(runtime
+            .block_on(poller_first_rx)
+            .expect("poller owner task")
+            .is_ok());
+
+        let (poller_foreign_tx, poller_foreign_rx) = oneshot::channel();
+        runtime
+            .spawn_on(1, async move {
+                let _ = poller_foreign_tx.send(poller.ensure_owner());
+            })
+            .expect("admit foreign poller task");
+        let poller_error = runtime
+            .block_on(poller_foreign_rx)
+            .expect("foreign poller task")
+            .expect_err("foreign shard acquired poller ownership");
+        assert!(poller_error.to_string().contains("owned by shard 0"));
+
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .expect("shutdown workers");
+    }
+
+    #[test]
+    fn dropping_owner_socket_drains_pending_receive() {
+        let runtime = MultiCoreRuntime::new(Some(1)).expect("worker shard");
+        let socket = Arc::new(
+            MinissUdpSocket::new(UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"))
+                .expect("create miniss UDP socket"),
+        );
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .spawn_on(0, {
+                let socket = socket.clone();
+                async move {
+                    let mut bytes = [0u8; 128];
+                    let mut bufs = [IoSliceMut::new(&mut bytes)];
+                    let mut meta = [RecvMeta::default()];
+                    let waker = std::task::Waker::noop().clone();
+                    let mut cx = Context::from_waker(&waker);
+                    let result = socket.poll_recv(&mut cx, &mut bufs, &mut meta);
+                    assert!(result.is_pending(), "empty UDP socket completed receive");
+                    let pending_before =
+                        with_io_state(|state| state.io_backend.pending_operation_count());
+                    assert!(
+                        pending_before > 0,
+                        "receive did not retain a backend operation"
+                    );
+
+                    drop(socket);
+                    let mut pending_after = pending_before;
+                    for _ in 0..10 {
+                        with_io_state(|state| {
+                            state.io_backend.park(Duration::from_millis(10));
+                            let _ = state.io_backend.drain_completions();
+                            pending_after = state.io_backend.pending_operation_count();
+                        });
+                        if pending_after == 0 {
+                            break;
+                        }
+                    }
+                    let _ = tx.send((pending_before, pending_after));
+                }
+            })
+            .expect("admit pending receive task");
+        drop(socket);
+
+        let (pending_before, pending_after) = runtime.block_on(rx).expect("pending receive task");
+        assert!(pending_before > 0);
+        assert_eq!(pending_after, 0, "owner drop left a receive operation live");
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .expect("shutdown workers");
     }
 }

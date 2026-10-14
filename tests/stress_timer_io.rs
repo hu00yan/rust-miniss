@@ -1,53 +1,24 @@
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
-};
+use rust_miniss::{fs::AsyncFile, timer, Runtime};
+use std::time::Duration;
 
-// Long-lived stress test exercising timers + I/O for 10 minutes.
-// Run manually: `cargo test --test stress_timer_io -- --ignored --nocapture`.
-// This test is ignored in CI to prevent timeouts.
 #[test]
-#[ignore = "Long running stress test - run manually"]
 fn stress_timer_io() {
-    const RUN_SECS: u64 = 600; // 10 minutes
+    let runtime = Runtime::new();
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let path = temp_dir.path().join("timer-io.bin");
 
-    let start = Instant::now();
-    let tmp_path = std::env::temp_dir().join("stress_timer_io.tmp");
-    let file = Arc::new(Mutex::new(
-        OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)
-            .unwrap(),
-    ));
-
-    let writer = {
-        let file = Arc::clone(&file);
-        thread::spawn(move || {
-            let mut counter: u64 = 0;
-            while start.elapsed() < Duration::from_secs(RUN_SECS) {
-                {
-                    let mut f = file.lock().unwrap();
-                    writeln!(f, "counter {counter}").unwrap();
-                }
-                counter += 1;
-                // Use yield instead of sleep for stress testing
-                thread::yield_now();
-            }
-        })
-    };
-
-    let timer = thread::spawn(move || {
-        while start.elapsed() < Duration::from_secs(RUN_SECS) {
-            // Use yield instead of sleep for stress testing
-            thread::yield_now();
+    runtime.block_on(async {
+        let file = AsyncFile::create(&path).expect("create async file");
+        for i in 0..32u64 {
+            let data = i.to_le_bytes();
+            assert_eq!(
+                file.write_at(i * 8, &data).await.expect("write"),
+                data.len()
+            );
+            timer::sleep(Duration::from_millis(1)).await;
         }
+        file.sync_all().await.expect("sync");
     });
 
-    writer.join().unwrap();
-    timer.join().unwrap();
+    assert_eq!(std::fs::metadata(path).expect("metadata").len(), 32 * 8);
 }

@@ -5,6 +5,7 @@
 //! contracts that implementation-specific regression tests tend to miss.
 
 use proptest::prelude::*;
+use rust_miniss::waker::{TaskArena, TaskKey};
 
 const SHARD: u16 = 3;
 const SLOT: u16 = 7;
@@ -553,6 +554,209 @@ fn op_action() -> impl Strategy<Value = OpAction> {
         Just(OpAction::TransferAccepted),
         Just(OpAction::CloseAccepted),
     ]
+}
+
+// This is the first production-linked differential test. The model is kept
+// deliberately smaller than TaskArena: it describes only the observable
+// generational allocation contract, while the production adapter exercises the
+// public arena API. The same action sequence must produce the same observations
+// on both sides.
+#[derive(Clone, Copy, Debug)]
+enum ArenaAction {
+    Allocate,
+    RemoveCurrent,
+    RemoveStale,
+    GetStale,
+    WrongRuntimeGet,
+    WrongShardGet,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArenaObservation {
+    live: bool,
+    generation: u16,
+    stale_present: bool,
+    last_remove_succeeded: bool,
+    last_get_succeeded: bool,
+}
+
+#[derive(Debug, Default)]
+struct ArenaReferenceModel {
+    current: Option<TaskKey>,
+    stale: Option<TaskKey>,
+    last_remove_succeeded: bool,
+    last_get_succeeded: bool,
+}
+
+impl ArenaReferenceModel {
+    fn apply(&mut self, action: ArenaAction) {
+        self.last_remove_succeeded = false;
+        self.last_get_succeeded = false;
+        match action {
+            ArenaAction::Allocate if self.current.is_none() => {
+                let generation = self
+                    .stale
+                    .map_or(1, |key| key.generation.wrapping_add(1).max(1));
+                self.current = Some(TaskKey::new(11, 3, 0, generation));
+            }
+            ArenaAction::RemoveCurrent => {
+                if let Some(current) = self.current.take() {
+                    self.stale = Some(current);
+                    self.last_remove_succeeded = true;
+                }
+            }
+            ArenaAction::RemoveStale => {
+                // A stale key must never remove the replacement occupant.
+                self.last_remove_succeeded = false;
+            }
+            ArenaAction::GetStale => {
+                self.last_get_succeeded = false;
+            }
+            ArenaAction::WrongRuntimeGet | ArenaAction::WrongShardGet => {
+                self.last_get_succeeded = false;
+            }
+            ArenaAction::Allocate => {}
+        }
+    }
+
+    fn observe(&self) -> ArenaObservation {
+        ArenaObservation {
+            live: self.current.is_some(),
+            generation: self.current.map_or(0, |key| key.generation),
+            stale_present: false,
+            last_remove_succeeded: self.last_remove_succeeded,
+            last_get_succeeded: self.last_get_succeeded,
+        }
+    }
+}
+
+struct ProductionArenaAdapter {
+    arena: TaskArena<()>,
+    current: Option<TaskKey>,
+    stale: Option<TaskKey>,
+    last_remove_succeeded: bool,
+    last_get_succeeded: bool,
+}
+
+impl ProductionArenaAdapter {
+    fn new() -> Self {
+        Self {
+            arena: TaskArena::with_capacity(11, 3, 1),
+            current: None,
+            stale: None,
+            last_remove_succeeded: false,
+            last_get_succeeded: false,
+        }
+    }
+
+    fn apply(&mut self, action: ArenaAction) {
+        self.last_remove_succeeded = false;
+        self.last_get_succeeded = false;
+        match action {
+            ArenaAction::Allocate if self.current.is_none() => {
+                let key = self.arena.reserve().expect("single arena slot available");
+                assert!(self.arena.insert(key, ()));
+                self.current = Some(key);
+            }
+            ArenaAction::RemoveCurrent => {
+                if let Some(current) = self.current.take() {
+                    self.last_remove_succeeded = self.arena.remove(current).is_some();
+                    self.stale = Some(current);
+                }
+            }
+            ArenaAction::RemoveStale => {
+                if let Some(stale) = self.stale {
+                    self.last_remove_succeeded = self.arena.remove(stale).is_some();
+                }
+            }
+            ArenaAction::GetStale => {
+                if let Some(stale) = self.stale {
+                    self.last_get_succeeded = self.arena.get(stale).is_some();
+                }
+            }
+            ArenaAction::WrongRuntimeGet => {
+                if let Some(current) = self.current {
+                    let wrong = TaskKey::new(
+                        current.runtime_generation + 1,
+                        current.shard,
+                        current.slot,
+                        current.generation,
+                    );
+                    self.last_get_succeeded = self.arena.get(wrong).is_some();
+                }
+            }
+            ArenaAction::WrongShardGet => {
+                if let Some(current) = self.current {
+                    let wrong = TaskKey::new(
+                        current.runtime_generation,
+                        current.shard + 1,
+                        current.slot,
+                        current.generation,
+                    );
+                    self.last_get_succeeded = self.arena.get(wrong).is_some();
+                }
+            }
+            ArenaAction::Allocate => {}
+        }
+    }
+
+    fn observe(&self) -> ArenaObservation {
+        ArenaObservation {
+            live: self.current.is_some() && !self.arena.is_empty(),
+            generation: self.current.map_or(0, |key| key.generation),
+            stale_present: self.stale.is_some_and(|key| self.arena.get(key).is_some()),
+            last_remove_succeeded: self.last_remove_succeeded,
+            last_get_succeeded: self.last_get_succeeded,
+        }
+    }
+}
+
+fn arena_action() -> impl Strategy<Value = ArenaAction> {
+    prop_oneof![
+        Just(ArenaAction::Allocate),
+        Just(ArenaAction::RemoveCurrent),
+        Just(ArenaAction::RemoveStale),
+        Just(ArenaAction::GetStale),
+        Just(ArenaAction::WrongRuntimeGet),
+        Just(ArenaAction::WrongShardGet),
+    ]
+}
+
+#[test]
+fn arena_differential_rejects_stale_and_foreign_keys() {
+    let actions = [
+        ArenaAction::Allocate,
+        ArenaAction::RemoveCurrent,
+        ArenaAction::Allocate,
+        ArenaAction::GetStale,
+        ArenaAction::RemoveStale,
+        ArenaAction::WrongRuntimeGet,
+        ArenaAction::WrongShardGet,
+    ];
+    let mut model = ArenaReferenceModel::default();
+    let mut production = ProductionArenaAdapter::new();
+    for action in actions {
+        model.apply(action);
+        production.apply(action);
+        assert_eq!(model.observe(), production.observe(), "action: {action:?}");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn arena_differential_matches_reference(
+        actions in prop::collection::vec(arena_action(), 0..32)
+    ) {
+        let mut model = ArenaReferenceModel::default();
+        let mut production = ProductionArenaAdapter::new();
+        for action in actions {
+            model.apply(action);
+            production.apply(action);
+            prop_assert_eq!(model.observe(), production.observe(), "action: {:?}", action);
+        }
+    }
 }
 
 /// A named replay case complements shrinking: it documents the shortest

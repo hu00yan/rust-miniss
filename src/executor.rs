@@ -512,7 +512,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_block_on_immediate() {
         let runtime = Runtime::new();
         let result = runtime.block_on(async { 42 });
@@ -520,7 +519,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_block_on_with_future_chain() {
         let runtime = Runtime::new();
         let result = runtime.block_on(async {
@@ -624,6 +622,88 @@ mod tests {
         assert!(peer_ran.load(Ordering::Acquire));
         assert_eq!(self_polls.load(Ordering::Acquire), 1);
         assert_eq!(executor.task_count(), 1);
+    }
+
+    #[test]
+    fn escaped_wake_race_with_task_retirement_cannot_revive_reused_slot() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        struct PendingUntil {
+            ready: Arc<AtomicBool>,
+            waker: Arc<parking_lot::Mutex<Option<Waker>>>,
+        }
+
+        impl Future for PendingUntil {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.ready.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    *self.waker.lock() = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut executor = Executor::with_task_capacity(1);
+        let ready = Arc::new(AtomicBool::new(false));
+        let saved_waker = Arc::new(parking_lot::Mutex::new(None));
+        executor.spawn(PendingUntil {
+            ready: ready.clone(),
+            waker: saved_waker.clone(),
+        });
+        assert!(executor.tick(), "initial task was not polled");
+
+        let stale_waker = saved_waker
+            .lock()
+            .take()
+            .expect("task did not publish its waker");
+        let producer_done = Arc::new(AtomicBool::new(false));
+        let wake_thread = {
+            let producer_done = producer_done.clone();
+            std::thread::spawn(move || {
+                // Keep the adversarial wake producer bounded. An unbounded
+                // producer can fill the ready queue faster than the owner
+                // retires the task and turn this regression into a test hang.
+                for _ in 0..10_000 {
+                    stale_waker.wake_by_ref();
+                    std::thread::yield_now();
+                }
+                stale_waker.wake_by_ref();
+                producer_done.store(true, Ordering::Release);
+            })
+        };
+
+        ready.store(true, Ordering::Release);
+        // Do not stop polling merely because the task retired once: the
+        // producer may still be publishing stale notifications. Wait until
+        // the bounded producer is finished, then drain those notifications
+        // before asserting retirement. This makes the test synchronize on a
+        // real producer-completion event instead of guessing with a tick
+        // count.
+        for _ in 0..20_000 {
+            executor.tick();
+            if producer_done.load(Ordering::Acquire) && executor.task_count() == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        wake_thread.join().expect("wake thread panicked");
+        assert_eq!(executor.task_count(), 0, "task was not retired");
+
+        // Reuse the only slot. Any late wake from the old task must be
+        // inactive and must not make the replacement task look ready.
+        let replacement_ran = Arc::new(AtomicBool::new(false));
+        let replacement_flag = replacement_ran.clone();
+        executor.spawn(async move {
+            replacement_flag.store(true, Ordering::Release);
+        });
+        executor.run();
+        assert!(replacement_ran.load(Ordering::Acquire));
+        assert_eq!(executor.task_count(), 0);
     }
 
     #[test]

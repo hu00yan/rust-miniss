@@ -136,6 +136,20 @@ impl Default for CpuIoState {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_io_state<P>(provider: P) -> CpuIoState
+where
+    P: IoProvider<Completion = (IoToken, Result<CompletionKind, IoError>)>,
+{
+    CpuIoState {
+        io_backend: Box::new(provider),
+        io_slots: Default::default(),
+        owner_completions: Default::default(),
+        owner_completion: Default::default(),
+        _local: std::marker::PhantomData,
+    }
+}
+
 impl std::fmt::Debug for CpuIoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuIoState")

@@ -47,16 +47,26 @@ match. An unset set is recorded as `unbound` for contention diagnostics.
 
 Record RPS, p50/p99/p99.9, errors, server/client CPU, task-clock, context
 switches, CPU migrations, RSS, `io_uring_enter` per request, and VM steal/load
-signals. The existing `bench_http.sh` remains the per-case runner. The new
-`just bench-verdict` consumes three or more summary files and emits JSON/CSV,
+signals. The existing `bench_http.sh` remains the per-case runner.
+`bench_http_matrix.sh` now accepts `BENCH_MATRIX_ROUNDS`; each round is retained
+under `round-N/` and contributes to machine-readable `matrix.csv`/`ratios.csv`.
+The `just bench-matrix` recipe exposes this driver without putting it in the
+default test gate. `just bench-verdict` consumes three or more summary files and emits JSON/CSV,
 rejecting errors, leaks, too few rounds, excessive CV/MAD, and baseline
 regressions. CPU pinning, client placement, and explicit skip/failure reasons
 remain the next matrix-driver extension.
+
+`bench_http_topology.sh` is the explicit topology driver for worker
+`1/2/4/8` × client threads `1/2/4`. It requires `BENCH_SERVER_CPUS` and
+`BENCH_CLIENT_CPUS`, preserves each topology's matrix directory, and rejects
+invalid or insufficient placement through the underlying runner. A host with
+only eight CPUs cannot provide an isolated eight-worker server plus a local
+client; that case must run with a larger host or a remote client.
 
 ## Regression-test rule
 
 Lifecycle tests must be bounded and run by default when the backend supports
 them. `multicore_spawned_async_file_future_completes` now runs on both Linux
 io_uring and macOS kqueue; its one-second completion and shutdown bounds remain
-part of the regression contract. The ten-minute `stress_timer_io` test stays
-opt-in and must never be pulled into the normal test gate.
+part of the regression contract. `stress_timer_io` is also bounded and runs in
+the normal test gate; long-duration pressure remains a separate benchmark job.

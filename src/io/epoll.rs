@@ -474,6 +474,23 @@ impl IoProvider for EpollBackend {
         pending + udp + completed
     }
 
+    fn retained_descriptor_count(&self) -> usize {
+        // SAFETY: queried only by the owning fallback event-loop thread at
+        // termination, while all backend storage is owner-thread exclusive.
+        let leases = unsafe { &*self.descriptor_leases.get() }
+            .iter()
+            .filter(|lease| lease.is_some())
+            .count();
+        // Accepted descriptors may be held by a completion until the owner
+        // consumes it; count those independently from operation leases.
+        // SAFETY: the completion vector is owner-thread exclusive here.
+        let accepted = unsafe { &*self.completed_local.get() }
+            .iter()
+            .filter(|(_, result)| matches!(result, Ok(CompletionKind::Accept { .. })))
+            .count();
+        leases + accepted
+    }
+
     fn cancel(&self, token: IoToken) -> bool {
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let poll = unsafe { &mut *self.poll.get() };

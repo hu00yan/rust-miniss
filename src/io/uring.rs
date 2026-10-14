@@ -330,8 +330,11 @@ impl UringBackend {
             return Ok(());
         }
         ring.submit()
+            // `io_uring::Submitter` already returns `std::io::Error` with
+            // the kernel errno. Preserve it so callers and diagnostics can
+            // distinguish EBADF/EINTR/EBUSY instead of seeing a wrapped
+            // error with no raw OS code.
             .map(|_| self.pending_sqes.set(0))
-            .map_err(io::Error::other)
     }
 
     #[inline]
@@ -1436,6 +1439,11 @@ impl UringBackend {
                     "io_uring submission queue is full",
                 )));
             }
+            let pending_sqes = self.pending_sqes.get() + 1;
+            self.pending_sqes.set(pending_sqes);
+            if pending_sqes >= self.flush_high_watermark {
+                self.flush_logged();
+            }
         } else {
             // Successful push — count it so flush() knows there's work.
             let pending_sqes = self.pending_sqes.get() + 1;
@@ -1501,6 +1509,24 @@ impl IoProvider for UringBackend {
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed = unsafe { &*self.completed_ops.get() }.len();
         pending + queued_accepts + completed + usize::from(self.pending_sqes.get() != 0)
+    }
+
+    fn retained_descriptor_count(&self) -> usize {
+        // SAFETY: queried only by the owning worker during termination.
+        let leases = unsafe { &*self.descriptor_leases.get() }
+            .iter()
+            .filter(|lease| lease.is_some())
+            .count();
+        // Accepted descriptors are retained in the multishot result queues,
+        // not in descriptor_leases, until the owner consumes or discards them.
+        // SAFETY: queried only by the owning worker during termination.
+        let accepted = unsafe { &*self.accept_results.get() }
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|queue| queue.iter())
+            .filter(|result| matches!(result, Ok(CompletionKind::Accept { .. })))
+            .count();
+        leases + accepted
     }
 
     fn cancel(&self, token: IoToken) -> bool {
@@ -1665,6 +1691,19 @@ impl IoProvider for UringBackend {
             // A negative CQE is terminal even if a canceled multishot op
             // carries the MORE flag; route it through terminal cleanup.
             if has_more && result >= 0 {
+                if matches!(pending_ops.get(idx), Some(PendingOp::PollAdd { .. })) {
+                    // Multishot poll results are ordinary repeated
+                    // completions. Keep the operation and descriptor lease
+                    // alive until a terminal CQE arrives.
+                    completed_ops.push((
+                        token,
+                        Ok(CompletionKind::PollAdd {
+                            events: result as u32,
+                        }),
+                    ));
+                    continue;
+                }
+
                 let Some(PendingOp::Accept {
                     op: _op,
                     addr_storage,
@@ -2155,11 +2194,7 @@ mod tests {
 
     #[test]
     fn failed_submission_is_reported_without_allocating_a_token() {
-        let Ok(backend) = UringBackend::new(2) else {
-            // Kernels without io_uring support are covered by the fallback
-            // backend tests; keep this unit test portable across CI hosts.
-            return;
-        };
+        let backend = UringBackend::new(2).expect("io_uring backend must be available");
         let result: Result<IoToken, IoError> = Err(IoError::Io(io::Error::new(
             io::ErrorKind::WouldBlock,
             "synthetic submission failure",
@@ -2169,10 +2204,65 @@ mod tests {
     }
 
     #[test]
+    fn io_uring_enter_failure_preserves_queued_submission_for_retry() {
+        let mut backend = UringBackend::new(2).expect("io_uring backend must be available");
+        // Keep the SQE queued so the first explicit flush exercises the real
+        // io_uring_enter call instead of the normal watermark path.
+        backend.flush_high_watermark = usize::MAX;
+        let token = backend.submit(Op::Nop).expect("nop admission");
+        assert_eq!(backend.pending_submission_count(), 1);
+
+        use std::os::fd::AsRawFd;
+        // SAFETY: this test borrows the initialized ring storage while the
+        // backend is exclusively owned and alive for the whole injection.
+        let ring_fd = unsafe { (&*backend.ring.get()).as_raw_fd() };
+        // Keep a duplicate file description so the owner can restore the
+        // ring after injecting EBADF and prove that the queued SQE is retryable.
+        // SAFETY: ring_fd is owned by this backend and remains valid here.
+        let backup_fd = unsafe { libc::dup(ring_fd) };
+        assert!(
+            backup_fd >= 0,
+            "dup io_uring fd: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: this intentionally closes the backend's syscall fd to force
+        // the real io_uring_enter submission path to return EBADF.
+        assert_eq!(unsafe { libc::close(ring_fd) }, 0);
+
+        let error = backend
+            .do_flush()
+            .expect_err("closed ring must reject submit");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(backend.pending_submission_count(), 1);
+
+        // SAFETY: restore the original descriptor number before the backend
+        // drops its IoUring owner; dup2 transfers the saved file description.
+        assert_eq!(unsafe { libc::dup2(backup_fd, ring_fd) }, ring_fd);
+        // SAFETY: backup_fd is the test-owned duplicate and is no longer needed.
+        assert_eq!(unsafe { libc::close(backup_fd) }, 0);
+
+        backend
+            .do_flush()
+            .expect("queued SQE should submit on retry");
+        assert_eq!(backend.pending_submission_count(), 0);
+        for _ in 0..8 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            backend.pending_operation_count(),
+            0,
+            "Nop leaked after retry"
+        );
+        let _ = token;
+    }
+
+    #[test]
     fn descriptor_lease_survives_numeric_fd_reuse() {
-        let Ok(backend) = UringBackend::new(8) else {
-            return;
-        };
+        let backend = UringBackend::new(8).expect("io_uring backend must be available");
         let mut fds = [0; 2];
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -2223,9 +2313,7 @@ mod tests {
 
     #[test]
     fn single_shot_accept_fallback_retains_address_storage() {
-        let Ok(mut backend) = UringBackend::new(8) else {
-            return;
-        };
+        let mut backend = UringBackend::new(8).expect("io_uring backend must be available");
         backend.supports_multishot_accept = false;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let token = backend
@@ -2247,10 +2335,127 @@ mod tests {
     }
 
     #[test]
+    fn queued_read_cancel_drains_terminal_cqe() {
+        let backend = UringBackend::new(8).expect("io_uring backend must be available");
+        let mut fds = [0; 2];
+        // SAFETY: fds points to two writable raw-fd slots and ownership is
+        // closed exactly once below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let token = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("queued read admission");
+        assert_eq!(backend.pending_submission_count(), 1);
+        assert!(backend.cancel(token));
+        backend.flush_logged();
+
+        // The cancel CQE and the target CQE have no application-level order
+        // contract.  Test the contract we own instead: the target eventually
+        // reaches one terminal cleanup path and no operation remains live.
+        for _ in 0..32 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(backend.pending_operation_count(), 0);
+        // SAFETY: both pipe descriptors remain owned by this test.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn submitted_read_cancel_drains_terminal_cqe() {
+        let backend = UringBackend::new(8).expect("io_uring backend must be available");
+        let mut fds = [0; 2];
+        // SAFETY: fds points to two writable raw-fd slots and ownership is
+        // closed exactly once below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let token = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("submitted read admission");
+        backend.flush_logged();
+        assert!(backend.pending_operation_count() >= 1);
+        assert!(backend.cancel(token));
+        backend.flush_logged();
+
+        // A kernel may report the cancel request before or after the target's
+        // terminal CQE.  Do not couple this test to either observation order;
+        // only eventual single reclamation is part of the runtime contract.
+        for _ in 0..32 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(backend.pending_operation_count(), 0);
+        // SAFETY: both pipe descriptors remain owned by this test.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn sq_full_retry_preserves_pending_submission_count() {
+        let mut backend = UringBackend::new(2).expect("io_uring backend must be available");
+        // Keep the first two SQEs queued so the third exercises the
+        // flush-and-retry branch instead of the normal watermark flush.
+        backend.flush_high_watermark = usize::MAX;
+        backend.submit(Op::Nop).expect("first nop");
+        backend.submit(Op::Nop).expect("second nop");
+        backend.submit(Op::Nop).expect("retry nop");
+        assert_eq!(backend.pending_submission_count(), 1);
+
+        backend.flush_logged();
+        for _ in 0..16 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(backend.pending_operation_count(), 0);
+    }
+
+    #[test]
+    fn small_completion_drain_batches_reclaim_all_terminal_operations() {
+        let mut backend = UringBackend::new(8).expect("io_uring backend must be available");
+        // Exercise the same drain protocol with one CQE per pass. This is a
+        // deterministic proxy for kernels or event-loop turns that expose
+        // completions in small batches.
+        backend.drain_batch_size = 1;
+        backend.flush_high_watermark = usize::MAX;
+        for _ in 0..4 {
+            backend.submit(Op::Nop).expect("nop admission");
+        }
+        backend.flush_logged();
+
+        for _ in 0..32 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(backend.pending_operation_count(), 0);
+        assert_eq!(backend.pending_submission_count(), 0);
+    }
+
+    #[test]
     fn multishot_accept_cancel_drains_terminal_cqe() {
-        let Ok(backend) = UringBackend::new(8) else {
-            return;
-        };
+        let backend = UringBackend::new(8).expect("io_uring backend must be available");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let token = backend
             .submit(Op::Accept {
@@ -2271,9 +2476,7 @@ mod tests {
 
     #[test]
     fn multishot_accept_cancel_discards_queued_owned_fds() {
-        let Ok(backend) = UringBackend::new(8) else {
-            return;
-        };
+        let backend = UringBackend::new(8).expect("io_uring backend must be available");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let token = backend
             .submit(Op::Accept {

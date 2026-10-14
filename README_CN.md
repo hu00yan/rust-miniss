@@ -155,6 +155,33 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080
 2. **性能**：在特定用例中实现接近最优的性能
 3. **简洁性**：保持代码库小而易懂
 
+## 测试状态
+
+当前 macOS/kqueue 与 Linux/io-uring 的完整 feature 测试、HTTP/2、TLS、QUIC/H3、
+UDP、多核生命周期和 Loom 取消模型均有自动化回归。TLS 根证书平台矩阵、持续多核
+QUIC/UDP 压力和长期性能矩阵仍未完成；这些状态以 `TODO.md` 为准。
+
+完整正确性套件入口是 `just test-full`。它会串行运行格式/静态检查、feature 编译
+矩阵、一次全 feature 普通回归、差分模型、Loom 和压力测试；Linux 会额外运行 io_uring safety，检测到 nightly
+和 Miri 时运行 Miri。被当前主机跳过的 gate 会明确打印 `SKIP`。
+
+## 与 monoio/compio 的当前差距
+
+除了性能，当前差距主要在成熟度和 API 范围，不在核心调度模型：
+
+- 和 monoio、compio 一样，`rust-miniss` 的数据面采用 thread-per-core，
+  不是 Tokio 那种 work-stealing 加透明任务迁移模型。若有跨线程 dispatch 或
+  blocking offload，那是显式的操作，不是把已有任务偷偷迁移到另一个核心；
+- 公开 API、生态适配、文档、发布版本和生产案例都比成熟运行时少；
+- TLS 当前主要是客户端流，HTTP/2 和 HTTP/3 分别通过 Hyper、Quinn/H3 集成，
+  不是完整的协议框架；
+- 明确支持 Linux 和 macOS，Linux 路径要求较新的 io_uring 内核。
+
+这些是项目当前的产品边界。`IOSQE_IO_LINK`、provided buffer、multishot receive、
+registered buffer、SQPOLL 等是 runtime 内部的实现手段，不是必须暴露给用户的功能。
+上层只表达功能语义，由 runtime 在不改变 API 行为的前提下选择实现；直接暴露内核
+flag 会造成抽象泄露。
+
 ## 许可证
 
 MIT OR Apache-2.0

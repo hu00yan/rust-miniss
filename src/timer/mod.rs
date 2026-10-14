@@ -226,6 +226,14 @@ impl TimerWheel {
     pub fn has_pending(&self) -> bool {
         self.pending_timers != 0
     }
+
+    /// Drop every pending timer during owner-thread shutdown.
+    pub fn clear(&mut self) {
+        for slot in &mut self.slots {
+            slot.clear();
+        }
+        self.pending_timers = 0;
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +291,18 @@ mod tests {
 
         // Cancelling again should return false
         assert!(!wheel.cancel(timer_id));
+    }
+
+    #[test]
+    fn test_timer_clear_reclaims_pending_entries() {
+        let mut wheel = TimerWheel::new(8, 1);
+        let waker = create_test_waker();
+        wheel.schedule(Instant::now() + Duration::from_secs(60), &waker);
+        wheel.schedule(Instant::now() + Duration::from_secs(60), &waker);
+        assert_eq!(wheel.pending_count(), 2);
+        wheel.clear();
+        assert_eq!(wheel.pending_count(), 0);
+        assert!(!wheel.has_pending());
     }
 
     #[test]

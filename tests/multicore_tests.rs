@@ -37,6 +37,7 @@ mod tests {
 
 #[test]
 fn test_timer_schedule_across_cpus() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
     let cpus_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -62,11 +63,15 @@ fn test_timer_schedule_across_cpus() {
 
     assert_eq!(received_count, 4);
 
-    runtime.shutdown().unwrap();
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .unwrap();
+    runtime.join().unwrap();
 }
 
 #[test]
 fn test_graceful_shutdown_no_leaks() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = rust_miniss::multicore::MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -91,8 +96,19 @@ fn test_graceful_shutdown_no_leaks() {
 use rust_miniss::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+// A runtime owns worker threads and pins them to shard CPUs.  Serialize this
+// binary's runtime tests so concurrent runtime startup/shutdown cannot make a
+// passing test leave workers behind or contend on the same affinity plan.
+static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn runtime_test_lock() -> MutexGuard<'static, ()> {
+    RUNTIME_TEST_LOCK
+        .lock()
+        .expect("multicore test lock poisoned")
+}
 
 fn init_tracing() {
     // Initialize tracing to prevent panics in multi-threaded environment
@@ -104,6 +120,7 @@ fn init_tracing() {
 
 #[test]
 fn test_multicore_basic_functionality() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -131,6 +148,7 @@ fn test_multicore_basic_functionality() {
 
 #[test]
 fn test_spawn_local_requires_worker_core() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -142,6 +160,7 @@ fn test_spawn_local_requires_worker_core() {
 
 #[test]
 fn test_spawn_local_runs_from_worker_core() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -163,6 +182,7 @@ fn test_spawn_local_runs_from_worker_core() {
 
 #[test]
 fn test_spawn_local_accepts_non_send_future() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -186,6 +206,7 @@ fn test_spawn_local_accepts_non_send_future() {
 
 #[test]
 fn test_spawn_wait_runs_task() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -205,6 +226,7 @@ fn test_spawn_wait_runs_task() {
 
 #[test]
 fn test_spawn_on_wait_rejects_invalid_core() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -216,6 +238,7 @@ fn test_spawn_on_wait_rejects_invalid_core() {
 
 #[test]
 fn test_runtime_metrics_snapshot_reports_each_core() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -232,6 +255,7 @@ fn test_runtime_metrics_snapshot_reports_each_core() {
 
 #[test]
 fn test_multicore_cross_cpu_communication() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
 
@@ -260,6 +284,7 @@ fn test_multicore_cross_cpu_communication() {
 
 #[test]
 fn test_multicore_round_robin_distribution() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(3)).unwrap();
     let task_counter = Arc::new(AtomicU32::new(0));
@@ -290,6 +315,7 @@ fn test_multicore_round_robin_distribution() {
 
 #[test]
 fn test_multicore_block_on() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -312,6 +338,7 @@ fn test_multicore_block_on() {
 
 #[test]
 fn test_multicore_error_handling() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -319,17 +346,22 @@ fn test_multicore_error_handling() {
     let result = MultiCoreRuntime::new(Some(0));
     assert!(result.is_err());
 
-    runtime.shutdown().unwrap();
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .unwrap();
+    runtime.join().unwrap();
 }
 
 #[test]
 fn test_multicore_zero_cpus_error() {
+    let _test_lock = runtime_test_lock();
     let result = MultiCoreRuntime::new(Some(0));
     assert!(result.is_err());
 }
 
 #[test]
 fn test_multicore_concurrent_spawning() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = Arc::new(MultiCoreRuntime::new(Some(4)).unwrap());
     let counter = Arc::new(AtomicU32::new(0));
@@ -379,21 +411,8 @@ fn test_multicore_concurrent_spawning() {
 }
 
 #[test]
-fn test_multicore_ping_communication() {
-    init_tracing();
-    let runtime = MultiCoreRuntime::new(Some(3)).unwrap();
-
-    // Ping functionality is not implemented yet
-    // runtime.ping_all().unwrap();
-
-    // Give time for messages to be processed
-    std::thread::yield_now();
-
-    runtime.shutdown().unwrap();
-}
-
-#[test]
 fn test_multicore_optimal_cpu_count() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(None).unwrap();
 
@@ -402,11 +421,15 @@ fn test_multicore_optimal_cpu_count() {
     assert!(cpu_count >= 1);
     assert!(cpu_count <= num_cpus::get());
 
-    runtime.shutdown().unwrap();
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .unwrap();
+    runtime.join().unwrap();
 }
 
 #[test]
 fn test_multicore_task_isolation() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -450,6 +473,7 @@ fn test_multicore_task_isolation() {
 
 #[test]
 fn test_multicore_graceful_shutdown() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(3)).unwrap();
     let running_tasks = Arc::new(AtomicU32::new(0));
@@ -483,6 +507,7 @@ fn test_multicore_graceful_shutdown() {
 
 #[test]
 fn test_shutdown_drains_running_timer_task() {
+    let _test_lock = runtime_test_lock();
     init_tracing();
     let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -494,13 +519,18 @@ fn test_shutdown_drains_running_timer_task() {
         })
         .unwrap();
 
-    runtime.shutdown().unwrap();
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .unwrap();
+    runtime.join().unwrap();
 
-    rx.recv_timeout(Duration::from_millis(500)).unwrap();
+    rx.recv_timeout(Duration::from_millis(500))
+        .expect("shutdown did not drain the timer task");
 }
 
 #[test]
 fn test_shutdown_deadline_escalates_permanently_pending_task() {
+    let _test_lock = runtime_test_lock();
     let runtime = rust_miniss::multicore::MultiCoreRuntime::new(Some(1)).unwrap();
     runtime
         .spawn(async {

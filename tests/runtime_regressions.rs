@@ -1,3 +1,4 @@
+use rust_miniss::multicore::RuntimeTerminationSnapshot;
 use rust_miniss::{AsyncFile, Executor, MultiCoreRuntime, Runtime, TaskError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +29,17 @@ impl RuntimeGuard {
         let joined = runtime.join();
         shutdown.expect("runtime shutdown request");
         joined.expect("runtime workers joined");
+    }
+
+    fn finish_and_snapshot(mut self) -> RuntimeTerminationSnapshot {
+        let runtime = self.runtime.take().expect("runtime guard is active");
+        let shutdown = runtime.shutdown_with_timeout(self.timeout);
+        let joined = runtime.join();
+        shutdown.expect("runtime shutdown request");
+        joined.expect("runtime workers joined");
+        runtime
+            .termination_snapshot()
+            .expect("termination snapshot after join")
     }
 }
 
@@ -169,6 +181,187 @@ fn tcp_accept_multishot_completes_after_delayed_connect() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn tcp_accept_multishot_rearms_for_a_bounded_burst() {
+    use rust_miniss::net::AsyncTcpListener;
+    use std::net::{SocketAddr, TcpStream};
+    use std::thread;
+
+    const CLIENTS: usize = 64;
+    let runtime = Runtime::new();
+
+    runtime.block_on(async {
+        let mut listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let clients = (0..CLIENTS)
+            .map(|_| {
+                thread::spawn(move || {
+                    TcpStream::connect(addr).expect("connect burst client");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for _ in 0..CLIENTS {
+            let accepted = rust_miniss::timer::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("accept burst timed out")
+                .expect("accept burst failed");
+            drop(accepted.0);
+        }
+        for client in clients {
+            client.join().expect("burst client panicked");
+        }
+    });
+}
+
+#[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn tcp_multishot_accept_shutdown_drains_pending_listener() {
+    use rust_miniss::net::AsyncTcpListener;
+    use std::net::{SocketAddr, TcpStream};
+    use std::thread;
+
+    const CLIENTS: usize = 64;
+    let runtime = MultiCoreRuntime::new(Some(1)).expect("runtime");
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let task_runtime = runtime.clone();
+    task_runtime
+        .spawn_on(0, async move {
+            let mut listener = AsyncTcpListener::bind(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("listener address"),
+            )
+            .expect("bind listener");
+            addr_tx
+                .send(listener.local_addr().expect("listener local address"))
+                .expect("send listener address");
+            let _ = listener.accept().await;
+        })
+        .expect("admit pending accept task");
+
+    let addr = addr_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("listener did not start");
+    thread::sleep(Duration::from_millis(20));
+    let clients = (0..CLIENTS)
+        .map(|_| {
+            thread::spawn(move || {
+                let _ = TcpStream::connect(addr);
+            })
+        })
+        .collect::<Vec<_>>();
+
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(2))
+        .expect("shutdown pending accept listener");
+    runtime.join().expect("join pending accept worker");
+    for client in clients {
+        client.join().expect("client thread");
+    }
+    assert!(runtime
+        .termination_snapshot()
+        .expect("termination snapshot")
+        .all_zero());
+}
+
+#[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn tcp_multishot_accept_reclaims_multiple_overflow_bursts_on_listener_drop() {
+    use rust_miniss::net::AsyncTcpListener;
+    use std::net::{SocketAddr, TcpStream};
+    use std::thread;
+
+    const BURSTS: usize = 3;
+    const CLIENTS_PER_BURST: usize = 128;
+    let runtime = MultiCoreRuntime::new(Some(1)).expect("runtime");
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    runtime
+        .spawn_on(0, async move {
+            let mut listener = AsyncTcpListener::bind(
+                "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("listener address"),
+            )
+            .expect("bind listener");
+            addr_tx
+                .send(listener.local_addr().expect("listener local address"))
+                .expect("send listener address");
+            let (stream, _) = listener.accept().await.expect("arm multishot accept");
+            drop(stream);
+            armed_tx.send(()).expect("accept arm signal");
+            rust_miniss::timer::sleep(Duration::from_millis(500)).await;
+            drop(listener);
+        })
+        .expect("admit overflow accept task");
+
+    let addr = addr_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("listener did not start");
+    let _ = TcpStream::connect(addr).expect("arm client connection");
+    armed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("multishot accept did not arm");
+
+    for _ in 0..BURSTS {
+        let clients = (0..CLIENTS_PER_BURST)
+            .map(|_| {
+                thread::spawn(move || {
+                    let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
+                })
+            })
+            .collect::<Vec<_>>();
+        for client in clients {
+            client.join().expect("overflow client thread");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(2))
+        .expect("shutdown overflow listener");
+    runtime.join().expect("join overflow accept worker");
+    assert!(runtime
+        .termination_snapshot()
+        .expect("termination snapshot")
+        .all_zero());
+}
+
+#[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn tcp_pending_read_drop_is_drained_before_late_data_arrives() {
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
+    use std::net::SocketAddr;
+
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let mut listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4];
+            let result =
+                rust_miniss::timer::timeout(Duration::from_millis(20), stream.read(&mut buffer))
+                    .await;
+            assert!(result.is_err(), "read completed before the late write");
+        };
+
+        let client = async move {
+            let mut stream = AsyncTcpStream::connect(addr).await.unwrap();
+            rust_miniss::sleep(Duration::from_millis(50)).await;
+            stream.write_all(b"late").await.unwrap();
+        };
+
+        futures::future::join(server, client).await;
+    });
+}
+
+#[test]
 fn multicore_spawned_timer_future_completes() {
     let guard = RuntimeGuard::new(MultiCoreRuntime::new(Some(1)).expect("runtime"));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -227,5 +420,37 @@ fn multicore_spawned_async_file_future_completes() {
     assert_eq!(
         std::fs::read(&temp_path).expect("read back"),
         b"multicore io"
+    );
+}
+
+#[test]
+fn multicore_loaded_timer_shutdown_publishes_zero_termination_snapshot() {
+    const TASKS: usize = 256;
+    let guard = RuntimeGuard::new(MultiCoreRuntime::new(Some(4)).expect("runtime"));
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    for task_number in 0..TASKS {
+        let tx = tx.clone();
+        guard
+            .runtime()
+            .spawn(async move {
+                rust_miniss::sleep(Duration::from_millis((task_number % 4 + 1) as u64)).await;
+                tx.send(task_number)
+                    .expect("completion receiver remains live");
+            })
+            .expect("timer task admitted");
+    }
+    drop(tx);
+
+    let mut completed = 0;
+    while rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+        completed += 1;
+    }
+
+    let snapshot = guard.finish_and_snapshot();
+    assert_eq!(completed, TASKS, "not all loaded timer tasks completed");
+    assert!(
+        snapshot.all_zero(),
+        "loaded shutdown left non-zero resources: {snapshot:?}"
     );
 }

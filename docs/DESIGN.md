@@ -200,6 +200,9 @@ thread-local spawn 队列，`CpuCore::execute_tasks()` 在同一轮 drain 到本
 `spawn_wait()` 不引入 unbounded queue，也不阻塞 worker 线程；它只是在 bounded inbox 满时按
 1ms timer backoff 重试。它不是负载均衡机制，也不会把任务迁移到其他核心。
 
+`spawn_local()` 的 admission 计数只保护本地队列入队；任务本身不会持有 shutdown admission
+票据，否则一个长期运行的 `!Send` 子任务会阻塞 shutdown 的 admission cutoff。
+
 ### Shutdown Drain
 
 `shutdown()` 分两层信号：
@@ -216,9 +219,9 @@ draining
 && message_inbox.is_empty()
 ```
 
-这保证 shutdown 不会因为普通 task 消息堆积而完全饿死，也不会粗暴丢掉已入队任务。它仍然不是
-强制终止机制：如果业务 task 永不完成，worker 会继续等待。未来如果需要生产级优雅关闭，应增加
-显式超时和 force-shutdown 阶段，但不能把强制取消塞进数据面热路径。
+这保证 shutdown 不会因为普通 task 消息堆积而完全饿死，也不会粗暴丢掉已入队任务。
+`shutdown_with_timeout()` 超时后由 owner worker 执行 force-shutdown：先取消并有限 drain
+后端 operation，再丢弃 shard-local task、timer 和 ready state；控制线程不直接触碰这些对象。
 
 ---
 
@@ -460,13 +463,11 @@ bit 31..0  = 本核自增序号
 
 ### TLS 集成
 
-```
-TlsStream {
-    inner: rustls (直接调用，不依赖 tokio-rustls)
-}
-```
-
-**当前实现** 还是通过 `tokio-rustls` + compat 复用现成生态。等后续要做纯 rustls 版本时，再把这段迁移成原生实现。
+`TlsStream` 当前通过 `tokio-rustls` + `tokio_util::compat` 复用现成的
+Rustls/Tokio trait 生态，并在 miniss 的 `AsyncTcpStream` 之上完成客户端
+握手。它不是自研 TLS 协议栈，也不创建 Tokio runtime；当前仓库有编译、
+线程归属约束和 TLS 1.3 回环握手/读写/关闭、证书错误与主机名不匹配回归，
+但默认根证书路径、平台矩阵和完整 TLS 兼容性仍未验证。
 
 ---
 
@@ -489,7 +490,7 @@ src/
 ├── net.rs              # AsyncTcpListener/Stream，AsyncUdpSocket
 ├── fs.rs               # AsyncFile（io_uring 文件读写）
 ├── http.rs             # HTTP Request/Response 解析（简单实现，不依赖 Hyper）
-├── tls.rs              # 暂存，未实现（需要 Rustls 直接调用）
+├── tls.rs              # 基于 tokio-rustls compat 的 TLS 客户端流
 ├── timer/              # TimerWheel，sleep，timeout，Interval
 ├── signal.rs           # 信号处理
 ├── compat.rs           # futures-io ↔ tokio-io compat re-export
@@ -529,7 +530,7 @@ Apache Iggy（2026年2月公开迁移）完整评估了 Monoio、Glommio、compi
 | 架构 | driver/executor 解耦 | driver 与调度器耦合 | 可借鉴解耦设计，但不必过度工程 |
 | Buffer 模型 | `IoBuf`/`IoBufMut` trait | owned buffer trait | 当前 Rent 路径思路正确，需修复 bug |
 | I/O 请求分配 | 堆分配（mimalloc 弥补） | Slab allocator | 当前 Slab 设计是正确的，保持 |
-| io_uring 特性覆盖 | 广（multi-shot、buf ring、注册文件...） | 基础覆盖，更新滞后 | 本运行时的 6.12 基线给了更多空间 |
+| io_uring 后端能力 | 广（multi-shot、buf ring、注册文件...） | 基础覆盖，更新滞后 | 可逐步在后端内部采用，不构成对外 API 要求 |
 | 跨平台 | Linux + macOS | Linux io_uring 与 macOS kqueue 均有协议集成测试；Windows/IOCP 不在支持范围 |
 
 #### Driver/Executor 解耦
@@ -542,6 +543,8 @@ compio 把 `compio-driver`（管理 ring、提交 SQE、收割 CQE）和 `compio
 
 当前实现中 `IoProvider` trait 的接口边界本质上也做到了类似的分离（
 `submit`/`poll_complete`/`flush`/`park`），区别在于 executor 驱动方式不同。
+
+上表比较的是后端实现和分层方式，不是要求 `rust-miniss` 把内核机制暴露给业务代码。
 
 #### IoBuf / IoBufMut 所有权模型
 
@@ -576,9 +579,15 @@ join!(write1, write2).await;
 你以为这是"批量提交两个有序写操作"，但实际上 io_uring **不保证 SQE 的完成顺序**。
 两个操作的完成顺序可能是任意的——对于有序依赖的操作（如 WAL 写入），这会静默损坏数据。
 
-正确做法是显式使用 **`IOSQE_IO_LINK`** 标志来链接有顺序依赖的 SQE。
-compio 和 Monoio 目前暴露这个能力但需要手动处理。当前运行时尚未暴露此功能，
-是后续需要实现的关键能力。
+正确做法是让上层表达“先写入、再刷盘”这样的依赖语义；是否使用
+**`IOSQE_IO_LINK`** 应由 runtime 在内部决定。`join!` 本身只表达并发等待，不能
+凭空产生 I/O 顺序保证。即使其他运行时提供底层 driver 选项，也不是本运行时必须
+复制的 API。
+
+本项目遵循“上层表达语义、后端选择机制”的边界：provided buffer、multishot
+receive、registered buffer、SQPOLL 等同样属于内部优化手段。只有当某个公开 API
+承诺的语义无法实现，或者需要新增明确的高层语义（例如有序写后刷盘）时，才应新增
+高层 API；不直接暴露 io_uring flag。
 
 ### ntex/neon-uring 的设计选择
 
@@ -669,8 +678,9 @@ HTTP 场景只是进一步确认，不是第一证据。
 
 - **线程数**：一个 worker thread 对应一个物理 core，不要超。
   context switch 会吞掉 thread-per-core 的所有收益。
-- **Pin 核心**：用 `core_affinity` crate pin 线程。不 pin 会导致 OS 随机迁移，
-  CPU cache 失效直接把性能打回 Tokio 级别。
+- **Pin 核心**：worker 启动时按平台调用线程 affinity（Linux 当前使用
+  `sched_setaffinity`）把线程绑定到计划的 CPU。不 pin 不会破坏 Rust 的
+  所有权模型，但会削弱 cache locality，并使性能数据混入 OS 调度迁移噪声。
 - **运行时长**：网络 benchmark 至少 30s，前 5~10s warm-up 丢弃。
   磁盘 benchmark 至少 60s（page cache 状态前几十秒大幅变化）。
 - **Percentile 延迟**：测 P50/P99/P999 而非平均值。P999 高说明偶发的调度停顿
@@ -697,6 +707,10 @@ perf report
 
 基线优先用 `bench/scripts/bench_http_matrix.sh <base_port>` 跑同一组场景，
 保存 `summary.csv`、原始 perf CSV 和 server/wrk 日志，避免只看单次吞吐。
+
+正确性验证统一入口为 `just test-full`：它串行执行 portable gate、feature
+编译矩阵、一次全 feature 普通回归、差分模型、Loom 和 bounded stress；Linux/Miri gate 按主机能力加入，
+不可用时必须显式输出 `SKIP`。
 
 ### 关于 fsync 的基准测试
 

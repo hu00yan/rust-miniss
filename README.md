@@ -155,6 +155,15 @@ and retain host, kernel, workload, throughput, and p99 metadata.
 - Lock-free data structures from `crossbeam` crate
 - Proper pinning for futures and async state
 
+### Complete correctness suite
+
+Run `just test-full` for the complete non-benchmark correctness suite. It runs
+the feature compilation matrix, one all-feature regular regression pass,
+production-linked differential tests, Loom, and bounded stress tests; Linux adds
+the io_uring safety gate and a host with nightly Miri
+adds the Miri gate. Any unavailable environment-specific gate is reported as
+`SKIP`, never silently treated as passed.
+
 ### Memory Safety Testing
 
 - **AddressSanitizer (ASan)**: Detects memory errors
@@ -164,10 +173,39 @@ and retain host, kernel, workload, throughput, and p99 metadata.
 
 ## Status
 
-Active development. Core io_uring backend, task system, and timer wheel are functional.
-Hyper/Quinn/TLS integrations are **under reconstruction** — the previous implementations
-were broken (busy-spin on WouldBlock, tokio::spawn in thread-per-core context). See
-[DESIGN.md](docs/DESIGN.md) for the correct approach.
+Active development. The core io_uring backend, task system, timer wheel, HTTP/1.1,
+Hyper HTTP/2, and Quinn/H3 integrations are functional for the tested loopback
+scenarios. HTTP/2 and QUIC/H3 have bounded integration checks on macOS/kqueue and
+Orb Linux/io_uring; TLS currently has an implemented client stream and compile/
+ownership coverage, plus bounded local TLS 1.3 handshake, certificate rejection,
+hostname mismatch, read/write, and close tests.
+This is tested integration, not complete protocol-compatibility coverage:
+TLS default-root/platform matrices, sustained multicore QUIC/UDP ownership stress,
+and long-running kernel/performance matrices remain open. A macOS/Linux CI gate
+now runs the supported feature tests and Linux safety checks. See
+[the protocol record](docs/review/protocol-integration-2026-07-13.md) and
+[DESIGN.md](docs/DESIGN.md).
+
+### Position relative to monoio and compio
+
+The main differences are API and ecosystem maturity, not the core scheduler
+model:
+
+- Like monoio and compio, `rust-miniss` uses a thread-per-core model for its
+  data plane; it is not a Tokio-style work-stealing runtime with transparent
+  task migration. Cross-thread dispatch or blocking offload, where provided,
+  is an explicit operation rather than migration of an existing task.
+- Its public API is smaller and its production ecosystem is much less mature.
+- TLS is currently a client stream; HTTP/2 and HTTP/3 are integrations through
+  Hyper and Quinn/H3 rather than a complete protocol framework.
+- Linux and macOS are the supported platforms; the Linux path requires a recent
+  io_uring-capable kernel.
+
+These are the project's current boundaries. io_uring mechanisms such as linked
+SQEs, provided buffers, multishot receive, registered buffers, and SQPOLL are
+implementation techniques, not required public API features. The runtime should
+choose them internally when they preserve the same API semantics; exposing raw
+kernel flags would be an abstraction leak.
 
 ## License
 

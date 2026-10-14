@@ -19,6 +19,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
+#[cfg(any(target_os = "linux", loom))]
+#[cfg(loom)]
+use loom::sync::atomic as gate_atomic;
+#[cfg(any(target_os = "linux", loom))]
+#[cfg(not(loom))]
+use std::sync::atomic as gate_atomic;
+
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::task::Poll;
@@ -39,18 +46,77 @@ type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
 // Local tasks never cross the accepting worker boundary.  Keep this queue
 // explicitly `!Send` so the API cannot accidentally migrate shard-local
 // state through the cross-core message path.
-type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>, AdmissionTicket);
+type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 const LOCAL_SPAWN_QUEUE_CAPACITY: usize = 65_536;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
 const ADMISSION_COUNT_MASK: usize = !ADMISSION_CLOSED;
 
-struct AdmissionTicket(Arc<AtomicUsize>);
+/// Coordinates the boundary between the worker deciding to park and a
+/// control-plane notification.  A notification that wins before the park is
+/// consumed by `begin_sleep`; one that wins after it is observed as a parked
+/// worker and wakes the real eventfd path.
+#[cfg(any(target_os = "linux", loom))]
+struct WorkerSleepGate {
+    state: gate_atomic::AtomicU8,
+}
 
-impl Drop for AdmissionTicket {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+#[cfg(any(target_os = "linux", loom))]
+impl WorkerSleepGate {
+    const SLEEPING: u8 = 1;
+    const WAKE_REQUESTED: u8 = 2;
+
+    fn new() -> Self {
+        Self {
+            state: gate_atomic::AtomicU8::new(0),
+        }
+    }
+
+    fn begin_sleep(&self) -> bool {
+        let mut current = self.state.load(gate_atomic::Ordering::Acquire);
+        loop {
+            let (next, should_park) = if current & Self::WAKE_REQUESTED != 0 {
+                (current & !Self::WAKE_REQUESTED, false)
+            } else {
+                (current | Self::SLEEPING, true)
+            };
+            match self.state.compare_exchange(
+                current,
+                next,
+                gate_atomic::Ordering::AcqRel,
+                gate_atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return should_park,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn notify(&self) -> bool {
+        let mut current = self.state.load(gate_atomic::Ordering::Acquire);
+        loop {
+            let next = current | Self::WAKE_REQUESTED;
+            match self.state.compare_exchange(
+                current,
+                next,
+                gate_atomic::Ordering::AcqRel,
+                gate_atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return current & Self::SLEEPING != 0,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn end_sleep(&self) {
+        self.state
+            .fetch_and(!Self::SLEEPING, gate_atomic::Ordering::AcqRel);
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn is_sleeping(&self) -> bool {
+        self.state.load(gate_atomic::Ordering::Acquire) & Self::SLEEPING != 0
     }
 }
 
@@ -69,17 +135,13 @@ thread_local! {
     static LOCAL_SPAWN_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-fn push_local_spawn(
-    task_id: TaskId,
-    future: Pin<Box<dyn Future<Output = ()>>>,
-    ticket: AdmissionTicket,
-) -> bool {
+fn push_local_spawn(task_id: TaskId, future: Pin<Box<dyn Future<Output = ()>>>) -> bool {
     let admitted = LOCAL_SPAWN_QUEUE.with(|queue| {
         let mut queue = queue.borrow_mut();
         if queue.len() >= LOCAL_SPAWN_QUEUE_CAPACITY {
             return false;
         }
-        queue.push((task_id, future, ticket));
+        queue.push((task_id, future));
         true
     });
     if !admitted {
@@ -92,7 +154,7 @@ fn push_local_spawn(
 fn cancel_deferred_local_spawn(task_id: TaskId) -> bool {
     LOCAL_SPAWN_QUEUE.with(|queue| {
         let mut queue = queue.borrow_mut();
-        let Some(index) = queue.iter().position(|(id, _, _)| *id == task_id) else {
+        let Some(index) = queue.iter().position(|(id, _)| *id == task_id) else {
             return false;
         };
         let _cancelled = queue.swap_remove(index);
@@ -242,6 +304,49 @@ pub struct RuntimeMetrics {
     pub cores: Vec<CoreMetricsSnapshot>,
 }
 
+/// Owner-thread resource counts published exactly once when a worker exits.
+/// The report is control-plane evidence for shutdown, not hot-path metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoreTerminationSnapshot {
+    pub core_id: usize,
+    pub task_arena_len: usize,
+    pub local_task_count: usize,
+    pub ready_queue_len: usize,
+    pub timer_count: usize,
+    pub message_inbox_len: usize,
+    pub owner_ready_len: usize,
+    pub owner_completion_len: usize,
+    pub queued_submissions: usize,
+    pub pending_operations: usize,
+    pub retained_descriptors: usize,
+}
+
+impl CoreTerminationSnapshot {
+    pub fn is_zero(&self) -> bool {
+        self.task_arena_len == 0
+            && self.local_task_count == 0
+            && self.ready_queue_len == 0
+            && self.timer_count == 0
+            && self.message_inbox_len == 0
+            && self.owner_ready_len == 0
+            && self.owner_completion_len == 0
+            && self.queued_submissions == 0
+            && self.pending_operations == 0
+            && self.retained_descriptors == 0
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeTerminationSnapshot {
+    pub cores: Vec<CoreTerminationSnapshot>,
+}
+
+impl RuntimeTerminationSnapshot {
+    pub fn all_zero(&self) -> bool {
+        !self.cores.is_empty() && self.cores.iter().all(CoreTerminationSnapshot::is_zero)
+    }
+}
+
 #[derive(Debug, Default)]
 struct CoreMetrics {
     tasks_spawned: u64,
@@ -304,7 +409,7 @@ pub struct CpuCore {
     park_timeout: Duration,
     /// Per-core park wakeup flag, shared with the runtime control plane.
     #[cfg(target_os = "linux")]
-    sleeping: Arc<AtomicBool>,
+    sleep_gate: Arc<WorkerSleepGate>,
     #[cfg(target_os = "linux")]
     /// Eventfd used to wake the worker when a cross-core message arrives.
     wakeup_eventfd: RawFd,
@@ -333,6 +438,8 @@ pub struct CpuCore {
     task_poll_budget: usize,
     /// Shard-local metrics. Aggregated only by explicit control-plane request.
     metrics: CoreMetrics,
+    /// Control-plane report written once after the owner has drained its state.
+    termination_report: Arc<parking_lot::Mutex<Option<CoreTerminationSnapshot>>>,
 }
 
 impl CpuCore {
@@ -347,10 +454,11 @@ impl CpuCore {
         io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
         force_shutdown: Arc<AtomicBool>,
-        #[cfg(target_os = "linux")] sleeping: Arc<AtomicBool>,
+        #[cfg(target_os = "linux")] sleep_gate: Arc<WorkerSleepGate>,
         message_inbox: Receiver<CoreMessage>,
         ready_sender: std::sync::mpsc::Sender<std::result::Result<(), String>>,
         park_timeout: Duration,
+        termination_report: Arc<parking_lot::Mutex<Option<CoreTerminationSnapshot>>>,
         #[cfg(target_os = "linux")] wakeup_eventfd: RawFd,
     ) -> Self {
         let mut io_state = CpuIoState::default();
@@ -369,7 +477,7 @@ impl CpuCore {
             timer_wheel: TimerWheel::new(1024, 1),
             park_timeout,
             #[cfg(target_os = "linux")]
-            sleeping,
+            sleep_gate,
             #[cfg(target_os = "linux")]
             wakeup_eventfd,
             #[cfg(target_os = "linux")]
@@ -384,6 +492,7 @@ impl CpuCore {
             message_poll_ticks: 0,
             task_poll_budget: crate::config::task_poll_budget(),
             metrics: CoreMetrics::default(),
+            termination_report,
         }
     }
 
@@ -424,6 +533,29 @@ impl CpuCore {
             inline_completion_hits: self.metrics.inline_completion_hits,
             waker_wakeups: self.metrics.waker_wakeups,
         }
+    }
+
+    fn termination_snapshot(&self) -> CoreTerminationSnapshot {
+        // SAFETY: this method runs on the owner thread after the event loop
+        // has stopped touching these shard-local containers.
+        let owner_completion_len = unsafe { &*self.io_state.owner_completions.get() }.len();
+        CoreTerminationSnapshot {
+            core_id: self.id,
+            task_arena_len: self.task_queue.len(),
+            local_task_count: self.local_task_count,
+            ready_queue_len: self.ready_queue.len(),
+            timer_count: self.timer_wheel.pending_count(),
+            message_inbox_len: self.message_inbox.len(),
+            owner_ready_len: self.owner_ready_queue.len(),
+            owner_completion_len,
+            queued_submissions: self.io_state.io_backend.pending_submission_count(),
+            pending_operations: self.io_state.io_backend.pending_operation_count(),
+            retained_descriptors: self.io_state.io_backend.retained_descriptor_count(),
+        }
+    }
+
+    fn publish_termination_snapshot(&self) {
+        *self.termination_report.lock() = Some(self.termination_snapshot());
     }
 
     #[cfg(target_os = "linux")]
@@ -515,6 +647,11 @@ impl CpuCore {
                 }
                 self.task_queue.clear();
                 while self.ready_queue.pop().is_some() {}
+                self.timer_wheel.clear();
+                self.owner_ready_queue.clear();
+                // SAFETY: the worker owns this completion storage during
+                // forced teardown; no other thread can access it.
+                unsafe { (&mut *self.io_state.owner_completions.get()).clear() };
                 self.local_task_count = 0;
                 self.draining = true;
                 break;
@@ -603,10 +740,15 @@ impl CpuCore {
             // We've exhausted local work; block until at least one completion
             // arrives, a wake message lands, or the timeout fires.
             #[cfg(target_os = "linux")]
-            self.sleeping.store(true, Ordering::Release);
+            let should_park = self.sleep_gate.begin_sleep();
+            #[cfg(target_os = "linux")]
+            if !should_park {
+                self.sleep_gate.end_sleep();
+                continue;
+            }
             #[cfg(target_os = "linux")]
             if self.process_messages() {
-                self.sleeping.store(false, Ordering::Release);
+                self.sleep_gate.end_sleep();
                 continue;
             }
             #[cfg(target_os = "linux")]
@@ -618,7 +760,7 @@ impl CpuCore {
             let (park_flushes, park_flush_total_us, max_park_flush_us) =
                 self.io_state.io_backend.take_park_flush_stats();
             #[cfg(target_os = "linux")]
-            self.sleeping.store(false, Ordering::Release);
+            self.sleep_gate.end_sleep();
             self.metrics.park_total_us += park_elapsed_us;
             self.metrics.max_park_us = self.metrics.max_park_us.max(park_elapsed_us);
             self.metrics.park_flushes += park_flushes;
@@ -914,15 +1056,12 @@ impl CpuCore {
 
             let mut deferred = Vec::new();
             let mut inserted = false;
-            for (id, future, ticket) in queue.drain(..) {
+            for (id, future) in queue.drain(..) {
                 if !self.task_queue.can_insert_external(id.key()) {
-                    deferred.push((id, future, ticket));
+                    deferred.push((id, future));
                     continue;
                 }
-                let wrapped: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
-                    future.await;
-                    drop(ticket);
-                });
+                let wrapped: Pin<Box<dyn Future<Output = ()>>> = future;
                 let mut task = Task::from_pinned(id, wrapped);
                 task.ensure_waker_with_overflow_hint(
                     self.ready_queue.clone(),
@@ -1102,7 +1241,7 @@ pub struct MultiCoreRuntime {
     /// Per-core sleep flags; senders only write to the wake eventfd when the
     /// target core is actually parked.
     #[cfg(target_os = "linux")]
-    core_sleeping: Vec<Arc<AtomicBool>>,
+    core_sleeping: Vec<Arc<WorkerSleepGate>>,
     #[cfg(target_os = "linux")]
     /// Per-core eventfds used to wake parked workers when messages arrive.
     core_wakeup_fds: Vec<OwnedFd>,
@@ -1113,6 +1252,8 @@ pub struct MultiCoreRuntime {
     core_threads: Vec<thread::Thread>,
     /// Per-core task sequence counters.
     task_counters: Vec<AtomicU64>,
+    /// One owner-published termination report per worker.
+    termination_reports: Vec<Arc<parking_lot::Mutex<Option<CoreTerminationSnapshot>>>>,
     /// Runtime state
     state: AtomicU8,
     shutdown_phase: AtomicU8,
@@ -1230,12 +1371,6 @@ impl MultiCoreRuntime {
         }
     }
 
-    fn keep_admission(guard: AdmissionGuard) -> AdmissionTicket {
-        let counter = guard.counter.clone();
-        std::mem::forget(guard);
-        AdmissionTicket(counter)
-    }
-
     /// Create new multi-core runtime with specified number of CPU cores
     pub fn with_cpus(num_cores: usize) -> Result<Arc<Self>> {
         Self::new(Some(num_cores))
@@ -1272,6 +1407,7 @@ impl MultiCoreRuntime {
         let mut core_threads = Vec::with_capacity(num_cores);
         let mut ready_receivers = Vec::with_capacity(num_cores);
         let mut task_counters = Vec::with_capacity(num_cores);
+        let mut termination_reports = Vec::with_capacity(num_cores);
 
         // Create cores and start threads
         for (core_id, affinity_cpu) in cpu_plan.iter().copied().enumerate() {
@@ -1280,14 +1416,16 @@ impl MultiCoreRuntime {
             let core_shutdown = Arc::new(AtomicBool::new(false));
             let core_exited_flag = Arc::new(AtomicBool::new(false));
             let force_shutdown = Arc::new(AtomicBool::new(false));
+            let termination_report = Arc::new(parking_lot::Mutex::new(None));
             #[cfg(target_os = "linux")]
-            let core_sleeping_flag = Arc::new(AtomicBool::new(false));
+            let core_sleeping_flag = Arc::new(WorkerSleepGate::new());
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
             let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
             core_senders.push(sender.clone());
             core_shutdowns.push(core_shutdown.clone());
             core_exited.push(core_exited_flag.clone());
             force_shutdowns.push(force_shutdown.clone());
+            termination_reports.push(termination_report.clone());
             #[cfg(target_os = "linux")]
             core_sleeping.push(core_sleeping_flag.clone());
             ready_receivers.push((core_id, ready_receiver));
@@ -1314,7 +1452,7 @@ impl MultiCoreRuntime {
                     };
                     #[cfg(target_os = "linux")]
                     let mut core = {
-                        let sleeping = core_sleeping_flag.clone();
+                        let sleep_gate = core_sleeping_flag.clone();
                         CpuCore::new(
                             core_id,
                             affinity_cpu,
@@ -1322,10 +1460,11 @@ impl MultiCoreRuntime {
                             io_backend,
                             core_shutdown.clone(),
                             force_shutdown.clone(),
-                            sleeping,
+                            sleep_gate,
                             receiver,
                             ready_sender,
                             crate::config::park_timeout(),
+                            termination_report.clone(),
                             wakeup_fd_raw,
                         )
                     };
@@ -1339,8 +1478,10 @@ impl MultiCoreRuntime {
                         receiver,
                         ready_sender,
                         crate::config::park_timeout(),
+                        termination_report.clone(),
                     );
                     let result = core.run();
+                    core.publish_termination_snapshot();
                     // Set shutdown flag when core exits
                     // Publish worker teardown before the coordinator observes
                     // the shutdown flag and returns from its deadline wait.
@@ -1398,6 +1539,7 @@ impl MultiCoreRuntime {
             join_handles: parking_lot::Mutex::new(join_handles),
             core_threads,
             task_counters,
+            termination_reports,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
             shutdown_phase: AtomicU8::new(ShutdownPhase::Running as u8),
             admission: Arc::new(AtomicUsize::new(0)),
@@ -1417,7 +1559,7 @@ impl MultiCoreRuntime {
         self.core_threads[core_id].unpark();
         #[cfg(target_os = "linux")]
         {
-            if self.core_sleeping[core_id].load(Ordering::Acquire) {
+            if self.core_sleeping[core_id].notify() {
                 notify_wakeup_eventfd(self.core_wakeup_fds[core_id].as_raw_fd());
             }
         }
@@ -1638,7 +1780,7 @@ impl MultiCoreRuntime {
     where
         F: Future<Output = ()> + 'static,
     {
-        let admission = Self::keep_admission(self.begin_admission()?);
+        let _admission = self.begin_admission()?;
         let state = self.state.load(Ordering::Acquire);
         if state != RuntimeState::Running as u8 {
             return Err(RuntimeError::TaskFailed(
@@ -1650,11 +1792,7 @@ impl MultiCoreRuntime {
             RuntimeError::TaskFailed("spawn_local called outside a worker core".to_string())
         })?;
         let task_id = self.next_task_id_for_core(core_id);
-        if !push_local_spawn(
-            task_id,
-            Box::pin(DetachedTaskFuture::new(future)),
-            admission,
-        ) {
+        if !push_local_spawn(task_id, Box::pin(DetachedTaskFuture::new(future))) {
             return Err(RuntimeError::TaskFailed(
                 "local task admission queue capacity exhausted".to_string(),
             ));
@@ -1971,10 +2109,11 @@ impl MultiCoreRuntime {
             shutdown.store(true, Ordering::Release);
         }
 
-        // Best-effort wakeup. Do not block if a bounded message queue is full:
-        // the direct shutdown flag above is authoritative.
-        for (core_id, sender) in self.core_senders.iter().enumerate() {
-            let _ = sender.try_send(CoreMessage::Shutdown);
+        // The direct shutdown flag is the lifecycle protocol. Do not enqueue a
+        // duplicate Shutdown message: a worker can observe the flag and exit
+        // before a concurrently queued message becomes visible, leaving a
+        // control message in the post-join termination snapshot.
+        for core_id in 0..self.num_cores {
             self.notify_core(core_id);
         }
 
@@ -2168,6 +2307,28 @@ impl MultiCoreRuntime {
         Ok(())
     }
 
+    /// Return the owner-published resource counts from the last worker exit.
+    ///
+    /// This is intentionally available only after `join`: before then a
+    /// worker may still be draining its shard-local state.
+    pub fn termination_snapshot(&self) -> Result<RuntimeTerminationSnapshot> {
+        if self.state.load(Ordering::Acquire) != RuntimeState::Terminated as u8 {
+            return Err(RuntimeError::TaskFailed(
+                "Runtime must be joined before collecting termination snapshot".to_string(),
+            ));
+        }
+        let mut cores = Vec::with_capacity(self.num_cores);
+        for (core_id, report) in self.termination_reports.iter().enumerate() {
+            let snapshot = report.lock().as_ref().copied().ok_or_else(|| {
+                RuntimeError::TaskFailed(format!(
+                    "Core {core_id} did not publish a termination snapshot"
+                ))
+            })?;
+            cores.push(snapshot);
+        }
+        Ok(RuntimeTerminationSnapshot { cores })
+    }
+
     /// Block on a future using the runtime
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
@@ -2316,7 +2477,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_runtime_creation() {
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let stats = runtime.stats();
@@ -2325,7 +2485,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_task_execution() {
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
 
@@ -2341,7 +2500,9 @@ mod tests {
         // Give task time to execute
         thread::sleep(Duration::from_millis(100));
 
-        runtime.shutdown().unwrap();
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .unwrap();
         match Arc::try_unwrap(runtime) {
             Ok(rt) => rt.join().unwrap(),
             Err(_) => panic!("Failed to get unique ownership of runtime"),
@@ -2351,7 +2512,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn spawn_local_above_poll_budget_uses_ready_queue_without_starvation() {
         const LOCAL_TASKS: usize = 256;
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
@@ -2394,22 +2554,18 @@ mod tests {
     #[test]
     fn deferred_local_spawn_can_be_cancelled_before_arena_installation() {
         let task_id = TaskId::from_key(crate::waker::TaskKey::new(9, 0, 17, 1));
-        let admission = Arc::new(AtomicUsize::new(1));
         let local_only = std::rc::Rc::new(std::cell::Cell::new(false));
         assert!(push_local_spawn(
             task_id,
             Box::pin(async move { local_only.set(true) }),
-            AdmissionTicket(Arc::clone(&admission)),
         ));
 
         assert!(cancel_deferred_local_spawn(task_id));
         assert_eq!(LOCAL_SPAWN_COUNT.with(Cell::get), 0);
-        assert_eq!(admission.load(Ordering::Acquire), 0);
         assert!(!cancel_deferred_local_spawn(task_id));
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_shutdown() {
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
         runtime.shutdown().unwrap();
@@ -2420,7 +2576,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn shutdown_with_timeout_waits_for_worker_exit_ack() {
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
         runtime
@@ -2433,7 +2588,26 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    fn concurrent_shutdown_calls_are_idempotent() {
+        let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+        let callers = (0..4)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                std::thread::spawn(move || {
+                    runtime
+                        .shutdown_with_timeout(Duration::from_secs(1))
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for caller in callers {
+            caller.join().expect("shutdown caller panicked");
+        }
+        runtime.join().unwrap();
+    }
+
+    #[test]
     fn shutdown_publishes_explicit_lifecycle_phases() {
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
         assert_eq!(runtime.stats().shutdown_phase, ShutdownPhase::Running);
@@ -2447,7 +2621,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn admission_rejects_spawn_after_shutdown_cutoff() {
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
         runtime.shutdown().unwrap();
@@ -2459,7 +2632,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn cancel_routes_to_owner_and_rejects_missing_shard() {
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let foreign = TaskId::from_key(crate::waker::TaskKey::new(1, 7, 0, 1));
@@ -2472,7 +2644,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn cancel_reports_owner_acknowledgement() {
         let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
         let task = runtime
@@ -2488,6 +2659,28 @@ mod tests {
     }
 
     #[test]
+    fn termination_snapshot_is_zero_after_join() {
+        let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+        runtime
+            .spawn(async {
+                crate::timer::sleep(Duration::from_secs(60)).await;
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        runtime
+            .shutdown_with_timeout(Duration::from_millis(50))
+            .unwrap();
+        match Arc::try_unwrap(runtime) {
+            Ok(runtime) => {
+                runtime.join().unwrap();
+                let snapshot = runtime.termination_snapshot().unwrap();
+                assert!(snapshot.all_zero(), "non-zero termination: {snapshot:?}");
+            }
+            Err(_) => panic!("Failed to get unique ownership of runtime"),
+        }
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn startup_cpu_plan_uses_allowed_physical_cpu_ids() {
         let plan = MultiCoreRuntime::startup_cpu_plan(Some(1)).unwrap();
@@ -2495,5 +2688,108 @@ mod tests {
         assert!(plan[0] < libc::CPU_SETSIZE as usize);
         let second = MultiCoreRuntime::startup_cpu_plan(Some(1)).unwrap();
         assert_eq!(plan, second);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cross_core_spawn_wakes_a_parked_worker() {
+        let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+        let sleeping = &runtime.core_sleeping[1];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !sleeping.is_sleeping() {
+            assert!(
+                Instant::now() < deadline,
+                "target worker did not enter the parked state"
+            );
+            thread::yield_now();
+        }
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        runtime
+            .spawn_on(1, async move {
+                completed_tx
+                    .send(thread::current().name().map(str::to_owned))
+                    .expect("completion receiver remains live");
+            })
+            .unwrap();
+
+        let worker_name = completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("parked worker was not woken by cross-core admission");
+        assert_eq!(worker_name.as_deref(), Some("miniss-core-1"));
+
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .unwrap();
+        runtime.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cross_core_spawn_stress_keeps_bounded_admission_and_affinity() {
+        const TASKS: usize = 256;
+        let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+        let sleeping = &runtime.core_sleeping[1];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !sleeping.is_sleeping() {
+            assert!(
+                Instant::now() < deadline,
+                "target worker did not enter the parked state"
+            );
+            thread::yield_now();
+        }
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(TASKS);
+        for task_id in 0..TASKS {
+            let completed_tx = completed_tx.clone();
+            runtime
+                .spawn_on(1, async move {
+                    completed_tx
+                        .send((task_id, thread::current().name().map(str::to_owned)))
+                        .expect("completion receiver remains live");
+                })
+                .expect("bounded cross-core admission");
+        }
+        drop(completed_tx);
+
+        let mut seen = vec![false; TASKS];
+        for _ in 0..TASKS {
+            let (task_id, worker_name) = completed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cross-core stress task did not complete");
+            assert!(!seen[task_id], "task completed twice: {task_id}");
+            seen[task_id] = true;
+            assert_eq!(worker_name.as_deref(), Some("miniss-core-1"));
+        }
+        assert!(seen.into_iter().all(|completed| completed));
+
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .unwrap();
+        runtime.join().unwrap();
+        assert!(runtime
+            .termination_snapshot()
+            .expect("termination snapshot")
+            .all_zero());
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_worker_sleep_gate_cannot_lose_notification() {
+        loom::model(|| {
+            let gate = std::sync::Arc::new(WorkerSleepGate::new());
+            let notifier_gate = gate.clone();
+            let notifier = loom::thread::spawn(move || notifier_gate.notify());
+
+            let should_park = gate.begin_sleep();
+            let notified_while_sleeping = notifier.join().expect("notifier thread");
+
+            // If notification won before begin_sleep, begin_sleep consumes the
+            // pending bit and refuses to park. Otherwise notify observes the
+            // sleeping state and the real eventfd path is responsible for the
+            // wakeup.
+            assert!(!should_park || notified_while_sleeping);
+            gate.end_sleep();
+        });
     }
 }

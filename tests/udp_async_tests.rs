@@ -137,3 +137,45 @@ fn test_udp_multiple_senders() {
         assert_eq!(received.len(), 5);
     });
 }
+
+#[test]
+fn test_udp_pending_receive_is_cancelled_by_timeout() {
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let socket = AsyncUdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let mut buffer = [0u8; 32];
+        let result = timer::timeout(Duration::from_millis(20), socket.recv_from(&mut buffer)).await;
+        assert!(
+            result.is_err(),
+            "pending UDP receive unexpectedly completed"
+        );
+    });
+}
+
+#[test]
+fn test_udp_receive_can_be_reused_after_cancellation() {
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let receiver = AsyncUdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let sender = AsyncUdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut buffer = [0u8; 32];
+
+        let cancelled =
+            timer::timeout(Duration::from_millis(20), receiver.recv_from(&mut buffer)).await;
+        assert!(
+            cancelled.is_err(),
+            "receive unexpectedly completed before send"
+        );
+
+        sender
+            .send_to(b"after-cancel", receiver_addr)
+            .await
+            .unwrap();
+        let (bytes, _) = timer::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+            .await
+            .expect("receive after cancellation timed out")
+            .unwrap();
+        assert_eq!(&buffer[..bytes], b"after-cancel");
+    });
+}

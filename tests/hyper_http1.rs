@@ -22,7 +22,7 @@ fn hyper_http1_connection_runs_on_miniss() {
         let server = async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut http = http1::Builder::new();
-            http.keep_alive(false);
+            http.keep_alive(true);
 
             let service = service_fn(|_req: Request<Incoming>| async move {
                 Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"hello"))))
@@ -34,7 +34,13 @@ fn hyper_http1_connection_runs_on_miniss() {
         let client = async move {
             let mut stream = AsyncTcpStream::connect(addr).await.unwrap();
             stream
-                .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+                .write_all(
+                    b"GET /one HTTP/1.1\r\nhost: localhost\r\nconnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"GET /two HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
                 .await
                 .unwrap();
             stream.flush().await.unwrap();
@@ -42,9 +48,17 @@ fn hyper_http1_connection_runs_on_miniss() {
             let mut response = Vec::new();
             stream.read_to_end(&mut response).await.unwrap();
             assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
-            assert!(response.ends_with(b"\r\n\r\nhello"));
+            assert_eq!(
+                response.windows(5).filter(|part| *part == b"hello").count(),
+                2
+            );
         };
 
-        future::join(server, client).await;
+        rust_miniss::timer::timeout(
+            std::time::Duration::from_secs(5),
+            future::join(server, client),
+        )
+        .await
+        .expect("HTTP/1.1 keep-alive exchange timed out");
     });
 }

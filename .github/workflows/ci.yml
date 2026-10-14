@@ -1,0 +1,96 @@
+name: rust-miniss checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS kqueue
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Compile all targets
+        run: cargo check --all-targets --all-features
+      - name: Tests
+        run: cargo test --all-features --lib --tests --examples
+      - name: Feature-off tests
+        run: cargo test --no-default-features --lib --tests --examples
+      - name: Feature matrix
+        run: just test-feature-matrix
+      - name: No ignored tests
+        run: bash scripts/check_no_ignored_tests.sh
+      - name: Architecture audit
+        run: bash scripts/audit_architecture.sh
+
+  loom:
+    name: Loom production synchronization models
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - name: No ignored tests
+        run: bash scripts/check_no_ignored_tests.sh
+      - name: Loom models
+        run: just loom
+
+  miri:
+    name: Miri memory-safety tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+      - uses: taiki-e/install-action@just
+      - name: No ignored tests
+        run: bash scripts/check_no_ignored_tests.sh
+      - name: Miri setup
+        run: rustup run nightly cargo miri setup
+      - name: Miri safety gate
+        run: just miri-safety
+
+  linux:
+    name: Linux io_uring
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - name: Require the supported kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel="$(uname -r | cut -d. -f1-2)"
+          printf 'kernel=%s\n' "$kernel"
+          if [[ "$(printf '%s\n' 6.12 "$kernel" | sort -V | head -n1)" != "6.12" ]]; then
+            echo 'rust-miniss Linux CI requires kernel 6.12+ for io_uring.' >&2
+            exit 1
+          fi
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Compile all targets
+        run: cargo check --all-targets --all-features
+      - name: Tests
+        run: cargo test --all-features --lib --tests --examples
+      - name: Feature-off tests
+        run: cargo test --no-default-features --lib --tests --examples
+      - name: Feature matrix
+        run: just test-feature-matrix
+      - name: No ignored tests
+        run: bash scripts/check_no_ignored_tests.sh
+      - name: Architecture audit
+        run: bash scripts/audit_architecture.sh
+      - name: Linux safety gate
+        run: sh scripts/linux_safety.sh
+      - name: Sustained pressure gate
+        run: just stress

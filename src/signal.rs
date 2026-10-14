@@ -80,21 +80,22 @@ impl SignalHandler {
                         if !shutdown_flag.load(Ordering::Acquire) {
                             shutdown_flag.store(true, Ordering::Release);
 
-                            for flag in &core_shutdowns {
-                                flag.store(true, Ordering::Release);
-                            }
+                            // Queue at most one wake message before publishing
+                            // the owner flags. Once a worker observes its
+                            // flag, it may exit immediately; publishing the
+                            // flag first could leave this control message in
+                            // the worker's post-join inbox.
                             for (core_id, sender) in cpu_senders.iter().enumerate() {
                                 if let Err(error) = sender.try_send(CoreMessage::Shutdown) {
-                                    // The flag publication above is the
-                                    // lifecycle linearization point; a full
-                                    // inbox must be observable, never silently
-                                    // treated as a delivered shutdown message.
                                     tracing::warn!(
                                         core_id,
                                         ?error,
-                                        "signal shutdown message was not queued; owner flag remains set"
+                                        "signal shutdown message was not queued; owner flag will provide shutdown"
                                     );
                                 }
+                            }
+                            for flag in &core_shutdowns {
+                                flag.store(true, Ordering::Release);
                             }
 
                             if let Some(signal_callbacks) = callbacks.get(&sig) {

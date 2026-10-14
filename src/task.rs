@@ -686,6 +686,34 @@ mod tests {
     }
 
     #[test]
+    fn join_handle_cancel_before_owner_poll_is_terminal() {
+        let (handle, completer) = JoinHandle::new(TaskId::new(0, 2));
+        let mut task = Box::pin(JoinTaskFuture::new(std::future::pending::<()>(), completer));
+        let waker = dummy_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        handle.cancel().unwrap();
+        handle.cancel().unwrap();
+        assert!(matches!(task.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(matches!(
+            futures::executor::block_on(handle),
+            Err(TaskError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn join_handle_cancel_after_owner_completion_keeps_result() {
+        let (handle, completer) = JoinHandle::new(TaskId::new(0, 3));
+        let mut task = Box::pin(JoinTaskFuture::new(async { 42 }, completer));
+        let waker = dummy_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(task.as_mut().poll(&mut cx), Poll::Ready(())));
+        handle.cancel().unwrap();
+        assert_eq!(futures::executor::block_on(handle).unwrap(), 42);
+    }
+
+    #[test]
     #[should_panic(expected = "spawn_periodic() requires an active Runtime")]
     fn test_spawn_periodic_requires_runtime() {
         use std::time::Duration;

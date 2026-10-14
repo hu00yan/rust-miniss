@@ -1,6 +1,6 @@
 # Runtime Safety Contracts
 
-Status: design and enforcement map, verified against the current worktree on 2026-07-12.
+Status: design and enforcement map, verified against the current worktree on 2026-07-14.
 Passing these tests is not a proof that the runtime is safe. The contracts below
 state only what is mechanically checked and what remains a Linux/kernel obligation.
 
@@ -9,7 +9,7 @@ state only what is mechanically checked and what remains a Linux/kernel obligati
 | Layer | Layout / command | Exact scope | Expected warm runtime |
 |---|---|---|---|
 | Fast | crate unit tests plus `tests/runtime_safety_models.rs`; `just test-fast` | fmt, negative trait assertions, 64 bounded task sequences, 64 bounded operation sequences | 2-10 s |
-| Loom obligation | `just loom` | fails clearly until production synchronization seams are extracted | not runnable |
+| Loom | `just loom` | three production seams: cancellation/waiter registration, waker close/schedule, and worker sleep/notification | explicit |
 | Miri | named crate unit tests; `just miri-safety` | TLS restore, waker teardown, fallback buffer publication | 30-120 s |
 | Linux | existing named io_uring regressions; `just linux-safety` | kernel lifetime and descriptor ownership | 5-30 s, excluding stress |
 
@@ -18,14 +18,28 @@ sanitizers, fault injection, sleeps, real sockets, or wall-clock assertions
 from the property models. Existing ordinary unit tests may initialize the host
 backend; CI separately retains the ordinary integration suite.
 
+Orb Ubuntu verification on 2026-07-14 ran all eight exact Miri targets listed
+below; each reported `1 passed, 0 ignored`. Miri setup was available through
+the nightly toolchain there; the macOS stable toolchain still has no Miri
+component.
+
 ## Production seams
 
-The reference models are deliberately independent of the runtime. Production
-changes are limited to negative auto-trait markers for shard-local owner types.
-No production notifier/cancellation/sleep seam is currently suitable for Loom,
-so no independent bitset model is presented as evidence. The Arc-backed bounded queue held by a waker is a cross-thread
-notifier, despite the historical `ReadyQueue` alias; shard-local task/ready
-ownership remains in the worker and task arena.
+The task and operation reference models remain deliberately small and mostly
+independent of the runtime. The task model has one production-linked
+differential slice in `tests/runtime_safety_models.rs`; focused unit tests in
+`io::future` connect the real `IoFuture` to a tiny test provider for successful
+delivery and abandoned completion. This does not model the kernel or connect
+the full task/waker protocol.
+
+`CancellationState` is now a production seam: the normal build uses the same
+state protocol with parking_lot, while `MINISS_LOOM=1 just loom` runs
+the cancellation/waiter-registration interleaving against Loom atomics, Arc,
+and mutexes. The waker close/schedule protocol is now a production
+`WakeControl` seam and is checked by Loom; no independent bitset model is
+presented as evidence for that path. The Arc-backed bounded queue held by a
+waker is a cross-thread notifier, despite the historical `ReadyQueue` alias;
+shard-local task/ready ownership remains in the worker and task arena.
 
 ## Contract map
 
@@ -34,17 +48,17 @@ ownership remains in the worker and task arena.
 | C1 | `Runtime`, `CpuIoState`, executor/task arena, timer wheel, driver mutable state | worker/shard thread | bounded commands and notifier tokens only | move/share local mutable owner state | negative `Send`/`Sync` assertions in crate tests; architecture audit | backend thread-affinity under real CQE load |
 | C2 | shard-local mutable references | worker/shard thread | handles may carry keys, bounded senders, atomics and owned values | cross-thread handle exposes local reference/raw pointer | partial: positive Send/Sync assertions for `WakerState`, `ReadyQueue`, `TaskId`, and `MultiCoreRuntime`; ordinary late-wake tests; review for new handles | no Rust auto-trait assertion can reject every semantically wrong shared reference; API-surface obligation remains |
 | C3 | kernel-pending operation storage | driver operation arena | operation key and cancellation request | clone pending operation or kernel-visible pointees | `PendingOp: !Clone` assertion in its defining module; operation model | pointer stability through kernel terminal CQE |
-| C4 | task identity | shard task arena | full `TaskKey { runtime_generation, shard, slot, generation }` | stale/wrong-shard key mutates replacement | layout assertion, ordinary arena tests, task model after every action | `u16` generation/runtime-generation exhaustion is unverified |
-| C5 | ready notification bit/entry | live task wake state; consumed by worker | coalesced wake notification | more than one live ready notification | task model and ordinary wake dedup tests | wake/close concurrency lacks a production-linked Loom seam |
-| C6 | task/waker lifetime | task owner, then closed wake state | clone/wake/drop via Arc state | late wake accesses retired task/runtime memory | ordinary waker teardown tests, task model, named Miri tests | concurrent teardown lacks a production-linked Loom seam |
-| C7 | buffers, descriptor leases, kernel argument memory | driver operation slot until terminal completion | waiter abandonment/cancel request | future drop reclaims resources before terminal completion | operation model; existing fd-lease unit tests | queued vs submitted drop/cancel and terminal CQE ordering |
+| C4 | task identity | shard task arena | full `TaskKey { runtime_generation, shard, slot, generation }` | stale/wrong-shard key mutates replacement | layout assertion, ordinary arena tests, task model after every action, and explicit generation-exhaustion tests | long-running wraparound under production-scale allocation remains unmeasured |
+| C5 | ready notification bit/entry | live task wake state; consumed by worker | coalesced wake notification | more than one live ready notification | task model, ordinary wake dedup tests, and production `WakeControl` Loom model | queue overflow and kernel wake delivery remain runtime obligations |
+| C6 | task/waker lifetime | task owner, then closed wake state | clone/wake/drop via Arc state | late wake accesses retired task/runtime memory | ordinary waker teardown tests, production Executor retirement/slot-reuse race, `WakeControl` Loom model, task model, named Miri tests | queued stale keys still require owner-side generation checks |
+| C7 | buffers, descriptor leases, kernel argument memory | driver operation slot until terminal completion | waiter abandonment/cancel request | future drop reclaims resources before terminal completion | operation model; queued-read cancel and fd-lease unit tests | invalid terminal completion from the backend |
 | C8 | buffer initialized and logical lengths | operation/buffer owner | publish checked completion length | logical length exceeds initialized length or submitted capacity | operation model, ordinary buffer tests, named Miri tests | malicious/impossible CQE lengths from a real backend |
-| C9 | cancellation state | task/operation owner | request plus owner acknowledgement | report success without owner-observed state transition | task and operation models; ordinary owner-ack tests | cancel/register concurrency and kernel terminal CQE semantics |
+| C9 | cancellation state | task/operation owner | request plus owner acknowledgement | report success without owner-observed state transition | task/operation models, owner-ack tests, and production `CancellationState` Loom race | kernel terminal CQE semantics |
 | C10 | admission cutoff | runtime owner plus admission gate | acknowledged pre-cutoff admission | post-cutoff work silently accepted or pre-cutoff work lost | task model and existing admission unit tests | worker exit racing real channel/eventfd traffic |
-| C11 | accepted descriptor | accepting driver slot, then exactly one consumer | transfer one `OwnedFd` or owner close | leak, double-close, or duplicate transfer | operation model and ordinary `OwnedFd` tests | multishot overflow, parse failure, cancellation CQEs |
-| C12 | operation token namespace | driver arena | return `Result<OpKey, SubmitError>` after valid allocation | sentinel/apparently valid token on rejection | operation model and rejected-submit unit test | SQ full/enter failure injection |
-| C13 | worker sleep notification | notifier protocol, observed by worker | set pending and unpark/notify | live target silently loses event while sleeping | explicitly unverified; `just loom` fails | production seam plus eventfd/kernel integration |
-| C14 | termination accounting | runtime owner after every shard acknowledgement | shutdown/cancel/drain messages | publish terminal with live tasks, timers, queued/submitted ops or retained accepts | component models prove their own owner-finalize cleanup only | production timers/messages/multiple ops and a full zero-resource report are not mechanically exposed |
+| C11 | accepted descriptor | accepting driver slot, then exactly one consumer | transfer one `OwnedFd` or owner close | leak, double-close, or duplicate transfer | operation model, ordinary `OwnedFd` tests, and three 128-client overflow bursts | parse failure and cancellation CQEs in the supported backend |
+| C12 | operation token namespace | driver arena | return `Result<OpKey, SubmitError>` after valid allocation | sentinel/apparently valid token on rejection | operation model, rejected-submit unit test, and real `io_uring_enter` EBADF/retry injection | invalid backend error sequences outside the supported API |
+| C13 | worker sleep notification | notifier protocol, observed by worker | single-state CAS gate plus eventfd/unpark | live target silently loses event while sleeping | production `WorkerSleepGate` Loom model, parked-worker eventfd wake, and 256-task cross-core admission stress | longer kernel stress |
+| C14 | termination accounting | runtime owner after every shard acknowledgement | shutdown/cancel/drain messages | publish terminal with live tasks, timers, queued/submitted ops or retained accepts | owner-published `RuntimeTerminationSnapshot`; forced-shutdown, pending-accept drain, 4-worker/256-timer bounded-load tests, three-round 4-worker loaded shutdown stress, immediate/timer 1/2/4-worker × 16/64-task matrix, two-round pending UDP socket lease matrix, and two-round TCP accepted-fd forced-shutdown matrix | broader descriptor/task-type combinations remain open |
 | C15 | scoped runtime TLS | current thread and context guard | nested scoped closure access | reference escape or failed panic restoration | ordinary panic/nesting tests and named Miri tests | backend syscalls intentionally excluded from Miri |
 | C16 | event-loop fairness | shard worker | bounded polls/messages/completions per turn | self-waker prevents I/O/timer/control progress | ordinary poll-budget tests; task model notification bound | tail latency under real load is performance evidence, not a safety proof |
 
@@ -83,8 +97,9 @@ threads, sleeps, clocks, sockets, file descriptors, or a runtime backend.
   `executor::tests::poll_budget_bounds_self_waking_task_and_runs_peer`;
   `multicore::tests::admission_rejects_spawn_after_shutdown_cutoff`; and
   `multicore::tests::cancel_reports_owner_acknowledgement`.
-- C13 and the concurrent portions of C5/C6/C9 remain explicit obligations.
-  `just loom` exits non-zero and lists the missing production seams; no
+- C5-C6 now use the production `WakeControl` Loom seam; C13 uses the production
+  `WorkerSleepGate` seam. `just loom` passes the production
+  cancellation/waiter-registration, waker-close, and worker-sleep models; no
   standalone reference bitset is counted as synchronization evidence.
 - C7-C8, C11-C12, C14:
   `tests/runtime_safety_models.rs::operation_actions_retain_resources_until_terminal_reclamation`;
@@ -99,13 +114,18 @@ threads, sleeps, clocks, sockets, file descriptors, or a runtime backend.
 
 ## Explicitly unverified obligations
 
-- generation and runtime-generation wrap/exhaustion policy;
 - kernel pointer stability and descriptor leases through actual queued and
   submitted io_uring operations;
-- SQ pressure, `io_uring_enter` failure, cancellation terminal CQEs, multishot
-  accept overflow/rearm, and shutdown drain;
-- a production termination snapshot proving zero tasks, timers, messages,
-  queued/submitted operations, and retained accepted descriptors;
+- cancellation terminal CQEs and alternate accept-overflow CQ-drain batch shapes
+  in the supported io_uring backend (bounded rearm, three 128-client overflow bursts,
+  pending-accept shutdown drain, and direct `io_uring_enter` EBADF/retry injection
+  are covered);
+- a sustained multi-core loaded termination matrix proving zero tasks, timers,
+  messages, queued/submitted operations, and retained accepted descriptors;
+  the bounded 4-worker/256-timer regression, three-round 4-worker loaded
+  shutdown stress, 1/2/4-worker × 16/64-task matrix, and 1/2/4-worker × 8/32
+  two-round pending UDP socket lease matrix and two-round TCP accepted-fd
+  forced-shutdown matrix are covered on macOS/kqueue and Linux/io_uring;
 - performance and p99 tail-latency non-regression.
 
 `just linux-safety` lists/runs the available Linux evidence and prints missing

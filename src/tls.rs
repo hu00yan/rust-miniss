@@ -32,12 +32,15 @@ pub struct TlsStream {
 impl TlsStream {
     /// Performs a TLS handshake over the given TCP stream.
     ///
-    /// Uses the system's default root certificates for server verification.
+    /// Uses the bundled Mozilla/WebPKI root certificates for server verification.
     pub async fn connect(domain: &str, stream: AsyncTcpStream) -> io::Result<Self> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = rustls::ClientConfig::builder()
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(io::Error::other)?
             .with_root_certificates(root_store)
             .with_no_client_auth();
 

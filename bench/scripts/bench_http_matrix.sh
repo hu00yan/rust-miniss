@@ -6,6 +6,7 @@ BASE_PORT=${1:-15000}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MATRIX_DIR=${BENCH_MATRIX_DIR:-"$ROOT/bench/results/http-matrix-$(date '+%Y%m%d-%H%M%S')"}
 LIGHT_MODE=${HTTP_MATRIX_LIGHT:-0}
+ROUNDS=${BENCH_MATRIX_ROUNDS:-1}
 BASELINE_SCENARIO=${HTTP_MATRIX_BASELINE_SCENARIO:-"ka200:0:200:8:5"}
 BASELINE_RUNTIMES=${HTTP_MATRIX_BASELINE_RUNTIMES:-"miniss,monoio,compio"}
 
@@ -19,6 +20,11 @@ DEFAULT_SCENARIOS=(
     "close32:1:32:8:5"
     "close800:1:800:8:10"
 )
+
+if ! [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BENCH_MATRIX_ROUNDS must be a positive integer" >&2
+    exit 2
+fi
 
 if [[ -n "${HTTP_MATRIX_SCENARIOS:-}" ]]; then
     read -r -a SCENARIOS <<<"$HTTP_MATRIX_SCENARIOS"
@@ -38,7 +44,9 @@ port=$BASE_PORT
 run_matrix_case() {
     local scenario=$1
     local runtimes=$2
-    local out_dir="$MATRIX_DIR/$scenario"
+    local round_dir=${3:-$MATRIX_DIR}
+    local matrix_scenario=${4:-$scenario}
+    local out_dir="$round_dir/$scenario"
 
     IFS=: read -r name close connections threads duration <<<"$scenario"
 
@@ -52,7 +60,7 @@ run_matrix_case() {
             "$ROOT/bench/scripts/bench_http.sh" "$port" "$duration" "$connections" "$threads"
     fi
 
-    perl -MList::Util=max - "$name" "$out_dir/summary.csv" "$matrix_csv" "$ratio_csv" "$runtimes" <<'PERL'
+    perl -MList::Util=max - "$matrix_scenario" "$out_dir/summary.csv" "$matrix_csv" "$ratio_csv" "$runtimes" <<'PERL'
 use strict;
 use warnings;
 use List::Util qw(max);
@@ -107,19 +115,23 @@ PERL
     port=$((port + 10))
 }
 
-if [[ "$LIGHT_MODE" = "1" ]]; then
-    run_matrix_case "$BASELINE_SCENARIO" "$BASELINE_RUNTIMES"
-    for scenario in "${SCENARIOS[@]}"; do
-        if [[ "$scenario" == "$BASELINE_SCENARIO" ]]; then
-            continue
-        fi
-        run_matrix_case "$scenario" "miniss"
-    done
-else
-    for scenario in "${SCENARIOS[@]}"; do
-        run_matrix_case "$scenario" "miniss,monoio,compio,tokio,glommio"
-    done
-fi
+for round in $(seq 1 "$ROUNDS"); do
+    round_dir="$MATRIX_DIR/round-$round"
+    mkdir -p "$round_dir"
+    if [[ "$LIGHT_MODE" = "1" ]]; then
+        run_matrix_case "$BASELINE_SCENARIO" "$BASELINE_RUNTIMES" "$round_dir" "round${round}/$BASELINE_SCENARIO"
+        for scenario in "${SCENARIOS[@]}"; do
+            if [[ "$scenario" == "$BASELINE_SCENARIO" ]]; then
+                continue
+            fi
+            run_matrix_case "$scenario" "miniss" "$round_dir" "round${round}/$scenario"
+        done
+    else
+        for scenario in "${SCENARIOS[@]}"; do
+            run_matrix_case "$scenario" "miniss,monoio,compio,tokio,glommio" "$round_dir" "round${round}/$scenario"
+        done
+    fi
+done
 
 echo "matrix=$matrix_csv"
 echo "ratios=$ratio_csv"

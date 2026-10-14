@@ -294,6 +294,12 @@ pub trait IoProvider: 'static {
         0
     }
 
+    /// Number of descriptors retained by accepted operations or completion
+    /// queues. Queried only during owner-thread termination reporting.
+    fn retained_descriptor_count(&self) -> usize {
+        0
+    }
+
     /// Request owner-thread cancellation while retaining operation resources
     /// until the backend publishes its terminal cancellation CQE.
     fn cancel(&self, _token: IoToken) -> bool {
