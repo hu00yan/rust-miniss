@@ -210,12 +210,14 @@ test-all-features:
 # Exercise feature-off and feature-on compilation/test surfaces. Benchmark
 # binaries remain excluded because they launch live workloads. Each matrix
 # entry is serial so stress cases cannot contend with one another.
+#
+# `arena` / `rent-traits` / `advanced` were removed: they gated nothing
+# (`rent-traits`) or only verbatim-duplicated buffer constructors
+# (`arena` / `advanced`). `arena` was also incompatible with `Buffer`'s
+# owned-`Vec` + pooled-recycle model.
 test-feature-matrix:
     ./scripts/check_no_ignored_tests.sh
     cargo check --no-default-features --all-targets
-    cargo check --no-default-features --features arena --all-targets
-    cargo check --no-default-features --features rent-traits --all-targets
-    cargo check --no-default-features --features advanced --all-targets
     cargo check --no-default-features --features tls --all-targets
     cargo check --no-default-features --features signal --all-targets
     cargo check --no-default-features --features debug --all-targets

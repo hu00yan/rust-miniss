@@ -17,11 +17,11 @@ pin-project-lite = "0.2"
 pin-project = "1.1"
 
 # Concurrency utilities
+# NOTE: `dashmap` is deliberately NOT a dependency. See AGENTS.md MUST NOT #1.
 crossbeam = "0.8"
 crossbeam-queue = "0.3"
 once_cell = "1.19"
 crossbeam-channel = "0.5"
-dashmap = "5.5"
 parking_lot = "0.12"
 
 # System programming
@@ -32,8 +32,7 @@ socket2 = { version = "0.5", features = ["all"] }
 
 # I/O backends (io-uring is Linux-only)
 
-# Fast hashing for integer-keyed HashMaps
-rustc-hash = "2"
+# Slab for O(1) pending-operation storage keyed by io_uring user_data.
 slab = "0.4.9"
 
 # HTTP parsing and types
@@ -57,9 +56,6 @@ signal-hook = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "signal", "io-util"] }
 threadpool = "1.8"
 tokio-util = { version = "0.7", features = ["compat"] }
-metrics = { version = "0.24", default-features = false }
-metrics-exporter-prometheus = { version = "0.15", default-features = false }
-bumpalo = { version = "3.16.0", optional = true }
 tracing-test = "0.2.5"
 tokio-rustls = { version = "0.26" }
 smallvec = "1.13"
@@ -134,10 +130,12 @@ path = "bench/criterion/memory_perf.rs"
 harness = false
 
 [features]
-default = ["arena"]
-arena = ["dep:bumpalo"]
-rent-traits = []  # Enable AsyncReadRent/WriteRent
-advanced = ["dep:bumpalo", "rent-traits"]  # Zero-copy Rent + arena
+# No optional dependencies. `default` previously enabled an `arena` feature that
+# gated nothing but four buffer constructors duplicated verbatim from the
+# non-arena ones, plus a `bumpalo` dependency and a `src/arena.rs` module with
+# zero callers. It was removed; a bump arena is incompatible with `Buffer`'s
+# owned-`Vec` + `set_len` + pooled-recycle model anyway.
+default = []
 debug = []  # Tracing spans, backtraces
 tls = []
 signal = ["dep:signal-hook"]

@@ -439,7 +439,10 @@ pub struct CpuCore {
     /// Shard-local metrics. Aggregated only by explicit control-plane request.
     metrics: CoreMetrics,
     /// Control-plane report written once after the owner has drained its state.
-    termination_report: Arc<parking_lot::Mutex<Option<CoreTerminationSnapshot>>>,
+    // Write-once publication: the owning worker sets it during exit, the
+    // coordinator reads it after joining. `OnceLock` gives lock-free reads
+    // instead of a mutex that only ever holds one value.
+    termination_report: Arc<std::sync::OnceLock<CoreTerminationSnapshot>>,
 }
 
 impl CpuCore {
@@ -458,7 +461,10 @@ impl CpuCore {
         message_inbox: Receiver<CoreMessage>,
         ready_sender: std::sync::mpsc::Sender<std::result::Result<(), String>>,
         park_timeout: Duration,
-        termination_report: Arc<parking_lot::Mutex<Option<CoreTerminationSnapshot>>>,
+        // Write-once publication: the owning worker sets it during exit, the
+        // coordinator reads it after joining. `OnceLock` gives lock-free reads
+        // instead of a mutex that only ever holds one value.
+        termination_report: Arc<std::sync::OnceLock<CoreTerminationSnapshot>>,
         #[cfg(target_os = "linux")] wakeup_eventfd: RawFd,
     ) -> Self {
         let mut io_state = CpuIoState::default();
@@ -555,7 +561,9 @@ impl CpuCore {
     }
 
     fn publish_termination_snapshot(&self) {
-        *self.termination_report.lock() = Some(self.termination_snapshot());
+        // A second publish means the worker ran its exit path twice; that is
+        // a runtime bug, not a condition to absorb silently.
+        let _ = self.termination_report.set(self.termination_snapshot());
     }
 
     #[cfg(target_os = "linux")]
@@ -1253,7 +1261,7 @@ pub struct MultiCoreRuntime {
     /// Per-core task sequence counters.
     task_counters: Vec<AtomicU64>,
     /// One owner-published termination report per worker.
-    termination_reports: Vec<Arc<parking_lot::Mutex<Option<CoreTerminationSnapshot>>>>,
+    termination_reports: Vec<Arc<std::sync::OnceLock<CoreTerminationSnapshot>>>,
     /// Runtime state
     state: AtomicU8,
     shutdown_phase: AtomicU8,
@@ -1416,7 +1424,7 @@ impl MultiCoreRuntime {
             let core_shutdown = Arc::new(AtomicBool::new(false));
             let core_exited_flag = Arc::new(AtomicBool::new(false));
             let force_shutdown = Arc::new(AtomicBool::new(false));
-            let termination_report = Arc::new(parking_lot::Mutex::new(None));
+            let termination_report = Arc::new(std::sync::OnceLock::new());
             #[cfg(target_os = "linux")]
             let core_sleeping_flag = Arc::new(WorkerSleepGate::new());
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
@@ -1586,26 +1594,27 @@ impl MultiCoreRuntime {
 
         #[cfg(target_os = "macos")]
         {
-            match crate::io::kqueue::KqueueBackend::new() {
-                Ok(kqueue) => {
-                    tracing::debug!("Core {} using kqueue backend", core_id);
-                    return Ok(Box::new(kqueue));
+            // macOS reuses the mio readiness backend; mio maps to kqueue there.
+            match crate::io::mio_poll::MioBackend::new() {
+                Ok(mio) => {
+                    tracing::debug!("Core {} using mio (kqueue) backend", core_id);
+                    return Ok(Box::new(mio));
                 }
                 Err(e) => {
-                    tracing::warn!("Core {} failed to create kqueue: {}", core_id, e);
+                    tracing::warn!("Core {} failed to create mio (kqueue): {}", core_id, e);
                 }
             }
         }
 
         #[cfg(all(target_os = "linux", io_backend = "epoll"))]
         {
-            match crate::io::epoll::EpollBackend::new() {
-                Ok(epoll) => {
-                    tracing::debug!("Core {} using epoll backend", core_id);
-                    return Ok(Box::new(epoll));
+            match crate::io::mio_poll::MioBackend::new() {
+                Ok(mio) => {
+                    tracing::debug!("Core {} using mio (epoll) backend", core_id);
+                    return Ok(Box::new(mio));
                 }
                 Err(e) => {
-                    tracing::warn!("Core {} failed to create epoll: {}", core_id, e);
+                    tracing::warn!("Core {} failed to create mio (epoll): {}", core_id, e);
                 }
             }
         }
@@ -2319,7 +2328,7 @@ impl MultiCoreRuntime {
         }
         let mut cores = Vec::with_capacity(self.num_cores);
         for (core_id, report) in self.termination_reports.iter().enumerate() {
-            let snapshot = report.lock().as_ref().copied().ok_or_else(|| {
+            let snapshot = report.get().copied().ok_or_else(|| {
                 RuntimeError::TaskFailed(format!(
                     "Core {core_id} did not publish a termination snapshot"
                 ))

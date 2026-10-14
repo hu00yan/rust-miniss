@@ -21,6 +21,11 @@ HOT_PATH_PATTERNS=(
     "lazy_static"
     "once_cell::sync::"
     "std::sync::LazyLock"
+    # A lock reached through a type alias is still a lock. The `Arc<Mutex`
+    # spellings above do not match `Arc<parking_lot::Mutex<..>>`, which is how
+    # `JoinHandle` currently hides one from this gate.
+    "Arc<parking_lot::Mutex"
+    "Arc<parking_lot::RwLock"
 )
 
 SRC_ONLY_PATTERNS=(
@@ -40,7 +45,10 @@ NEEDS_JUSTIFICATION_PATTERNS=(
     "unsafe"
 )
 
-SCAN_DIRS=("src" "tests" "benches" "examples")
+# `bench` holds the benchmark binaries registered in Cargo.toml (`bench/internal/*`).
+# `benches` does not exist and the old `[ -d ]` guard silently skipped them,
+# leaving the benchmark path entirely unaudited.
+SCAN_DIRS=("src" "tests" "bench" "examples")
 SRC_SCAN_DIRS=("src")
 
 hard_fail=0
@@ -52,7 +60,10 @@ echo ""
 search_pattern() {
     local pattern="$1"
     local dir="$2"
+    # `Cargo.lock` is generated, not source: skip it so transitive dependency
+    # lists do not read as violations.
     grep -rEn "$pattern" "$dir" 2>/dev/null \
+        | grep -v '/Cargo\.lock:' \
         | grep -v '^[^:]*:[0-9][0-9]*:[[:space:]]*//' \
         | grep -v '^[^:]*:[0-9][0-9]*:[[:space:]]*\*' \
         | grep -v '^[^:]*:[0-9][0-9]*:[[:space:]]*///' \

@@ -1,12 +1,12 @@
 //! Fallback-backend buffer initialization regressions.
 //!
-//! These deliberately drive `EpollBackend` rather than `Runtime`: Linux
+//! These deliberately drive `MioBackend` rather than `Runtime`: Linux
 //! runtime builds normally select io_uring, while this test must exercise the
 //! mio/epoll (and macOS kqueue-via-mio) containment path.
 
 #![cfg(any(io_backend = "epoll", all(target_os = "macos", io_backend = "kqueue")))]
 
-use rust_miniss::io::{CompletionKind, EpollBackend, IoError, IoProvider, Op};
+use rust_miniss::io::{CompletionKind, IoError, IoProvider, MioBackend, Op};
 use rust_miniss::Buffer;
 use smallvec::smallvec;
 use std::io::Write;
@@ -16,7 +16,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 fn completion(
-    backend: &EpollBackend,
+    backend: &MioBackend,
     expected: rust_miniss::IoToken,
 ) -> Result<CompletionKind, IoError> {
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -41,7 +41,7 @@ fn fallback_file_read_publishes_only_short_read_and_eof_lengths() {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     file.write_all(b"abc").expect("write fixture");
     file.flush().expect("flush fixture");
-    let backend = EpollBackend::new().expect("fallback backend");
+    let backend = MioBackend::new().expect("fallback backend");
 
     let token = backend
         .submit(Op::ReadFile {
@@ -77,7 +77,7 @@ fn fallback_file_read_publishes_only_short_read_and_eof_lengths() {
 
 #[test]
 fn fallback_file_read_reports_error_without_a_buffer_completion() {
-    let backend = EpollBackend::new().expect("fallback backend");
+    let backend = MioBackend::new().expect("fallback backend");
     let error = backend
         .submit(Op::ReadFile {
             fd: -1,
@@ -96,7 +96,7 @@ fn fallback_tcp_read_publishes_only_bytes_kernel_returned_and_eof_is_empty() {
     let mut client = TcpStream::connect(address).expect("connect");
     let (server, _) = listener.accept().expect("accept");
     server.set_nonblocking(true).expect("nonblocking server");
-    let backend = EpollBackend::new().expect("fallback backend");
+    let backend = MioBackend::new().expect("fallback backend");
 
     let read = backend
         .submit(Op::Read {
@@ -142,7 +142,7 @@ fn fallback_tcp_readv_publishes_each_buffer_only_up_to_short_read() {
     let mut client = TcpStream::connect(address).expect("connect");
     let (server, _) = listener.accept().expect("accept");
     server.set_nonblocking(true).expect("nonblocking server");
-    let backend = EpollBackend::new().expect("fallback backend");
+    let backend = MioBackend::new().expect("fallback backend");
 
     let readv = backend
         .submit(Op::ReadVectored {
@@ -172,7 +172,7 @@ fn fallback_udp_read_zero_fills_before_safe_recv_and_publishes_datagram_length()
         .set_nonblocking(true)
         .expect("nonblocking receiver");
     let sender = UdpSocket::bind("127.0.0.1:0").expect("UDP sender");
-    let backend = EpollBackend::new().expect("fallback backend");
+    let backend = MioBackend::new().expect("fallback backend");
 
     let token = backend
         .submit(Op::UdpRecv {

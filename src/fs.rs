@@ -1,13 +1,21 @@
 //! Async file I/O for miniss.
 //!
 //! This module provides high-level asynchronous file operations built on top
-//! of the low-level I/O backends. It supports all three I/O backends:
-//! - io_uring on Linux (high-performance zero-copy)
-//! - epoll on Linux (event-driven)
-//! - kqueue on macOS (BSD-style event notification)
+//! of the low-level I/O backends. It supports the runtime's I/O backends:
+//! - `io_uring` on Linux (asynchronous; still one kernel copy per operation)
+//! - the `mio` readiness backend on Linux (`epoll` underneath)
+//! - the same `mio` readiness backend on macOS (`kqueue` underneath)
 //!
 //! The implementation ensures memory safety and proper lifecycle management
 //! for asynchronous operations across all backends.
+//!
+//! ## Copy cost
+//!
+//! No file path is zero-copy: there is no `O_DIRECT`, no registered buffers and
+//! no fixed-file table. Reads cost one kernel copy into a pooled `Buffer`;
+//! writes cost one copy from the caller's slice into a `Buffer` plus one
+//! kernel copy out. The `mio` backend additionally copies each payload a
+//! second time when it hands the write to its thread pool.
 
 use crate::cpu::with_io_state;
 use crate::io::{future::IoFuture, CompletionKind, Op};
@@ -24,9 +32,12 @@ use std::path::Path;
 ///
 /// # Platform Support
 ///
-/// - On Linux with an io_uring-capable kernel: Uses io_uring for zero-copy operations
-/// - On Linux without io_uring support: Uses epoll for event-driven I/O
-/// - On macOS: Uses kqueue for BSD-style event notification
+/// - On Linux with an io_uring-capable kernel: Uses io_uring (asynchronous,
+///   one kernel copy per operation — not zero-copy)
+/// - On Linux without io_uring support: Uses the `mio` readability backend,
+///   offloading file work to its thread pool
+/// - On macOS: Uses the same `mio` readiness backend (`kqueue` underneath).
+///   `Op::Fsync` currently blocks the runtime thread there.
 ///
 /// # Examples
 ///

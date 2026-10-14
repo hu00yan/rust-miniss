@@ -42,9 +42,12 @@ pub(crate) fn create_default_io_backend() -> Box<IoBackend> {
 
     #[cfg(all(target_os = "macos", io_backend = "kqueue"))]
     {
+        // macOS shares the mio readiness backend: mio maps to kqueue there.
+        // See `crate::io::mio_poll` for what that abstraction does and does
+        // not normalize.
         Box::new(
-            crate::io::kqueue::KqueueBackend::new()
-                .unwrap_or_else(|e| panic!("Failed to create kqueue backend: {e}")),
+            crate::io::mio_poll::MioBackend::new()
+                .unwrap_or_else(|e| panic!("Failed to create mio (kqueue) backend: {e}")),
         )
     }
 
@@ -57,8 +60,8 @@ pub(crate) fn create_default_io_backend() -> Box<IoBackend> {
     ))]
     {
         Box::new(
-            crate::io::epoll::EpollBackend::new()
-                .unwrap_or_else(|e| panic!("Failed to create epoll backend: {e}")),
+            crate::io::mio_poll::MioBackend::new()
+                .unwrap_or_else(|e| panic!("Failed to create mio (epoll) backend: {e}")),
         )
     }
 

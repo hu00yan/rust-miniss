@@ -42,8 +42,6 @@
 
 #![deny(warnings)]
 
-#[cfg(feature = "arena")]
-pub mod arena;
 pub mod buffer;
 pub mod cancellation;
 pub mod compat;

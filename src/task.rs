@@ -25,11 +25,12 @@
 //! via the [`JoinHandle::cancel`] method.
 
 use crate::waker::{ReadyQueue, TaskId, WakerState};
-use futures::task::AtomicWaker;
 use std::any::Any;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -45,40 +46,59 @@ pub enum TaskError {
 /// The result of a completed task.
 pub type TaskResult<T> = Result<T, TaskError>;
 
+/// Result and wake channel shared between a task and its joiner.
+///
+/// Deliberately shard-local: `Rc`/`RefCell`/`Cell`, no `Arc`, no atomics, no
+/// locks. A task and its `JoinHandle` can only ever be polled by the shard
+/// that owns the task's arena slot, so there is nothing to synchronize. The
+/// completer writes exactly once, from the owning shard, after the task's
+/// future returns; the joiner reads from that same shard.
+///
+/// The trade-off is that `JoinHandle` is `!Send`, which turns "await a task
+/// across cores" from a cross-core lock into a compile error. That is the
+/// intended outcome: `AGENTS.md` MUST #3 forbids shared mutable state across
+/// cores, and this runtime gives tasks no reason to migrate.
 struct JoinState<T> {
-    result: Option<TaskResult<T>>,
-    completed: bool,
-    waker: Option<Waker>,
+    result: RefCell<Option<TaskResult<T>>>,
+    /// Separate from `result` because the joiner takes `result` out; without a
+    /// second flag a repeated poll could not distinguish "already consumed"
+    /// from "never completed".
+    completed: Cell<bool>,
+    waker: Cell<Option<Waker>>,
 }
 
 impl<T> JoinState<T> {
     fn pending() -> Self {
         Self {
-            result: None,
-            completed: false,
-            waker: None,
+            result: RefCell::new(None),
+            completed: Cell::new(false),
+            waker: Cell::new(None),
         }
     }
 }
 
 /// Completes a [`JoinHandle`] from the task execution side.
 pub(crate) struct JoinCompleter<T> {
-    state: Arc<parking_lot::Mutex<JoinState<T>>>,
-    cancel_requested: Arc<AtomicBool>,
-    task_waker: Arc<AtomicWaker>,
+    state: Rc<JoinState<T>>,
+    /// Cooperative cancellation flag, read by the task on every poll. Shard-
+    /// local for the same reason as `JoinState`: only the owning shard both
+    /// sets and observes it.
+    cancel_requested: Rc<Cell<bool>>,
+    /// The task's own waker, kept so `JoinHandle::cancel` can re-poll it
+    /// without going through the ready queue.
+    task_waker: Rc<Cell<Option<Waker>>>,
 }
 
 impl<T> JoinCompleter<T> {
     fn complete(&self, result: TaskResult<T>) {
-        let mut state = self.state.lock();
-        if state.completed {
+        if self.state.completed.get() {
             return;
         }
 
-        state.result = Some(result);
-        state.completed = true;
+        *self.state.result.borrow_mut() = Some(result);
+        self.state.completed.set(true);
 
-        if let Some(waker) = state.waker.take() {
+        if let Some(waker) = self.state.waker.take() {
             waker.wake();
         }
     }
@@ -97,8 +117,8 @@ where
 {
     future: Pin<Box<F>>,
     completer: Option<JoinCompleter<T>>,
-    cancel_requested: Arc<AtomicBool>,
-    task_waker: Arc<AtomicWaker>,
+    cancel_requested: Rc<Cell<bool>>,
+    task_waker: Rc<Cell<Option<Waker>>>,
 }
 
 impl<F, T> JoinTaskFuture<F, T>
@@ -106,8 +126,8 @@ where
     F: Future<Output = T>,
 {
     pub(crate) fn new(future: F, completer: JoinCompleter<T>) -> Self {
-        let cancel_requested = completer.cancel_requested.clone();
-        let task_waker = completer.task_waker.clone();
+        let cancel_requested = Rc::clone(&completer.cancel_requested);
+        let task_waker = Rc::clone(&completer.task_waker);
         Self {
             future: Box::pin(future),
             completer: Some(completer),
@@ -125,8 +145,8 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.task_waker.register(cx.waker());
-        if this.cancel_requested.load(Ordering::Acquire) {
+        this.task_waker.set(Some(cx.waker().clone()));
+        if this.cancel_requested.get() {
             if let Some(completer) = this.completer.take() {
                 completer.complete(Err(TaskError::Cancelled));
             }
@@ -397,25 +417,34 @@ impl Task {
     }
 }
 
-/// A spawned task handle that can be awaited
+/// A spawned task handle that can be awaited.
+///
+/// `!Send`: awaiting a task is only meaningful on the shard that owns the
+/// task's arena slot, and this type cannot leave that shard. Attempting to
+/// move it to another thread is a compile error, which is the desired outcome
+/// under `AGENTS.md` MUST #3 (no shared mutable state across cores).
 pub struct JoinHandle<T> {
     task_id: TaskId,
-    state: Arc<parking_lot::Mutex<JoinState<T>>>,
-    cancel_requested: Arc<AtomicBool>,
-    task_waker: Arc<AtomicWaker>,
+    state: Rc<JoinState<T>>,
+    cancel_requested: Rc<Cell<bool>>,
+    task_waker: Rc<Cell<Option<Waker>>>,
+    /// Keeps the `!Send` property visible in the public type even if the
+    /// fields above ever become `Send` by accident.
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl<T> JoinHandle<T> {
     /// Create a new join handle
     pub(crate) fn new(task_id: TaskId) -> (Self, JoinCompleter<T>) {
-        let state = Arc::new(parking_lot::Mutex::new(JoinState::pending()));
-        let cancel_requested = Arc::new(AtomicBool::new(false));
-        let task_waker = Arc::new(AtomicWaker::new());
+        let state = Rc::new(JoinState::pending());
+        let cancel_requested = Rc::new(Cell::new(false));
+        let task_waker = Rc::new(Cell::new(None));
         let handle = Self {
             task_id,
-            state: state.clone(),
-            cancel_requested: cancel_requested.clone(),
-            task_waker: task_waker.clone(),
+            state: Rc::clone(&state),
+            cancel_requested: Rc::clone(&cancel_requested),
+            task_waker: Rc::clone(&task_waker),
+            _not_send: PhantomData,
         };
         let completer = JoinCompleter {
             state,
@@ -432,13 +461,16 @@ impl<T> JoinHandle<T> {
 
     /// Check if the task has completed
     pub fn is_finished(&self) -> bool {
-        self.state.lock().completed
+        self.state.completed.get()
     }
 
     /// Cancel the task
     ///
     /// This method attempts to cancel the running task. Note that cancellation
     /// is cooperative - the task will only be cancelled if it hasn't already completed.
+    ///
+    /// Must be called from the shard that owns the task; `JoinHandle` is
+    /// `!Send`, so this is enforced by the type system.
     ///
     /// Returns `Ok(())` if the cancellation was processed successfully,
     /// or an error if the task cannot be cancelled (e.g., runtime shutdown).
@@ -450,9 +482,11 @@ impl<T> JoinHandle<T> {
             self.task_id
         );
 
-        if !self.state.lock().completed {
-            self.cancel_requested.store(true, Ordering::Release);
-            self.task_waker.wake();
+        if !self.state.completed.get() {
+            self.cancel_requested.set(true);
+            if let Some(waker) = self.task_waker.take() {
+                waker.wake();
+            }
             tracing::info!("Task {:?} cancellation requested", self.task_id);
         }
 
@@ -460,20 +494,25 @@ impl<T> JoinHandle<T> {
     }
 }
 
-impl<T: Send> Future for JoinHandle<T> {
+// A join handle must never cross cores: the state it shares with its task is
+// shard-local by construction.
+// `static_assertions` is a dev-dependency, so this assertion lives in the
+// test module below rather than in the library build.
+// static_assertions::assert_not_impl_any!(JoinHandle<()>: Send, Sync);
+
+impl<T> Future for JoinHandle<T> {
     type Output = TaskResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.state.lock();
-        if let Some(result) = state.result.take() {
+        if let Some(result) = self.state.result.borrow_mut().take() {
             return Poll::Ready(result);
         }
 
-        if state.completed {
+        if self.state.completed.get() {
             return Poll::Ready(Err(TaskError::Cancelled));
         }
 
-        state.waker = Some(cx.waker().clone());
+        self.state.waker.set(Some(cx.waker().clone()));
         Poll::Pending
     }
 }
@@ -584,6 +623,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    /// A `JoinHandle` shares shard-local state with its task. It must not be
+    /// able to leave that shard, or the `!Send` guarantee is decoration.
+    #[test]
+    fn join_handle_is_not_send_or_sync() {
+        static_assertions::assert_not_impl_any!(JoinHandle<()>: Send, Sync);
+    }
 
     #[test]
     fn test_task_creation() {

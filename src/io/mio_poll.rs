@@ -1,13 +1,24 @@
 #![cfg(any(io_backend = "epoll", all(unix, not(target_os = "linux"))))]
 
-//! An `epoll` (or `kqueue` via `mio`) backend for the I/O subsystem.
+//! Readiness backend built on `mio` (`epoll` on Linux, `kqueue` on macOS).
 //!
 //! This implementation is designed for a thread-per-core architecture, serving as a
-//! fallback for Unix-like systems where `io-uring` is not available. Each `EpollBackend`
+//! fallback for Unix-like systems where `io-uring` is not available. Each `MioBackend`
 //! instance owns a `mio::Poll` handle and is intended for single-threaded use.
 //!
 //! Like the `uring` backend, this module uses `UnsafeCell` and `unsafe` trait impls
 //! to manage thread-local state within the `IoBackend` trait's `&self` methods.
+//!
+//! ## Scope of the mio abstraction
+//!
+//! `mio` only normalizes *readiness notification*. Both `epoll_wait` and `kevent`
+//! return the same shape there — a list of `(fd, readiness)` pairs — so one code
+//! path is valid at that layer. It does **not** normalize the operation state
+//! machine that lives in this module: re-arm semantics for `EPOLLONESHOT` vs
+//! `EV_ONESHOT`, knote accumulation on repeated `EV_ADD`, and the
+//! `EV_EOF` vs `EPOLLHUP`/`EPOLLERR` mapping all differ between the two kernels.
+//! macOS therefore shares this code path but is **not** covered by independent
+//! kqueue-specific tests; treat any macOS-only result as unverified here.
 
 use crate::io::{CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op};
 use crate::Buffer;
@@ -76,9 +87,9 @@ impl Drop for SafeFdFile {
     }
 }
 
-/// An `epoll` based `IoBackend` implementation using `mio`.
+/// A readiness-based `IoBackend` implementation using `mio`.
 #[derive(Debug)]
-pub struct EpollBackend {
+pub struct MioBackend {
     /// The `mio::Poll` instance, which manages file descriptor readiness.
     poll: UnsafeCell<Poll>,
     /// A buffer for receiving events from `mio::Poll`.
@@ -103,11 +114,17 @@ pub struct EpollBackend {
     /// Completed operations from the file I/O thread pool.
     completed_tx: SyncSender<IoCompletion>,
     completed_rx: UnsafeCell<Receiver<IoCompletion>>,
+    /// Set when `park()` filled `events` with readiness notifications that the
+    /// next drain must consume. The runtime calls park() then drain, and both
+    /// would otherwise call `Poll::poll` on the same kernel queue: drain's
+    /// zero-timeout poll would report zero new events and drop the ones park
+    /// just harvested.
+    park_left_events: std::cell::Cell<bool>,
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl EpollBackend {
-    /// Creates a new `EpollBackend`.
+impl MioBackend {
+    /// Creates a new `MioBackend`.
     pub fn new() -> io::Result<Self> {
         // Create a small thread pool for blocking I/O operations
         let pool_size = std::cmp::max(2, num_cpus::get() / 4);
@@ -127,12 +144,13 @@ impl EpollBackend {
             completed_local: UnsafeCell::new(Vec::new()),
             completed_tx,
             completed_rx: UnsafeCell::new(completed_rx),
+            park_left_events: std::cell::Cell::new(false),
             _local: std::marker::PhantomData,
         })
     }
 
     fn complete_local(&self, completion: IoCompletion) {
-        // SAFETY: EpollBackend is driven by one runtime thread; completed_local
+        // SAFETY: MioBackend is driven by one runtime thread; completed_local
         // is shard-local and not accessed concurrently.
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed_local = unsafe { &mut *self.completed_local.get() };
@@ -147,7 +165,7 @@ impl EpollBackend {
     }
 }
 
-impl IoProvider for EpollBackend {
+impl IoProvider for MioBackend {
     type Completion = (IoToken, Result<CompletionKind, IoError>);
 
     fn submit(&self, op: Op) -> Result<IoToken, IoError> {
@@ -171,7 +189,7 @@ impl IoProvider for EpollBackend {
         Self::ensure_slot_capacity(descriptor_leases, slot);
         Self::ensure_slot_capacity(descriptor_lease_tokens, slot);
         // SAFETY: udp_recv_buffers is shard-local and only accessed from this
-        // epoll backend owner thread while submitting operations.
+        // backend owner thread while submitting operations.
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         Self::ensure_slot_capacity(unsafe { &mut *self.udp_recv_buffers.get() }, slot);
 
@@ -206,7 +224,7 @@ impl IoProvider for EpollBackend {
                     registration_error = Some(e);
                 }
                 // SAFETY: udp_recv_buffers is shard-local and only touched by
-                // the owning epoll runtime thread while submitting/draining.
+                // the owning runtime thread while submitting/draining.
                 // `recv_from` takes a safe `&mut [u8]`, so it must never see
                 // the uninitialized spare capacity supplied by rent buffers.
                 buffer.prepare_for_safe_read();
@@ -234,7 +252,11 @@ impl IoProvider for EpollBackend {
                         pending_ops[slot] = Some((io_token, op));
                     }
                 }
-                Op::Read { fd, .. } => {
+                // `ReadRent` differs from `Read` only in who owns the buffer:
+                // rent keeps the caller's allocation instead of allocating one
+                // at completion time. The readiness registration is identical,
+                // which is why the two share one arm.
+                Op::Read { fd, .. } | Op::ReadRent { fd, .. } => {
                     let effective_fd = leased_fd.unwrap_or(*fd);
                     let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
@@ -246,7 +268,7 @@ impl IoProvider for EpollBackend {
                         pending_ops[slot] = Some((io_token, op));
                     }
                 }
-                Op::Write { fd, .. } | Op::WriteStatic { fd, .. } => {
+                Op::Write { fd, .. } | Op::WriteStatic { fd, .. } | Op::WriteRent { fd, .. } => {
                     let effective_fd = leased_fd.unwrap_or(*fd);
                     let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
@@ -371,24 +393,33 @@ impl IoProvider for EpollBackend {
                         poll.registry()
                             .register(&mut source, mio_token, mio::Interest::WRITABLE)
                     {
-                        eprintln!("Failed to register UDP socket with epoll for send: {e}");
+                        eprintln!("Failed to register UDP socket with mio for send: {e}");
                     }
                     // Store the data buffer and address with the op. The op contains the Buffer.
                     pending_ops[slot] = Some((io_token, op));
                 }
                 Op::Fsync { fd } => {
                     let effective_fd = leased_fd.unwrap_or(*fd);
-                    let result = match SafeFdFile::new(effective_fd) {
-                        Ok(mut safe_file) => safe_file
-                            .as_mut()
-                            .sync_all()
-                            .map(|_| CompletionKind::Fsync)
-                            .map_err(IoError::Io),
-                        Err(err) => Err(IoError::Io(err)),
-                    };
-                    self.complete_local((io_token, result));
-                    descriptor_leases[slot] = None;
-                    descriptor_lease_tokens[slot] = None;
+                    // `fsync(2)` can block for milliseconds. Running it inline
+                    // here stalls the shard's whole event loop, which
+                    // AGENTS.md MUST NOT #7 forbids. Route it through the same
+                    // bounded thread pool that already carries file reads and
+                    // writes so the worker keeps polling.
+                    let completed_tx = self.completed_tx.clone();
+                    let thread_pool = self.thread_pool.clone();
+                    let io_token_copy = io_token;
+
+                    thread_pool.execute(move || {
+                        let result = match SafeFdFile::new(effective_fd) {
+                            Ok(mut safe_file) => safe_file
+                                .as_mut()
+                                .sync_all()
+                                .map(|_| CompletionKind::Fsync)
+                                .map_err(IoError::Io),
+                            Err(err) => Err(IoError::Io(err)),
+                        };
+                        let _ = completed_tx.send((io_token_copy, result));
+                    });
                 }
                 Op::Close { fd } => {
                     let result = {
@@ -411,7 +442,7 @@ impl IoProvider for EpollBackend {
                     events,
                     multishot: _,
                 } => {
-                    // Register fd with mio for epoll-based polling
+                    // Register fd with mio for readiness polling
                     let effective_fd = leased_fd.unwrap_or(*fd);
                     let mut source = mio::unix::SourceFd(&effective_fd);
                     let events_u32 = *events;
@@ -431,7 +462,7 @@ impl IoProvider for EpollBackend {
                 _ => {
                     registration_error = Some(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "Operation not supported by epoll backend",
+                        "Operation not supported by the mio readiness backend",
                     ));
                     descriptor_leases[slot] = None;
                     descriptor_lease_tokens[slot] = None;
@@ -522,6 +553,61 @@ impl IoProvider for EpollBackend {
         true
     }
 
+    /// Block until a readiness notification arrives or `timeout` elapses.
+    ///
+    /// Returns the number of completions available after the wait: the events
+    /// harvested here plus anything the file thread pool produced. A return of
+    /// 0 means the timeout fired with nothing ready.
+    ///
+    /// This is the missing piece for macOS: the default `IoProvider::park` is
+    /// a no-op returning 0, so a `MioBackend` worker with no ready work spun
+    /// at 100% CPU instead of sleeping. `mio::Poll::poll` is exactly the
+    /// blocking primitive needed here, and on both `epoll` and `kqueue` it
+    /// parks the thread in the kernel.
+    ///
+    /// Harvested events are left in the shared `events` buffer and flagged via
+    /// `park_left_events`, because the runtime's next call is the drain.
+    fn park(&self, timeout: Duration) -> usize {
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let poll = unsafe { &mut *self.poll.get() };
+        // SAFETY: events is shard-local and reused across park calls; poll()
+        // fully re-initializes it each time.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let events = unsafe { &mut *self.events.get() };
+        // SAFETY: completed_local is shard-local and only touched by this
+        // backend owner thread; park() runs on that thread.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let completed = unsafe { &*self.completed_local.get() }.len();
+
+        // Nothing to wait for if the pool already produced work.
+        if completed != 0 {
+            self.park_left_events.set(false);
+            return completed;
+        }
+
+        // A zero timeout would busy-loop; mio treats `None` as "block forever".
+        // Use a 1ms floor so the worker still re-runs its budgeted work at a
+        // bounded rate while parking the thread between turns.
+        let wait = timeout.max(Duration::from_millis(1));
+        // `Poll::poll` in mio 1.0 returns `io::Result<()>`, so the event count
+        // is read back from the shared buffer instead of from the return value.
+        match poll.poll(events, Some(wait)) {
+            Ok(()) => {
+                // Reported as 1, not a true count: the runtime only uses this
+                // as "there is work, drain now". Reporting a fabricated count
+                // would corrupt `park_completions`.
+                let readiness = usize::from(!events.is_empty());
+                self.park_left_events.set(readiness != 0);
+                readiness + completed
+            }
+            Err(error) => {
+                eprintln!("mio park poll error: {error}");
+                self.park_left_events.set(false);
+                0
+            }
+        }
+    }
+
     fn cancel_all(&self) {
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let tokens = unsafe { &*self.descriptor_lease_tokens.get() }
@@ -570,15 +656,23 @@ impl IoProvider for EpollBackend {
             }
         }
 
-        // Poll for events non-blockingly to avoid delays.
-        if let Err(e) = poll.poll(events, Some(Duration::from_millis(0))) {
-            // An error from poll is serious, but we'll just log it for now.
-            eprintln!("mio poll error: {e}");
-            return if completions.is_empty() {
-                TaskPoll::Ready(Vec::new())
-            } else {
-                TaskPoll::Ready(completions)
-            };
+        // Poll for events non-blockingly to avoid delays — unless park()
+        // already harvested them, in which case re-polling would clear the
+        // buffer and lose them.
+        let park_delivered = self.park_left_events.replace(false);
+        if !park_delivered {
+            match poll.poll(events, Some(Duration::from_millis(0))) {
+                Ok(_) => {}
+                Err(e) => {
+                    // An error from poll is serious, but we'll just log it for now.
+                    eprintln!("mio poll error: {e}");
+                    return if completions.is_empty() {
+                        TaskPoll::Ready(Vec::new())
+                    } else {
+                        TaskPoll::Ready(completions)
+                    };
+                }
+            }
         }
         // First, handle any events from mio
         for event in events.iter() {
@@ -593,9 +687,13 @@ impl IoProvider for EpollBackend {
                 let mut source = SourceFd(&raw_fd);
                 let _ = poll.registry().deregister(&mut source);
 
-                let result = match &op {
+                // Match by value so the rent arms can move the caller's buffer
+                // out and back without a payload copy, and so a WouldBlock
+                // requeue reconstructs the op from its own fields instead of
+                // deep-cloning the payload (`Buffer::clone` copies bytes).
+                let result = match op {
                     Op::Accept { fd } => {
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // The file descriptor is a listening socket, so we can accept a connection.
                         match syscall_accept(effective_fd) {
                             Ok((new_fd, addr)) => Ok(CompletionKind::Accept {
@@ -608,9 +706,68 @@ impl IoProvider for EpollBackend {
                             Err(e) => Err(IoError::Io(e)),
                         }
                     }
-                    Op::Read { fd, len, .. } => {
-                        let effective_fd = leased_fd.unwrap_or(*fd);
-                        let mut buffer = Buffer::with_capacity(*len);
+                    // Rent read: the buffer is the caller's own allocation, so
+                    // the kernel writes straight into it and no second copy is
+                    // needed. The buffer's spare capacity is uninitialized;
+                    // `read` only writes it, and the length is published only
+                    // after the syscall reports success.
+                    Op::ReadRent { fd, mut buffer } => {
+                        let effective_fd = leased_fd.unwrap_or(fd);
+                        let mut requeue = false;
+                        // The loop returns a count so `buffer` stays owned past
+                        // it; the completion variant consumes the buffer only
+                        // after the requeue decision has been made.
+                        let bytes = loop {
+                            // SAFETY: `as_mut_ptr` + `capacity()` describe exactly
+                            // the allocation. libc::read writes at most that many
+                            // bytes and never reads them.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                            let ret = unsafe {
+                                libc::read(
+                                    effective_fd,
+                                    buffer.as_mut_ptr() as *mut libc::c_void,
+                                    buffer.capacity(),
+                                )
+                            };
+                            if ret < 0 {
+                                let err = io::Error::last_os_error();
+                                if err.kind() == io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                if err.kind() == io::ErrorKind::WouldBlock {
+                                    requeue = true;
+                                }
+                                break Err(IoError::Io(err));
+                            }
+                            break Ok(ret as usize);
+                        };
+                        // Requeue while `buffer` is still owned; only the
+                        // non-requeue path is allowed to consume it.
+                        if requeue {
+                            let mut source = SourceFd(&effective_fd);
+                            if let Err(reg_err) =
+                                poll.registry()
+                                    .register(&mut source, mio_token, Interest::READABLE)
+                            {
+                                eprintln!(
+                                    "Failed to re-register fd for rent read after WouldBlock: {reg_err}"
+                                );
+                            }
+                            pending_ops[slot] = Some((io_token, Op::ReadRent { fd, buffer }));
+                            continue;
+                        }
+
+                        match bytes {
+                            Ok(bytes_read) => match publish_read_len(&mut buffer, bytes_read) {
+                                Ok(()) => Ok(CompletionKind::ReadRent { buffer }),
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Op::Read { fd, offset, len } => {
+                        let effective_fd = leased_fd.unwrap_or(fd);
+                        let mut buffer = Buffer::with_capacity(len);
                         let mut requeue = false;
                         let result = loop {
                             // SAFETY: buffer has at least `len` capacity and
@@ -620,7 +777,7 @@ impl IoProvider for EpollBackend {
                                 libc::read(
                                     effective_fd,
                                     buffer.as_mut_ptr() as *mut libc::c_void,
-                                    *len,
+                                    len,
                                 )
                             };
                             if ret < 0 {
@@ -656,14 +813,84 @@ impl IoProvider for EpollBackend {
                                     "Failed to re-register fd for read after WouldBlock: {reg_err}"
                                 );
                             }
-                            pending_ops[slot] = Some((io_token, op.clone()));
+                            // Reconstruct from the arm's own fields. The old
+                            // `op.clone()` deep-copied `Buffer` (payload copy)
+                            // to re-arm a read that had not produced a byte yet.
+                            // `Op::Read` carries only a length, so re-arming it
+                            // is free. The old `op.clone()` still walked the
+                            // `Buffer` clone path for the other variants.
+                            pending_ops[slot] = Some((io_token, Op::Read { fd, offset, len }));
                             continue;
                         }
 
                         result
                     }
-                    Op::Write { fd, data, .. } => {
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                    // Rent write: same partial-write loop as `Write`, but the
+                    // payload is the caller's own buffer and it is returned on
+                    // completion instead of being dropped.
+                    Op::WriteRent { fd, data } => {
+                        let effective_fd = leased_fd.unwrap_or(fd);
+                        let mut written = 0usize;
+                        let mut requeue = false;
+                        // The loop reports progress instead of building the
+                        // completion, so `data` stays owned until after the
+                        // requeue decision.
+                        loop {
+                            let remaining = &data[written..];
+                            if remaining.is_empty() {
+                                break;
+                            }
+                            // SAFETY: remaining points to initialized bytes owned
+                            // by `data`; write reads at most len bytes.
+                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                            let ret = unsafe {
+                                libc::write(
+                                    effective_fd,
+                                    remaining.as_ptr() as *const libc::c_void,
+                                    remaining.len(),
+                                )
+                            };
+                            if ret < 0 {
+                                let err = io::Error::last_os_error();
+                                if err.kind() == io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                if err.kind() == io::ErrorKind::WouldBlock && written == 0 {
+                                    requeue = true;
+                                    break;
+                                }
+                                // A partial write followed by an error is a
+                                // successful partial write, not a failure of the
+                                // whole operation.
+                                break;
+                            }
+                            written += ret as usize;
+                            if written == data.len() {
+                                break;
+                            }
+                        }
+
+                        if requeue {
+                            let mut source = SourceFd(&effective_fd);
+                            if let Err(reg_err) =
+                                poll.registry()
+                                    .register(&mut source, mio_token, Interest::WRITABLE)
+                            {
+                                eprintln!(
+                                    "Failed to re-register fd for rent write after WouldBlock: {reg_err}"
+                                );
+                            }
+                            pending_ops[slot] = Some((io_token, Op::WriteRent { fd, data }));
+                            continue;
+                        }
+
+                        Ok(CompletionKind::WriteRent {
+                            bytes_written: written,
+                            data,
+                        })
+                    }
+                    Op::Write { fd, offset, data } => {
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         let mut written = 0usize;
                         let mut requeue = false;
                         let result = loop {
@@ -725,14 +952,18 @@ impl IoProvider for EpollBackend {
                                     "Failed to re-register fd for write after WouldBlock: {reg_err}"
                                 );
                             }
-                            pending_ops[slot] = Some((io_token, op.clone()));
+                            // Reconstruct from the arm's own fields instead of
+                            // `op.clone()`: `Buffer::clone` copies the whole
+                            // payload, so cloning to re-arm a partial write
+                            // doubled the bytes on the wire path.
+                            pending_ops[slot] = Some((io_token, Op::Write { fd, offset, data }));
                             continue;
                         }
 
                         result
                     }
                     Op::WriteStatic { fd, data } => {
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         let mut written = 0usize;
                         let mut requeue = false;
                         let result = loop {
@@ -794,7 +1025,7 @@ impl IoProvider for EpollBackend {
                                     "Failed to re-register fd for static write after WouldBlock: {reg_err}"
                                 );
                             }
-                            pending_ops[slot] = Some((io_token, op.clone()));
+                            pending_ops[slot] = Some((io_token, Op::WriteStatic { fd, data }));
                             continue;
                         }
 
@@ -805,11 +1036,11 @@ impl IoProvider for EpollBackend {
                         // but included for completeness if event-driven file I/O were enabled.
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
-                        let result = file.seek(SeekFrom::Start(*offset)).and_then(|_| {
-                            let mut buf = Buffer::new_zeroed(*len);
+                        let result = file.seek(SeekFrom::Start(offset)).and_then(|_| {
+                            let mut buf = Buffer::new_zeroed(len);
                             file.read(buf.as_mut()).and_then(|bytes_read| {
                                 if buf.publish_read_len(bytes_read) {
                                     Ok(CompletionKind::ReadFile {
@@ -831,21 +1062,21 @@ impl IoProvider for EpollBackend {
                         // This path should ideally not be hit.
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
                         let result = file
-                            .seek(SeekFrom::Start(*offset))
+                            .seek(SeekFrom::Start(offset))
                             .and_then(|_| file.write(data.as_ref()))
                             .map(|bytes_written| CompletionKind::WriteFile { bytes_written });
                         let _ = file.into_raw_fd();
                         result.map_err(IoError::Io)
                     }
                     Op::UdpRecv { fd, .. } => {
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // Matched by `event.token()`
                         // SAFETY: udp_recv_buffers is shard-local and only
-                        // accessed by this epoll owner thread.
+                        // accessed by this backend owner thread.
                         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                         if let Some(mut buffer) =
@@ -875,11 +1106,17 @@ impl IoProvider for EpollBackend {
                                         mio::Interest::READABLE,
                                     ) {
                                         eprintln!(
-                                            "Failed to re-register UDP socket with epoll: {reg_err}"
+                                            "Failed to re-register UDP socket with mio: {reg_err}"
                                         );
                                     }
                                     udp_recv_buffers[slot] = Some(buffer);
-                                    pending_ops[slot] = Some((io_token, op.clone()));
+                                    pending_ops[slot] = Some((
+                                        io_token,
+                                        Op::UdpRecv {
+                                            fd,
+                                            buffer: Buffer::empty(),
+                                        },
+                                    ));
                                     retry = true;
                                     Err(IoError::Io(e))
                                 }
@@ -901,10 +1138,10 @@ impl IoProvider for EpollBackend {
 
                         // SAFETY: UdpSocket temporarily wraps fd and is
                         // converted back with into_raw_fd before drop.
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
-                        let result = socket.send_to(data.as_ref(), *addr).map(|bytes_written| {
+                        let result = socket.send_to(data.as_ref(), addr).map(|bytes_written| {
                             CompletionKind::UdpSend {
                                 bytes_written,
                                 data: data.clone(),
@@ -914,7 +1151,7 @@ impl IoProvider for EpollBackend {
                         result.map_err(IoError::Io)
                     }
                     Op::Connect { fd, addr: _ } => {
-                        let raw_fd = leased_fd.unwrap_or(*fd);
+                        let raw_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: TcpStream temporarily wraps fd to call
                         // take_error, then into_raw_fd preserves ownership.
                         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
@@ -928,15 +1165,18 @@ impl IoProvider for EpollBackend {
                         result
                     }
                     Op::ReadVectored { fd, buffers } => {
-                        let effective_fd = leased_fd.unwrap_or(*fd);
-                        // Buffer::clone copies logical bytes, not spare capacity. Read
-                        // destinations are often empty, so clone would create zero-length
-                        // iovecs and make readv report EOF without reading anything.
-                        let mut buffers: smallvec::SmallVec<[Buffer; 4]> = buffers
+                        let effective_fd = leased_fd.unwrap_or(fd);
+                        // `Op::ReadVectored` carries placeholder buffers whose
+                        // only meaningful property is capacity; the real read
+                        // destinations are built from that capacity. Renamed so
+                        // the arm's own `buffers` stays owned for the requeue
+                        // path (shadowing the same name trips the loop move
+                        // analysis).
+                        let mut dest_buffers: smallvec::SmallVec<[Buffer; 4]> = buffers
                             .iter()
                             .map(|buffer| Buffer::new_uninitialized(buffer.capacity()))
                             .collect();
-                        let iovecs: Vec<libc::iovec> = buffers
+                        let iovecs: Vec<libc::iovec> = dest_buffers
                             .iter_mut()
                             .map(|buf| libc::iovec {
                                 iov_base: buf.as_mut_ptr() as *mut libc::c_void,
@@ -945,8 +1185,8 @@ impl IoProvider for EpollBackend {
                             .collect();
                         let mut requeue = false;
                         let result = loop {
-                            // SAFETY: iovecs point to writable capacity in the
-                            // cloned buffers and remain valid for this call.
+                            // SAFETY: iovecs point to writable capacity in
+                            // dest_buffers and remain valid for this call.
                             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::readv(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
@@ -958,13 +1198,12 @@ impl IoProvider for EpollBackend {
                                 }
                                 if err.kind() == io::ErrorKind::WouldBlock {
                                     requeue = true;
-                                    break Err(IoError::Io(err));
                                 }
                                 break Err(IoError::Io(err));
                             } else if ret == 0 {
                                 break Ok(CompletionKind::ReadVectored {
                                     bytes_read: 0,
-                                    buffers,
+                                    buffers: dest_buffers,
                                 });
                             } else {
                                 let bytes_read = ret as usize;
@@ -976,7 +1215,7 @@ impl IoProvider for EpollBackend {
                                     )));
                                 }
                                 let mut remaining = bytes_read;
-                                for buf in buffers.iter_mut() {
+                                for buf in dest_buffers.iter_mut() {
                                     let can_read = std::cmp::min(remaining, buf.capacity());
                                     // `can_read` is bounded by both the checked
                                     // readv result and this buffer's capacity.
@@ -988,7 +1227,7 @@ impl IoProvider for EpollBackend {
                                 }
                                 break Ok(CompletionKind::ReadVectored {
                                     bytes_read,
-                                    buffers,
+                                    buffers: dest_buffers,
                                 });
                             }
                         };
@@ -1003,14 +1242,17 @@ impl IoProvider for EpollBackend {
                                     "Failed to re-register fd for readv after WouldBlock: {reg_err}"
                                 );
                             }
-                            pending_ops[slot] = Some((io_token, op.clone()));
+                            // Reconstruct from the op's own fields. `Buffer::clone`
+                            // copies bytes, so cloning to re-arm a read that had
+                            // produced nothing duplicated the payload for nothing.
+                            pending_ops[slot] = Some((io_token, Op::ReadVectored { fd, buffers }));
                             continue;
                         }
 
                         result
                     }
                     Op::WriteVectored { fd, buffers } => {
-                        let effective_fd = leased_fd.unwrap_or(*fd);
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         let total_len: usize = buffers.iter().map(|b| b.len()).sum();
                         if total_len == 0 {
                             Ok(CompletionKind::WriteVectored {
@@ -1101,7 +1343,8 @@ impl IoProvider for EpollBackend {
                                         "Failed to re-register fd for writev after WouldBlock: {reg_err}"
                                     );
                                 }
-                                pending_ops[slot] = Some((io_token, op.clone()));
+                                pending_ops[slot] =
+                                    Some((io_token, Op::WriteVectored { fd, buffers }));
                                 continue;
                             }
 
@@ -1145,16 +1388,18 @@ impl IoProvider for EpollBackend {
 
 #[cfg(all(test, unix))]
 mod descriptor_lease_acceptance_tests {
-    use super::EpollBackend;
+    use super::MioBackend;
     use crate::io::{IoProvider, Op};
     use smallvec::SmallVec;
 
     #[test]
     fn accepted_read_keeps_descriptor_lease_after_user_close() {
         let mut fds = [0; 2];
-        // SAFETY: fds points to two writable descriptor slots.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let backend = EpollBackend::new().expect("epoll backend");
+        // SAFETY: fds points at two live descriptor slots sized for a pipe.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(piped, 0, "pipe creation failed");
+        let backend = MioBackend::new().expect("mio backend");
         let token = backend
             .submit(Op::Read {
                 fd: fds[0],
@@ -1181,9 +1426,11 @@ mod descriptor_lease_acceptance_tests {
     #[test]
     fn unsupported_submit_returns_error_without_completion_token() {
         let mut fds = [0; 2];
+        // SAFETY: fds points at two live descriptor slots sized for a pipe.
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let backend = EpollBackend::new().expect("epoll backend");
+        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(piped, 0, "pipe creation failed");
+        let backend = MioBackend::new().expect("mio backend");
         let result = backend.submit(Op::UdpRecvVectored {
             fd: fds[0],
             iovecs: SmallVec::new(),
@@ -1276,5 +1523,295 @@ impl AsRawFd for Op {
 
 #[cfg(test)]
 mod locality_contract_tests {
-    static_assertions::assert_not_impl_any!(super::EpollBackend: Send, Sync);
+    static_assertions::assert_not_impl_any!(super::MioBackend: Send, Sync);
+}
+
+#[cfg(all(test, unix))]
+mod park_and_rent_tests {
+    use super::MioBackend;
+    use crate::buffer::Buffer;
+    use crate::io::{CompletionKind, IoProvider, Op};
+    use std::time::{Duration, Instant};
+
+    fn set_nonblocking(fd: std::os::unix::io::RawFd) {
+        // SAFETY: fd is a valid descriptor owned by this test and fcntl only
+        // reads its status flags.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        // SAFETY: same descriptor, same call shape, only adds O_NONBLOCK to the
+        // value just read back.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(set, 0, "F_SETFL failed");
+    }
+
+    /// `park` must actually park. Before this existed, the default
+    /// `IoProvider::park` returned 0 immediately, so an idle worker spun at
+    /// 100% CPU instead of blocking in the kernel.
+    #[test]
+    fn park_blocks_rather_than_returning_immediately() {
+        let backend = MioBackend::new().expect("mio backend");
+
+        // An empty pipe with no writer is never readable, so any blocking
+        // behaviour must come from the wait, not from an early return.
+        let mut fds = [0; 2];
+        // SAFETY: fds points at two live descriptor slots sized for a pipe.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(piped, 0, "pipe creation failed");
+        set_nonblocking(fds[0]);
+
+        let token = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 4096,
+            })
+            .expect("register read readiness");
+
+        let started = Instant::now();
+        let n = backend.park(Duration::from_millis(60));
+        let elapsed = started.elapsed();
+
+        // The wait must have happened, and no completion may be fabricated.
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "park returned after {elapsed:?}; it is not blocking"
+        );
+        assert_eq!(n, 0, "park reported completions for a never-readable fd");
+
+        // A second park must still report nothing and must not have consumed
+        // the registration.
+        assert_eq!(backend.park(Duration::from_millis(1)), 0);
+        assert!(backend.pending_operation_count() >= 1);
+
+        assert!(backend.cancel(token));
+        // SAFETY: both pipe ends are owned by this test and not aliased.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// park() fills the shared event buffer and drain must consume it. A drain
+    /// that re-polls with a zero timeout would clear the buffer and lose the
+    /// events park just harvested.
+    #[test]
+    fn park_hands_harvested_events_to_the_next_drain() {
+        let backend = MioBackend::new().expect("mio backend");
+        let mut fds = [0; 2];
+        // SAFETY: fds points at two live descriptor slots sized for a pipe.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(piped, 0, "pipe creation failed");
+
+        // Make the read end readable before parking so the wait returns
+        // immediately with an event in hand.
+        // SAFETY: b"x" is a live 1-byte static and fds[1] is a valid, writable
+        // pipe end for the duration of the call.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let written = unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) };
+        assert_eq!(written, 1, "pipe write failed");
+        set_nonblocking(fds[0]);
+
+        let token = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 16,
+            })
+            .expect("register read readiness");
+
+        let n = backend.park(Duration::from_millis(200));
+        assert!(n > 0, "park found no readiness on a readable pipe");
+
+        let drained = backend.drain_completions();
+        let completions = match drained {
+            std::task::Poll::Ready(c) => c,
+            std::task::Poll::Pending => panic!("drain reported pending after park"),
+        };
+        assert_eq!(completions.len(), 1);
+        let (tok, result) = completions.into_iter().next().unwrap();
+        assert_eq!(tok, token);
+        match result {
+            Ok(CompletionKind::Read { bytes_read, data }) => {
+                assert_eq!(bytes_read, 1);
+                assert_eq!(&data[..], b"x");
+            }
+            other => panic!("unexpected completion: {other:?}"),
+        }
+
+        // SAFETY: both pipe ends are owned by this test and not aliased.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// The rent operations were `ErrorKind::Unsupported` on the readiness
+    /// backend, which made the zero-copy API Linux-only even on macOS, where
+    /// it matters most.
+    #[test]
+    fn read_rent_round_trips_on_the_readiness_backend() {
+        let backend = MioBackend::new().expect("mio backend");
+        let mut fds = [0; 2];
+        // SAFETY: fds points at two live descriptor slots sized for a pipe.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(piped, 0, "pipe creation failed");
+        // SAFETY: b"hello" is a live 5-byte static and fds[1] is a valid,
+        // writable pipe end for the duration of the call.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let written = unsafe { libc::write(fds[1], b"hello".as_ptr().cast(), 5) };
+        assert_eq!(written, 5, "pipe write failed");
+        set_nonblocking(fds[0]);
+
+        let token = backend
+            .submit(Op::ReadRent {
+                fd: fds[0],
+                buffer: Buffer::with_capacity(32),
+            })
+            .expect("register rent read");
+
+        let completions = match backend.drain_completions() {
+            std::task::Poll::Ready(c) => c,
+            std::task::Poll::Pending => {
+                // Not ready in the same tick: park, then drain again.
+                assert!(backend.park(Duration::from_millis(200)) > 0);
+                match backend.drain_completions() {
+                    std::task::Poll::Ready(c) => c,
+                    std::task::Poll::Pending => panic!("rent read never completed"),
+                }
+            }
+        };
+        let (tok, result) = completions.into_iter().next().unwrap();
+        assert_eq!(tok, token);
+        match result {
+            Ok(CompletionKind::ReadRent { buffer }) => {
+                assert_eq!(buffer.len(), 5);
+                assert_eq!(&buffer[..], b"hello");
+            }
+            other => panic!("unexpected completion: {other:?}"),
+        }
+
+        // SAFETY: both pipe ends are owned by this test and not aliased.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn write_rent_round_trips_on_the_readiness_backend() {
+        let backend = MioBackend::new().expect("mio backend");
+        let mut fds = [0; 2];
+        // SAFETY: fds points at two live descriptor slots sized for a pipe.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(piped, 0, "pipe creation failed");
+        set_nonblocking(fds[1]);
+
+        let token = backend
+            .submit(Op::WriteRent {
+                fd: fds[1],
+                data: Buffer::from_slice(b"payload"),
+            })
+            .expect("register rent write");
+
+        let completions = loop {
+            match backend.drain_completions() {
+                std::task::Poll::Ready(c) if !c.is_empty() => break c,
+                std::task::Poll::Ready(_) | std::task::Poll::Pending => {
+                    assert!(
+                        backend.park(Duration::from_millis(200)) > 0,
+                        "rent write never became writable"
+                    );
+                }
+            }
+        };
+        let (tok, result) = completions.into_iter().next().unwrap();
+        assert_eq!(tok, token);
+        match result {
+            Ok(CompletionKind::WriteRent {
+                bytes_written,
+                data,
+            }) => {
+                assert_eq!(bytes_written, 7);
+                assert_eq!(&data[..], b"payload");
+            }
+            other => panic!("unexpected completion: {other:?}"),
+        }
+
+        // The bytes actually reached the pipe.
+        let mut out = [0u8; 16];
+        // SAFETY: out is a live 16-byte value and fds[0] is readable.
+        let got = unsafe { libc::read(fds[0], out.as_mut_ptr().cast(), out.len()) };
+        assert_eq!(got, 7);
+        assert_eq!(&out[..7], b"payload");
+
+        // SAFETY: both pipe ends are owned by this test and not aliased.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// `Op::Fsync` used to run `sync_all()` inline in `submit`, stalling the
+    /// shard's whole event loop (AGENTS.md MUST NOT #7). It now goes through the
+    /// bounded file thread pool. The observable difference: `submit` returns
+    /// while the flush is still in flight, and the completion arrives later.
+    #[test]
+    fn fsync_submits_without_running_inline_on_the_calling_thread() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let mut temp = std::env::temp_dir();
+        temp.push(format!("miniss-fsync-submit-{}.bin", std::process::id()));
+        // A file large enough that `fsync` cannot complete in microseconds;
+        // otherwise the timing assertion below is not meaningful.
+        const CHUNK: usize = 8 * 1024 * 1024;
+        {
+            let mut file = std::fs::File::create(&temp).expect("create temp file");
+            let block = vec![0xA5u8; CHUNK];
+            for _ in 0..6 {
+                file.write_all(&block).expect("fill temp file");
+            }
+            file.sync_all().expect("prime sync");
+        }
+
+        let backend = MioBackend::new().expect("mio backend");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .expect("reopen temp file");
+        let fd = file.as_raw_fd();
+
+        let submitted = Instant::now();
+        let token = backend.submit(Op::Fsync { fd }).expect("submit fsync");
+        let submit_elapsed = submitted.elapsed();
+
+        assert!(
+            submit_elapsed < Duration::from_millis(50),
+            "submitting fsync took {submit_elapsed:?}; it is running inline on the caller"
+        );
+
+        // The completion must still arrive, through the pool.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let completions = loop {
+            match backend.drain_completions() {
+                std::task::Poll::Ready(batch) if !batch.is_empty() => break batch,
+                _ => {
+                    assert!(Instant::now() < deadline, "fsync never completed");
+                    let _ = backend.park(Duration::from_millis(20));
+                }
+            }
+        };
+        let (tok, result) = completions.into_iter().next().unwrap();
+        assert_eq!(tok, token);
+        assert!(result.is_ok(), "fsync failed: {:?}", result.err());
+
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+    }
 }

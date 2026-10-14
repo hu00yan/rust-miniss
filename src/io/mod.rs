@@ -1,7 +1,8 @@
 //! Core I/O abstractions for the runtime.
 //!
 //! This module defines the `IoBackend` trait, which provides a generic interface
-//! for different asynchronous I/O mechanisms like `io-uring`, `epoll`, or `kqueue`.
+//! for different asynchronous I/O mechanisms like `io-uring` or a
+//! `mio`-based readiness backend.
 //! Each CPU thread will own an instance of an `IoBackend` implementation.
 //!
 //! ## IO Backend Selection
@@ -10,8 +11,13 @@
 //! and kernel version:
 //!
 //! - **Linux with kernel 6.12+**: Uses `io_uring` for optimal performance
-//! - **Linux (older kernels)**: Uses `epoll` via mio
-//! - **macOS**: Uses `kqueue` via mio (reuses epoll implementation)
+//! - **Linux (older kernels)**: Uses the `mio` readiness backend (`epoll` underneath)
+//! - **macOS**: Uses the *same* `mio` readiness backend (`kqueue` underneath).
+//!   `mio` normalizes readiness notification but not operation state-machine
+//!   semantics, so macOS shares one code path with no independent kqueue tests.
+//!   Known macOS gaps: `IoProvider::park` is a no-op (workers busy-spin),
+//!   `Op::ReadRent`/`WriteRent` are unsupported, and `Op::Fsync` blocks the
+//!   runtime thread.
 //!   Other Unix targets are not supported or tested by this project.
 //!
 //! This selection is handled by the build script (`build.rs`) which detects the
@@ -623,11 +629,8 @@ impl From<IoError> for std::io::Error {
 // Conditional compilation for different I/O backend implementations.
 // These modules will contain the concrete implementations of the `IoBackend` trait.
 
-#[cfg(io_backend = "kqueue")]
-pub mod kqueue;
-
 #[cfg(any(io_backend = "epoll", all(unix, not(target_os = "linux"))))]
-pub mod epoll;
+pub mod mio_poll;
 
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 pub mod uring;
@@ -635,4 +638,4 @@ pub mod uring;
 pub mod future;
 
 #[cfg(any(io_backend = "epoll", all(unix, not(target_os = "linux"))))]
-pub use epoll::EpollBackend;
+pub use mio_poll::MioBackend;

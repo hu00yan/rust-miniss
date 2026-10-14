@@ -76,8 +76,10 @@ fn run_worker(addr: SocketAddr, core_id: usize, requests: Option<Arc<AtomicU64>>
     socket.listen(1024).expect("listen failed");
 
     let fd = socket.into_raw_fd();
-    // Safety: fd is valid and unique
-    let listener = unsafe { TcpListener::from_raw_fd(fd) };
+    // SAFETY: `socket` was bound and listening above and `into_raw_fd`
+    // transferred its sole ownership into `fd`, so this is the unique
+    // ownership transfer that `from_raw_fd` requires. No other owner exists.
+    let listener = unsafe { TcpListener::from_raw_fd(fd) }; // arch-audit: allow benchmark fd transfer
 
     let runtime = compio::runtime::Runtime::new().unwrap();
     runtime.block_on(async move {
