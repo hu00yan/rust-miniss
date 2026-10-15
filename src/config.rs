@@ -65,6 +65,26 @@ pub fn io_drain_limit() -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+/// Default control-plane metrics aggregation interval in milliseconds.
+///
+/// AGENTS.md MUST #6 requires aggregation outside the hot path.  One pass per
+/// interval costs each shard exactly one bounded control-plane message.
+pub const DEFAULT_METRICS_INTERVAL_MS: u64 = 1000;
+
+/// Resolve the control-plane metrics aggregation interval from
+/// `MINISS_METRICS_INTERVAL_MS`.
+///
+/// Read once when a runtime starts its aggregator thread, never from a worker.
+/// Invalid or absent values fall back to [`DEFAULT_METRICS_INTERVAL_MS`].
+pub fn metrics_interval() -> Duration {
+    let interval_ms = std::env::var("MINISS_METRICS_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_METRICS_INTERVAL_MS);
+    Duration::from_millis(interval_ms)
+}
+
 /// Resolve the I/O park timeout from `MINISS_PARK_TIMEOUT_US`.
 ///
 /// This is read at runtime startup only. Invalid or absent values fall back to

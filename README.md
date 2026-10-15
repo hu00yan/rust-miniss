@@ -39,5 +39,28 @@ Raw artifacts are retained under `.bench-http-20260714*` directories:
 See `docs/review/performance-baseline-2026-07-14.md` and
 `docs/review/performance-baseline-2026-07-11.md` for full details.
 
+## Metrics
+
+Every `MultiCoreRuntime` owns one control-plane aggregator thread, started in
+`MultiCoreRuntime::new` and joined when the runtime drops. There is no
+process-global registry — see `src/metrics.rs` for why a global is both
+forbidden by `AGENTS.md` MUST NOT #4 and wrong for a thread-per-core runtime.
+
+```rust
+// Serve this from any /metrics handler you own; the runtime only owns numbers.
+let body = runtime.metrics_view()?.render_prometheus();
+
+// Or force a fresh, bounded aggregation pass instead of reading the last one.
+let body = runtime.metrics_refresh(Duration::from_secs(1))?.render_prometheus();
+```
+
+Each exported metric is emitted as `# HELP` / `# TYPE`, one
+`name{shard="N"} value` line per shard, and one unlabelled `name value` line
+holding the runtime-wide merge (sum for counters and gauges, max for
+high-water marks). The interval defaults to 1s and is set at startup with
+`MINISS_METRICS_INTERVAL_MS`.
+
+See `examples/metrics_export.rs` for a runnable scrape endpoint.
+
 Performance is tracked as reproducible Linux snapshots, not as a permanent
 throughput claim. See [the current baseline](docs/review/performance-baseline-2026-07-15.md).

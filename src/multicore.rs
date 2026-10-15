@@ -37,6 +37,9 @@ use crate::cpu::{
 };
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
+use crate::metrics::{
+    Aggregator, MetricsCommand, MetricsControl, MetricsError, MetricsFanout, MetricsView,
+};
 use crate::task::{DetachedTaskFuture, Task};
 use crate::timer::TimerWheel;
 use crate::waker::{next_runtime_generation, OverflowHint, ReadyQueue, TaskArena, TaskId};
@@ -50,6 +53,8 @@ type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 const LOCAL_SPAWN_QUEUE_CAPACITY: usize = 65_536;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+/// How long a scrape caller waits for an idle aggregator to answer `View`.
+const METRICS_VIEW_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 const ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
 const ADMISSION_COUNT_MASK: usize = !ADMISSION_CLOSED;
 
@@ -120,7 +125,7 @@ impl WorkerSleepGate {
     }
 }
 
-struct AdmissionGuard {
+pub(crate) struct AdmissionGuard {
     counter: Arc<AtomicUsize>,
 }
 
@@ -128,6 +133,99 @@ impl Drop for AdmissionGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Release);
     }
+}
+
+/// Take one admission ticket on `counter`, or fail once the gate is closed.
+///
+/// Shared by the spawn paths and by the metrics fan-out so that
+/// `close_admission_and_wait` covers both.  That is what stops a sampling pass
+/// from enqueueing a `CollectMetrics` message into a shard that is about to
+/// pass its drain check and exit, which would otherwise leave a control message
+/// in the post-join termination snapshot.
+///
+/// The cost to `shutdown` is bounded: it waits for an in-flight pass, which is
+/// itself bounded by that pass's own sampling timeout.
+pub(crate) fn begin_admission_on(counter: &Arc<AtomicUsize>) -> Result<AdmissionGuard> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current & ADMISSION_CLOSED != 0 {
+            return Err(RuntimeError::TaskFailed(
+                "Runtime admission is closed".to_string(),
+            ));
+        }
+        let count = current & ADMISSION_COUNT_MASK;
+        let next = count
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::TaskFailed("Admission counter exhausted".to_string()))?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                return Ok(AdmissionGuard {
+                    counter: Arc::clone(counter),
+                })
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Per-shard control-plane wake transport.
+///
+/// Owning the sleep gate and the eventfd together behind one `Arc` is what lets
+/// the control plane hand a notification handle to
+/// [`crate::metrics::MetricsFanout`] without duplicating the ownership rules for
+/// the eventfd.  Worker threads keep borrowing a raw fd from it exactly as
+/// before; the `Arc` makes that borrow strictly outlive the runtime instead of
+/// merely matching it.
+///
+/// On non-Linux there is no parked-worker poll to feed, so this is empty and
+/// `notify` is the `unpark` half only.
+pub(crate) struct CoreWakeup {
+    #[cfg(target_os = "linux")]
+    gate: Arc<WorkerSleepGate>,
+    #[cfg(target_os = "linux")]
+    fd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl CoreWakeup {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            gate: Arc::new(WorkerSleepGate::new()),
+            fd: create_wakeup_eventfd()?,
+        })
+    }
+
+    /// Hand the gate a clone for a worker that polls this shard.
+    fn gate(&self) -> Arc<WorkerSleepGate> {
+        self.gate.clone()
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// Notify a shard that a control-plane message is waiting for it.
+    pub(crate) fn notify(&self) {
+        if self.gate.notify() {
+            notify_wakeup_eventfd(self.fd.as_raw_fd());
+        }
+    }
+
+    #[cfg(test)]
+    fn is_sleeping(&self) -> bool {
+        self.gate.is_sleeping()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl CoreWakeup {
+    fn new() -> Result<Self> {
+        Ok(Self {})
+    }
+
+    /// Non-Linux workers have no parked poll to feed; `unpark` is the whole
+    /// notification path there.
+    pub(crate) fn notify(&self) {}
 }
 
 thread_local! {
@@ -1246,13 +1344,9 @@ pub struct MultiCoreRuntime {
     core_exited: Vec<Arc<AtomicBool>>,
     /// Per-core escalation flags; only workers mutate local task/driver state.
     force_shutdowns: Vec<Arc<AtomicBool>>,
-    /// Per-core sleep flags; senders only write to the wake eventfd when the
-    /// target core is actually parked.
-    #[cfg(target_os = "linux")]
-    core_sleeping: Vec<Arc<WorkerSleepGate>>,
-    #[cfg(target_os = "linux")]
-    /// Per-core eventfds used to wake parked workers when messages arrive.
-    core_wakeup_fds: Vec<OwnedFd>,
+    /// Per-shard control-plane wake transport, shared with the metrics
+    /// aggregator. See [`CoreWakeup`].
+    core_wakeups: Vec<Arc<CoreWakeup>>,
     /// Thread join handles. This lock is control-plane only: worker hot paths
     /// never access it, while it lets the global OnceLock owner join safely.
     join_handles: parking_lot::Mutex<Vec<thread::JoinHandle<Result<()>>>>,
@@ -1269,6 +1363,10 @@ pub struct MultiCoreRuntime {
     /// owner-shard send completes, so shutdown cannot cut across an in-flight
     /// admission.
     admission: Arc<AtomicUsize>,
+    /// Control-plane metrics aggregator. Owned by this runtime rather than by a
+    /// process-global registry; see `src/metrics.rs` for why a global is both
+    /// forbidden by AGENTS.md MUST NOT #4 and wrong here.
+    metrics: MetricsControl,
     /// Next core for round-robin task distribution
     next_core: AtomicUsize,
 }
@@ -1345,31 +1443,7 @@ impl MultiCoreRuntime {
     }
 
     fn begin_admission(&self) -> Result<AdmissionGuard> {
-        let mut current = self.admission.load(Ordering::Acquire);
-        loop {
-            if current & ADMISSION_CLOSED != 0 {
-                return Err(RuntimeError::TaskFailed(
-                    "Runtime admission is closed".to_string(),
-                ));
-            }
-            let count = current & ADMISSION_COUNT_MASK;
-            let next = count.checked_add(1).ok_or_else(|| {
-                RuntimeError::TaskFailed("Admission counter exhausted".to_string())
-            })?;
-            match self.admission.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(AdmissionGuard {
-                        counter: self.admission.clone(),
-                    })
-                }
-                Err(observed) => current = observed,
-            }
-        }
+        begin_admission_on(&self.admission)
     }
 
     fn close_admission_and_wait(&self) {
@@ -1407,15 +1481,15 @@ impl MultiCoreRuntime {
         let mut core_shutdowns = Vec::with_capacity(num_cores);
         let mut core_exited = Vec::with_capacity(num_cores);
         let mut force_shutdowns = Vec::with_capacity(num_cores);
-        #[cfg(target_os = "linux")]
-        let mut core_sleeping = Vec::with_capacity(num_cores);
-        #[cfg(target_os = "linux")]
-        let mut core_wakeup_fds = Vec::with_capacity(num_cores);
+        let mut core_wakeups = Vec::with_capacity(num_cores);
         let mut join_handles = Vec::with_capacity(num_cores);
         let mut core_threads = Vec::with_capacity(num_cores);
         let mut ready_receivers = Vec::with_capacity(num_cores);
         let mut task_counters = Vec::with_capacity(num_cores);
         let mut termination_reports = Vec::with_capacity(num_cores);
+        // Shared with the metrics fan-out so a sampling pass is covered by the
+        // same shutdown cutoff as a spawn.
+        let admission = Arc::new(AtomicUsize::new(0));
 
         // Create cores and start threads
         for (core_id, affinity_cpu) in cpu_plan.iter().copied().enumerate() {
@@ -1425,8 +1499,7 @@ impl MultiCoreRuntime {
             let core_exited_flag = Arc::new(AtomicBool::new(false));
             let force_shutdown = Arc::new(AtomicBool::new(false));
             let termination_report = Arc::new(std::sync::OnceLock::new());
-            #[cfg(target_os = "linux")]
-            let core_sleeping_flag = Arc::new(WorkerSleepGate::new());
+            let wakeup = Arc::new(CoreWakeup::new()?);
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
             let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
             core_senders.push(sender.clone());
@@ -1434,16 +1507,9 @@ impl MultiCoreRuntime {
             core_exited.push(core_exited_flag.clone());
             force_shutdowns.push(force_shutdown.clone());
             termination_reports.push(termination_report.clone());
-            #[cfg(target_os = "linux")]
-            core_sleeping.push(core_sleeping_flag.clone());
+            core_wakeups.push(wakeup.clone());
             ready_receivers.push((core_id, ready_receiver));
             task_counters.push(AtomicU64::new(1));
-            #[cfg(target_os = "linux")]
-            let wakeup_fd = create_wakeup_eventfd()?;
-            #[cfg(target_os = "linux")]
-            let wakeup_fd_raw = wakeup_fd.as_raw_fd();
-            #[cfg(target_os = "linux")]
-            core_wakeup_fds.push(wakeup_fd);
 
             // Spawn thread for this core
             let handle = thread::Builder::new()
@@ -1460,7 +1526,7 @@ impl MultiCoreRuntime {
                     };
                     #[cfg(target_os = "linux")]
                     let mut core = {
-                        let sleep_gate = core_sleeping_flag.clone();
+                        let sleep_gate = wakeup.gate();
                         CpuCore::new(
                             core_id,
                             affinity_cpu,
@@ -1473,7 +1539,7 @@ impl MultiCoreRuntime {
                             ready_sender,
                             crate::config::park_timeout(),
                             termination_report.clone(),
-                            wakeup_fd_raw,
+                            wakeup.raw_fd(),
                         )
                     };
                     #[cfg(not(target_os = "linux"))]
@@ -1533,6 +1599,36 @@ impl MultiCoreRuntime {
             }
         }
 
+        // Control-plane metrics aggregator.  Started here, in the same pass
+        // that starts the workers, so nothing is created after startup
+        // (AGENTS.md MUST #2).  It is a plain OS thread with no executor,
+        // reactor, task queue, or shard state, and it is joined by
+        // `Drop for MultiCoreRuntime`.
+        //
+        // It samples through a `MetricsFanout` handle rather than through an
+        // `Arc<MultiCoreRuntime>`.  A background thread that keeps the runtime
+        // alive would make `Arc::try_unwrap(runtime)` permanently fail for
+        // embedders, and a `Weak` would leave that call racy.
+        let metrics_interval = crate::config::metrics_interval();
+        let metrics_fanout = Arc::new(MetricsFanout {
+            senders: core_senders.clone(),
+            threads: core_threads.clone(),
+            wakeups: core_wakeups.clone(),
+            admission: Arc::clone(&admission),
+        });
+        let (metrics_tx, metrics_rx) = std::sync::mpsc::channel();
+        let metrics_sampler = thread::Builder::new()
+            .name("miniss-metrics".to_string())
+            .spawn({
+                let fanout = Arc::clone(&metrics_fanout);
+                move || {
+                    Aggregator::new(metrics_interval).run(fanout, metrics_rx);
+                }
+            })
+            .map_err(|e| {
+                RuntimeError::TaskFailed(format!("Failed to spawn metrics thread: {e}"))
+            })?;
+
         let runtime = Arc::new(Self {
             num_cores,
             runtime_generation,
@@ -1540,17 +1636,20 @@ impl MultiCoreRuntime {
             core_shutdowns,
             core_exited,
             force_shutdowns,
-            #[cfg(target_os = "linux")]
-            core_sleeping,
-            #[cfg(target_os = "linux")]
-            core_wakeup_fds,
+            core_wakeups,
             join_handles: parking_lot::Mutex::new(join_handles),
             core_threads,
             task_counters,
             termination_reports,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
             shutdown_phase: AtomicU8::new(ShutdownPhase::Running as u8),
-            admission: Arc::new(AtomicUsize::new(0)),
+            admission,
+            metrics: MetricsControl {
+                commands: metrics_tx,
+                fanout: metrics_fanout,
+                sampler: Some(metrics_sampler),
+                interval: metrics_interval,
+            },
             next_core: AtomicUsize::new(0),
         });
 
@@ -1565,12 +1664,7 @@ impl MultiCoreRuntime {
     #[inline]
     fn notify_core(&self, core_id: usize) {
         self.core_threads[core_id].unpark();
-        #[cfg(target_os = "linux")]
-        {
-            if self.core_sleeping[core_id].notify() {
-                notify_wakeup_eventfd(self.core_wakeup_fds[core_id].as_raw_fd());
-            }
-        }
+        self.core_wakeups[core_id].notify();
     }
 
     /// Create IO backend for a specific core
@@ -2225,6 +2319,42 @@ impl MultiCoreRuntime {
         Ok(())
     }
 
+    /// Return the most recent control-plane aggregation pass.
+    ///
+    /// This never triggers sampling, so it is safe to call from a scrape
+    /// handler: it answers from whatever the aggregator's periodic clock last
+    /// merged.  Returns [`MetricsError::NotSampled`] until the first pass has
+    /// completed.  See [`MultiCoreRuntime::metrics_refresh`] to force one.
+    pub fn metrics_view(&self) -> std::result::Result<MetricsView, MetricsError> {
+        self.metrics
+            .ask(METRICS_VIEW_REPLY_TIMEOUT, MetricsCommand::View)
+    }
+
+    /// Force one bounded aggregation pass and return the merged view.
+    ///
+    /// `timeout` bounds both the shard round trip and the caller's wait.  The
+    /// wait can be up to twice `timeout` in the worst case: once for the
+    /// aggregator to finish the pass, once for this call to collect the reply.
+    ///
+    /// This is a control-plane call and blocks the calling thread.  It must not
+    /// be used from a worker shard's request path; per-request hot-path metrics
+    /// do not exist by design (AGENTS.md MUST #6).
+    pub fn metrics_refresh(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<MetricsView, MetricsError> {
+        self.metrics
+            .ask(timeout.saturating_mul(2), |reply| MetricsCommand::Refresh {
+                timeout,
+                reply,
+            })
+    }
+
+    /// How often this runtime's aggregator thread runs a sampling pass.
+    pub fn metrics_interval(&self) -> Duration {
+        self.metrics.interval
+    }
+
     /// Collect per-core runtime metrics through control-plane shard messages.
     ///
     /// Metrics counters are shard-local; this method aggregates snapshots on
@@ -2236,44 +2366,10 @@ impl MultiCoreRuntime {
                 "Runtime is not running".to_string(),
             ));
         }
-
-        let (reply, receiver) = std::sync::mpsc::channel();
-        for (core_id, sender) in self.core_senders.iter().enumerate() {
-            sender
-                .try_send(CoreMessage::CollectMetrics {
-                    reply: reply.clone(),
-                })
-                .map_err(|err| {
-                    RuntimeError::TaskFailed(format!(
-                        "Core {core_id} metrics request failed: {err}"
-                    ))
-                })?;
-            self.notify_core(core_id);
-        }
-        drop(reply);
-
-        let deadline = Instant::now() + timeout;
-        let mut cores = Vec::with_capacity(self.num_cores);
-        while cores.len() < self.num_cores {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(RuntimeError::TaskFailed(format!(
-                    "Timed out collecting metrics: got {}/{} cores",
-                    cores.len(),
-                    self.num_cores
-                )));
-            }
-            match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
-                Ok(snapshot) => cores.push(snapshot),
-                Err(err) => {
-                    return Err(RuntimeError::TaskFailed(format!(
-                        "Metrics collection failed: {err}"
-                    )));
-                }
-            }
-        }
-        cores.sort_by_key(|snapshot| snapshot.core_id);
-        Ok(RuntimeMetrics { cores })
+        self.metrics
+            .fanout
+            .sample(timeout)
+            .map_err(RuntimeError::TaskFailed)
     }
 
     /// Wait for all cores to complete
@@ -2411,6 +2507,13 @@ impl RuntimeStats {
 
 impl Drop for MultiCoreRuntime {
     fn drop(&mut self) {
+        // Stop and join the control-plane aggregator first.  It samples the
+        // workers, so it must be retired before the join handles are drained
+        // and before the eventfds they borrow are dropped.
+        let _ = self.metrics.commands.send(MetricsCommand::Stop);
+        if let Some(sampler) = self.metrics.sampler.take() {
+            let _ = sampler.join();
+        }
         let state = self.state.load(Ordering::Acquire);
         if state == RuntimeState::Terminated as u8 || self.join_handles.lock().is_empty() {
             return;
@@ -2419,9 +2522,12 @@ impl Drop for MultiCoreRuntime {
             tracing::warn!("Runtime dropped without explicit shutdown");
             let _ = self.shutdown();
         }
-        // Worker owns raw eventfd numbers borrowed from `core_wakeup_fds`;
+        // Worker owns raw eventfd numbers borrowed from `core_wakeups`;
         // always join before those OwnedFd values are dropped.  Drop is a
-        // control-plane blocking path, never a data-plane operation.
+        // control-plane blocking path, never a data-plane operation.  The
+        // metrics aggregator is retired first: it holds `Arc<CoreWakeup>`
+        // clones, and retiring it first is what guarantees no notification can
+        // reach a descriptor this runtime is about to close.
         for handle in self.join_handles.lock().drain(..) {
             let _ = handle.join();
         }
@@ -2703,7 +2809,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn cross_core_spawn_wakes_a_parked_worker() {
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
-        let sleeping = &runtime.core_sleeping[1];
+        let sleeping = &runtime.core_wakeups[1];
         let deadline = Instant::now() + Duration::from_secs(1);
         while !sleeping.is_sleeping() {
             assert!(
@@ -2733,12 +2839,31 @@ mod tests {
         runtime.join().unwrap();
     }
 
+    /// The control-plane aggregator must not take a strong reference to the
+    /// runtime, or `Arc::try_unwrap` would never succeed for an embedder and
+    /// the runtime would never be released.
+    #[test]
+    fn metrics_aggregator_does_not_extend_runtime_lifetime() {
+        let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+        // Exercise both the periodic clock and the forced path, then let a full
+        // interval elapse so at least one background pass has completed.
+        let _ = runtime.metrics_refresh(Duration::from_secs(2));
+        let _ = runtime.metrics_view();
+        let _ = runtime.metrics_snapshot(Duration::from_secs(1));
+        thread::sleep(crate::config::metrics_interval() + Duration::from_millis(200));
+
+        runtime.shutdown().unwrap();
+        let owned = Arc::try_unwrap(runtime)
+            .expect("the metrics aggregator must not hold the runtime alive");
+        owned.join().unwrap();
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn cross_core_spawn_stress_keeps_bounded_admission_and_affinity() {
         const TASKS: usize = 256;
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
-        let sleeping = &runtime.core_sleeping[1];
+        let sleeping = &runtime.core_wakeups[1];
         let deadline = Instant::now() + Duration::from_secs(1);
         while !sleeping.is_sleeping() {
             assert!(

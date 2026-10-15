@@ -52,6 +52,7 @@ pub mod fs;
 pub mod http;
 pub mod hyper_rt;
 pub mod io;
+pub mod metrics;
 pub mod multicore;
 pub mod net;
 pub mod quic;
@@ -70,6 +71,7 @@ pub use http::{
 };
 pub use hyper_rt::{MinissHyperExecutor, MinissHyperTimer};
 pub use io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+pub use metrics::{MetricsError, MetricsView};
 pub use multicore::{
     join_global, shutdown_global_with_timeout, CoreMetricsSnapshot, MultiCoreRuntime,
     RuntimeMetrics, ShutdownPhase,
