@@ -535,302 +535,14 @@ impl UringBackend {
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
                 }
-                let completion_result = match pending_op {
-                    PendingOp::Accept {
-                        addr_storage,
-                        addr_len,
-                        ..
-                    } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else if let (Some(addr_storage), Some(addr_len)) =
-                            (addr_storage.as_ref(), addr_len.as_ref())
-                        {
-                            let storage: *const sockaddr_storage = &**addr_storage as *const _;
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            let socket_addr = unsafe {
-                                match (*storage).ss_family as libc::c_int {
-                                    libc::AF_INET => {
-                                        let sa =
-                                            &*(storage as *const _ as *const libc::sockaddr_in);
-                                        let ip = std::net::Ipv4Addr::from(u32::from_be(
-                                            sa.sin_addr.s_addr,
-                                        ));
-                                        let port = u16::from_be(sa.sin_port);
-                                        Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                                            ip, port,
-                                        )))
-                                    }
-                                    libc::AF_INET6 => {
-                                        let sa =
-                                            &*(storage as *const _ as *const libc::sockaddr_in6);
-                                        let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
-                                        let port = u16::from_be(sa.sin6_port);
-                                        Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-                                            ip,
-                                            port,
-                                            sa.sin6_flowinfo,
-                                            sa.sin6_scope_id,
-                                        )))
-                                    }
-                                    _ => Err(IoError::Io(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "Unsupported address family",
-                                    ))),
-                                }
-                            };
-                            let _ = **addr_len;
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
-                            match socket_addr {
-                                Ok(sa) => Ok(CompletionKind::Accept {
-                                    fd: accepted_fd,
-                                    addr: Some(sa),
-                                }),
-                                Err(e) => {
-                                    drop(accepted_fd);
-                                    Err(e)
-                                }
-                            }
-                        } else {
-                            Ok(CompletionKind::Accept {
-                                // SAFETY: a successful accept CQE transfers a
-                                // fresh descriptor to this completion.
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                                fd: unsafe { OwnedFd::from_raw_fd(result) },
-                                addr: None,
-                            })
-                        }
-                    }
-                    PendingOp::Read { op, mut buf } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            unsafe {
-                                buf.set_len(bytes_read);
-                            }
-                            match &op {
-                                Op::ReadRent { .. } => Ok(CompletionKind::ReadRent { buffer: buf }),
-                                _ => Ok(CompletionKind::Read {
-                                    bytes_read,
-                                    data: buf,
-                                }),
-                            }
-                        }
-                    }
-                    PendingOp::Write { op, data } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            match &op {
-                                Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
-                                    bytes_written: result as usize,
-                                    data,
-                                }),
-                                _ => {
-                                    let _ = data;
-                                    Ok(CompletionKind::Write {
-                                        bytes_written: result as usize,
-                                    })
-                                }
-                            }
-                        }
-                    }
-                    PendingOp::WriteStatic { .. } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Write {
-                                bytes_written: result as usize,
-                            })
-                        }
-                    }
-                    PendingOp::Fsync { .. } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Fsync)
-                        }
-                    }
-                    PendingOp::Close { .. } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Close)
-                        }
-                    }
-                    PendingOp::ReadFile { mut buf, .. } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            unsafe {
-                                buf.set_len(bytes_read);
-                            }
-                            Ok(CompletionKind::ReadFile {
-                                bytes_read,
-                                data: buf,
-                            })
-                        }
-                    }
-                    PendingOp::WriteFile { data, .. } => {
-                        let _ = data;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::WriteFile {
-                                bytes_written: result as usize,
-                            })
-                        }
-                    }
-                    PendingOp::UdpRecv {
-                        mut buffer,
-                        addr_storage,
-                        addr_len,
-                        ..
-                    } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            unsafe {
-                                buffer.set_len(bytes_read);
-                            }
-                            let socket_addr = {
-                                let storage: *const sockaddr_storage = &*addr_storage as *const _;
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                                unsafe {
-                                    match (*storage).ss_family as libc::c_int {
-                                        libc::AF_INET => {
-                                            let sa =
-                                                &*(storage as *const _ as *const libc::sockaddr_in);
-                                            let ip = std::net::Ipv4Addr::from(u32::from_be(
-                                                sa.sin_addr.s_addr,
-                                            ));
-                                            let port = u16::from_be(sa.sin_port);
-                                            Ok(std::net::SocketAddr::V4(
-                                                std::net::SocketAddrV4::new(ip, port),
-                                            ))
-                                        }
-                                        libc::AF_INET6 => {
-                                            let sa = &*(storage as *const _
-                                                as *const libc::sockaddr_in6);
-                                            let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
-                                            let port = u16::from_be(sa.sin6_port);
-                                            Ok(std::net::SocketAddr::V6(
-                                                std::net::SocketAddrV6::new(
-                                                    ip,
-                                                    port,
-                                                    sa.sin6_flowinfo,
-                                                    sa.sin6_scope_id,
-                                                ),
-                                            ))
-                                        }
-                                        _ => Err(IoError::Io(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "Unsupported address family",
-                                        ))),
-                                    }
-                                }
-                            };
-                            let _ = *addr_len;
-                            match socket_addr {
-                                Ok(sa) => Ok(CompletionKind::UdpRecv {
-                                    bytes_read,
-                                    buffer,
-                                    addr: sa,
-                                }),
-                                Err(e) => Err(e),
-                            }
-                        }
-                    }
-                    PendingOp::UdpSend {
-                        data,
-                        addr_storage,
-                        addr_len,
-                        ..
-                    } => {
-                        let _ = &*addr_storage as *const _;
-                        let _ = *addr_len;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::UdpSend {
-                                bytes_written: result as usize,
-                                data,
-                            })
-                        }
-                    }
-                    PendingOp::Connect { addr_storage, .. } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let _ = &*addr_storage;
-                            Ok(CompletionKind::Connect)
-                        }
-                    }
-                    PendingOp::ReadVectored {
-                        mut buffers,
-                        iovecs,
-                        ..
-                    } => {
-                        let _ = iovecs;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            let mut remaining = bytes_read;
-                            for buf in buffers.iter_mut() {
-                                let can_read = std::cmp::min(remaining, buf.capacity());
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                                unsafe {
-                                    buf.set_len(can_read);
-                                }
-                                remaining -= can_read;
-                                if remaining == 0 {
-                                    break;
-                                }
-                            }
-                            Ok(CompletionKind::ReadVectored {
-                                bytes_read,
-                                buffers,
-                            })
-                        }
-                    }
-                    PendingOp::WriteVectored {
-                        buffers, iovecs, ..
-                    } => {
-                        let _ = iovecs;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::WriteVectored {
-                                bytes_written: result as usize,
-                                buffers,
-                            })
-                        }
-                    }
-                    PendingOp::PollAdd { .. } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::PollAdd {
-                                events: result as u32,
-                            })
-                        }
-                    }
-                    PendingOp::Nop { .. } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Nop)
-                        }
-                    }
-                };
+                // Reconstruct the terminal completion from the slot's pending
+                // operation and this CQE's result.
+                // SAFETY: `pending_op` came from this slot and its CQE is the one
+                // being consumed right now, so every kernel-written region it owns is
+                // valid for exactly `result` bytes. See `reconstruct_completion` for
+                // the full contract.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                let completion_result = unsafe { Self::reconstruct_completion(pending_op, result) };
 
                 // Store result in slot and wake the task — no intermediate Vec.
                 // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
@@ -1457,6 +1169,340 @@ impl UringBackend {
     }
 }
 
+/// Reconstruct the terminal completion for a slot whose operation just
+/// finished.
+///
+/// Both drain paths need this, and both used to carry their own copy of the
+/// `match`: the fused drain (`drain_completions_fused_inline`) and the Vec drain
+/// (`drain_completions_into`). They were written independently and drifted —
+/// the fused copy lost every SAFETY comment, renamed the sockaddr locals, and
+/// bound patterns differently. A terminal-completion bug therefore had to be
+/// found and fixed twice, and a fix that missed one copy was silently Linux-only
+/// (the Vector path) or fused-only. Nothing in the logic actually depends on
+/// which drain is running, so there is exactly one copy now.
+///
+/// This is `unsafe` for the same reason the two copies were: it publishes
+/// kernel-written bytes as initialized Rust memory (`Buffer::set_len`) and
+/// reads kernel-filled `sockaddr` memory. Both are valid only for the CQE being
+/// consumed.
+///
+/// # Safety
+///
+/// - `pending_op` must have just reached terminal completion for the CQE whose
+///   `result` is `result`. Every kernel-written region it owns must be valid for
+///   exactly `result` bytes — no more.
+/// - For `UdpRecv`/`UdpSend`/`Connect`/`Accept`, the `addr_storage` box must
+///   still hold the `sockaddr` bytes the kernel filled for *this* completion,
+///   and `addr_len` the length it reported.
+/// - Not safe against a malicious or corrupted CQE length: `result` is trusted
+///   as an upper bound on the kernel's write (see
+///   `docs/review/runtime-safety-contracts.md` C8).
+unsafe fn reconstruct_completion(
+    pending_op: PendingOp,
+    result: i32,
+) -> Result<CompletionKind, IoError> {
+    match pending_op {
+        PendingOp::Accept {
+            addr_storage,
+            addr_len,
+        } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else if let (Some(addr_storage), Some(addr_len)) =
+                (addr_storage.as_ref(), addr_len.as_ref())
+            {
+                let storage: *const libc::sockaddr_storage = &**addr_storage as *const _;
+                // SAFETY: addr_storage points to kernel-filled sockaddr
+                // bytes for this completion, and the family tag comes
+                // from the kernel for the same CQE.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                let socket_addr = unsafe {
+                    match (*storage).ss_family as libc::c_int {
+                        libc::AF_INET => {
+                            let sockaddr_in = &*(storage as *const _ as *const libc::sockaddr_in);
+                            let ip =
+                                std::net::Ipv4Addr::from(u32::from_be(sockaddr_in.sin_addr.s_addr));
+                            let port = u16::from_be(sockaddr_in.sin_port);
+                            Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                                ip, port,
+                            )))
+                        }
+                        libc::AF_INET6 => {
+                            let sockaddr_in6 = &*(storage as *const _ as *const libc::sockaddr_in6);
+                            let ip = std::net::Ipv6Addr::from(sockaddr_in6.sin6_addr.s6_addr);
+                            let port = u16::from_be(sockaddr_in6.sin6_port);
+                            Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                                ip,
+                                port,
+                                sockaddr_in6.sin6_flowinfo,
+                                sockaddr_in6.sin6_scope_id,
+                            )))
+                        }
+                        _ => Err(IoError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unsupported address family",
+                        ))),
+                    }
+                };
+                let _ = **addr_len;
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
+                match socket_addr {
+                    Ok(sa) => Ok(CompletionKind::Accept {
+                        fd: accepted_fd,
+                        addr: Some(sa),
+                    }),
+                    Err(e) => {
+                        drop(accepted_fd);
+                        Err(e)
+                    }
+                }
+            } else {
+                Ok(CompletionKind::Accept {
+                    // SAFETY: a successful accept CQE transfers a
+                    // fresh descriptor to this completion.
+                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    fd: unsafe { OwnedFd::from_raw_fd(result) },
+                    addr: None,
+                })
+            }
+        }
+        PendingOp::Read { op, mut buf } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                let bytes_read = result as usize;
+                // SAFETY: buffer has enough capacity for the kernel
+                // write, and result bytes were just reported by CQE.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                unsafe {
+                    buf.set_len(bytes_read);
+                }
+                match &op {
+                    Op::ReadRent { .. } => Ok(CompletionKind::ReadRent { buffer: buf }),
+                    _ => Ok(CompletionKind::Read {
+                        bytes_read,
+                        data: buf,
+                    }),
+                }
+            }
+        }
+        PendingOp::Write { op, data } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                match &op {
+                    Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
+                        bytes_written: result as usize,
+                        data,
+                    }),
+                    _ => {
+                        let _ = data;
+                        Ok(CompletionKind::Write {
+                            bytes_written: result as usize,
+                        })
+                    }
+                }
+            }
+        }
+        PendingOp::WriteStatic { op: .. } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::Write {
+                    bytes_written: result as usize,
+                })
+            }
+        }
+        PendingOp::Fsync { op: .. } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::Fsync)
+            }
+        }
+        PendingOp::Close { op: .. } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::Close)
+            }
+        }
+        PendingOp::ReadFile { op: .., mut buf } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                let bytes_read = result as usize;
+                // SAFETY: buffer has enough capacity for the kernel
+                // write, and result bytes were just reported by CQE.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                unsafe {
+                    buf.set_len(bytes_read);
+                }
+                Ok(CompletionKind::ReadFile {
+                    bytes_read,
+                    data: buf,
+                })
+            }
+        }
+        PendingOp::WriteFile { op: .., data } => {
+            let _ = data;
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::WriteFile {
+                    bytes_written: result as usize,
+                })
+            }
+        }
+        PendingOp::UdpRecv {
+            mut buffer,
+            addr_storage,
+            addr_len,
+            ..
+        } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                let bytes_read = result as usize;
+                // SAFETY: buffer has enough capacity for the kernel
+                // write, and result bytes were just reported by CQE.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                unsafe {
+                    buffer.set_len(bytes_read);
+                }
+                let socket_addr = {
+                    let storage: *const libc::sockaddr_storage = &*addr_storage as *const _;
+                    // SAFETY: storage points at the sockaddr bytes
+                    // just filled by the kernel for this recv.
+                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    unsafe {
+                        match (*storage).ss_family as libc::c_int {
+                            libc::AF_INET => {
+                                let sockaddr_in =
+                                    &*(storage as *const _ as *const libc::sockaddr_in);
+                                let ip = std::net::Ipv4Addr::from(u32::from_be(
+                                    sockaddr_in.sin_addr.s_addr,
+                                ));
+                                let port = u16::from_be(sockaddr_in.sin_port);
+                                Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                                    ip, port,
+                                )))
+                            }
+                            libc::AF_INET6 => {
+                                let sockaddr_in6 =
+                                    &*(storage as *const _ as *const libc::sockaddr_in6);
+                                let ip = std::net::Ipv6Addr::from(sockaddr_in6.sin6_addr.s6_addr);
+                                let port = u16::from_be(sockaddr_in6.sin6_port);
+                                Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                                    ip,
+                                    port,
+                                    sockaddr_in6.sin6_flowinfo,
+                                    sockaddr_in6.sin6_scope_id,
+                                )))
+                            }
+                            _ => Err(IoError::Io(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Unsupported address family",
+                            ))),
+                        }
+                    }
+                };
+                let _ = *addr_len;
+                match socket_addr {
+                    Ok(sa) => Ok(CompletionKind::UdpRecv {
+                        bytes_read,
+                        buffer,
+                        addr: sa,
+                    }),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        PendingOp::UdpSend {
+            data,
+            addr_storage,
+            addr_len,
+            ..
+        } => {
+            let _ = &*addr_storage as *const _;
+            let _ = *addr_len;
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::UdpSend {
+                    bytes_written: result as usize,
+                    data,
+                })
+            }
+        }
+        PendingOp::Connect { addr_storage } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                let _ = &*addr_storage;
+                Ok(CompletionKind::Connect)
+            }
+        }
+        PendingOp::ReadVectored {
+            mut buffers,
+            iovecs,
+        } => {
+            let _ = iovecs;
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                let bytes_read = result as usize;
+                let mut remaining = bytes_read;
+                for buf in buffers.iter_mut() {
+                    let can_read = std::cmp::min(remaining, buf.capacity());
+                    // SAFETY: buffer slots are bounded by the
+                    // kernel-reported read length.
+                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    unsafe {
+                        buf.set_len(can_read);
+                    }
+                    remaining -= can_read;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                Ok(CompletionKind::ReadVectored {
+                    bytes_read,
+                    buffers,
+                })
+            }
+        }
+        PendingOp::WriteVectored { buffers, iovecs } => {
+            let _ = iovecs;
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::WriteVectored {
+                    bytes_written: result as usize,
+                    buffers,
+                })
+            }
+        }
+        PendingOp::PollAdd { op: .. } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::PollAdd {
+                    events: result as u32,
+                })
+            }
+        }
+        PendingOp::Nop { op: .. } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::Nop)
+            }
+        }
+    };
+}
+
 impl IoProvider for UringBackend {
     type Completion = (IoToken, Result<CompletionKind, IoError>);
 
@@ -1804,328 +1850,14 @@ impl IoProvider for UringBackend {
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
                 }
-                let completion_result = match pending_op {
-                    PendingOp::Accept {
-                        op: _op,
-                        addr_storage,
-                        addr_len,
-                    } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else if let (Some(addr_storage), Some(addr_len)) =
-                            (addr_storage.as_ref(), addr_len.as_ref())
-                        {
-                            let storage: *const libc::sockaddr_storage =
-                                &**addr_storage as *const _;
-                            // SAFETY: addr_storage points to kernel-filled sockaddr
-                            // bytes for this completion, and the family tag comes
-                            // from the kernel for the same CQE.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            let socket_addr = unsafe {
-                                match (*storage).ss_family as libc::c_int {
-                                    libc::AF_INET => {
-                                        let sockaddr_in =
-                                            &*(storage as *const _ as *const libc::sockaddr_in);
-                                        let ip = std::net::Ipv4Addr::from(u32::from_be(
-                                            sockaddr_in.sin_addr.s_addr,
-                                        ));
-                                        let port = u16::from_be(sockaddr_in.sin_port);
-                                        Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                                            ip, port,
-                                        )))
-                                    }
-                                    libc::AF_INET6 => {
-                                        let sockaddr_in6 =
-                                            &*(storage as *const _ as *const libc::sockaddr_in6);
-                                        let ip = std::net::Ipv6Addr::from(
-                                            sockaddr_in6.sin6_addr.s6_addr,
-                                        );
-                                        let port = u16::from_be(sockaddr_in6.sin6_port);
-                                        Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-                                            ip,
-                                            port,
-                                            sockaddr_in6.sin6_flowinfo,
-                                            sockaddr_in6.sin6_scope_id,
-                                        )))
-                                    }
-                                    _ => Err(IoError::Io(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "Unsupported address family",
-                                    ))),
-                                }
-                            };
-                            let _ = **addr_len;
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            let accepted_fd = unsafe { OwnedFd::from_raw_fd(result) };
-                            match socket_addr {
-                                Ok(sa) => Ok(CompletionKind::Accept {
-                                    fd: accepted_fd,
-                                    addr: Some(sa),
-                                }),
-                                Err(e) => {
-                                    drop(accepted_fd);
-                                    Err(e)
-                                }
-                            }
-                        } else {
-                            Ok(CompletionKind::Accept {
-                                // SAFETY: a successful accept CQE transfers a
-                                // fresh descriptor to this completion.
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                                fd: unsafe { OwnedFd::from_raw_fd(result) },
-                                addr: None,
-                            })
-                        }
-                    }
-                    PendingOp::Read { op, mut buf } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            // SAFETY: buffer has enough capacity for the kernel
-                            // write, and result bytes were just reported by CQE.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            unsafe {
-                                buf.set_len(bytes_read);
-                            }
-                            match &op {
-                                Op::ReadRent { .. } => Ok(CompletionKind::ReadRent { buffer: buf }),
-                                _ => Ok(CompletionKind::Read {
-                                    bytes_read,
-                                    data: buf,
-                                }),
-                            }
-                        }
-                    }
-                    PendingOp::Write { op, data } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            match &op {
-                                Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
-                                    bytes_written: result as usize,
-                                    data,
-                                }),
-                                _ => {
-                                    let _ = data;
-                                    Ok(CompletionKind::Write {
-                                        bytes_written: result as usize,
-                                    })
-                                }
-                            }
-                        }
-                    }
-                    PendingOp::WriteStatic { op: _op } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Write {
-                                bytes_written: result as usize,
-                            })
-                        }
-                    }
-                    PendingOp::Fsync { op: _op } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Fsync)
-                        }
-                    }
-                    PendingOp::Close { op: _op } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Close)
-                        }
-                    }
-                    PendingOp::ReadFile { op: _op, mut buf } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            // SAFETY: buffer has enough capacity for the kernel
-                            // write, and result bytes were just reported by CQE.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            unsafe {
-                                buf.set_len(bytes_read);
-                            }
-                            Ok(CompletionKind::ReadFile {
-                                bytes_read,
-                                data: buf,
-                            })
-                        }
-                    }
-                    PendingOp::WriteFile { op: _op, data } => {
-                        let _ = data;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::WriteFile {
-                                bytes_written: result as usize,
-                            })
-                        }
-                    }
-                    PendingOp::UdpRecv {
-                        op: _op,
-                        mut buffer,
-                        addr_storage,
-                        addr_len,
-                        ..
-                    } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            // SAFETY: buffer has enough capacity for the kernel
-                            // write, and result bytes were just reported by CQE.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                            unsafe {
-                                buffer.set_len(bytes_read);
-                            }
-                            let socket_addr = {
-                                let storage: *const libc::sockaddr_storage =
-                                    &*addr_storage as *const _;
-                                // SAFETY: storage points at the sockaddr bytes
-                                // just filled by the kernel for this recv.
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                                unsafe {
-                                    match (*storage).ss_family as libc::c_int {
-                                        libc::AF_INET => {
-                                            let sockaddr_in =
-                                                &*(storage as *const _ as *const libc::sockaddr_in);
-                                            let ip = std::net::Ipv4Addr::from(u32::from_be(
-                                                sockaddr_in.sin_addr.s_addr,
-                                            ));
-                                            let port = u16::from_be(sockaddr_in.sin_port);
-                                            Ok(std::net::SocketAddr::V4(
-                                                std::net::SocketAddrV4::new(ip, port),
-                                            ))
-                                        }
-                                        libc::AF_INET6 => {
-                                            let sockaddr_in6 = &*(storage as *const _
-                                                as *const libc::sockaddr_in6);
-                                            let ip = std::net::Ipv6Addr::from(
-                                                sockaddr_in6.sin6_addr.s6_addr,
-                                            );
-                                            let port = u16::from_be(sockaddr_in6.sin6_port);
-                                            Ok(std::net::SocketAddr::V6(
-                                                std::net::SocketAddrV6::new(
-                                                    ip,
-                                                    port,
-                                                    sockaddr_in6.sin6_flowinfo,
-                                                    sockaddr_in6.sin6_scope_id,
-                                                ),
-                                            ))
-                                        }
-                                        _ => Err(IoError::Io(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "Unsupported address family",
-                                        ))),
-                                    }
-                                }
-                            };
-                            let _ = *addr_len;
-                            match socket_addr {
-                                Ok(sa) => Ok(CompletionKind::UdpRecv {
-                                    bytes_read,
-                                    buffer,
-                                    addr: sa,
-                                }),
-                                Err(e) => Err(e),
-                            }
-                        }
-                    }
-                    PendingOp::UdpSend {
-                        op: _op,
-                        data,
-                        addr_storage,
-                        addr_len,
-                        ..
-                    } => {
-                        let _ = &*addr_storage as *const _;
-                        let _ = *addr_len;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::UdpSend {
-                                bytes_written: result as usize,
-                                data,
-                            })
-                        }
-                    }
-                    PendingOp::Connect {
-                        op: _op,
-                        addr_storage,
-                    } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let _ = &*addr_storage;
-                            Ok(CompletionKind::Connect)
-                        }
-                    }
-                    PendingOp::ReadVectored {
-                        op: _op,
-                        mut buffers,
-                        iovecs,
-                    } => {
-                        let _ = iovecs;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            let bytes_read = result as usize;
-                            let mut remaining = bytes_read;
-                            for buf in buffers.iter_mut() {
-                                let can_read = std::cmp::min(remaining, buf.capacity());
-                                // SAFETY: buffer slots are bounded by the
-                                // kernel-reported read length.
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-                                unsafe {
-                                    buf.set_len(can_read);
-                                }
-                                remaining -= can_read;
-                                if remaining == 0 {
-                                    break;
-                                }
-                            }
-                            Ok(CompletionKind::ReadVectored {
-                                bytes_read,
-                                buffers,
-                            })
-                        }
-                    }
-                    PendingOp::WriteVectored {
-                        op: _op,
-                        buffers,
-                        iovecs,
-                    } => {
-                        let _ = iovecs;
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::WriteVectored {
-                                bytes_written: result as usize,
-                                buffers,
-                            })
-                        }
-                    }
-                    PendingOp::PollAdd { op: _op } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::PollAdd {
-                                events: result as u32,
-                            })
-                        }
-                    }
-                    PendingOp::Nop { op: _op } => {
-                        if result < 0 {
-                            Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-                        } else {
-                            Ok(CompletionKind::Nop)
-                        }
-                    }
-                };
+                // Reconstruct the terminal completion from the slot's pending
+                // operation and this CQE's result.
+                // SAFETY: `pending_op` came from this slot and its CQE is the one
+                // being consumed right now, so every kernel-written region it owns is
+                // valid for exactly `result` bytes. See `reconstruct_completion` for
+                // the full contract.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                let completion_result = unsafe { Self::reconstruct_completion(pending_op, result) };
                 completions.push((token, completion_result));
             }
 

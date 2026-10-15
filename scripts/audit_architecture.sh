@@ -138,19 +138,47 @@ root = pathlib.Path(sys.argv[1])
 unsafe_re = re.compile(r"\bunsafe\b")
 comment_re = re.compile(r"(SAFETY:|# Safety|arch-audit: allow)")
 
+# `unsafe fn` items are documented in the doc block directly above them, and a
+# `# Safety` section on a long contract can sit well above an 8-line window.
+# Counting backward 8 lines reported such a function as undocumented, which
+# pushes authors into an inline `arch-audit: allow` even though the obligation
+# is already spelled out in the doc block.
+#
+# Walk backward from the item, skipping blank lines, doc comments and code
+# attributes, until the first non-attribute code line. Attributes
+# (`#[inline(always)]`, `#[cfg(...)]`) legitimately sit between the doc block and
+# the item, so they must not terminate the walk. A bare `unsafe` with no
+# preceding comment anywhere in that chain is still reported.
 for path in sorted(root.rglob("*.rs")):
     lines = path.read_text(errors="ignore").splitlines()
     for idx, line in enumerate(lines):
         if not unsafe_re.search(line):
             continue
-        if line.lstrip().startswith(("//", "//!","///", "*")):
+        if line.lstrip().startswith(("//", "//!", "///", "*")):
             continue
-        start = max(0, idx - 8)
-        end = min(len(lines), idx + 3)
-        context = lines[start:end]
-        if any(comment_re.search(item) for item in context):
-            continue
-        print(f"{path}:{idx + 1}:{line}")
+
+        # A trailing or following-line comment documents the site directly.
+        documented = any(
+            comment_re.search(item)
+            for item in lines[idx:idx + 3]
+        )
+
+        j = idx - 1
+        while j >= 0:
+            stripped = lines[j].strip()
+            if stripped == "":
+                j -= 1
+                continue
+            if stripped.startswith(("#[", "#![", "///", "//!", "//", "*", "/*", "*/")):
+                if comment_re.search(lines[j]):
+                    documented = True
+                j -= 1
+                continue
+            # First real code line above the item ends the doc block.
+            break
+
+        if not documented:
+            print(f"{path}:{idx + 1}:{line}")
 PY
 }
 
