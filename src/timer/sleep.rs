@@ -80,7 +80,7 @@ impl Future for SleepFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: SleepFuture never moves its internal fields after pinning.
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         this.poll_inner(cx)
     }
 }

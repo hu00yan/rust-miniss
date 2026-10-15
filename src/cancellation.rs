@@ -3,6 +3,8 @@
 //! This module provides utilities for implementing cooperative task cancellation.
 //! Tasks should periodically check for cancellation and exit early when requested.
 
+use pin_project::pin_project;
+
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, Ordering};
 #[cfg(loom)]
@@ -111,7 +113,15 @@ pub trait CancellableFutureExt<T>: Sized {
 impl<F, T> CancellableFutureExt<T> for F where F: std::future::Future<Output = T> {}
 
 /// A future that can be cancelled
+///
+/// The only field that participates in pinning is `inner`: this type delegates
+/// the projection to it and never re-borrows it independently. Declaring that
+/// with `pin_project` is what lets `poll` reach the inner future without an
+/// `unsafe` projection — the projection's soundness is structural instead of a
+/// comment.
+#[pin_project]
 pub struct CancellableFuture<F> {
+    #[pin]
     inner: F,
     token: CancellationToken,
 }
@@ -126,10 +136,9 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // SAFETY: CancellableFuture does not move `inner` after being pinned;
-        // the projection only exposes fields through this pinned poll call.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        let this = unsafe { self.get_unchecked_mut() };
+        // Structural projection: `inner` stays pinned, `token` is reachable as
+        // a plain reference. No hand-written unsafe projection is needed.
+        let this = self.project();
 
         // Check for cancellation
         if this.token.is_cancelled() {
@@ -143,11 +152,9 @@ where
             return std::task::Poll::Ready(Err(crate::task::TaskError::Cancelled));
         }
 
-        // Poll the inner future
-        // SAFETY: `inner` is pinned in place by the parent CancellableFuture
-        // and is not moved before or after this delegated poll.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        match unsafe { std::pin::Pin::new_unchecked(&mut this.inner) }.poll(cx) {
+        // Poll the inner future. `project()` keeps `inner` pinned structurally,
+        // so this delegation is sound without a hand-written projection.
+        match this.inner.poll(cx) {
             std::task::Poll::Ready(value) => std::task::Poll::Ready(Ok(value)),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }

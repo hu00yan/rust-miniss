@@ -91,7 +91,7 @@ impl Future for MinissSleep {
         // SAFETY: `MinissSleep` only contains an inner future; replacing the
         // field is handled in `reset` and does not rely on self-references.
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         Pin::new(&mut this.inner).poll(cx)
     }
 }
@@ -101,7 +101,7 @@ impl AsyncTimer for MinissSleep {
         // SAFETY: `MinissSleep` does not self-reference; replacing the inner
         // sleep future is safe because callers hold `Pin<&mut Self>`.
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         this.inner = SleepFuture::new(deadline.saturating_duration_since(Instant::now()));
     }
 

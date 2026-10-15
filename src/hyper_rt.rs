@@ -22,6 +22,19 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     fn execute(&self, fut: F) {
+        // hyper calls this from inside a connection task, so we are on the
+        // shard that owns that connection. `spawn` would cross cores *and*
+        // block this shard for up to 1s waiting for the admission ack
+        // (`spawn_on_wait` uses a 1s `recv_timeout`). `spawn_local` keeps the
+        // background task on the owning shard, which is where its state lives.
+        if crate::cpu::current_core_id().is_some() {
+            self.runtime
+                .spawn_local(fut)
+                .expect("hyper local task admission queue exhausted");
+            return;
+        }
+        // Not on a worker shard (hyper driven from `block_on` on the main
+        // thread): the cross-core path is the only option there.
         self.runtime
             .spawn(fut)
             .expect("hyper background task spawn failed");

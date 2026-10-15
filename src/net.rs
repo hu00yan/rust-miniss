@@ -555,7 +555,7 @@ impl AsyncRead for AsyncTcpStream {
             // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
             // self-referential fields; poll never moves fields after projection.
             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-            let this = unsafe { self.as_mut().get_unchecked_mut() };
+            let this = self.as_mut().get_mut();
 
             if this.read_token.is_none() {
                 match try_read(this.as_raw_fd(), buf) {
@@ -622,7 +622,7 @@ impl AsyncRead for AsyncTcpStream {
             // SAFETY: AsyncTcpStream has no self-referential fields; poll only
             // mutates fields in place and never moves them out of the pin.
             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-            let this = unsafe { self.as_mut().get_unchecked_mut() };
+            let this = self.as_mut().get_mut();
 
             if !bufs.is_empty() && this.read_token.is_none() {
                 match try_read_vectored(this.as_raw_fd(), bufs) {
@@ -702,7 +702,7 @@ impl AsyncWrite for AsyncTcpStream {
             // SAFETY: AsyncTcpStream has no self-referential fields; poll only
             // mutates fields in place and never moves them out of the pin.
             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-            let this = unsafe { self.as_mut().get_unchecked_mut() };
+            let this = self.as_mut().get_mut();
 
             // Clear stale POLLOUT completion (fire-and-forget).
             // POLLOUT just serves as a wakeup mechanism when the socket
@@ -812,7 +812,7 @@ impl AsyncWrite for AsyncTcpStream {
             // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
             // self-referential fields; poll never moves fields after projection.
             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-            let this = unsafe { self.as_mut().get_unchecked_mut() };
+            let this = self.as_mut().get_mut();
 
             // Clear stale POLLOUT completion (fire-and-forget).
             if let Some(pollout_tok) = this.pollout_token.take() {

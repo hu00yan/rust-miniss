@@ -106,12 +106,20 @@
 
 ```
 每一个 CpuCore {
-    task_queue: FxHashMap<TaskId, Task>    // 所有活跃 task
-    ready_queue: SegQueue<TaskId>          // 可被 poll 的 task ID
-    timer_wheel: TimerWheel                // 本核定时器
-    io_backend: UringBackend               // 本核 io_uring
+    task_queue: TaskArena<Task>             // 固定 65_536 槽的 shard-local 任务表
+                                          // （不是 HashMap；槽索引即 TaskId）
+    ready_queue: ReadyQueue                 // ArrayQueue(65_536) 的 TaskId
+    owner_ready_queue: Vec<OwnerCompletion> // 持有扩容后的生产通道
+    io_backend: UringBackend | MioBackend  // 本核 io_uring / mio
 }
 ```
+
+`task_queue` 曾经写作 `FxHashMap<TaskId, Task>`。实际实现是固定容量槽表
+（`multicore.rs:395`，容量 65_536，`TaskArena::with_capacity`）。这不是
+性能微调：HashMap 需要每个 task 至少一次堆分配，而且泛型键的哈希/探测在
+热路径上；固定槽表让 `TaskId` 直接就是槽索引，没有分配、没有探测，也不需要
+`rustc-hash`（该依赖已删除）。槽位表同时也支撑 `TaskKey` 的 generation 检查，
+这是拒绝 stale wake 的唯一依据。
 
 ### 事件循环（单次迭代）
 
@@ -234,7 +242,23 @@ draining
 | ring 大小 | 4096 entries |
 | CQE 数量 | 4096 |
 | 提交模式 | 普通（非 SQPOLL，减少内核线程竞争） |
-| 特性 | `IORING_FEAT_FAST_POLL`、`IORING_FEAT_EXT_ARG` |
+| 实际使用的特性 | `IORING_FEAT_FAST_POLL`（READ/WRITE/ACCEPT 无需 `IOSQE_ASYNC`） |
+
+下表列出内核特性与运行时实际启用状态。**"内核 ≥ 6.12 基线"不代表这些特性都在用**
+——`build.rs` 的 6.12 检查只保证 opcode 存在，具体启用与否取决于运行时探测。
+
+| 特性 | 内核 | 运行时状态 |
+|------|------|-----------|
+| multishot accept | ≥ 5.19 | ✅ 已启用（`net.rs:73` 探测，`Op::PollAdd { multishot: true }`） |
+| `IORING_FEAT_FAST_POLL` | ≥ 5.7 | ✅ 用于网络读写 |
+| multishot recv | ≥ 6.0 | ❌ 仅普通 accept 后的单次 recv |
+| 固定文件（`IORING_REGISTER_FILES`） | ≥ 5.12 | ❌ 未注册，每次 op 传 fd |
+| 注册 buffer / `buf_ring` | ≥ 5.19 | ❌ 未使用，每次 op 传指针 |
+| sendzc / `IOSQE_FIXED_FILE` | ≥ 6.0 | ❌ 未使用 |
+
+这张表的意义在 `docs/review/performance-baseline-2026-07-11.md`：42.4 req/enter
+与 monoio 持平，而 monoio 用了 fixed file + registered buffer。差距不在实现质量，
+在**未启用的机制**。上面每一项都是独立可做的工作，不要当成一个整体的"io_uring 优化"。
 
 ### io_uring 性能敏感开关
 
