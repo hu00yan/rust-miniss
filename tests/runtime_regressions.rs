@@ -454,3 +454,54 @@ fn multicore_loaded_timer_shutdown_publishes_zero_termination_snapshot() {
         "loaded shutdown left non-zero resources: {snapshot:?}"
     );
 }
+
+/// The `AsyncRead` async path used to submit `Op::Read`, which made the backend
+/// own a `Buffer`, read a copy into it, and then copy a second time into the
+/// caller's buffer on completion. It now arms readiness and re-enters
+/// `poll_read`, so a read that had to wait costs the same one copy as one that
+/// found data immediately.
+///
+/// This pins the contract that change depends on: a read that arrives *after*
+/// the poll went `Pending` must come back complete, and readiness must re-arm
+/// correctly across several such waits. The client deliberately sleeps so the
+/// server's read cannot take the `WouldBlock` fast path — without the delay the
+/// test would pass against the old code too.
+#[test]
+fn async_read_that_waits_returns_the_full_payload_over_several_waits() {
+    use futures::future::join;
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use rust_miniss::net::{AsyncTcpListener, AsyncTcpStream};
+    use std::net::SocketAddr;
+
+    let runtime = Runtime::new();
+
+    runtime.block_on(async {
+        let mut listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+
+            // Three reads, each of which must go Pending first: the client waits
+            // 50ms before every write, long enough that the server's read has
+            // already armed POLLIN when the bytes arrive.
+            for expected in ["first".as_bytes(), "second".as_bytes(), "third".as_bytes()] {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert_eq!(n, expected.len());
+                assert_eq!(&buf[..n], expected);
+            }
+        };
+
+        let client = async {
+            let mut stream = AsyncTcpStream::connect(addr).await.unwrap();
+            for chunk in ["first", "second", "third"] {
+                rust_miniss::sleep(Duration::from_millis(50)).await;
+                stream.write_all(chunk.as_bytes()).await.unwrap();
+            }
+        };
+
+        join(server, client).await;
+    });
+}

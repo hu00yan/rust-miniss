@@ -153,7 +153,7 @@ fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListen
 #[derive(Debug)]
 pub struct AsyncTcpStream {
     descriptor: Option<RegisteredDescriptor>,
-    read_token: Option<IoToken>,
+    readiness_token: Option<IoToken>,
     write_token: Option<IoToken>,
     /// Token for POLLOUT submitted after a Write returned EAGAIN.
     /// The task is woken when the socket becomes writable, then
@@ -185,7 +185,7 @@ impl AsyncTcpStream {
         let descriptor = RegisteredDescriptor::from_owned(OwnedFd::from(stream));
         Ok(Self {
             descriptor: Some(descriptor),
-            read_token: None,
+            readiness_token: None,
             write_token: None,
             pollout_token: None,
             _owner_local: PhantomData,
@@ -508,7 +508,7 @@ impl IntoRawFd for AsyncTcpStream {
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         with_io_state(|state| unsafe {
             // SAFETY: Single-threaded access.
-            if let Some(token) = self.read_token {
+            if let Some(token) = self.readiness_token {
                 state.cancel_and_discard(token);
             }
             if let Some(token) = self.write_token {
@@ -531,7 +531,7 @@ impl Drop for AsyncTcpStream {
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         try_with_io_state(|state| unsafe {
             // SAFETY: Single-threaded access.
-            if let Some(token) = self.read_token {
+            if let Some(token) = self.readiness_token {
                 state.cancel_and_discard(token);
             }
             if let Some(token) = self.write_token {
@@ -557,48 +557,46 @@ impl AsyncRead for AsyncTcpStream {
             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let this = self.as_mut().get_mut();
 
-            if this.read_token.is_none() {
-                match try_read(this.as_raw_fd(), buf) {
-                    Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
-                    Err(err) if is_wouldblock(&err) => {}
-                    Err(err) => return Poll::Ready(Err(err)),
+            // Consume the readiness completion that woke us. It carries no
+            // payload — it exists only to re-enter this poll, exactly the way
+            // `pollout_token` does for writes below.
+            if let Some(readiness_tok) = this.readiness_token.take() {
+                // SAFETY: readiness_tok belongs to this stream and is cleared
+                // once before a new readiness registration is submitted.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                unsafe {
+                    state.clear_slot(readiness_tok);
                 }
             }
 
-            let token = if let Some(token) = this.read_token {
-                // SAFETY: Single-threaded access.
-                if let Some(result) = unsafe { state.take_completed(token) } {
-                    this.read_token = None;
-                    return match result {
-                        Ok(crate::io::CompletionKind::Read { bytes_read, data }) => {
-                            let copy_len = std::cmp::min(bytes_read, buf.len());
-                            buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                            Poll::Ready(Ok(copy_len))
-                        }
-                        Ok(_) => Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Unexpected completion",
-                        ))),
-                        Err(e) => Poll::Ready(Err(e.into())),
-                    };
-                }
-                token
-            } else {
-                let op = crate::io::Op::Read {
-                    fd: this.as_raw_fd(),
-                    offset: 0,
-                    len: buf.len(),
-                };
-                let token = match state
-                    .io_backend
-                    .submit_with_descriptor(op, this.descriptor_lease())
-                {
-                    Ok(token) => token,
-                    Err(error) => return Poll::Ready(Err(error.into())),
-                };
-                this.read_token = Some(token);
-                token
+            // Read directly into the caller's buffer: one syscall, one copy.
+            //
+            // The previous path submitted `Op::Read`, which made the backend
+            // allocate a `Buffer` of its own, read a copy into it, and then
+            // copy a second time into `buf` when the completion arrived — so
+            // the async path paid two copies where the `WouldBlock` fast path
+            // above pays one. Arming readiness and re-entering this poll is the
+            // same one-copy cost as the fast path, and it also removes the only
+            // reason a kernel pointer to a caller-owned buffer was ever needed.
+            match try_read(this.as_raw_fd(), buf) {
+                Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            let op = crate::io::Op::PollAdd {
+                fd: this.as_raw_fd(),
+                events: libc::POLLIN as u32,
+                multishot: false,
             };
+            let token = match state
+                .io_backend
+                .submit_with_descriptor(op, this.descriptor_lease())
+            {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            this.readiness_token = Some(token);
             // Register waker AND pending_task for inline completion.
             // SAFETY: Single-threaded access.
             unsafe {
@@ -624,65 +622,43 @@ impl AsyncRead for AsyncTcpStream {
             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let this = self.as_mut().get_mut();
 
-            if !bufs.is_empty() && this.read_token.is_none() {
-                match try_read_vectored(this.as_raw_fd(), bufs) {
-                    Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
-                    Err(err) if is_wouldblock(&err) => {}
-                    Err(err) => return Poll::Ready(Err(err)),
+            // Consume the readiness completion that woke us — same fire-and-forget
+            // wakeup role as `pollout_token` on the write path.
+            if let Some(readiness_tok) = this.readiness_token.take() {
+                // SAFETY: readiness_tok belongs to this stream and is cleared
+                // once before a new readiness registration is submitted.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                unsafe {
+                    state.clear_slot(readiness_tok);
                 }
             }
 
-            let token = if let Some(token) = this.read_token {
-                // SAFETY: Single-threaded access.
-                if let Some(result) = unsafe { state.take_completed(token) } {
-                    this.read_token = None;
-                    return match result {
-                        Ok(crate::io::CompletionKind::ReadVectored {
-                            bytes_read,
-                            buffers,
-                        }) => {
-                            let mut remaining = bytes_read;
-                            for (owned_buf, caller_buf) in buffers.iter().zip(bufs.iter_mut()) {
-                                let copy_len = std::cmp::min(
-                                    remaining,
-                                    std::cmp::min(owned_buf.len(), caller_buf.len()),
-                                );
-                                caller_buf[..copy_len].copy_from_slice(&owned_buf[..copy_len]);
-                                remaining -= copy_len;
-                                if remaining == 0 {
-                                    break;
-                                }
-                            }
-                            Poll::Ready(Ok(bytes_read))
-                        }
-                        Ok(_) => Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Unexpected completion",
-                        ))),
-                        Err(e) => Poll::Ready(Err(e.into())),
-                    };
-                }
-                token
-            } else {
-                let mut buffers: SmallVec<[crate::Buffer; 4]> = SmallVec::new();
-                for buf in bufs {
-                    buffers.push(crate::Buffer::with_capacity(buf.len()));
-                }
-                let op = crate::io::Op::ReadVectored {
-                    fd: this.as_raw_fd(),
-                    buffers,
-                };
-                let token = match state
-                    .io_backend
-                    .submit_with_descriptor(op, this.descriptor_lease())
-                {
-                    Ok(token) => token,
-                    Err(error) => return Poll::Ready(Err(error.into())),
-                };
-                this.read_token = Some(token);
-                token
+            // readv straight into the caller's slices: one syscall, one copy.
+            // Submitting `Op::ReadVectored` would have the backend allocate its
+            // own `Buffer`s, read into them, and then be copied a second time
+            // into `bufs` on completion.
+            match try_read_vectored(this.as_raw_fd(), bufs) {
+                Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            let op = crate::io::Op::PollAdd {
+                fd: this.as_raw_fd(),
+                events: libc::POLLIN as u32,
+                multishot: false,
             };
-            // SAFETY: Single-threaded access.
+            let token = match state
+                .io_backend
+                .submit_with_descriptor(op, this.descriptor_lease())
+            {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            this.readiness_token = Some(token);
+            // SAFETY: token was just submitted on this shard; waker/task
+            // association is shard-local.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
@@ -930,63 +906,64 @@ impl HyperRead for AsyncTcpStream {
 
         with_io_state(|state| {
             let this = self.as_mut().get_mut();
+            // SAFETY: `ReadBufCursor` exposes the unwritten tail of hyper's
+            // buffer as a writable chunk for the duration of this call.
             // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let raw = unsafe { buf.as_mut() };
             let read_buf =
+                // SAFETY: same region, `raw.len()` is its exact capacity.
                 // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
 
-            if this.read_token.is_none() {
-                match try_read(this.as_raw_fd(), read_buf) {
-                    Ok(bytes_read) => {
-                        // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
-                        unsafe {
-                            buf.advance(bytes_read);
-                        }
-                        return Poll::Ready(Ok(()));
-                    }
-                    Err(err) if is_wouldblock(&err) => {}
-                    Err(err) => return Poll::Ready(Err(err)),
+            // Consume the readiness completion that woke us — fire-and-forget,
+            // same as `pollout_token` on the write path.
+            if let Some(readiness_tok) = this.readiness_token.take() {
+                // SAFETY: readiness_tok belongs to this stream and is cleared
+                // once before a new readiness registration is submitted.
+                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                unsafe {
+                    state.clear_slot(readiness_tok);
                 }
             }
 
-            let token = if let Some(token) = this.read_token {
-                // SAFETY: Single-threaded access.
-                if let Some(result) = unsafe { state.take_completed(token) } {
-                    this.read_token = None;
-                    return match result {
-                        Ok(crate::io::CompletionKind::Read { bytes_read, data }) => {
-                            let copy_len = std::cmp::min(bytes_read, buf.remaining());
-                            if copy_len > 0 {
-                                buf.put_slice(&data[..copy_len]);
-                            }
-                            Poll::Ready(Ok(()))
-                        }
-                        Ok(_) => Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Unexpected completion",
-                        ))),
-                        Err(e) => Poll::Ready(Err(e.into())),
-                    };
+            // Read straight into hyper's buffer: one syscall, one copy, and no
+            // Buffer allocated by the backend.
+            //
+            // This used to submit `Op::Read` and then `buf.put_slice(&data[..])`
+            // when the completion arrived, so every read that ever waited paid
+            // two copies and one allocation where the `WouldBlock` fast path
+            // above pays one copy and none. `Op::ReadInto` with a raw pointer
+            // was the original idea for closing that gap and it is not viable:
+            // `cancel_and_discard` only enqueues an async cancel, so a CQE can
+            // still land after the future owning the buffer is dropped. Arming
+            // readiness keeps the pointer's lifetime inside this call.
+            match try_read(this.as_raw_fd(), read_buf) {
+                Ok(bytes_read) => {
+                    // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
+                    unsafe {
+                        buf.advance(bytes_read);
+                    }
+                    return Poll::Ready(Ok(()));
                 }
-                token
-            } else {
-                let op = crate::io::Op::Read {
-                    fd: this.as_raw_fd(),
-                    offset: 0,
-                    len: buf.remaining(),
-                };
-                let token = match state
-                    .io_backend
-                    .submit_with_descriptor(op, this.descriptor_lease())
-                {
-                    Ok(token) => token,
-                    Err(error) => return Poll::Ready(Err(error.into())),
-                };
-                this.read_token = Some(token);
-                token
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            let op = crate::io::Op::PollAdd {
+                fd: this.as_raw_fd(),
+                events: libc::POLLIN as u32,
+                multishot: false,
             };
+            let token = match state
+                .io_backend
+                .submit_with_descriptor(op, this.descriptor_lease())
+            {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            this.readiness_token = Some(token);
             // SAFETY: Single-threaded access.
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
