@@ -15,9 +15,10 @@
 //! - **macOS**: Uses the *same* `mio` readiness backend (`kqueue` underneath).
 //!   `mio` normalizes readiness notification but not operation state-machine
 //!   semantics, so macOS shares one code path with no independent kqueue tests.
-//!   Known macOS gaps: `IoProvider::park` is a no-op (workers busy-spin),
-//!   `Op::ReadRent`/`WriteRent` are unsupported, and `Op::Fsync` blocks the
-//!   runtime thread.
+//!   File flushes (`Op::Fsync`, `Op::Fdatasync`) and file reads and writes all
+//!   run on the backend's bounded thread pool, never on the runtime thread, and
+//!   flushes requested by tasks in the same shard round are group-committed per
+//!   inode (see `crate::io::mio_poll`).
 //!   Other Unix targets are not supported or tested by this project.
 //!
 //! This selection is handled by the build script (`build.rs`) which detects the
