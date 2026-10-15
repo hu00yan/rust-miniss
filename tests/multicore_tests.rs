@@ -94,9 +94,10 @@ fn test_graceful_shutdown_no_leaks() {
 
 /// Integration tests for multi-core runtime functionality
 use rust_miniss::*;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::Poll;
 use std::time::Duration;
 
 // A runtime owns worker threads and pins them to shard CPUs.  Serialize this
@@ -549,4 +550,155 @@ fn test_shutdown_deadline_escalates_permanently_pending_task() {
     // Dropping the last Arc joins the escalated worker and owns all driver
     // cleanup on the worker thread.
     drop(runtime);
+}
+
+/// Join a runtime before any assertion can unwind, so a failing expectation
+/// never leaves worker threads behind.
+struct RuntimeGuard(Arc<rust_miniss::multicore::MultiCoreRuntime>);
+
+impl RuntimeGuard {
+    fn new(cores: usize) -> Self {
+        Self(rust_miniss::multicore::MultiCoreRuntime::new(Some(cores)).expect("create runtime"))
+    }
+
+    fn runtime(&self) -> &rust_miniss::multicore::MultiCoreRuntime {
+        &self.0
+    }
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown_with_timeout(Duration::from_secs(1));
+        let _ = self.0.join();
+    }
+}
+
+/// Block until `condition` holds, so the test synchronises on the owner's
+/// published signal instead of sleeping for a guessed duration.
+fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    condition()
+}
+
+/// A task that re-arms its own waker on every poll.
+///
+/// The signal measures *runnable* work, and a task that reschedules itself
+/// stays in the ready queue. A task parked on a channel would drain out of the
+/// ready queue and publish zero, which is the opposite of the load under test.
+async fn run_until(release: Arc<AtomicBool>) {
+    let mut released = false;
+    std::future::poll_fn(move |context| {
+        if released || release.load(Ordering::Acquire) {
+            released = true;
+            return Poll::Ready(());
+        }
+        context.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
+#[test]
+fn spawn_routes_around_the_shard_that_already_holds_runnable_work() {
+    let _test_lock = runtime_test_lock();
+    init_tracing();
+    const PINNED: usize = 32;
+    const BURST: usize = 8;
+    let guard = RuntimeGuard::new(2);
+    let runtime = guard.runtime();
+
+    // Pin tasks that keep re-arming themselves on shard 0, so its published
+    // depth never returns to zero while the test runs.
+    let release = Arc::new(AtomicBool::new(false));
+    for _ in 0..PINNED {
+        runtime
+            .spawn_on(0, run_until(release.clone()))
+            .expect("pin task to shard 0");
+    }
+
+    // Shard 1 owns nothing, so its hint stays exactly 0 for the whole test.
+    assert_eq!(runtime.core_ready_hint(1), Some(0));
+
+    // Wait for shard 0 to publish the depth it actually holds.
+    assert!(
+        wait_until(Duration::from_secs(5), || runtime
+            .core_ready_hint(0)
+            .is_some_and(|depth| depth >= PINNED)),
+        "shard 0 never published its ready depth; hint {:?}",
+        runtime.core_ready_hint(0)
+    );
+
+    let mut counts = [0_usize; 2];
+    for _ in 0..BURST {
+        let task_id = runtime.spawn(async {}).expect("burst task admitted");
+        counts[task_id.cpu_id()] += 1;
+    }
+
+    // Exact counts, not "approximately balanced": every burst task must land on
+    // the shard that published zero, and none on the shard still holding PINNED
+    // runnable tasks. Shard 0's hint can only rise while those tasks are armed,
+    // so this holds regardless of how stale the other shards' reads are.
+    assert_eq!(
+        counts,
+        [0, BURST],
+        "burst did not spread off the loaded shard"
+    );
+
+    // Let the pinned tasks finish so shutdown drains instead of escalating.
+    release.store(true, Ordering::Release);
+}
+
+#[test]
+fn single_shard_runtime_pins_every_spawn_to_shard_zero() {
+    let _test_lock = runtime_test_lock();
+    init_tracing();
+    const TASKS: usize = 32;
+    let guard = RuntimeGuard::new(1);
+    let runtime = guard.runtime();
+
+    let mut counts = [0_usize; 1];
+    for _ in 0..TASKS {
+        let task_id = runtime.spawn(async {}).expect("spawn on single shard");
+        assert_eq!(task_id.cpu_id(), 0, "single-shard runtime must not reroute");
+        counts[task_id.cpu_id()] += 1;
+    }
+    assert_eq!(counts, [TASKS]);
+}
+
+#[test]
+fn spawn_on_ignores_the_ready_hint_and_pins_exactly() {
+    let _test_lock = runtime_test_lock();
+    init_tracing();
+    const PER_SHARD: usize = 16;
+    let guard = RuntimeGuard::new(4);
+    let runtime = guard.runtime();
+    let release = Arc::new(AtomicBool::new(false));
+
+    // Pin an identical self-re-arming load to shards 0 and 1, so the hint
+    // cannot break the tie and `spawn_on` is the only thing keeping tasks where
+    // the caller asked.
+    for core_id in [0_usize, 1] {
+        for _ in 0..PER_SHARD {
+            runtime
+                .spawn_on(core_id, run_until(release.clone()))
+                .expect("pin task");
+        }
+    }
+
+    let mut counts = [0_usize; 4];
+    for core_id in 0..4 {
+        let task_id = runtime
+            .spawn_on(core_id, async {})
+            .expect("pinned spawn admitted");
+        counts[task_id.cpu_id()] += 1;
+    }
+    assert_eq!(counts, [1, 1, 1, 1]);
+
+    release.store(true, Ordering::Release);
 }

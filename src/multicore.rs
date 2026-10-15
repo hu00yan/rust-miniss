@@ -9,6 +9,7 @@
 //! 3. **CPU Affinity**: Each core bound to physical CPU for optimal cache locality
 //! 4. **Independent IO**: Each core has its own io_uring/epoll instance
 
+use crossbeam::utils::CachePadded;
 use crossbeam_queue::ArrayQueue;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -536,6 +537,18 @@ pub struct CpuCore {
     task_poll_budget: usize,
     /// Shard-local metrics. Aggregated only by explicit control-plane request.
     metrics: CoreMetrics,
+    /// Ready-queue depth published for cross-core spawn selection.
+    ///
+    /// Single writer (this owner thread), lock-free readers on any thread, so
+    /// the data plane still owns its work: nothing here is written by another
+    /// shard. The value is a *balance hint*. Readers may observe a stale depth
+    /// because publication happens once per event-loop turn; that costs
+    /// balance, never correctness. Admission, shutdown and task ownership
+    /// never read it.
+    ///
+    /// Cache-padded so one shard's publication cannot invalidate another
+    /// shard's copy of the signal.
+    ready_hint: Arc<CachePadded<AtomicUsize>>,
     /// Control-plane report written once after the owner has drained its state.
     // Write-once publication: the owning worker sets it during exit, the
     // coordinator reads it after joining. `OnceLock` gives lock-free reads
@@ -555,6 +568,7 @@ impl CpuCore {
         io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
         shutdown: Arc<AtomicBool>,
         force_shutdown: Arc<AtomicBool>,
+        ready_hint: Arc<CachePadded<AtomicUsize>>,
         #[cfg(target_os = "linux")] sleep_gate: Arc<WorkerSleepGate>,
         message_inbox: Receiver<CoreMessage>,
         ready_sender: std::sync::mpsc::Sender<std::result::Result<(), String>>,
@@ -591,6 +605,7 @@ impl CpuCore {
             io_state,
             shutdown,
             force_shutdown,
+            ready_hint,
             draining: false,
             local_task_count: 0,
             message_poll_ticks: 0,
@@ -656,6 +671,19 @@ impl CpuCore {
             pending_operations: self.io_state.io_backend.pending_operation_count(),
             retained_descriptors: self.io_state.io_backend.retained_descriptor_count(),
         }
+    }
+
+    /// Publish this shard's ready-queue depth for cross-core spawn selection.
+    ///
+    /// Called once per event-loop turn, after messages, completions, timers and
+    /// task polls have all settled, so the stored value is the runnable work a
+    /// spawning thread should route around. `Relaxed` is sufficient and is the
+    /// whole point of the signal: it publishes a single self-consistent
+    /// integer, and no reader uses it to order anything else.
+    #[inline]
+    fn publish_ready_hint(&self) {
+        self.ready_hint
+            .store(self.ready_queue.len(), Ordering::Relaxed);
     }
 
     fn publish_termination_snapshot(&self) {
@@ -807,6 +835,12 @@ impl CpuCore {
                     let now = Instant::now();
                     work_done |= self.process_timers(now, &mut ready_timers);
                 }
+
+                // 5b. Republish the runnable-work depth for spawn selection.
+                // Placed after every producer of ready work and before the
+                // exit check, so the stored value reflects this turn's
+                // settled queue rather than a mid-turn snapshot.
+                self.publish_ready_hint();
 
                 if !work_done && self.io_state.io_backend.pending_submission_count() > 0 {
                     self.metrics.flushes += 1;
@@ -1354,6 +1388,9 @@ pub struct MultiCoreRuntime {
     core_threads: Vec<thread::Thread>,
     /// Per-core task sequence counters.
     task_counters: Vec<AtomicU64>,
+    /// Per-core ready-queue depth, written only by the owning worker and read
+    /// lock-free by the submission side. Read strictly as a balance hint.
+    core_ready_hints: Vec<Arc<CachePadded<AtomicUsize>>>,
     /// One owner-published termination report per worker.
     termination_reports: Vec<Arc<std::sync::OnceLock<CoreTerminationSnapshot>>>,
     /// Runtime state
@@ -1486,6 +1523,7 @@ impl MultiCoreRuntime {
         let mut core_threads = Vec::with_capacity(num_cores);
         let mut ready_receivers = Vec::with_capacity(num_cores);
         let mut task_counters = Vec::with_capacity(num_cores);
+        let mut core_ready_hints = Vec::with_capacity(num_cores);
         let mut termination_reports = Vec::with_capacity(num_cores);
         // Shared with the metrics fan-out so a sampling pass is covered by the
         // same shutdown cutoff as a spawn.
@@ -1498,6 +1536,7 @@ impl MultiCoreRuntime {
             let core_shutdown = Arc::new(AtomicBool::new(false));
             let core_exited_flag = Arc::new(AtomicBool::new(false));
             let force_shutdown = Arc::new(AtomicBool::new(false));
+            let ready_hint = Arc::new(CachePadded::new(AtomicUsize::new(0)));
             let termination_report = Arc::new(std::sync::OnceLock::new());
             let wakeup = Arc::new(CoreWakeup::new()?);
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
@@ -1506,6 +1545,7 @@ impl MultiCoreRuntime {
             core_shutdowns.push(core_shutdown.clone());
             core_exited.push(core_exited_flag.clone());
             force_shutdowns.push(force_shutdown.clone());
+            core_ready_hints.push(ready_hint.clone());
             termination_reports.push(termination_report.clone());
             core_wakeups.push(wakeup.clone());
             ready_receivers.push((core_id, ready_receiver));
@@ -1534,6 +1574,7 @@ impl MultiCoreRuntime {
                             io_backend,
                             core_shutdown.clone(),
                             force_shutdown.clone(),
+                            ready_hint.clone(),
                             sleep_gate,
                             receiver,
                             ready_sender,
@@ -1549,6 +1590,7 @@ impl MultiCoreRuntime {
                         io_backend,
                         core_shutdown.clone(),
                         force_shutdown.clone(),
+                        ready_hint.clone(),
                         receiver,
                         ready_sender,
                         crate::config::park_timeout(),
@@ -1640,6 +1682,7 @@ impl MultiCoreRuntime {
             join_handles: parking_lot::Mutex::new(join_handles),
             core_threads,
             task_counters,
+            core_ready_hints,
             termination_reports,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
             shutdown_phase: AtomicU8::new(ShutdownPhase::Running as u8),
@@ -1720,11 +1763,14 @@ impl MultiCoreRuntime {
         )))
     }
 
-    /// Spawn task on optimal core
+    /// Spawn task on the least-loaded core.
     ///
     /// This is a cross-core-capable API: the future is sent to a worker chosen
-    /// by round-robin. Use `spawn_local` from within a worker task when the new
-    /// task should stay on the same shard as its parent.
+    /// from owner-published runnable-work hints, with round-robin as the
+    /// tie-breaker. The choice is only a starting point — if that shard's inbox
+    /// is full the scan continues, and if every inbox is full the call fails.
+    /// Use `spawn_local` from within a worker task when the new task should
+    /// stay on the same shard as its parent.
     pub fn spawn<F>(&self, future: F) -> Result<TaskId>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -1918,29 +1964,64 @@ impl MultiCoreRuntime {
         ))
     }
 
-    /// Pick the least-loaded core as the starting point for cross-core spawn.
+    /// Scan shards from `start` and return the one with the lowest `score`.
     ///
-    /// This is a control-plane decision on the submission side. It only reads
-    /// shard inbox depth and uses round-robin as a tie-breaker to avoid bias.
+    /// Pure so the selection rule is testable without a runtime. `start` is the
+    /// round-robin cursor and doubles as the tie-breaker, so equal scores
+    /// rotate instead of collapsing onto one shard. A score of zero is the best
+    /// possible value, so the scan stops as soon as one is found. The cursor is
+    /// normalised first, which makes a single-shard runtime return shard 0 for
+    /// any cursor rather than trusting the caller to have reduced it.
     #[inline]
-    fn select_spawn_core(&self) -> usize {
-        let start = self.next_core.fetch_add(1, Ordering::Relaxed) % self.num_cores;
+    fn least_loaded_core(start: usize, num_cores: usize, score: impl Fn(usize) -> usize) -> usize {
+        let start = if num_cores == 0 { 0 } else { start % num_cores };
         let mut best_core = start;
-        let mut best_depth = self.core_senders[start].len();
+        let mut best_score = score(start);
 
-        for offset in 1..self.num_cores {
-            let core_id = (start + offset) % self.num_cores;
-            let depth = self.core_senders[core_id].len();
-            if depth < best_depth {
+        for offset in 1..num_cores {
+            let core_id = (start + offset) % num_cores;
+            let candidate = score(core_id);
+            if candidate < best_score {
                 best_core = core_id;
-                best_depth = depth;
-                if depth == 0 {
+                best_score = candidate;
+                if candidate == 0 {
                     break;
                 }
             }
         }
 
         best_core
+    }
+
+    /// Pick the least-loaded core as the starting point for cross-core spawn.
+    ///
+    /// This is a control-plane decision on the submission side and is only a
+    /// hint: every caller keeps scanning the remaining shards if the chosen one
+    /// rejects the message, and `spawn_on` bypasses it entirely. Inbox depth
+    /// alone cannot see a shard that has already drained its inbox into a deep
+    /// ready queue, so the owner-published ready depth is summed in as the
+    /// runnable-work term. That term is stale by up to one event-loop turn;
+    /// a stale reading can only send a spawn to an already-busy shard, which is
+    /// the behaviour this replaced. Nothing about admission, shutdown, or task
+    /// ownership is derived from either term.
+    #[inline]
+    fn select_spawn_core(&self) -> usize {
+        if self.num_cores == 1 {
+            return 0;
+        }
+        let start = self.next_core.fetch_add(1, Ordering::Relaxed) % self.num_cores;
+        Self::least_loaded_core(start, self.num_cores, |core_id| {
+            self.core_load_score(core_id)
+        })
+    }
+
+    /// Combined pending-work estimate for one shard: runnable tasks the owner
+    /// has already published, plus the cross-core inbox depth read live here.
+    #[inline]
+    fn core_load_score(&self, core_id: usize) -> usize {
+        self.core_ready_hints[core_id]
+            .load(Ordering::Relaxed)
+            .saturating_add(self.core_senders[core_id].len())
     }
 
     /// Internal helper to spawn a task on a specific core
@@ -2484,6 +2565,22 @@ impl MultiCoreRuntime {
     pub fn cpu_count(&self) -> usize {
         self.num_cores
     }
+
+    /// Owner-published ready-queue depth for `core_id`.
+    ///
+    /// This is the same lock-free signal cross-core spawn selection reads, and
+    /// it is a *hint*: the owning worker refreshes it once per event-loop turn,
+    /// so a reader may see a stale depth. Use it for observability and
+    /// synchronisation in tests. Never use it to decide whether a shard is
+    /// alive, whether it is draining, or whether a task can be admitted —
+    /// those answers come from `spawn`/`spawn_on` and the shutdown phase.
+    ///
+    /// Returns `None` when `core_id` is not a shard of this runtime.
+    pub fn core_ready_hint(&self, core_id: usize) -> Option<usize> {
+        self.core_ready_hints
+            .get(core_id)
+            .map(|hint| hint.load(Ordering::Relaxed))
+    }
 }
 
 /// Runtime statistics
@@ -2590,6 +2687,68 @@ mod tests {
     static_assertions::assert_impl_all!(MultiCoreRuntime: Send, Sync);
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn least_loaded_core_prefers_the_lowest_published_depth() {
+        // Fixed depth table: shard 2 holds the most runnable work.
+        let depths = [5_usize, 3, 9, 1, 7];
+        let pick = |start: usize| {
+            MultiCoreRuntime::least_loaded_core(start, depths.len(), |core_id| depths[core_id])
+        };
+
+        // Exact expected core for every rotation position: the scan starts at
+        // `start` and only moves on a strictly smaller score, so ties keep the
+        // rotation cursor.
+        assert_eq!(
+            (0..depths.len()).map(pick).collect::<Vec<_>>(),
+            vec![3, 3, 3, 3, 3]
+        );
+
+        // A zero score short-circuits the scan and wins from any start.
+        let idle = [4_usize, 0, 6, 2];
+        let pick_idle = |start: usize| {
+            MultiCoreRuntime::least_loaded_core(start, idle.len(), |core_id| idle[core_id])
+        };
+        assert_eq!(
+            (0..idle.len()).map(pick_idle).collect::<Vec<_>>(),
+            vec![1, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn least_loaded_core_rotates_ties_so_a_burst_spreads() {
+        // All shards report equal depth, which is exactly the case the
+        // round-robin tie-break has to resolve. 12 decisions over 4 shards must
+        // land exactly 3 on each.
+        let depths = [2_usize; 4];
+        let picks = (0..12)
+            .map(|spawn_index| {
+                MultiCoreRuntime::least_loaded_core(
+                    spawn_index % depths.len(),
+                    depths.len(),
+                    |core_id| depths[core_id],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut counts = [0_usize; 4];
+        for core_id in &picks {
+            counts[*core_id] += 1;
+        }
+        assert_eq!(counts, [3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn least_loaded_core_is_identity_for_a_single_shard() {
+        // Nothing to choose between; the rule must not invent a preference, and
+        // it must not depend on the caller having reduced the cursor.
+        for start in 0..4 {
+            assert_eq!(
+                MultiCoreRuntime::least_loaded_core(start, 1, |_| 0),
+                0,
+                "single-shard selection must stay on shard 0"
+            );
+        }
+    }
 
     #[test]
     fn test_runtime_creation() {
