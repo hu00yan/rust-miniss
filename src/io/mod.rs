@@ -15,10 +15,11 @@
 //! - **macOS**: Uses the *same* `mio` readiness backend (`kqueue` underneath).
 //!   `mio` normalizes readiness notification but not operation state-machine
 //!   semantics, so macOS shares one code path with no independent kqueue tests.
-//!   File flushes (`Op::Fsync`, `Op::Fdatasync`) and file reads and writes all
-//!   run on the backend's bounded thread pool, never on the runtime thread, and
-//!   flushes requested by tasks in the same shard round are group-committed per
-//!   inode (see `crate::io::mio_poll`).
+//!   Known macOS gaps: `IoProvider::park` is a no-op (workers busy-spin) and
+//!   `Op::ReadRent`/`WriteRent` are unsupported. File flushes (`Op::Fsync`,
+//!   `Op::Fdatasync`) and file reads and writes all run on the backend's bounded
+//!   thread pool, never on the runtime thread; flushes requested by tasks in the
+//!   same shard round are group-committed per inode (see `crate::io::mio_poll`).
 //!   Other Unix targets are not supported or tested by this project.
 //!
 //! This selection is handled by the build script (`build.rs`) which detects the
@@ -388,6 +389,14 @@ pub enum Op {
     Fsync {
         fd: i32,
     },
+    /// Flush file data without the metadata that `fsync(2)` also guarantees.
+    ///
+    /// `fdatasync(2)` still flushes the metadata required to read the data
+    /// back (file size, block extent); it does not promise mtime durability.
+    /// Callers that do not need mtime to survive a crash should prefer this.
+    Fdatasync {
+        fd: i32,
+    },
     Close {
         fd: i32,
     },
@@ -534,6 +543,10 @@ pub enum CompletionKind {
         buffers: SmallVec<[Buffer; 4]>,
     },
     Fsync,
+    /// Terminal result of [`Op::Fdatasync`]. Distinct from `Fsync` so callers
+    /// can tell which guarantee they were given, even when group commit served
+    /// their request with a stronger `fsync(2)`.
+    Fdatasync,
     Close,
     ReadFile {
         bytes_read: usize,

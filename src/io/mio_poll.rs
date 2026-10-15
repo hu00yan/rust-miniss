@@ -36,6 +36,79 @@ use threadpool::ThreadPool;
 type IoCompletion = (IoToken, Result<CompletionKind, IoError>);
 const COMPLETION_QUEUE_CAPACITY: usize = 4096;
 
+/// Flush strength requested by one caller.
+///
+/// A group that mixes requests runs the *strongest* one, so a caller that
+/// needs `fsync(2)` metadata durability is never served by a `fdatasync(2)`
+/// that skipped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FlushMode {
+    /// `fdatasync(2)`: data only.
+    Data,
+    /// `fsync(2)`: data plus metadata.
+    All,
+}
+
+impl FlushMode {
+    /// Completion kind reported back to a caller that asked for this mode.
+    fn completion(self) -> CompletionKind {
+        match self {
+            FlushMode::Data => CompletionKind::Fdatasync,
+            FlushMode::All => CompletionKind::Fsync,
+        }
+    }
+}
+
+/// File identity used to decide that two flushes may share one syscall.
+///
+/// Descriptor *numbers* are not identity: a caller may close its file between
+/// two submits and the number may be handed to a different file, which would
+/// let one caller observe durability for a flush nobody did on its behalf.
+/// `fstat` identity is stable for as long as a lease keeps the inode alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+/// One inode's pending flushes, to be served by a single syscall.
+///
+/// The group is closed at dispatch time: once the closure is queued, later
+/// requests open a new group instead of joining, because a request that arrives
+/// after the syscall started may have written data the syscall has already
+/// passed.
+#[derive(Debug)]
+struct FlushGroup {
+    identity: FileIdentity,
+    mode: FlushMode,
+    /// Descriptor the pool worker flushes. Holding the lease here keeps the
+    /// inode (and therefore `identity`) alive independently of any one slot.
+    lease: DescriptorLease,
+    /// Tokens waiting on this group's syscall, leader first.
+    waiters: Vec<(IoToken, FlushMode)>,
+}
+
+/// `fstat` the descriptor an accepted flush will run against.
+///
+/// This runs on the owner thread once per flush request. It is a metadata
+/// read, not a blocking flush, and it is what makes group commit safe.
+fn flush_identity(fd: RawFd) -> io::Result<FileIdentity> {
+    // SAFETY: stat is a plain C storage type; fstat only writes into it.
+    let mut stat: libc::stat =
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        unsafe { std::mem::zeroed() };
+    // SAFETY: fd is a live descriptor held by an accepted lease, so the stat
+    // call cannot outlive it.
+    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileIdentity {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    })
+}
+
 fn publish_read_len(buffer: &mut Buffer, bytes_read: usize) -> Result<(), IoError> {
     buffer
         .publish_read_len(bytes_read)
@@ -109,6 +182,13 @@ pub struct MioBackend {
     next_io_token: std::cell::Cell<u64>,
     /// Thread pool for blocking file I/O operations
     thread_pool: Arc<ThreadPool>,
+    /// Flush requests accepted but not yet handed to the file thread pool.
+    /// Shard-local: only the owner thread reads or writes this list.
+    flush_groups: UnsafeCell<Vec<FlushGroup>>,
+    /// Per-shard counters for flush accounting. Read only by the owner thread;
+    /// aggregating them is a control-plane concern (MUST #6).
+    flush_requests: std::cell::Cell<u64>,
+    flush_syscalls: std::cell::Cell<u64>,
     /// Same-thread completed operations.
     completed_local: UnsafeCell<Vec<IoCompletion>>,
     /// Completed operations from the file I/O thread pool.
@@ -141,6 +221,9 @@ impl MioBackend {
             next_token: UnsafeCell::new(0),
             next_io_token: std::cell::Cell::new(1),
             thread_pool,
+            flush_groups: UnsafeCell::new(Vec::new()),
+            flush_requests: std::cell::Cell::new(0),
+            flush_syscalls: std::cell::Cell::new(0),
             completed_local: UnsafeCell::new(Vec::new()),
             completed_tx,
             completed_rx: UnsafeCell::new(completed_rx),
@@ -161,6 +244,114 @@ impl MioBackend {
     fn ensure_slot_capacity<T>(vec: &mut Vec<Option<T>>, idx: usize) {
         if idx >= vec.len() {
             vec.resize_with(idx + 1, || None);
+        }
+    }
+
+    /// Number of `fsync(2)`/`fdatasync(2)` syscalls this shard has issued.
+    ///
+    /// Per-shard counter (AGENTS.md MUST #6). Compared against
+    /// [`Self::flush_request_count`] it shows how much group commit saved.
+    /// Test-only: the data plane reads it nowhere, and a cross-shard atomic
+    /// would violate MUST #3.
+    #[cfg(test)]
+    fn flush_syscall_count(&self) -> u64 {
+        self.flush_syscalls.get()
+    }
+
+    /// Number of flush operations accepted on this shard, one per caller.
+    #[cfg(test)]
+    fn flush_request_count(&self) -> u64 {
+        self.flush_requests.get()
+    }
+
+    /// Enqueue one flush request, coalescing it with an open group for the same
+    /// inode when that group has not been handed to the pool yet.
+    fn enqueue_flush(
+        &self,
+        token: IoToken,
+        mode: FlushMode,
+        lease: DescriptorLease,
+    ) -> io::Result<()> {
+        let identity = flush_identity(lease.as_raw_fd())?;
+        // SAFETY: flush_groups is shard-local and only mutated by the owner
+        // thread inside submit().
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let groups = unsafe { &mut *self.flush_groups.get() };
+        self.flush_requests.set(self.flush_requests.get() + 1);
+        match groups.iter_mut().find(|group| group.identity == identity) {
+            // Merge into the open group. `All` sorts above `Data`, so the
+            // group upgrades to the strongest guarantee any waiter needs.
+            Some(group) => {
+                group.mode = group.mode.max(mode);
+                group.waiters.push((token, mode));
+            }
+            None => groups.push(FlushGroup {
+                identity,
+                mode,
+                lease,
+                waiters: vec![(token, mode)],
+            }),
+        }
+        Ok(())
+    }
+
+    /// Close every open flush group and hand each one to the file thread pool.
+    ///
+    /// Called from the two owner-thread event-loop boundaries (`drain` and
+    /// `park`) so that all flushes requested by tasks polled since the last
+    /// boundary share one syscall, while a request made after a group was
+    /// dispatched can never join it. Groups are removed before the closure is
+    /// queued, so a group is never in flight and open at the same time.
+    fn dispatch_flush_groups(&self) {
+        // SAFETY: shard-local, owner-thread-only list.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        if unsafe { &*self.flush_groups.get() }.is_empty() {
+            return;
+        }
+        // SAFETY: flush_groups is shard-local; this runs on the owner thread
+        // from drain/park, never re-entrantly from submit.
+        let pending = {
+            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+            let groups = unsafe { &mut *self.flush_groups.get() };
+            mem::take(groups)
+        };
+        for group in pending {
+            let FlushGroup {
+                mode,
+                lease,
+                waiters,
+                ..
+            } = group;
+            let completed_tx = self.completed_tx.clone();
+            let thread_pool = self.thread_pool.clone();
+            // The syscall runs once for the whole group; every waiter is
+            // published only after it returned, so no caller can observe
+            // durability for a flush that has not happened yet.
+            self.flush_syscalls.set(self.flush_syscalls.get() + 1);
+            thread_pool.execute(move || {
+                let fd = lease.as_raw_fd();
+                let outcome = match SafeFdFile::new(fd) {
+                    Ok(mut file) => {
+                        let file = file.as_mut();
+                        match mode {
+                            FlushMode::Data => file.sync_data(),
+                            FlushMode::All => file.sync_all(),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                // `io::Error` is not `Clone`, so the failure is carried as a
+                // raw code and rebuilt per waiter.
+                let failure = outcome.as_ref().err().map(|error| error.raw_os_error());
+                for (token, waiter_mode) in waiters {
+                    let completion = match failure {
+                        None => Ok(waiter_mode.completion()),
+                        Some(Some(code)) => Err(IoError::Io(io::Error::from_raw_os_error(code))),
+                        Some(None) => Err(IoError::Io(io::Error::other("file flush failed"))),
+                    };
+                    let _ = completed_tx.send((token, completion));
+                }
+            });
         }
     }
 }
@@ -398,28 +589,32 @@ impl IoProvider for MioBackend {
                     // Store the data buffer and address with the op. The op contains the Buffer.
                     pending_ops[slot] = Some((io_token, op));
                 }
-                Op::Fsync { fd } => {
-                    let effective_fd = leased_fd.unwrap_or(*fd);
-                    // `fsync(2)` can block for milliseconds. Running it inline
-                    // here stalls the shard's whole event loop, which
-                    // AGENTS.md MUST NOT #7 forbids. Route it through the same
-                    // bounded thread pool that already carries file reads and
-                    // writes so the worker keeps polling.
-                    let completed_tx = self.completed_tx.clone();
-                    let thread_pool = self.thread_pool.clone();
-                    let io_token_copy = io_token;
-
-                    thread_pool.execute(move || {
-                        let result = match SafeFdFile::new(effective_fd) {
-                            Ok(mut safe_file) => safe_file
-                                .as_mut()
-                                .sync_all()
-                                .map(|_| CompletionKind::Fsync)
-                                .map_err(IoError::Io),
-                            Err(err) => Err(IoError::Io(err)),
-                        };
-                        let _ = completed_tx.send((io_token_copy, result));
-                    });
+                // A flush is never issued here. `fsync(2)`/`fdatasync(2)` can
+                // block for milliseconds, and running either inline would stall
+                // the shard's whole event loop (AGENTS.md MUST NOT #7). The
+                // request joins this shard's group-commit queue and is handed to
+                // the same thread pool that already carries file reads and
+                // writes at the next event-loop boundary.
+                Op::Fsync { .. } | Op::Fdatasync { .. } => {
+                    let mode = if matches!(op, Op::Fdatasync { .. }) {
+                        FlushMode::Data
+                    } else {
+                        FlushMode::All
+                    };
+                    // The group owns the acceptance lease outright: it must
+                    // outlive every waiter's slot until the syscall returns.
+                    match descriptor_leases[slot].take() {
+                        Some(lease) => {
+                            if let Err(error) = self.enqueue_flush(io_token, mode, lease) {
+                                registration_error = Some(error);
+                            }
+                        }
+                        None => {
+                            registration_error = Some(io::Error::other(
+                                "flush submission lost its descriptor lease",
+                            ));
+                        }
+                    }
                 }
                 Op::Close { fd } => {
                     let result = {
@@ -500,9 +695,16 @@ impl IoProvider for MioBackend {
             .iter()
             .filter(|entry| entry.is_some())
             .count();
+        // Flush requests waiting for the next event-loop boundary to dispatch
+        // their group are accepted work the owner still owes a completion.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let flushes = unsafe { &*self.flush_groups.get() }
+            .iter()
+            .map(|group| group.waiters.len())
+            .sum::<usize>();
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed = unsafe { &*self.completed_local.get() }.len();
-        pending + udp + completed
+        pending + udp + flushes + completed
     }
 
     fn retained_descriptor_count(&self) -> usize {
@@ -519,7 +721,13 @@ impl IoProvider for MioBackend {
             .iter()
             .filter(|(_, result)| matches!(result, Ok(CompletionKind::Accept { .. })))
             .count();
-        leases + accepted
+        // An undispatched flush group holds the lease its syscall will run
+        // against, moved out of the waiter slot that accepted it. Descriptors
+        // already handed to the thread pool are not counted: that in-flight
+        // window was never included for file reads and writes either.
+        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        let flush_groups = unsafe { &*self.flush_groups.get() }.len();
+        leases + accepted + flush_groups
     }
 
     fn cancel(&self, token: IoToken) -> bool {
@@ -568,6 +776,11 @@ impl IoProvider for MioBackend {
     /// Harvested events are left in the shared `events` buffer and flagged via
     /// `park_left_events`, because the runtime's next call is the drain.
     fn park(&self, timeout: Duration) -> usize {
+        // Event-loop boundary: close every open flush group so its syscall is
+        // queued before this thread blocks. Without this, a shard whose only
+        // outstanding work is a flush would sleep until the pool happened to
+        // wake it.
+        self.dispatch_flush_groups();
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let poll = unsafe { &mut *self.poll.get() };
         // SAFETY: events is shard-local and reused across park calls; poll()
@@ -621,6 +834,10 @@ impl IoProvider for MioBackend {
     }
 
     fn drain_completions(&self) -> TaskPoll<Vec<Self::Completion>> {
+        // Event-loop boundary: this is where a shard decides the set of flushes
+        // that share one syscall. Everything requested since the previous
+        // boundary is closed here and handed to the file thread pool.
+        self.dispatch_flush_groups();
         // SAFETY: We have exclusive, single-threaded access.
         let poll = unsafe { &mut *self.poll.get() };
         // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
@@ -1361,7 +1578,8 @@ impl IoProvider for MioBackend {
                         }
                         Ok(CompletionKind::PollAdd { events: readiness })
                     }
-                    // Fsync and Close are not handled in this path currently.
+                    // Fsync, Fdatasync and Close are not readiness operations;
+                    // they complete from the thread pool or inline.
                     _ => continue,
                 };
 
@@ -1503,6 +1721,7 @@ impl AsRawFd for Op {
             Op::Write { fd, .. } => fd,
             Op::WriteStatic { fd, .. } => fd,
             Op::Fsync { fd, .. } => fd,
+            Op::Fdatasync { fd, .. } => fd,
             Op::Close { fd, .. } => fd,
             Op::ReadFile { fd, .. } => fd,
             Op::WriteFile { fd, .. } => fd,
@@ -1813,5 +2032,266 @@ mod park_and_rent_tests {
 
         drop(file);
         let _ = std::fs::remove_file(&temp);
+    }
+}
+
+/// Group-commit evidence.
+///
+/// These tests drive one backend directly so the coalescing decision is
+/// observed by counting the syscalls the shard issued, not by timing. The
+/// runtime-level path (`AsyncFile::sync_data`) is covered in
+/// `tests/async_file_tests.rs`.
+#[cfg(all(test, unix))]
+mod flush_group_commit_tests {
+    use super::MioBackend;
+    use crate::io::{CompletionKind, IoProvider, IoToken, Op};
+    use std::collections::HashSet;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::io::AsRawFd;
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+
+    /// A temp file that removes itself, so a failed assertion cannot leave
+    /// scratch files behind.
+    struct TempFile {
+        path: std::path::PathBuf,
+        file: std::fs::File,
+    }
+
+    impl TempFile {
+        fn new(tag: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "miniss-flush-group-{}-{tag}.bin",
+                std::process::id()
+            ));
+            let file = std::fs::File::create(&path).expect("create temp file");
+            Self { path, file }
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Drain until `expected` completions arrive or the deadline expires.
+    fn drain_until(
+        backend: &MioBackend,
+        expected: usize,
+    ) -> Vec<(IoToken, Result<CompletionKind, crate::io::IoError>)> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        while seen.len() < expected {
+            match backend.drain_completions() {
+                Poll::Ready(batch) => {
+                    for completion in batch {
+                        seen.push(completion);
+                    }
+                }
+                Poll::Pending => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "only {} of {expected} flush completions arrived",
+                        seen.len()
+                    );
+                    let _ = backend.park(Duration::from_millis(5));
+                }
+            }
+        }
+        seen
+    }
+
+    /// `CompletionKind` is neither `Clone` nor `Eq`, so completions are
+    /// classified into booleans by the caller-supplied predicate.
+    fn completion_is(
+        completions: &[(IoToken, Result<CompletionKind, crate::io::IoError>)],
+        token: IoToken,
+        predicate: impl Fn(&CompletionKind) -> bool,
+    ) -> bool {
+        completions
+            .iter()
+            .find(|(seen, _)| *seen == token)
+            .map(|(_, result)| match result {
+                Ok(kind) => predicate(kind),
+                Err(error) => panic!("waiter {token:?} failed: {error:?}"),
+            })
+            .unwrap_or(false)
+    }
+
+    /// The headline property: N flush requests for one file on one shard cost
+    /// one syscall, not N.
+    #[test]
+    fn same_file_flushes_in_one_shard_cost_one_syscall() {
+        const REQUESTS: usize = 16;
+        let temp = TempFile::new("coalesce");
+        let fd = temp.file.as_raw_fd();
+        let backend = MioBackend::new().expect("mio backend");
+
+        let tokens: Vec<IoToken> = (0..REQUESTS)
+            .map(|_| {
+                backend
+                    .submit(Op::Fdatasync { fd })
+                    .expect("submit fdatasync")
+            })
+            .collect();
+
+        // Nothing may have been issued yet: the group is still open, which is
+        // what lets later requests join it.
+        assert_eq!(
+            backend.flush_syscall_count(),
+            0,
+            "a flush syscall ran before the event-loop boundary"
+        );
+
+        let completions = drain_until(&backend, REQUESTS);
+        assert_eq!(backend.flush_request_count(), REQUESTS as u64);
+        assert_eq!(
+            backend.flush_syscall_count(),
+            1,
+            "group commit issued {} syscalls for {REQUESTS} requests",
+            backend.flush_syscall_count()
+        );
+
+        // Every caller still gets its own completion, with its own kind.
+        let tokens: HashSet<IoToken> = tokens.into_iter().collect();
+        let seen: HashSet<IoToken> = completions.iter().map(|(token, _)| *token).collect();
+        assert_eq!(tokens, seen, "group commit lost or duplicated a waiter");
+        for (token, result) in completions {
+            assert!(
+                matches!(result, Ok(CompletionKind::Fdatasync)),
+                "waiter {token:?} got {result:?}"
+            );
+        }
+    }
+
+    /// A caller that needs `fsync(2)` must not be served by the weaker
+    /// `fdatasync(2)` that another waiter asked for; the group upgrades.
+    #[test]
+    fn mixed_flush_strength_upgrades_the_group_to_fsync() {
+        let temp = TempFile::new("mixed");
+        let fd = temp.file.as_raw_fd();
+        let backend = MioBackend::new().expect("mio backend");
+
+        let data_first = backend
+            .submit(Op::Fdatasync { fd })
+            .expect("submit fdatasync");
+        let all_second = backend.submit(Op::Fsync { fd }).expect("submit fsync");
+        let data_third = backend
+            .submit(Op::Fdatasync { fd })
+            .expect("submit second fdatasync");
+
+        let completions = drain_until(&backend, 3);
+        assert_eq!(backend.flush_syscall_count(), 1);
+        assert!(completion_is(&completions, data_first, |kind| matches!(
+            kind,
+            CompletionKind::Fdatasync
+        )));
+        assert!(completion_is(&completions, all_second, |kind| matches!(
+            kind,
+            CompletionKind::Fsync
+        )));
+        assert!(completion_is(&completions, data_third, |kind| matches!(
+            kind,
+            CompletionKind::Fdatasync
+        )));
+    }
+
+    /// A request made after a group was dispatched cannot join it: the syscall
+    /// may already have passed the caller's writes. It must open a new group.
+    #[test]
+    fn flush_requested_after_dispatch_starts_a_new_group() {
+        let temp = TempFile::new("late");
+        let fd = temp.file.as_raw_fd();
+        let backend = MioBackend::new().expect("mio backend");
+
+        backend.submit(Op::Fdatasync { fd }).expect("submit first");
+        // The first drain closes the group and queues its syscall.
+        let first = drain_until(&backend, 1);
+        assert_eq!(backend.flush_syscall_count(), 1);
+        assert!(matches!(first[0].1, Ok(CompletionKind::Fdatasync)));
+
+        backend.submit(Op::Fdatasync { fd }).expect("submit second");
+        assert_eq!(
+            backend.flush_syscall_count(),
+            1,
+            "a late request was counted before its group was dispatched"
+        );
+        let second = drain_until(&backend, 1);
+        assert_eq!(backend.flush_syscall_count(), 2);
+        assert!(matches!(second[0].1, Ok(CompletionKind::Fdatasync)));
+    }
+
+    /// Two files are two groups: identity, not "a flush is a flush".
+    #[test]
+    fn flushes_of_different_files_are_not_coalesced() {
+        let first = TempFile::new("file-a");
+        let second = TempFile::new("file-b");
+        let backend = MioBackend::new().expect("mio backend");
+
+        backend
+            .submit(Op::Fdatasync {
+                fd: first.file.as_raw_fd(),
+            })
+            .expect("submit first file");
+        backend
+            .submit(Op::Fdatasync {
+                fd: second.file.as_raw_fd(),
+            })
+            .expect("submit second file");
+
+        let completions = drain_until(&backend, 2);
+        assert_eq!(backend.flush_syscall_count(), 2);
+        for (_, result) in completions {
+            assert!(matches!(result, Ok(CompletionKind::Fdatasync)));
+        }
+    }
+
+    /// Same inode, two descriptors: `fsync(2)` is a property of the inode, so
+    /// these are the same group. Proves identity is not the descriptor number.
+    #[test]
+    fn same_inode_through_two_descriptors_coalesces() {
+        let temp = TempFile::new("two-fds");
+        let second_fd = {
+            // SAFETY: fd is a live open descriptor owned by the temp file and
+            // is duplicated exactly once into a test-owned `File`.
+            let duplicated = unsafe { libc::dup(temp.file.as_raw_fd()) };
+            assert!(duplicated >= 0, "dup failed");
+            // SAFETY: ownership of the fresh descriptor moves into the File.
+            let file = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicated) };
+            std::fs::File::from(file)
+        };
+        let backend = MioBackend::new().expect("mio backend");
+
+        backend
+            .submit(Op::Fdatasync {
+                fd: temp.file.as_raw_fd(),
+            })
+            .expect("submit via first descriptor");
+        backend
+            .submit(Op::Fdatasync {
+                fd: second_fd.as_raw_fd(),
+            })
+            .expect("submit via second descriptor");
+
+        let completions = drain_until(&backend, 2);
+        assert_eq!(backend.flush_syscall_count(), 1);
+        for (_, result) in completions {
+            assert!(matches!(result, Ok(CompletionKind::Fdatasync)));
+        }
+    }
+
+    /// Identity lookup must fail closed. A descriptor number that cannot be
+    /// statted must not be queued against a guessed identity — the backend
+    /// rejects it instead, and nothing is counted as a request.
+    ///
+    /// `-1` is used directly rather than a closed descriptor: closing a real
+    /// descriptor frees a number that a parallel test thread may reuse before
+    /// this one runs, which would make the premise racy.
+    #[test]
+    fn flush_identity_rejects_a_descriptor_it_cannot_stat() {
+        let error = super::flush_identity(-1).expect_err("fstat(-1) must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 }

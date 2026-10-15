@@ -37,7 +37,9 @@ use std::path::Path;
 /// - On Linux without io_uring support: Uses the `mio` readability backend,
 ///   offloading file work to its thread pool
 /// - On macOS: Uses the same `mio` readiness backend (`kqueue` underneath).
-///   `Op::Fsync` currently blocks the runtime thread there.
+///   `sync_all`/`sync_data` are offloaded to the same thread pool, and flushes
+///   for one file requested in the same shard round are served by a single
+///   syscall (see `crate::io::mio_poll`).
 ///
 /// # Examples
 ///
@@ -260,6 +262,57 @@ impl AsyncFile {
 
         match future.await {
             Ok(CompletionKind::Fsync) => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected completion kind",
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Synchronizes the file's data with storage, but not all its metadata.
+    ///
+    /// This is the asynchronous version of `fdatasync(2)`. It guarantees that
+    /// previously written data is on disk, along with the metadata needed to
+    /// read it back (file size, block extents). It does **not** guarantee the
+    /// durability of `mtime` and friends, which `fsync(2)` does — prefer
+    /// [`AsyncFile::sync_all`] when a reader or a later run must observe the
+    /// modification time.
+    ///
+    /// Prefer this over [`AsyncFile::sync_all`] when mtime durability is not
+    /// needed: it is strictly less work for the storage stack. On the
+    /// readiness backend it also shares one group-commit round with the
+    /// concurrent flushes of the same file, and a round that contains an
+    /// `fsync` caller performs the stronger flush for everyone.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Data successfully synchronized
+    /// * `Err(io::Error)` - Failed to synchronize
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_miniss::{fs::AsyncFile, Runtime};
+    ///
+    /// let runtime = Runtime::new();
+    /// runtime.block_on(async {
+    ///     let file = AsyncFile::create("/tmp/test.txt").expect("Failed to create file");
+    ///     let data = b"Important data";
+    ///     file.write_at(0, data).await.expect("Failed to write");
+    ///     file.sync_data().await.expect("Failed to sync data");
+    ///     println!("Data on disk");
+    /// });
+    /// ```
+    pub async fn sync_data(&self) -> io::Result<()> {
+        let op = Op::Fdatasync {
+            fd: self.inner.as_raw_fd(),
+        };
+        let token = with_io_state(|state| state.io_backend.submit(op));
+        let future = IoFuture::new(token);
+
+        match future.await {
+            Ok(CompletionKind::Fdatasync) => Ok(()),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Unexpected completion kind",

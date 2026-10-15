@@ -99,6 +99,23 @@ fn async_file_sync_all_completes_after_write() {
     });
 }
 
+#[test]
+fn async_file_sync_data_completes_after_write() {
+    let runtime = Runtime::new();
+
+    runtime.block_on(async {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_path = temp_dir.path().join("sync_data.txt");
+        let file = AsyncFile::create(&temp_path).expect("create async file");
+        let data = b"fdatasync me";
+
+        assert_eq!(file.write_at(0, data).await.expect("write"), data.len());
+        file.sync_data().await.expect("sync_data");
+
+        assert_eq!(std::fs::read(&temp_path).expect("read back"), data);
+    });
+}
+
 // Token-generation slot aliasing is covered by the crate-private unit test
 // `cpu::tests::cpu_io_slots_do_not_alias_different_token_generations`:
 // integration tests cannot call `IoToken::from_id` without exposing a public footgun.

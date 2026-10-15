@@ -76,6 +76,9 @@ enum PendingOp {
     Fsync {
         op: Op,
     },
+    Fdatasync {
+        op: Op,
+    },
     Close {
         op: Op,
     },
@@ -203,6 +206,7 @@ impl UringBackend {
             | Op::Write { fd, .. }
             | Op::WriteStatic { fd, .. }
             | Op::Fsync { fd }
+            | Op::Fdatasync { fd }
             | Op::Close { fd }
             | Op::ReadFile { fd, .. }
             | Op::WriteFile { fd, .. }
@@ -726,6 +730,20 @@ impl UringBackend {
                         entry,
                         PendingOp::Fsync {
                             op: Op::Fsync { fd },
+                        },
+                    )
+                }
+                Op::Fdatasync { fd } => {
+                    // `IORING_FSYNC_DATASYNC` is io_uring's spelling of
+                    // `fdatasync(2)`: flush the data and the metadata needed to
+                    // read it back, but not mtime.
+                    let entry = opcode::Fsync::new(types::Fd(leased_fd(fd)))
+                        .flags(types::FsyncFlags::DATASYNC)
+                        .build();
+                    (
+                        entry,
+                        PendingOp::Fdatasync {
+                            op: Op::Fdatasync { fd },
                         },
                     )
                 }
@@ -1300,6 +1318,13 @@ unsafe fn reconstruct_completion(
                 Err(IoError::Io(io::Error::from_raw_os_error(-result)))
             } else {
                 Ok(CompletionKind::Fsync)
+            }
+        }
+        PendingOp::Fdatasync { op: .. } => {
+            if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else {
+                Ok(CompletionKind::Fdatasync)
             }
         }
         PendingOp::Close { op: .. } => {
