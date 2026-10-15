@@ -569,15 +569,10 @@ impl AsyncRead for AsyncTcpStream {
                 }
             }
 
-            // Read directly into the caller's buffer: one syscall, one copy.
-            //
-            // The previous path submitted `Op::Read`, which made the backend
-            // allocate a `Buffer` of its own, read a copy into it, and then
-            // copy a second time into `buf` when the completion arrived — so
-            // the async path paid two copies where the `WouldBlock` fast path
-            // above pays one. Arming readiness and re-entering this poll is the
-            // same one-copy cost as the fast path, and it also removes the only
-            // reason a kernel pointer to a caller-owned buffer was ever needed.
+            // The readiness wakeup carries no data, so re-issue the read here.
+            // Doing it in this call is what keeps the kernel's destination
+            // buffer valid: a queued read op could still be in flight after
+            // the future holding the caller's buffer is dropped.
             match try_read(this.as_raw_fd(), buf) {
                 Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
                 Err(err) if is_wouldblock(&err) => {}
@@ -926,17 +921,6 @@ impl HyperRead for AsyncTcpStream {
                 }
             }
 
-            // Read straight into hyper's buffer: one syscall, one copy, and no
-            // Buffer allocated by the backend.
-            //
-            // This used to submit `Op::Read` and then `buf.put_slice(&data[..])`
-            // when the completion arrived, so every read that ever waited paid
-            // two copies and one allocation where the `WouldBlock` fast path
-            // above pays one copy and none. `Op::ReadInto` with a raw pointer
-            // was the original idea for closing that gap and it is not viable:
-            // `cancel_and_discard` only enqueues an async cancel, so a CQE can
-            // still land after the future owning the buffer is dropped. Arming
-            // readiness keeps the pointer's lifetime inside this call.
             match try_read(this.as_raw_fd(), read_buf) {
                 Ok(bytes_read) => {
                     // SAFETY: `try_read` initialized exactly `bytes_read` bytes.

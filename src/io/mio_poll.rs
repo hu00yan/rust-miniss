@@ -593,10 +593,10 @@ impl IoProvider for MioBackend {
         // is read back from the shared buffer instead of from the return value.
         match poll.poll(events, Some(wait)) {
             Ok(()) => {
-                // Reported as 1, not a true count: the runtime only uses this
-                // as "there is work, drain now". Reporting a fabricated count
-                // would corrupt `park_completions`.
-                let readiness = usize::from(!events.is_empty());
+                // A count of 1, not the true event count: the caller only asks
+                // "is there work", and a fabricated count would corrupt
+                // `park_completions`.
+                let readiness = if events.is_empty() { 0 } else { 1 };
                 self.park_left_events.set(readiness != 0);
                 readiness + completed
             }

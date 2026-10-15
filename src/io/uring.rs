@@ -1169,34 +1169,15 @@ impl UringBackend {
     }
 }
 
-/// Reconstruct the terminal completion for a slot whose operation just
-/// finished.
-///
-/// Both drain paths need this, and both used to carry their own copy of the
-/// `match`: the fused drain (`drain_completions_fused_inline`) and the Vec drain
-/// (`drain_completions_into`). They were written independently and drifted —
-/// the fused copy lost every SAFETY comment, renamed the sockaddr locals, and
-/// bound patterns differently. A terminal-completion bug therefore had to be
-/// found and fixed twice, and a fix that missed one copy was silently Linux-only
-/// (the Vector path) or fused-only. Nothing in the logic actually depends on
-/// which drain is running, so there is exactly one copy now.
-///
-/// This is `unsafe` for the same reason the two copies were: it publishes
-/// kernel-written bytes as initialized Rust memory (`Buffer::set_len`) and
-/// reads kernel-filled `sockaddr` memory. Both are valid only for the CQE being
-/// consumed.
+/// Turns a finished slot's pending operation into a completion.
 ///
 /// # Safety
 ///
-/// - `pending_op` must have just reached terminal completion for the CQE whose
-///   `result` is `result`. Every kernel-written region it owns must be valid for
-///   exactly `result` bytes — no more.
-/// - For `UdpRecv`/`UdpSend`/`Connect`/`Accept`, the `addr_storage` box must
-///   still hold the `sockaddr` bytes the kernel filled for *this* completion,
-///   and `addr_len` the length it reported.
-/// - Not safe against a malicious or corrupted CQE length: `result` is trusted
-///   as an upper bound on the kernel's write (see
-///   `docs/review/runtime-safety-contracts.md` C8).
+/// - `pending_op` reached terminal completion for the CQE being consumed: every
+///   region the kernel wrote in it is valid for exactly `result` bytes.
+/// - `addr_storage`/`addr_len` still hold the bytes kernel filled for that CQE.
+/// - `result` is trusted as an upper bound on the kernel's write, so this is not
+///   safe against a corrupted CQE length. See runtime-safety-contracts.md C8.
 unsafe fn reconstruct_completion(
     pending_op: PendingOp,
     result: i32,

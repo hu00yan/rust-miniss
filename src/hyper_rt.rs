@@ -22,11 +22,9 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     fn execute(&self, fut: F) {
-        // hyper calls this from inside a connection task, so we are on the
-        // shard that owns that connection. `spawn` would cross cores *and*
-        // block this shard for up to 1s waiting for the admission ack
-        // (`spawn_on_wait` uses a 1s `recv_timeout`). `spawn_local` keeps the
-        // background task on the owning shard, which is where its state lives.
+        // Called from the shard that owns the connection. `spawn` would cross
+        // cores and then block this shard for up to 1s waiting for the
+        // admission ack.
         if crate::cpu::current_core_id().is_some() {
             self.runtime
                 .spawn_local(fut)
