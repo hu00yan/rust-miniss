@@ -2,23 +2,16 @@
 
 //! Readiness backend built on `mio` (`epoll` on Linux, `kqueue` on macOS).
 //!
-//! This implementation is designed for a thread-per-core architecture, serving as a
-//! fallback for Unix-like systems where `io-uring` is not available. Each `MioBackend`
-//! instance owns a `mio::Poll` handle and is intended for single-threaded use.
+//! Fallback for systems without `io-uring`. Each `MioBackend` owns one
+//! `mio::Poll` handle and is single-threaded: like the `uring` backend it keeps
+//! its state behind `UnsafeCell` and implements `IoBackend` on `&self`.
 //!
-//! Like the `uring` backend, this module uses `UnsafeCell` and `unsafe` trait impls
-//! to manage thread-local state within the `IoBackend` trait's `&self` methods.
-//!
-//! ## Scope of the mio abstraction
-//!
-//! `mio` only normalizes *readiness notification*. Both `epoll_wait` and `kevent`
-//! return the same shape there — a list of `(fd, readiness)` pairs — so one code
-//! path is valid at that layer. It does **not** normalize the operation state
-//! machine that lives in this module: re-arm semantics for `EPOLLONESHOT` vs
-//! `EV_ONESHOT`, knote accumulation on repeated `EV_ADD`, and the
-//! `EV_EOF` vs `EPOLLHUP`/`EPOLLERR` mapping all differ between the two kernels.
-//! macOS therefore shares this code path but is **not** covered by independent
-//! kqueue-specific tests; treat any macOS-only result as unverified here.
+//! `mio` normalizes only *readiness notification* (a list of `(fd, readiness)`
+//! pairs), not the operation state machine in this module: re-arm semantics for
+//! `EPOLLONESHOT` vs `EV_ONESHOT`, knote accumulation on repeated `EV_ADD`, and
+//! the `EV_EOF` vs `EPOLLHUP`/`EPOLLERR` mapping all differ between the two
+//! kernels. macOS therefore shares this code path with no independent
+//! kqueue-specific tests; treat macOS-only results as unverified here.
 
 use crate::io::{CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op};
 use crate::Buffer;
@@ -94,12 +87,9 @@ struct FlushGroup {
 /// read, not a blocking flush, and it is what makes group commit safe.
 fn flush_identity(fd: RawFd) -> io::Result<FileIdentity> {
     // SAFETY: stat is a plain C storage type; fstat only writes into it.
-    let mut stat: libc::stat =
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        unsafe { std::mem::zeroed() };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: fd is a live descriptor held by an accepted lease, so the stat
     // call cannot outlive it.
-    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -121,43 +111,20 @@ fn publish_read_len(buffer: &mut Buffer, bytes_read: usize) -> Result<(), IoErro
         })
 }
 
-/// Safe file descriptor wrapper that ensures RAII compliance
-#[derive(Debug)]
-struct SafeFdFile {
-    file: Option<std::fs::File>,
-}
-
-impl SafeFdFile {
-    /// Create a new SafeFdFile from a raw fd
-    fn new(fd: RawFd) -> io::Result<Self> {
-        // SAFETY: dup creates an independent owned fd; the original fd remains
-        // owned by its caller and is not consumed here.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // SAFETY: dup_fd is newly owned by this function and is transferred
-        // into File exactly once.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-        let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
-        Ok(Self { file: Some(file) })
+/// Duplicate `fd` into an owned handle a pool worker may close.
+///
+/// The caller's descriptor stays owned by its lease; closing the returned
+/// `File` closes only the duplicate.
+fn dup_owned_file(fd: RawFd) -> io::Result<std::fs::File> {
+    // SAFETY: `dup` returns a fresh descriptor owned by this call; the caller's
+    // descriptor is not consumed.
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-
-    /// Get mutable reference to the file
-    fn as_mut(&mut self) -> &mut std::fs::File {
-        self.file.as_mut().expect("File should be available")
-    }
-}
-
-impl Drop for SafeFdFile {
-    fn drop(&mut self) {
-        // Ensure the file is properly closed when SafeFdFile is dropped
-        if let Some(file) = self.file.take() {
-            drop(file); // This will close the fd
-        }
-    }
+    // SAFETY: `dup_fd` is a freshly owned descriptor, transferred into `File`
+    // exactly once and closed when that `File` drops.
+    Ok(unsafe { std::fs::File::from_raw_fd(dup_fd) })
 }
 
 /// A readiness-based `IoBackend` implementation using `mio`.
@@ -235,7 +202,6 @@ impl MioBackend {
     fn complete_local(&self, completion: IoCompletion) {
         // SAFETY: MioBackend is driven by one runtime thread; completed_local
         // is shard-local and not accessed concurrently.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed_local = unsafe { &mut *self.completed_local.get() };
         completed_local.push(completion);
     }
@@ -275,7 +241,6 @@ impl MioBackend {
         let identity = flush_identity(lease.as_raw_fd())?;
         // SAFETY: flush_groups is shard-local and only mutated by the owner
         // thread inside submit().
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let groups = unsafe { &mut *self.flush_groups.get() };
         self.flush_requests.set(self.flush_requests.get() + 1);
         match groups.iter_mut().find(|group| group.identity == identity) {
@@ -304,17 +269,12 @@ impl MioBackend {
     /// queued, so a group is never in flight and open at the same time.
     fn dispatch_flush_groups(&self) {
         // SAFETY: shard-local, owner-thread-only list.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         if unsafe { &*self.flush_groups.get() }.is_empty() {
             return;
         }
-        // SAFETY: flush_groups is shard-local; this runs on the owner thread
+        // SAFETY: `flush_groups` is shard-local; this runs on the owner thread
         // from drain/park, never re-entrantly from submit.
-        let pending = {
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
-            let groups = unsafe { &mut *self.flush_groups.get() };
-            mem::take(groups)
-        };
+        let pending = mem::take(unsafe { &mut *self.flush_groups.get() });
         for group in pending {
             let FlushGroup {
                 mode,
@@ -329,15 +289,11 @@ impl MioBackend {
             // durability for a flush that has not happened yet.
             self.flush_syscalls.set(self.flush_syscalls.get() + 1);
             thread_pool.execute(move || {
-                let fd = lease.as_raw_fd();
-                let outcome = match SafeFdFile::new(fd) {
-                    Ok(mut file) => {
-                        let file = file.as_mut();
-                        match mode {
-                            FlushMode::Data => file.sync_data(),
-                            FlushMode::All => file.sync_all(),
-                        }
-                    }
+                let outcome = match dup_owned_file(lease.as_raw_fd()) {
+                    Ok(file) => match mode {
+                        FlushMode::Data => file.sync_data(),
+                        FlushMode::All => file.sync_all(),
+                    },
                     Err(error) => Err(error),
                 };
                 // `io::Error` is not `Clone`, so the failure is carried as a
@@ -364,13 +320,13 @@ impl IoProvider for MioBackend {
 
         // SAFETY: We have exclusive, single-threaded access.
         let next_token = unsafe { &mut *self.next_token.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: `poll` is shard-local; `submit` runs on this backend's owner thread.
         let poll = unsafe { &mut *self.poll.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local pending-op slots; this thread is their only accessor.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local descriptor leases; this thread is their only accessor.
         let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local lease→token map; this thread is its only accessor.
         let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
 
         let mio_token = Token(*next_token);
@@ -381,7 +337,6 @@ impl IoProvider for MioBackend {
         Self::ensure_slot_capacity(descriptor_lease_tokens, slot);
         // SAFETY: udp_recv_buffers is shard-local and only accessed from this
         // backend owner thread while submitting operations.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         Self::ensure_slot_capacity(unsafe { &mut *self.udp_recv_buffers.get() }, slot);
 
         // Acquire the lease before registration/queueing.  File operations
@@ -419,7 +374,8 @@ impl IoProvider for MioBackend {
                 // `recv_from` takes a safe `&mut [u8]`, so it must never see
                 // the uninitialized spare capacity supplied by rent buffers.
                 buffer.prepare_for_safe_read();
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: same shard-local `udp_recv_buffers` as at the top of `submit`;
+                // this thread is its only accessor.
                 let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                 udp_recv_buffers[slot] = Some(buffer);
                 pending_ops[slot] = Some((
@@ -517,32 +473,24 @@ impl IoProvider for MioBackend {
                     let len_copy = *len;
 
                     thread_pool.execute(move || {
-                        let result = match SafeFdFile::new(fd_copy) {
-                            Ok(mut safe_file) => safe_file
-                                .as_mut()
-                                .seek(SeekFrom::Start(offset_copy))
-                                .and_then(|_| {
-                                    let mut buf = Buffer::new_zeroed(len_copy);
-                                    safe_file
-                                        .as_mut()
-                                        .read(buf.as_mut())
-                                        .and_then(|bytes_read| {
-                                            if buf.publish_read_len(bytes_read) {
-                                                Ok(CompletionKind::ReadFile {
-                                                    bytes_read,
-                                                    data: buf,
-                                                })
-                                            } else {
-                                                Err(io::Error::new(
-                                                    io::ErrorKind::InvalidData,
-                                                    "file read exceeded buffer capacity",
-                                                ))
-                                            }
-                                        })
-                                })
-                                .map_err(IoError::Io),
-                            Err(err) => Err(IoError::Io(err)),
-                        };
+                        let result = dup_owned_file(fd_copy)
+                            .and_then(|mut file| {
+                                file.seek(SeekFrom::Start(offset_copy))?;
+                                let mut buf = Buffer::new_zeroed(len_copy);
+                                let bytes_read = file.read(buf.as_mut())?;
+                                if buf.publish_read_len(bytes_read) {
+                                    Ok(CompletionKind::ReadFile {
+                                        bytes_read,
+                                        data: buf,
+                                    })
+                                } else {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "file read exceeded buffer capacity",
+                                    ))
+                                }
+                            })
+                            .map_err(IoError::Io);
 
                         let _ = completed_tx.send((io_token_copy, result));
                     });
@@ -556,18 +504,14 @@ impl IoProvider for MioBackend {
                     let data_clone = data.clone();
 
                     thread_pool.execute(move || {
-                        let result = match SafeFdFile::new(fd_copy) {
-                            Ok(mut safe_file) => safe_file
-                                .as_mut()
-                                .seek(SeekFrom::Start(offset_copy))
-                                .and_then(|_| {
-                                    safe_file.as_mut().write(data_clone.as_ref()).map(
-                                        |bytes_written| CompletionKind::WriteFile { bytes_written },
-                                    )
+                        let result = dup_owned_file(fd_copy)
+                            .and_then(|mut file| {
+                                file.seek(SeekFrom::Start(offset_copy))?;
+                                file.write(data_clone.as_ref()).map(|bytes_written| {
+                                    CompletionKind::WriteFile { bytes_written }
                                 })
-                                .map_err(IoError::Io),
-                            Err(err) => Err(IoError::Io(err)),
-                        };
+                            })
+                            .map_err(IoError::Io);
 
                         let _ = completed_tx.send((io_token_copy, result));
                     });
@@ -620,7 +564,6 @@ impl IoProvider for MioBackend {
                     let result = {
                         // SAFETY: Close consumes the raw fd for this operation;
                         // callers must not use it after submitting Op::Close.
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let res = unsafe { libc::close(*fd) };
                         if res == -1 {
                             Err(IoError::Io(io::Error::last_os_error()))
@@ -672,7 +615,7 @@ impl IoProvider for MioBackend {
             pending_ops[slot] = None;
             // A failed UDP registration may have staged its buffer before the
             // error was observed; discard that staged state with the lease.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+            // SAFETY: shard-local `udp_recv_buffers`, cleared on this owner thread.
             unsafe {
                 (&mut *self.udp_recv_buffers.get())[slot] = None;
             }
@@ -690,19 +633,19 @@ impl IoProvider for MioBackend {
             .iter()
             .filter(|entry| entry.is_some())
             .count();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: same owner-thread-only query as `pending_ops` above.
         let udp = unsafe { &*self.udp_recv_buffers.get() }
             .iter()
             .filter(|entry| entry.is_some())
             .count();
         // Flush requests waiting for the next event-loop boundary to dispatch
         // their group are accepted work the owner still owes a completion.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: same owner-thread-only query; `flush_groups` is shard-local.
         let flushes = unsafe { &*self.flush_groups.get() }
             .iter()
             .map(|group| group.waiters.len())
             .sum::<usize>();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: same owner-thread-only query; `completed_local` is shard-local.
         let completed = unsafe { &*self.completed_local.get() }.len();
         pending + udp + flushes + completed
     }
@@ -725,15 +668,15 @@ impl IoProvider for MioBackend {
         // against, moved out of the waiter slot that accepted it. Descriptors
         // already handed to the thread pool are not counted: that in-flight
         // window was never included for file reads and writes either.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: same owner-thread-exclusive access as above; termination-time count.
         let flush_groups = unsafe { &*self.flush_groups.get() }.len();
         leases + accepted + flush_groups
     }
 
     fn cancel(&self, token: IoToken) -> bool {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: `cancel` runs on the owning event-loop thread, so `poll` is ours alone.
         let poll = unsafe { &mut *self.poll.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local pending-op slots, mutated only on this owner thread.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
         let Some((slot, entry)) = pending_ops
             .iter_mut()
@@ -743,7 +686,7 @@ impl IoProvider for MioBackend {
             return false;
         };
         let op_fd = entry.as_ref().map(|(_, op)| op.as_raw_fd());
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: read-only borrow of the shard-local lease table for this slot.
         let fd = unsafe { &*self.descriptor_leases.get() }[slot]
             .as_ref()
             .map(DescriptorLease::as_raw_fd)
@@ -752,7 +695,7 @@ impl IoProvider for MioBackend {
         let mut source = mio::unix::SourceFd(&fd);
         let _ = poll.registry().deregister(&mut source);
         pending_ops[slot] = None;
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: the same three shard-local tables as above, written on this owner thread.
         unsafe {
             (&mut *self.udp_recv_buffers.get())[slot] = None;
             (&mut *self.descriptor_leases.get())[slot] = None;
@@ -781,15 +724,13 @@ impl IoProvider for MioBackend {
         // outstanding work is a flush would sleep until the pool happened to
         // wake it.
         self.dispatch_flush_groups();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: `park` runs on the owning event-loop thread, so `poll` is ours alone.
         let poll = unsafe { &mut *self.poll.get() };
         // SAFETY: events is shard-local and reused across park calls; poll()
         // fully re-initializes it each time.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let events = unsafe { &mut *self.events.get() };
         // SAFETY: completed_local is shard-local and only touched by this
         // backend owner thread; park() runs on that thread.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let completed = unsafe { &*self.completed_local.get() }.len();
 
         // Nothing to wait for if the pool already produced work.
@@ -822,7 +763,7 @@ impl IoProvider for MioBackend {
     }
 
     fn cancel_all(&self) {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local lease→token map, read on the owning event-loop thread.
         let tokens = unsafe { &*self.descriptor_lease_tokens.get() }
             .iter()
             .flatten()
@@ -840,17 +781,17 @@ impl IoProvider for MioBackend {
         self.dispatch_flush_groups();
         // SAFETY: We have exclusive, single-threaded access.
         let poll = unsafe { &mut *self.poll.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: `events` is shard-local; `drain_completions` runs on the owning thread.
         let events = unsafe { &mut *self.events.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local pending-op slots; this thread is their only accessor.
         let pending_ops = unsafe { &mut *self.pending_ops.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local descriptor leases; this thread is their only accessor.
         let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local lease→token map; this thread is its only accessor.
         let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local completion staging; this thread is its only accessor.
         let completed_local = unsafe { &mut *self.completed_local.get() };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: shard-local pool completion channel; this thread is its only receiver.
         let completed_rx = unsafe { &mut *self.completed_rx.get() };
 
         let mut completions = mem::take(completed_local);
@@ -916,7 +857,6 @@ impl IoProvider for MioBackend {
                             Ok((new_fd, addr)) => Ok(CompletionKind::Accept {
                                 // SAFETY: syscall_accept returns a fresh owned
                                 // descriptor on success.
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(new_fd) },
                                 addr: Some(addr),
                             }),
@@ -938,7 +878,6 @@ impl IoProvider for MioBackend {
                             // SAFETY: `as_mut_ptr` + `capacity()` describe exactly
                             // the allocation. libc::read writes at most that many
                             // bytes and never reads them.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::read(
                                     effective_fd,
@@ -989,7 +928,6 @@ impl IoProvider for MioBackend {
                         let result = loop {
                             // SAFETY: buffer has at least `len` capacity and
                             // libc::read writes at most that many bytes.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::read(
                                     effective_fd,
@@ -1059,7 +997,6 @@ impl IoProvider for MioBackend {
                             }
                             // SAFETY: remaining points to initialized bytes owned
                             // by `data`; write reads at most len bytes.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::write(
                                     effective_fd,
@@ -1119,7 +1056,6 @@ impl IoProvider for MioBackend {
                             }
                             // SAFETY: remaining points to initialized bytes
                             // owned by `data`; write reads at most len bytes.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::write(
                                     effective_fd,
@@ -1192,7 +1128,6 @@ impl IoProvider for MioBackend {
                             }
                             // SAFETY: remaining points to static initialized
                             // bytes; write reads at most len bytes.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::write(
                                     effective_fd,
@@ -1251,10 +1186,9 @@ impl IoProvider for MioBackend {
                     Op::ReadFile { fd, offset, len } => {
                         // This path should ideally not be hit as these are handled sync in submit
                         // but included for completeness if event-driven file I/O were enabled.
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
-                        let effective_fd = leased_fd.unwrap_or(fd);
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
                         let result = file.seek(SeekFrom::Start(offset)).and_then(|_| {
                             let mut buf = Buffer::new_zeroed(len);
@@ -1277,10 +1211,9 @@ impl IoProvider for MioBackend {
                     }
                     Op::WriteFile { fd, offset, data } => {
                         // This path should ideally not be hit.
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: File temporarily wraps fd for std APIs, then
                         // into_raw_fd prevents closing so ownership stays outside.
-                        let effective_fd = leased_fd.unwrap_or(fd);
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
                         let result = file
                             .seek(SeekFrom::Start(offset))
@@ -1294,14 +1227,12 @@ impl IoProvider for MioBackend {
                         // Matched by `event.token()`
                         // SAFETY: udp_recv_buffers is shard-local and only
                         // accessed by this backend owner thread.
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
                         if let Some(mut buffer) =
                             udp_recv_buffers.get_mut(slot).and_then(Option::take)
                         {
                             // SAFETY: UdpSocket temporarily wraps fd and is
                             // converted back with into_raw_fd before drop.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
                             let mut retry = false;
                             let result = match socket.recv_from(buffer.as_mut()) {
@@ -1353,10 +1284,9 @@ impl IoProvider for MioBackend {
                     Op::UdpSend { fd, data, addr } => {
                         // Perform UDP send operation
 
+                        let effective_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: UdpSocket temporarily wraps fd and is
                         // converted back with into_raw_fd before drop.
-                        let effective_fd = leased_fd.unwrap_or(fd);
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
                         let result = socket.send_to(data.as_ref(), addr).map(|bytes_written| {
                             CompletionKind::UdpSend {
@@ -1371,7 +1301,6 @@ impl IoProvider for MioBackend {
                         let raw_fd = leased_fd.unwrap_or(fd);
                         // SAFETY: TcpStream temporarily wraps fd to call
                         // take_error, then into_raw_fd preserves ownership.
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                         let sock = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
                         let result = match sock.take_error() {
                             Ok(None) => Ok(CompletionKind::Connect),
@@ -1404,7 +1333,6 @@ impl IoProvider for MioBackend {
                         let result = loop {
                             // SAFETY: iovecs point to writable capacity in
                             // dest_buffers and remain valid for this call.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             let ret = unsafe {
                                 libc::readv(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
                             };
@@ -1494,7 +1422,6 @@ impl IoProvider for MioBackend {
                                         Some(libc::iovec {
                                             // SAFETY: offset is within this
                                             // buffer due to checks above.
-                                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                             iov_base: unsafe {
                                                 buf.as_ref().as_ptr().add(offset)
                                                     as *mut libc::c_void
@@ -1511,7 +1438,6 @@ impl IoProvider for MioBackend {
                                 }
                                 // SAFETY: iovecs point to initialized bytes in
                                 // buffers and remain valid for this syscall.
-                                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                                 let ret = unsafe {
                                     libc::writev(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
                                 };
@@ -1583,11 +1509,9 @@ impl IoProvider for MioBackend {
                     _ => continue,
                 };
 
-                // The lease is retained across every readiness requeue and is
-                // released only after this terminal result is published.
-                // The lease vectors are backend-owned and remain valid for
-                // this owner-thread drain pass.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: the lease is retained across every readiness requeue and
+                // released only at this terminal result; the lease vectors are
+                // backend-owned and remain valid for this owner-thread drain pass.
                 unsafe {
                     (&mut *self.descriptor_leases.get())[slot] = None;
                     (&mut *self.descriptor_lease_tokens.get())[slot] = None;
@@ -1614,7 +1538,6 @@ mod descriptor_lease_acceptance_tests {
     fn accepted_read_keeps_descriptor_lease_after_user_close() {
         let mut fds = [0; 2];
         // SAFETY: fds points at two live descriptor slots sized for a pipe.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(piped, 0, "pipe creation failed");
         let backend = MioBackend::new().expect("mio backend");
@@ -1628,12 +1551,12 @@ mod descriptor_lease_acceptance_tests {
         assert!(backend.pending_operation_count() >= 1);
         // SAFETY: the read end is still owned by this test and is closed once.
         unsafe { libc::close(fds[0]) };
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: the test owns `backend` outright, so this cell has no other holder.
         let leases = unsafe { &*backend.descriptor_leases.get() };
         assert!(leases.iter().any(|lease| {
             lease
                 .as_ref()
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: the lease is live; `F_GETFD` only queries its descriptor.
                 .is_some_and(|lease| unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) } >= 0)
         }));
         let _ = token;
@@ -1645,7 +1568,6 @@ mod descriptor_lease_acceptance_tests {
     fn unsupported_submit_returns_error_without_completion_token() {
         let mut fds = [0; 2];
         // SAFETY: fds points at two live descriptor slots sized for a pipe.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(piped, 0, "pipe creation failed");
         let backend = MioBackend::new().expect("mio backend");
@@ -1658,7 +1580,7 @@ mod descriptor_lease_acceptance_tests {
             backend.drain_completions(),
             std::task::Poll::Pending
         ));
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: both pipe descriptors are owned by this test and closed exactly once.
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
@@ -1670,7 +1592,6 @@ fn syscall_accept(fd: RawFd) -> io::Result<(RawFd, std::net::SocketAddr)> {
     // SAFETY: sockaddr_storage is a plain C storage type and zeroed storage is
     // valid for accept to fill.
     let mut storage: libc::sockaddr_storage =
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
     let mut len = std::mem::size_of_val(&storage) as libc::socklen_t;
     // SAFETY: storage/len pointers are valid for the duration of accept.
@@ -1755,12 +1676,10 @@ mod park_and_rent_tests {
     fn set_nonblocking(fd: std::os::unix::io::RawFd) {
         // SAFETY: fd is a valid descriptor owned by this test and fcntl only
         // reads its status flags.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert!(flags >= 0, "F_GETFL failed");
         // SAFETY: same descriptor, same call shape, only adds O_NONBLOCK to the
         // value just read back.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
         assert_eq!(set, 0, "F_SETFL failed");
     }
@@ -1776,7 +1695,6 @@ mod park_and_rent_tests {
         // behaviour must come from the wait, not from an early return.
         let mut fds = [0; 2];
         // SAFETY: fds points at two live descriptor slots sized for a pipe.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(piped, 0, "pipe creation failed");
         set_nonblocking(fds[0]);
@@ -1821,7 +1739,6 @@ mod park_and_rent_tests {
         let backend = MioBackend::new().expect("mio backend");
         let mut fds = [0; 2];
         // SAFETY: fds points at two live descriptor slots sized for a pipe.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(piped, 0, "pipe creation failed");
 
@@ -1829,7 +1746,6 @@ mod park_and_rent_tests {
         // immediately with an event in hand.
         // SAFETY: b"x" is a live 1-byte static and fds[1] is a valid, writable
         // pipe end for the duration of the call.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let written = unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) };
         assert_eq!(written, 1, "pipe write failed");
         set_nonblocking(fds[0]);
@@ -1876,12 +1792,10 @@ mod park_and_rent_tests {
         let backend = MioBackend::new().expect("mio backend");
         let mut fds = [0; 2];
         // SAFETY: fds points at two live descriptor slots sized for a pipe.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(piped, 0, "pipe creation failed");
         // SAFETY: b"hello" is a live 5-byte static and fds[1] is a valid,
         // writable pipe end for the duration of the call.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let written = unsafe { libc::write(fds[1], b"hello".as_ptr().cast(), 5) };
         assert_eq!(written, 5, "pipe write failed");
         set_nonblocking(fds[0]);
@@ -1926,7 +1840,6 @@ mod park_and_rent_tests {
         let backend = MioBackend::new().expect("mio backend");
         let mut fds = [0; 2];
         // SAFETY: fds points at two live descriptor slots sized for a pipe.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let piped = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(piped, 0, "pipe creation failed");
         set_nonblocking(fds[1]);
