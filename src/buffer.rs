@@ -38,7 +38,6 @@ impl Buffer {
         BUFFER_POOL.with(|pool| {
             // SAFETY: BUFFER_POOL is thread-local. Runtime accesses it only
             // from owning worker thread, so no concurrent aliases exist.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 let pool = &mut *pool.get();
                 if pool.len() < POOL_CAPACITY {
@@ -52,7 +51,6 @@ impl Buffer {
         BUFFER_POOL.with(|pool| {
             // SAFETY: BUFFER_POOL is thread-local. Runtime accesses it only
             // from owning worker thread, so no concurrent aliases exist.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 let pool = &mut *pool.get();
                 // Take the most recently recycled buffer (hot in cache).
@@ -183,7 +181,6 @@ impl Buffer {
         }
         // SAFETY: the caller contract above ensures the newly exposed range
         // was initialized; the capacity bound was checked immediately above.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe { self.inner.set_len(len) };
         true
     }
@@ -193,29 +190,22 @@ impl Buffer {
         self.inner.resize(new_len, value);
     }
 
-    /// Sets the buffer length without checking.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure `len <= capacity()` and that every byte in the
-    /// new initialized range has been written before it is read.
     /// Sets the logical length of the buffer without initializing new bytes.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that all bytes in the range from the old length
-    /// to `len` have been initialized before they are read.
+    /// The caller must ensure `len <= capacity()` and that every byte in the
+    /// range from the old length to `len` has been initialized before it is read.
     pub unsafe fn set_len(&mut self, len: usize) {
         self.inner.set_len(len);
     }
 
-    /// Consumes the buffer and recycles its storage back into the pool if possible.
-    /// Consumes the buffer and recycles its storage. Drop also recycles,
-    /// so this is redundant — kept for compatibility with BufferPool.
+    /// Consumes the buffer and recycles its storage back into the pool if
+    /// possible. `Drop` also recycles, so this is redundant — kept for
+    /// compatibility with `BufferPool`.
     pub fn recycle(mut self) {
         // SAFETY: ManuallyDrop allows taking the value without dropping it.
         // We forget(self) to prevent Drop from running on the already-moved value.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let vec = unsafe { ManuallyDrop::take(&mut self.inner) };
         Self::recycle_vec(vec);
         std::mem::forget(self);
@@ -229,7 +219,6 @@ impl Drop for Buffer {
         // Buffer::new_zeroed() allocates fresh memory.
         // SAFETY: ManuallyDrop lets us take the inner Vec even though
         // we have Drop. After taking, self.inner is an empty Vec.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let vec = unsafe { ManuallyDrop::take(&mut self.inner) };
         if vec.capacity() > 0 {
             Self::recycle_vec(vec);

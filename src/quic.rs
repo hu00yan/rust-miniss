@@ -90,7 +90,6 @@ impl Future for MinissSleep {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: `MinissSleep` only contains an inner future; replacing the
         // field is handled in `reset` and does not rely on self-references.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll(cx)
     }
@@ -100,7 +99,6 @@ impl AsyncTimer for MinissSleep {
     fn reset(self: Pin<&mut Self>, deadline: Instant) {
         // SAFETY: `MinissSleep` does not self-reference; replacing the inner
         // sleep future is safe because callers hold `Pin<&mut Self>`.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let this = self.get_mut();
         this.inner = SleepFuture::new(deadline.saturating_duration_since(Instant::now()));
     }
@@ -190,7 +188,8 @@ impl Drop for MinissUdpSocket {
     fn drop(&mut self) {
         if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
             if let Some(token) = self.load_recv_token() {
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: the `owner_core` check above puts us on the owning shard, and
+                // `token` is this socket's own live recv token.
                 with_io_state(|state| unsafe {
                     state.cancel_and_discard(token);
                 });
@@ -224,9 +223,10 @@ impl AsyncUdpSocket for MinissUdpSocket {
                 // slot before the task is polled. Consume that slot first;
                 // falling back to the shared completion table covers backends
                 // which publish completion records there.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: `state` is this thread's own shard; `token` is this socket's
+                // live in-flight token, so the owner-completion slot is ours to take.
                 if let Some(result) = unsafe { state.take_owner_completion(token) }
-                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    // SAFETY: same live shard-local token; this is the shared-table fallback.
                     .or_else(|| unsafe { state.take_completed(token) })
                 {
                     self.clear_recv_token(token);
@@ -235,7 +235,8 @@ impl AsyncUdpSocket for MinissUdpSocket {
                         Err(err) => return Poll::Ready(Err(err.into())),
                     }
                 } else {
-                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    // SAFETY: `store_waker_and_pending_task` needs a live token owned by this
+                    // `CpuIoState`; `token` was just read above, on the owning thread.
                     unsafe {
                         state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
                     }
@@ -256,7 +257,8 @@ impl AsyncUdpSocket for MinissUdpSocket {
                         Err(error) => return Poll::Ready(Err(error.into())),
                     };
                     self.store_recv_token(token);
-                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    // SAFETY: `token` was just returned by `submit` on this same shard and
+                    // has no completion yet, so no slot reuse can race the store.
                     unsafe {
                         state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
                     }
@@ -352,7 +354,8 @@ impl Drop for MinissUdpPoller {
         #[cfg(not(target_os = "macos"))]
         if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
             if let Some(token) = self.load_token() {
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: the `owner_core` check above puts us on the owning shard, and
+                // `token` is this poller's own live token.
                 with_io_state(|state| unsafe {
                     state.cancel_and_discard(token);
                 });
@@ -382,7 +385,7 @@ impl UdpPoller for MinissUdpPoller {
             };
             // UDP write filters are not reliable through mio/kqueue on macOS,
             // but a zero-timeout poll accurately samples send-buffer pressure.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+            // SAFETY: `poll_fd` is a live local `libc::pollfd` and the socket owns the descriptor.
             let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
             if ready < 0 {
                 return Poll::Ready(Err(io::Error::last_os_error()));
@@ -415,9 +418,10 @@ impl UdpPoller for MinissUdpPoller {
                 if let Some(token) = self.load_token() {
                     // See poll_recv: io_uring fused completions wake the owner
                     // task with a result that is not stored in the shared table.
-                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    // SAFETY: `state` is this thread's own shard; `token` is this poller's
+                    // live in-flight token, so the owner-completion slot is ours to take.
                     if let Some(result) = unsafe { state.take_owner_completion(token) }
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                        // SAFETY: same live shard-local token; this is the shared-table fallback.
                         .or_else(|| unsafe { state.take_completed(token) })
                     {
                         self.clear_token(token);
@@ -426,7 +430,8 @@ impl UdpPoller for MinissUdpPoller {
                             Err(err) => Poll::Ready(Err(err.into())),
                         };
                     }
-                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    // SAFETY: `token` is this poller's live in-flight token on this shard;
+                    // `store_waker_and_pending_task` needs exactly that.
                     unsafe {
                         state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
                     }
@@ -443,7 +448,8 @@ impl UdpPoller for MinissUdpPoller {
                     Err(error) => return Poll::Ready(Err(error.into())),
                 };
                 self.store_token(token);
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: `token` was just returned by `submit` on this same shard and
+                // has no completion yet, so no slot reuse can race the store.
                 unsafe {
                     state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
                 }

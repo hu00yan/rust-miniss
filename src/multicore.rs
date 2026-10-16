@@ -266,7 +266,6 @@ fn cancel_deferred_local_spawn(task_id: TaskId) -> bool {
 fn create_wakeup_eventfd() -> Result<OwnedFd> {
     // SAFETY: eventfd creates a fresh fd owned by this function; we wrap it
     // immediately in OwnedFd on success and keep it thread-local.
-    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if fd < 0 {
         return Err(RuntimeError::TaskFailed(format!(
@@ -276,7 +275,6 @@ fn create_wakeup_eventfd() -> Result<OwnedFd> {
     }
     // SAFETY: `fd` is the owned descriptor returned by eventfd above and has
     // not been wrapped elsewhere.
-    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -739,7 +737,6 @@ impl CpuCore {
         }
         // SAFETY: CpuCore owns both fields for the whole run invocation; the
         // context guard drops before CpuCore can be moved or destroyed.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let _runtime_context = unsafe {
             RuntimeContextGuard::enter(&self.io_state, &mut self.timer_wheel, Some(self.id))
         };
@@ -951,7 +948,6 @@ impl CpuCore {
 
         // SAFETY: The cpu_set_t is zero-initialized before CPU_SET, and
         // sched_setaffinity receives a pointer valid for the call duration.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             let mut cpuset: cpu_set_t = mem::zeroed();
             CPU_ZERO(&mut cpuset);
@@ -1100,7 +1096,8 @@ impl CpuCore {
                 break;
             };
             if let Some(completion) = owner_completion {
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: `execute_tasks` runs on this core's own loop, so `io_state` has
+                // no other accessor while the owner completion is installed.
                 unsafe {
                     self.io_state
                         .set_owner_completion(completion.token, completion.result);
@@ -1117,14 +1114,16 @@ impl CpuCore {
                     if owner_ready {
                         // A completion can race cancellation/slot retirement;
                         // never retain its result for a later task poll.
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                        // SAFETY: same exclusive shard access; the result must be dropped
+                        // here rather than left behind for a task that no longer exists.
                         unsafe { self.io_state.clear_owner_completion() };
                     }
                     continue; // stale wake after cancellation
                 };
                 if task.id() != task_id {
                     if owner_ready {
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                        // SAFETY: same exclusive shard access; the slot was reused by a
+                        // different task, so this completion does not belong to it.
                         unsafe { self.io_state.clear_owner_completion() };
                     }
                     continue; // stale wake after slot reuse
@@ -1164,7 +1163,8 @@ impl CpuCore {
                 self.task_queue.remove(task_id.key());
             }
             if owner_ready {
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                // SAFETY: the completion was delivered to its task above, and this core's
+                // loop is the only accessor of `io_state`.
                 unsafe { self.io_state.clear_owner_completion() };
             }
         }
@@ -1243,7 +1243,8 @@ impl CpuCore {
         });
         let drain_started = Instant::now();
         #[cfg(target_os = "linux")]
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: this is the owning runtime thread for `io_state`, and nothing else
+        // drains CQEs concurrently — the contract `drain_completions_fused` states.
         let (count, saw_wakeup_poll, wakeups) = unsafe {
             self.io_state
                 .io_backend
@@ -1266,18 +1267,23 @@ impl CpuCore {
                 let count = completions.len();
                 let mut wakeups = 0usize;
                 for (token, result) in completions {
-                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    // SAFETY: this CQE is terminal for `token`, and the drain above ran on
+                    // this shard — `take_discarded`'s two preconditions.
                     if unsafe { self.io_state.take_discarded(token) } {
                         continue;
                     }
-                    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                    // SAFETY: `token` came from this shard's own drain, so it names one of
+                    // its live slots, and we are on the owning core.
                     if let Some(task_id) = unsafe { self.io_state.take_pending_task(token) } {
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                        // SAFETY: the task is waiting on this token on this shard, which is
+                        // the exclusive access `push_owner_completion` requires.
                         unsafe { self.io_state.push_owner_completion(task_id, token, result) };
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                        // SAFETY: same live shard-local token; its waker is dropped now that
+                        // the completion has been handed over.
                         let _ = unsafe { self.io_state.take_waker(token) };
                     } else if let Some(waker) =
-                        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+                        // SAFETY: `token` is live on this shard and has no pending task, so
+                        // the result is stored in its slot for a later poll.
                         unsafe {
                             self.io_state.insert_completed_and_take_waker(token, result)
                         }
@@ -1297,7 +1303,8 @@ impl CpuCore {
 
         let drain_elapsed_ns = drain_started.elapsed().as_nanos() as u64;
         self.metrics.io_completion_total_ns += drain_elapsed_ns;
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: this core's loop is the only accessor of `io_state`, and
+        // `owner_ready_queue` is already borrowed mutably through `&mut self`.
         unsafe {
             self.io_state
                 .swap_owner_completions(&mut self.owner_ready_queue)
@@ -1427,7 +1434,6 @@ impl MultiCoreRuntime {
 
         // SAFETY: the set is zeroed and libc writes only within its fixed ABI
         // size. This runs once on the control thread before workers start.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let allowed = unsafe {
             let mut set: cpu_set_t = mem::zeroed();
             CPU_ZERO(&mut set);

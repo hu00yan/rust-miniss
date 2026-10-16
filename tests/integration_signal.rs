@@ -33,7 +33,6 @@ fn signal_handling_sigterm_graceful() {
     runtime.block_on(async {
         // SAFETY: Sending SIGTERM to the current process is the behavior under
         // test; libc::kill is called with a valid pid from getpid().
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             libc::kill(libc::getpid(), libc::SIGTERM);
         }

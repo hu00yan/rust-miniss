@@ -176,7 +176,8 @@ impl CpuIoState {
         token: IoToken,
         result: Result<CompletionKind, IoError>,
     ) {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: the shard-local `owner_completions` queue; the caller contract
+        // above grants this thread exclusive access to it.
         unsafe { &mut *self.owner_completions.get() }.push(OwnerCompletion {
             task_id,
             token,
@@ -184,16 +185,17 @@ impl CpuIoState {
         });
     }
 
+    /// Swap the owner completion batch with a caller-owned buffer. Both
+    /// vectors retain their allocations, so draining a busy shard does not
+    /// allocate a replacement vector or move each completion individually.
+    ///
     /// # Safety
     ///
     /// The caller must run on the owning shard and provide exclusive access to
     /// the owner completion batch and destination vector.
     #[inline]
-    /// Swap the owner completion batch with a caller-owned buffer. Both
-    /// vectors retain their allocations, so draining a busy shard does not
-    /// allocate a replacement vector or move each completion individually.
     pub(crate) unsafe fn swap_owner_completions(&self, batch: &mut Vec<OwnerCompletion>) {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: same exclusive access to the shard-local `owner_completions` batch.
         std::mem::swap(unsafe { &mut *self.owner_completions.get() }, batch);
     }
 
@@ -206,7 +208,8 @@ impl CpuIoState {
         token: IoToken,
         result: Result<CompletionKind, IoError>,
     ) {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: writes the shard's own `owner_completion` slot; exclusive access
+        // is the caller contract above.
         *unsafe { &mut *self.owner_completion.get() } = Some((token, result));
     }
 
@@ -218,7 +221,8 @@ impl CpuIoState {
         &self,
         token: IoToken,
     ) -> Option<Result<CompletionKind, IoError>> {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: takes the shard's own `owner_completion` slot; exclusive access
+        // is the caller contract above.
         let completion = unsafe { &mut *self.owner_completion.get() };
         if completion
             .as_ref()
@@ -235,7 +239,8 @@ impl CpuIoState {
     /// The caller must run on the owning shard while no completion consumer is
     /// active.
     pub(crate) unsafe fn clear_owner_completion(&self) {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: clears the shard's own `owner_completion` slot; exclusive access
+        // is the caller contract above.
         unsafe { &mut *self.owner_completion.get() }.take();
     }
 
@@ -289,15 +294,13 @@ impl CpuIoState {
         }
     }
 
-    /// Stores a waker in the vec for the given token.
-    /// SAFETY: Must be called from the owning CPU thread.
-    #[inline(always)]
     /// Stores the waker for a pending I/O token.
     ///
     /// # Safety
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure slot reuse cannot race with this store.
+    #[inline(always)]
     pub unsafe fn store_waker(&self, token: IoToken, waker: &Waker) {
         let slots = &mut *self.io_slots.get();
         // SAFETY: This method is only called by the owning CPU thread.
@@ -335,72 +338,63 @@ impl CpuIoState {
         }
     }
 
-    /// Takes a waker from the vec for the given token.
-    /// SAFETY: Must be called from the owning CPU thread.
-    #[inline(always)]
     /// Removes and returns the waker for a pending I/O token.
     ///
     /// # Safety
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the slot has not been released for reuse.
+    #[inline(always)]
     pub unsafe fn take_waker(&self, token: IoToken) -> Option<Waker> {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: `live_slot` wants the owning thread with exclusive `slots`, which
+        // is this method's contract; `token` is live for the same reason.
         unsafe { Self::live_slot(slots, token) }?.waker.take()
     }
 
-    /// Insert a completed IO result.
-    /// SAFETY: Must be called from the owning CPU thread.
-    #[inline(always)]
     /// Stores the completion result for a token.
     ///
     /// # Safety
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// only one completion may be stored for a token before it is consumed.
+    #[inline(always)]
     pub unsafe fn insert_completed(&self, token: IoToken, result: Result<CompletionKind, IoError>) {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: `prepare_slot` wants the owning thread with exclusive `slots`,
+        // which is this method's contract.
         let slot = unsafe { Self::prepare_slot(slots, token) };
         slot.completed = Some(result);
     }
 
-    /// Remove and return a completed IO result.
-    /// SAFETY: Must be called from the owning CPU thread.
-    #[inline(always)]
     /// Removes and returns the completion result for a token.
     ///
     /// # Safety
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the token has not been recycled.
+    #[inline(always)]
     pub unsafe fn take_completed(&self, token: IoToken) -> Option<Result<CompletionKind, IoError>> {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: as in `take_waker` — owning thread, exclusive `slots`, live token.
         unsafe { Self::live_slot(slots, token) }?.completed.take()
     }
 
-    /// Check if a completed IO result exists without removing it.
-    /// SAFETY: Must be called from the owning CPU thread.
-    #[inline(always)]
     /// Returns whether a token has a stored completion.
     ///
     /// # Safety
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the token has not been recycled.
+    #[inline(always)]
     pub unsafe fn has_completed(&self, token: IoToken) -> bool {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: as in `take_waker` — owning thread, exclusive `slots`, live token.
         unsafe { Self::live_slot(slots, token) }
             .and_then(|slot| slot.completed.as_ref())
             .is_some()
     }
 
-    /// Store the task_id that is waiting for this token.
-    /// SAFETY: Must be called from the owning CPU thread.
-    #[inline(always)]
     /// Stores the task waiting on a pending I/O token.
     ///
     /// # Safety
@@ -408,27 +402,26 @@ impl CpuIoState {
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// the task id must remain valid until the operation completes or is
     /// cancelled.
+    #[inline(always)]
     pub unsafe fn store_pending_task(&self, token: IoToken, task_id: crate::waker::TaskId) {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: as in `insert_completed` — owning thread, exclusive `slots`, live token.
         let slot = unsafe { Self::prepare_slot(slots, token) };
         if slot.pending_task != Some(task_id) {
             slot.pending_task = Some(task_id);
         }
     }
 
-    /// Remove and return the task_id for a token.
-    /// SAFETY: Must be called from the owning CPU thread.
-    #[inline(always)]
     /// Removes and returns the task waiting on a pending I/O token.
     ///
     /// # Safety
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
     /// callers must ensure the token has not been recycled.
+    #[inline(always)]
     pub unsafe fn take_pending_task(&self, token: IoToken) -> Option<crate::waker::TaskId> {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: as in `take_waker` — owning thread, exclusive `slots`, live token.
         unsafe { Self::live_slot(slots, token) }?
             .pending_task
             .take()
@@ -500,7 +493,8 @@ impl CpuIoState {
     pub(crate) unsafe fn cancel_and_discard(&self, token: IoToken) {
         let _cancel_requested = self.io_backend.cancel(token);
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: the contract above says the caller owns the shard, so this thread
+        // has the exclusive `slots` access `live_slot` requires.
         let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
             return;
         };
@@ -513,14 +507,15 @@ impl CpuIoState {
     }
 
     /// Consume a terminal completion for an abandoned operation.
-    #[allow(dead_code)]
+    ///
     /// # Safety
     ///
     /// The caller must own the shard and call this only after terminal
     /// completion for the token has been observed.
+    #[allow(dead_code)]
     pub(crate) unsafe fn take_discarded(&self, token: IoToken) -> bool {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: as above — the caller owns the shard, so `slots` is exclusively held.
         let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
             return false;
         };
@@ -541,7 +536,7 @@ impl CpuIoState {
     #[inline(always)]
     pub unsafe fn clear_slot(&self, token: IoToken) {
         let slots = &mut *self.io_slots.get();
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: as above — the caller owns the shard, so `slots` is exclusively held.
         let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
             return;
         };
@@ -557,7 +552,6 @@ impl Drop for CpuIoState {
     fn drop(&mut self) {
         // SAFETY: Drop has exclusive access to CpuIoState; no worker can access
         // these UnsafeCell-backed vectors after the owner is being dropped.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             // Vec::clear is O(n) but fast — just sets len to 0,
             // dropping all remaining values.
@@ -641,7 +635,6 @@ pub fn with_io_state<R>(f: impl for<'a> FnOnce(&'a CpuIoState) -> R) -> R {
         );
         // SAFETY: RuntimeContextGuard installs this pointer only while its
         // owner is alive, and the borrow cannot escape `f`.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         f(unsafe { &*ptr })
     })
 }
@@ -710,7 +703,6 @@ where
         } else {
             // SAFETY: The pointer is only set while the owning runtime thread is active
             // and no other mutable references exist. Access is confined to that thread.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             Some(f(unsafe { &mut *ptr }))
         }
     })
@@ -760,7 +752,6 @@ mod tests {
 
         // SAFETY: The test owns this CpuIoState and never shares it across
         // threads, matching the runtime's shard-local access contract.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             state.insert_completed(old, Ok(CompletionKind::Nop));
             assert!(state.has_completed(old));

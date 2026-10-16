@@ -1,45 +1,8 @@
 //! Tests for async file I/O functionality.
 //!
-//! These tests verify that the async file I/O implementation works correctly
-//! across all supported I/O backends (io_uring, epoll, kqueue).
-//!
-//! ## Key Implementation Details
-//!
-//! ### Memory Safety for Async File Operations
-//!
-//! One critical aspect of our implementation is ensuring memory safety for
-//! asynchronous file operations, particularly with io_uring. The issue we
-//! encountered and fixed was:
-//!
-//! **Problem**: Async file write operations would return successfully but
-//! write incorrect data to the file. Debugging showed that:
-//! - The operation reported writing 4 bytes (correct)
-//! - But the file contained garbage data instead of the expected "Hello, async file I/O!"
-//!
-//! **Root Cause**: In the io_uring backend, we were using `data.as_ptr()` where
-//! `data` was borrowed via `ref data` in pattern matching. When the function
-//! returned, this borrowed reference could become invalid, causing io_uring
-//! to write from freed memory.
-//!
-//! **Solution**: Clone the data first to ensure it stays alive throughout the
-//! entire I/O operation, then use the cloned data's pointer. The cloned data is
-//! stored in the PendingOp to keep it alive until the operation completes.
-//!
-//! ```rust
-//! // Fixed implementation in src/io/uring.rs
-//! Op::WriteFile { fd, offset, ref data } => {
-//!     // Clone data first to ensure it stays alive
-//!     let cloned_data = data.clone();
-//!     let entry = opcode::Write::new(types::Fd(fd), cloned_data.as_ptr(), cloned_data.len() as u32)
-//!         .offset(offset)
-//!         .build()
-//!         .user_data(user_data);
-//!     // Store the cloned data to keep it alive until completion
-//!     (entry, PendingOp::WriteFile { op: Op::WriteFile { fd, offset, data: data.clone() }, data: cloned_data })
-//! }
-//! ```
-//!
-//! This fix ensures that file I/O operations work correctly across all backends.
+//! These exercise the paths the `mio` readiness backend implements through its
+//! thread pool, so a failure here is a real one on a backend that does not
+//! share the io_uring code path.
 
 use rust_miniss::{fs::AsyncFile, Runtime};
 use std::io::Write;

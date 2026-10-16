@@ -203,13 +203,12 @@ impl AsyncTcpStream {
     {
         let fd = self.as_raw_fd();
         let mut buffer = buffer.into();
-        // SAFETY: The owned buffer provides a writable region up to its full
-        // capacity; the slice is only used for this synchronous syscall.
         let direct = with_io_state(|state| state.io_backend.uses_completion_io());
         match if direct {
             Err(io::Error::from_raw_os_error(libc::EAGAIN))
         } else {
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+            // SAFETY: The owned buffer provides a writable region up to its full
+            // capacity; the slice is only used for this synchronous syscall.
             try_read(fd, unsafe {
                 std::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.capacity())
             })
@@ -426,14 +425,12 @@ impl AsyncTcpStream {
         };
         // SAFETY: libc::socket has no Rust wrapper for this exact nonblocking
         // connect setup; returned fd is checked before use.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: fcntl operates on the valid fd created above; failures are
         // reflected by later connect/readiness handling.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -442,7 +439,6 @@ impl AsyncTcpStream {
         let storage = socket_addr_to_storage(&resolved);
         // SAFETY: `storage` contains a sockaddr matching `resolved`, and the
         // pointer/length pair stays valid for the duration of connect.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let ret = unsafe {
             libc::connect(
                 fd,
@@ -454,7 +450,6 @@ impl AsyncTcpStream {
         if ret == 0 {
             // SAFETY: On immediate connect success, ownership of fd moves into
             // TcpStream exactly once.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
             return Self::new(std_stream);
         }
@@ -470,7 +465,6 @@ impl AsyncTcpStream {
 
         // SAFETY: EINPROGRESS leaves fd open and owned by this function; move
         // ownership into TcpStream once while io_uring waits for completion.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let stream = Self::new(std_stream)?;
 
@@ -505,9 +499,9 @@ impl AsRawFd for AsyncTcpStream {
 
 impl IntoRawFd for AsyncTcpStream {
     fn into_raw_fd(mut self) -> RawFd {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: `state` is this thread's own shard, and the readiness tokens
+        // belong to this stream — `cancel_and_discard`'s contract is met.
         with_io_state(|state| unsafe {
-            // SAFETY: Single-threaded access.
             if let Some(token) = self.readiness_token {
                 state.cancel_and_discard(token);
             }
@@ -528,9 +522,9 @@ impl IntoRawFd for AsyncTcpStream {
 
 impl Drop for AsyncTcpStream {
     fn drop(&mut self) {
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
+        // SAFETY: as in `into_raw_fd` — own shard, own tokens. `try_with_io_state`
+        // just skips the body when the dropping thread has no runtime state.
         try_with_io_state(|state| unsafe {
-            // SAFETY: Single-threaded access.
             if let Some(token) = self.readiness_token {
                 state.cancel_and_discard(token);
             }
@@ -554,7 +548,6 @@ impl AsyncRead for AsyncTcpStream {
         with_io_state(|state| {
             // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
             // self-referential fields; poll never moves fields after projection.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let this = self.as_mut().get_mut();
 
             // Consume the readiness completion that woke us. It carries no
@@ -563,7 +556,6 @@ impl AsyncRead for AsyncTcpStream {
             if let Some(readiness_tok) = this.readiness_token.take() {
                 // SAFETY: readiness_tok belongs to this stream and is cleared
                 // once before a new readiness registration is submitted.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe {
                     state.clear_slot(readiness_tok);
                 }
@@ -614,7 +606,6 @@ impl AsyncRead for AsyncTcpStream {
         with_io_state(|state| {
             // SAFETY: AsyncTcpStream has no self-referential fields; poll only
             // mutates fields in place and never moves them out of the pin.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let this = self.as_mut().get_mut();
 
             // Consume the readiness completion that woke us — same fire-and-forget
@@ -622,7 +613,6 @@ impl AsyncRead for AsyncTcpStream {
             if let Some(readiness_tok) = this.readiness_token.take() {
                 // SAFETY: readiness_tok belongs to this stream and is cleared
                 // once before a new readiness registration is submitted.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe {
                     state.clear_slot(readiness_tok);
                 }
@@ -653,7 +643,6 @@ impl AsyncRead for AsyncTcpStream {
             this.readiness_token = Some(token);
             // SAFETY: token was just submitted on this shard; waker/task
             // association is shard-local.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
@@ -672,7 +661,6 @@ impl AsyncWrite for AsyncTcpStream {
         with_io_state(|state| {
             // SAFETY: AsyncTcpStream has no self-referential fields; poll only
             // mutates fields in place and never moves them out of the pin.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let this = self.as_mut().get_mut();
 
             // Clear stale POLLOUT completion (fire-and-forget).
@@ -682,7 +670,6 @@ impl AsyncWrite for AsyncTcpStream {
             if let Some(pollout_tok) = this.pollout_token.take() {
                 // SAFETY: pollout_tok belongs to this stream and is being cleared
                 // once before submitting/reusing any write state.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe {
                     state.clear_slot(pollout_tok);
                 }
@@ -728,7 +715,6 @@ impl AsyncWrite for AsyncTcpStream {
                             this.pollout_token = Some(pollout_tok);
                             // SAFETY: pollout_tok was just submitted on this
                             // shard; waker/task association is shard-local.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 state.store_waker_and_pending_task(
                                     pollout_tok,
@@ -782,14 +768,12 @@ impl AsyncWrite for AsyncTcpStream {
         with_io_state(|state| {
             // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
             // self-referential fields; poll never moves fields after projection.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let this = self.as_mut().get_mut();
 
             // Clear stale POLLOUT completion (fire-and-forget).
             if let Some(pollout_tok) = this.pollout_token.take() {
                 // SAFETY: pollout_tok belongs to this stream and is being cleared
                 // once before submitting/reusing any write state.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe {
                     state.clear_slot(pollout_tok);
                 }
@@ -832,7 +816,6 @@ impl AsyncWrite for AsyncTcpStream {
                             this.pollout_token = Some(pollout_tok);
                             // SAFETY: pollout_tok was just submitted on this
                             // shard; waker/task association is shard-local.
-                            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                             unsafe {
                                 state.store_waker_and_pending_task(
                                     pollout_tok,
@@ -903,11 +886,9 @@ impl HyperRead for AsyncTcpStream {
             let this = self.as_mut().get_mut();
             // SAFETY: `ReadBufCursor` exposes the unwritten tail of hyper's
             // buffer as a writable chunk for the duration of this call.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             let raw = unsafe { buf.as_mut() };
             let read_buf =
                 // SAFETY: same region, `raw.len()` is its exact capacity.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
 
             // Consume the readiness completion that woke us — fire-and-forget,
@@ -915,7 +896,6 @@ impl HyperRead for AsyncTcpStream {
             if let Some(readiness_tok) = this.readiness_token.take() {
                 // SAFETY: readiness_tok belongs to this stream and is cleared
                 // once before a new readiness registration is submitted.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 unsafe {
                     state.clear_slot(readiness_tok);
                 }
@@ -947,7 +927,6 @@ impl HyperRead for AsyncTcpStream {
             };
             this.readiness_token = Some(token);
             // SAFETY: Single-threaded access.
-            // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
@@ -1004,7 +983,6 @@ impl AsyncUdpSocket {
         let fd = socket.as_raw_fd();
         // SAFETY: setsockopt only reads the provided size value during the
         // call; fd belongs to `socket` and remains open.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         unsafe {
             let size: u32 = 4 * 1024 * 1024;
             libc::setsockopt(
@@ -1100,7 +1078,6 @@ impl AsyncUdpSocket {
 fn socket_addr_to_storage(addr: &SocketAddr) -> libc::sockaddr_storage {
     // SAFETY: sockaddr_storage is a plain C storage type; it is immediately
     // overwritten with the matching sockaddr_in/sockaddr_in6 below.
-    // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         SocketAddr::V4(a) => {
@@ -1171,7 +1148,6 @@ fn try_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         // SAFETY: `buf` points to a valid writable slice for the duration of
         // this synchronous nonblocking syscall.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let n = unsafe {
             libc::read(
                 fd,
@@ -1211,7 +1187,6 @@ fn try_read_vectored(fd: RawFd, bufs: &mut [std::io::IoSliceMut<'_>]) -> io::Res
                 ];
                 // SAFETY: `iovecs` contains writable buffers derived from the
                 // caller's mutable slices and remains valid for this syscall.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 let n = unsafe { libc::readv(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
                 if n >= 0 {
                     return Ok(n as usize);
@@ -1227,7 +1202,6 @@ fn try_read_vectored(fd: RawFd, bufs: &mut [std::io::IoSliceMut<'_>]) -> io::Res
                 }
                 // SAFETY: `iovecs` contains writable buffers derived from the
                 // caller's mutable slices and remains valid for this syscall.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 let n = unsafe { libc::readv(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
                 if n >= 0 {
                     return Ok(n as usize);
@@ -1247,7 +1221,6 @@ fn try_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     loop {
         // SAFETY: `buf` points to a valid readable slice for the duration of
         // this synchronous nonblocking syscall.
-        // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
         let n = unsafe {
             libc::write(
                 fd,
@@ -1287,7 +1260,6 @@ fn try_write_vectored(fd: RawFd, bufs: &[std::io::IoSlice<'_>]) -> io::Result<us
                 ];
                 // SAFETY: `iovecs` contains readable buffers derived from the
                 // caller's borrowed slices and remains valid for this syscall.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 let n = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
                 if n >= 0 {
                     return Ok(n as usize);
@@ -1303,7 +1275,6 @@ fn try_write_vectored(fd: RawFd, bufs: &[std::io::IoSlice<'_>]) -> io::Result<us
                 }
                 // SAFETY: `iovecs` contains readable buffers derived from the
                 // caller's borrowed slices and remains valid for this syscall.
-                // SAFETY: The owning shard validates lifetime, aliasing, and initialization before this operation.
                 let n = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
                 if n >= 0 {
                     return Ok(n as usize);

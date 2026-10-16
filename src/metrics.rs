@@ -1,56 +1,23 @@
 //! Control-plane metrics aggregation and Prometheus text exposition.
 //!
-//! # Where the aggregator lives
-//!
-//! Every [`MultiCoreRuntime`](crate::multicore::MultiCoreRuntime) owns exactly
-//! one aggregator thread.  It is started inside `MultiCoreRuntime::new`, in the
-//! same pass that starts the workers, so nothing here is created after startup,
-//! and `Drop for MultiCoreRuntime` stops and joins it.
-//!
-//! It is deliberately **not** a process-global registry:
-//!
-//! * AGENTS.md MUST NOT #4 forbids `static mut`, `lazy_static`,
-//!   `once_cell::sync::`, and `std::sync::LazyLock`, so a global recorder is
-//!   not merely discouraged, it is unimplementable here.
-//! * The `metrics` + `metrics-exporter-prometheus` pair this replaces reaches
-//!   for exactly that shape: a process-global recorder behind a one-time
-//!   initialiser, with a global map of registered handles.  Both crates were
-//!   removed from this repository for having zero call sites.
-//! * A global would also be *wrong* here, not merely forbidden.  An aggregator
-//!   can only see the shards of one runtime, so two runtimes in one process
-//!   would merge into a single, meaningless series set.  Ownership by the
-//!   runtime makes the series set well defined by construction.
-//!
-//! # Sampling
+//! One aggregator thread is started per [`MultiCoreRuntime`](crate::multicore::MultiCoreRuntime)
+//! inside `new`, in the same pass that starts the workers, and `Drop` stops and
+//! joins it. It is deliberately not a process-global registry: AGENTS.md
+//! MUST NOT #4 forbids the statics such a registry needs, and an aggregator can
+//! only see the shards of one runtime, so two runtimes in one process would
+//! merge into a meaningless series set.
 //!
 //! The aggregator wakes on its own clock (default 1s, see
 //! [`crate::config::metrics_interval`]) and fans one
 //! [`crate::multicore::CoreMessage::CollectMetrics`] message per shard out over
-//! the existing bounded inbox, through an internal fan-out handle.  A worker
-//! answers by copying its shard-local counters: no atomics, no locks, and — the
-//! point of the whole exercise — no per-request work.  AGENTS.md MUST #6 holds
-//! by construction: the counters stay shard-local and are merged outside the hot
-//! path.
-//!
-//! The aggregator reaches the shards through that fan-out handle, not through
-//! the runtime itself.  Holding an `Arc<MultiCoreRuntime>` from a background
-//! thread would keep the runtime alive forever and make `Arc::try_unwrap`
-//! permanently fail for embedders; a `Weak` would leave that call racy whenever
-//! a sampling pass happened to be in flight.
+//! the existing bounded inbox. A worker answers by copying its shard-local
+//! counters, so AGENTS.md MUST #6 holds by construction: no atomics, no locks,
+//! and no per-request work.
 //!
 //! Sampling is bounded: a full inbox, a disconnected shard, or a stalled shard
-//! aborts the pass instead of blocking the sampler, and the previous good view
-//! is retained and reported.  A pass also holds one admission ticket for its
-//! whole fan-out, so `shutdown()` cannot close the gate while a pass is still
-//! enqueueing — which is what keeps the post-join termination snapshot empty.
-//!
-//! # Shared-state inventory
-//!
-//! The aggregator thread owns its merged view as a plain local variable.  There
-//! is no `Arc<Mutex<_>>`, no `RwLock`, no atomic, and no shared map.  Other
-//! threads reach the view only by sending it a command and waiting for the reply
-//! on a per-call `std::sync::mpsc` channel; every such wait is bounded by an
-//! explicit deadline.
+//! aborts the pass and the previous good view is retained. A pass holds one
+//! admission ticket for its whole fan-out, so `shutdown()` cannot close the gate
+//! while a pass is still enqueueing.
 
 use std::fmt::Write as _;
 use std::sync::atomic::AtomicUsize;

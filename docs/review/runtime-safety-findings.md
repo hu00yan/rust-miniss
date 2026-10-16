@@ -186,3 +186,16 @@ are not silently mixed into the implementation batch.
     its connection buffer; the bounded test also verifies both responses and
     clean EOF. The updated `just test-full` run passed with 10 HTTP integration
     tests and no ignored tests or leftover processes.
+39. The Linux `/root/gate.sh` sequence (OrbStack Ubuntu, kernel
+    `7.2.9-orbstack-00391-g2b298d05fbd4`, 8 vCPU) reported one intermittent
+    failure from `scripts/linux_safety.sh`: the 512-connection QUIC round
+    `MINISS_QUIC_CONNECTIONS=512 cargo test --all-features --test quinn_h3
+    quinn_endpoints_run_on_separate_owned_shards -- --exact` aborted after 8.19s
+    with `aborted by peer: the application or application protocol caused the
+    connection to be closed during the handshake`. The same command passed the
+    other round in that run (34.84s) and passed 3/3 standalone rounds afterwards
+    (36.51s / 36.57s / 37.57s); the unloaded single-connection variant passed
+    5/5 (1.52-2.55s). This is a load-sensitive handshake abort at the documented
+    512-connection pressure point, so the failing constraint is CPU contention
+    during the handshake, not a timeout budget: no timeout was raised. Rerun the
+    QUIC rounds on an unloaded host before treating this gate as green.
