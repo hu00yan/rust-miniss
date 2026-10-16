@@ -1,6 +1,6 @@
 use crate::cpu::{current_core_id, current_task_id, with_io_state};
 use crate::io::IoToken;
-use crate::multicore::MultiCoreRuntime;
+use crate::multicore::{current_core_handle, CoreHandle, CoreMessage, MultiCoreRuntime};
 use crate::timer::SleepFuture;
 use libc;
 use quinn::udp::{RecvMeta, Transmit, UdpSockRef};
@@ -13,7 +13,7 @@ use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::task::{Context, Poll};
 #[cfg(target_os = "macos")]
@@ -114,10 +114,39 @@ pub struct MinissUdpSocket {
     state: quinn::udp::UdpSocketState,
     recv_token: AtomicU64,
     owner_core: AtomicUsize,
+    /// The owning shard's inbox, captured when ownership is claimed - which
+    /// happens on that shard. `Drop` needs it when the last reference is
+    /// released somewhere else.
+    owner_shard: OnceLock<CoreHandle>,
 }
 
 const UNOWNED_CORE: usize = usize::MAX;
 const QUIC_UDP_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
+
+/// Record the shard that owns `slot` when it is first claimed, so that a later
+/// drop from another thread still knows where a pending operation must be
+/// retired.
+fn capture_shard(slot: &OnceLock<CoreHandle>) {
+    if slot.get().is_none() {
+        if let Some(handle) = current_core_handle() {
+            let _ = slot.set(handle);
+        }
+    }
+}
+
+/// Retire `token` on the shard that owns it.
+///
+/// On the owning shard the token can be cancelled directly. Anywhere else it
+/// has to be posted back, because the token names backend state that only the
+/// owning shard may touch. Handing it back is not optional on every backend:
+/// epoll silently removes a closed descriptor from its interest list, so no
+/// readiness event will arrive to resolve the pending operation, and the
+/// shard's shutdown then waits on that operation forever.
+fn retire_token(owner_shard: &OnceLock<CoreHandle>, token: IoToken) {
+    if let Some(handle) = owner_shard.get() {
+        handle.post(CoreMessage::CancelIoToken { token });
+    }
+}
 
 impl MinissUdpSocket {
     fn new(socket: UdpSocket) -> io::Result<Self> {
@@ -144,6 +173,7 @@ impl MinissUdpSocket {
             state,
             recv_token: AtomicU64::new(0),
             owner_core: AtomicUsize::new(UNOWNED_CORE),
+            owner_shard: OnceLock::new(),
         })
     }
 
@@ -175,26 +205,34 @@ impl MinissUdpSocket {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(()),
-            Err(owner) if owner == core => Ok(()),
-            Err(owner) => Err(io::Error::other(format!(
-                "QUIC socket owned by shard {owner}, polled from shard {core}"
-            ))),
+            Ok(_) => {}
+            Err(owner) if owner == core => {}
+            Err(owner) => {
+                return Err(io::Error::other(format!(
+                    "QUIC socket owned by shard {owner}, polled from shard {core}"
+                )))
+            }
         }
+        capture_shard(&self.owner_shard);
+        Ok(())
     }
 }
 
 impl Drop for MinissUdpSocket {
     fn drop(&mut self) {
-        if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
-            if let Some(token) = self.load_recv_token() {
-                // SAFETY: the `owner_core` check above puts us on the owning shard, and
-                // `token` is this socket's own live recv token.
-                with_io_state(|state| unsafe {
-                    state.cancel_and_discard(token);
-                });
-            }
+        let owner = self.owner_core.load(Ordering::Acquire);
+        let Some(token) = self.load_recv_token() else {
+            return;
+        };
+        if current_core_id() == Some(owner) {
+            // SAFETY: the `owner` check puts us on the owning shard, and
+            // `token` is this socket's own live recv token.
+            with_io_state(|state| unsafe {
+                state.cancel_and_discard(token);
+            });
+            return;
         }
+        retire_token(&self.owner_shard, token);
     }
 }
 
@@ -295,6 +333,8 @@ struct MinissUdpPoller {
     #[cfg(target_os = "macos")]
     retry_timer: Option<MinissSleep>,
     owner_core: AtomicUsize,
+    /// The owning shard's inbox; see `MinissUdpSocket::owner_shard`.
+    owner_shard: OnceLock<CoreHandle>,
 }
 
 impl MinissUdpPoller {
@@ -306,6 +346,7 @@ impl MinissUdpPoller {
             #[cfg(target_os = "macos")]
             retry_timer: None,
             owner_core: AtomicUsize::new(UNOWNED_CORE),
+            owner_shard: OnceLock::new(),
         }
     }
 
@@ -340,26 +381,36 @@ impl MinissUdpPoller {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(()),
-            Err(owner) if owner == core => Ok(()),
-            Err(owner) => Err(io::Error::other(format!(
-                "QUIC poller owned by shard {owner}, polled from shard {core}"
-            ))),
+            Ok(_) => {}
+            Err(owner) if owner == core => {}
+            Err(owner) => {
+                return Err(io::Error::other(format!(
+                    "QUIC poller owned by shard {owner}, polled from shard {core}"
+                )))
+            }
         }
+        capture_shard(&self.owner_shard);
+        Ok(())
     }
 }
 
 impl Drop for MinissUdpPoller {
     fn drop(&mut self) {
         #[cfg(not(target_os = "macos"))]
-        if current_core_id() == Some(self.owner_core.load(Ordering::Acquire)) {
-            if let Some(token) = self.load_token() {
-                // SAFETY: the `owner_core` check above puts us on the owning shard, and
+        {
+            let owner = self.owner_core.load(Ordering::Acquire);
+            let Some(token) = self.load_token() else {
+                return;
+            };
+            if current_core_id() == Some(owner) {
+                // SAFETY: the `owner` check puts us on the owning shard, and
                 // `token` is this poller's own live token.
                 with_io_state(|state| unsafe {
                     state.cancel_and_discard(token);
                 });
+                return;
             }
+            retire_token(&self.owner_shard, token);
         }
     }
 }

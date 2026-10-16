@@ -218,3 +218,24 @@ are not silently mixed into the implementation batch.
     threads, or runtime `Drop`), which is outside this batch's `allowed_files`;
     it needs its own task card with bounded-wait and owner evidence before the
     regular suite can be called deterministic.
+41. `quic::tests::dropping_owner_socket_drains_pending_receive` is racy by
+    construction, on every backend. The test body releases the socket's last
+    `Arc` from two places: inside the task on the owning worker shard, and on
+    the libtest thread after `spawn_on` returns. Whichever release happens last
+    decides the outcome: only the owner's release retires the pending receive
+    synchronously, and the assertion is evaluated inside the task's
+    non-yielding `park(10ms)` + `drain_completions()` window, during which the
+    shard cannot run `process_messages` and therefore cannot honour a
+    cancellation posted from another thread. Evidence: on the unmodified
+    baseline `c4f46a4`, the test fails 0/20 when run standalone on macOS
+    (`--exact --test-threads=1`) and passes when run inside the suite, so the
+    flake predates this batch and is not specific to epoll; on Linux/epoll
+    after the completion-path fix it passes 3/20 standalone and 2/8 full-suite
+    runs, failing only on this test (`FAILED. 123 passed; 1 failed`) with no
+    hang, where before the fix the whole epoll lib suite hung in 4-5 of 6 runs.
+    No timeout was raised, no test was skipped, ignored or deleted; the failing
+    constraint is a race in the test's own construction, and making the
+    off-shard retirement observable inside the owner's busy loop needs a
+    per-shard cancellation mailbox consumed by the drain, which is a design
+    change recorded in `tasks/epoll-pending-op-not-drained.yaml` rather than
+    smuggled into this batch.

@@ -229,6 +229,62 @@ impl CoreWakeup {
     pub(crate) fn notify(&self) {}
 }
 
+/// A shard's inbox handle, valid from any thread.
+///
+/// Posting to a shard is a `try_send` plus an explicit wake, because a shard
+/// parked in its backend poll is not woken by a queue push on its own. This is
+/// the same pairing `MultiCoreRuntime::notify_core` performs; it lives in its
+/// own type so an owner that is dropped off its shard - `MinissUdpSocket` and
+/// `MinissUdpPoller` are the current ones - can reach the shard without holding
+/// the runtime, which is not globally reachable for every construction path.
+#[derive(Clone)]
+pub(crate) struct CoreHandle {
+    sender: Sender<CoreMessage>,
+    wakeup: Arc<CoreWakeup>,
+    thread: thread::Thread,
+}
+
+impl CoreHandle {
+    /// Queue `message` for the shard and wake it.
+    ///
+    /// Returns `false` when the bounded inbox is full. Callers are `Drop`
+    /// paths, so this never blocks: the dropping thread may be another shard's
+    /// worker, and blocking it would stall that shard (AGENTS.md MUST NOT #3).
+    /// A full inbox means the shard is already saturated, so a dropped
+    /// cancellation is the lesser cost; the alternative - `send_timeout` -
+    /// would trade a leaked operation for a stalled worker.
+    pub(crate) fn post(&self, message: CoreMessage) -> bool {
+        if self.sender.try_send(message).is_err() {
+            return false;
+        }
+        self.thread.unpark();
+        self.wakeup.notify();
+        true
+    }
+}
+
+impl std::fmt::Debug for CoreHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreHandle").finish_non_exhaustive()
+    }
+}
+
+thread_local! {
+    /// The inbox handle of the shard this thread runs as, installed by the
+    /// worker before it enters its event loop. `None` on every other thread.
+    static CORE_HANDLE: RefCell<Option<CoreHandle>> = const { RefCell::new(None) };
+}
+
+/// The inbox handle of the shard this thread is running as, if any.
+pub(crate) fn current_core_handle() -> Option<CoreHandle> {
+    CORE_HANDLE.with(|handle| handle.borrow().clone())
+}
+
+/// Install this thread's shard inbox handle for the lifetime of the thread.
+fn install_core_handle(handle: CoreHandle) {
+    CORE_HANDLE.with(|slot| *slot.borrow_mut() = Some(handle));
+}
+
 thread_local! {
     static LOCAL_SPAWN_QUEUE: RefCell<Vec<LocalSpawn>> = const { RefCell::new(Vec::new()) };
     static LOCAL_SPAWN_COUNT: Cell<usize> = const { Cell::new(0) };
@@ -321,6 +377,12 @@ pub enum CoreMessage {
     CollectMetrics {
         reply: std::sync::mpsc::Sender<CoreMetricsSnapshot>,
     },
+    /// Retire an I/O token on the shard that owns it.
+    ///
+    /// Posted by the owner of the underlying resource when that owner is
+    /// dropped from another thread: the token names backend state that only the
+    /// owning shard may touch, so it cannot be retired where the drop happens.
+    CancelIoToken { token: IoToken },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,6 +416,10 @@ impl std::fmt::Debug for CoreMessage {
                 .field("task_id", task_id)
                 .finish(),
             Self::CollectMetrics { .. } => write!(f, "CollectMetrics"),
+            Self::CancelIoToken { token } => f
+                .debug_struct("CancelIoToken")
+                .field("token", token)
+                .finish(),
         }
     }
 }
@@ -1064,6 +1130,13 @@ impl CpuCore {
                     tracing::trace!("Cancelled task {:?}", task_id);
                     processed += 1;
                 }
+                Ok(CoreMessage::CancelIoToken { token }) => {
+                    // SAFETY: the poster recorded this shard as `token`'s owner
+                    // before sending, so the token names this core's own
+                    // backend state and no other shard's.
+                    unsafe { self.io_state.cancel_and_discard(token) };
+                    processed += 1;
+                }
                 Ok(CoreMessage::CollectMetrics { reply }) => {
                     let _ = reply.send(self.metrics_snapshot());
                     processed += 1;
@@ -1228,8 +1301,10 @@ impl CpuCore {
         // SAFETY: UringBackend is thread-affine and we are on the owning thread.
         #[cfg(target_os = "linux")]
         let wakeup_token = self.wakeup_poll_token;
+        // The mio backend has no parking poll of its own, so there is never a
+        // wakeup completion to recognise.
         #[cfg(not(target_os = "linux"))]
-        let _wakeup_token: Option<IoToken> = None;
+        let wakeup_token: Option<IoToken> = None;
 
         // Empty or nearly-empty ready queues can afford a larger CQE drain batch.
         let drain_limit = crate::config::io_drain_limit().unwrap_or_else(|| {
@@ -1242,7 +1317,13 @@ impl CpuCore {
             }
         });
         let drain_started = Instant::now();
-        #[cfg(target_os = "linux")]
+        // Only io_uring has a fused CQE path. The mio backend (epoll on Linux,
+        // kqueue elsewhere) publishes completions through its own portable queue,
+        // so those are routed through the same owner-task protocol below before
+        // the ready queue is polled; otherwise readiness completions stay
+        // invisible to shard-local futures. Selecting on the backend rather than
+        // the OS matters on Linux, where the mio backend is a supported choice.
+        #[cfg(io_backend = "io_uring")]
         // SAFETY: this is the owning runtime thread for `io_state`, and nothing else
         // drains CQEs concurrently — the contract `drain_completions_fused` states.
         let (count, saw_wakeup_poll, wakeups) = unsafe {
@@ -1250,12 +1331,8 @@ impl CpuCore {
                 .io_backend
                 .drain_completions_fused(wakeup_token, drain_limit)
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(io_backend = "io_uring"))]
         let (count, saw_wakeup_poll, wakeups) = {
-            // kqueue/mio uses the portable completion queue rather than the
-            // io_uring fused path. Route those completions through the same
-            // owner-task protocol before polling the ready queue; otherwise
-            // readiness CQEs remain invisible to shard-local futures.
             let mut completions = Vec::with_capacity(drain_limit);
             let drained = self
                 .io_state
@@ -1266,7 +1343,16 @@ impl CpuCore {
             } else {
                 let count = completions.len();
                 let mut wakeups = 0usize;
+                let mut saw_wakeup_poll = false;
                 for (token, result) in completions {
+                    if Some(token) == wakeup_token {
+                        // The shard's own parking poll. Its completion is what woke
+                        // this event loop; the armed bookkeeping is retired by
+                        // `clear_wakeup_poll` once the drain returns. It belongs to
+                        // no caller, so it is reported and not delivered.
+                        saw_wakeup_poll = true;
+                        continue;
+                    }
                     // SAFETY: this CQE is terminal for `token`, and the drain above ran on
                     // this shard — `take_discarded`'s two preconditions.
                     if unsafe { self.io_state.take_discarded(token) } {
@@ -1292,7 +1378,7 @@ impl CpuCore {
                         waker.wake();
                     }
                 }
-                (count, false, wakeups)
+                (count, saw_wakeup_poll, wakeups)
             }
         };
 
@@ -1548,6 +1634,9 @@ impl MultiCoreRuntime {
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
             let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
             core_senders.push(sender.clone());
+            // The worker publishes this clone as its own inbox handle, so code
+            // running on the shard can hand work back to it.
+            let core_sender = sender.clone();
             core_shutdowns.push(core_shutdown.clone());
             core_exited.push(core_exited_flag.clone());
             force_shutdowns.push(force_shutdown.clone());
@@ -1561,6 +1650,11 @@ impl MultiCoreRuntime {
             let handle = thread::Builder::new()
                 .name(format!("miniss-core-{core_id}"))
                 .spawn(move || {
+                    install_core_handle(CoreHandle {
+                        sender: core_sender,
+                        wakeup: wakeup.clone(),
+                        thread: thread::current(),
+                    });
                     // io_uring instances are thread-affine; create the backend inside
                     // the worker thread that will submit and poll its operations.
                     let io_backend = match MultiCoreRuntime::create_io_backend(core_id) {

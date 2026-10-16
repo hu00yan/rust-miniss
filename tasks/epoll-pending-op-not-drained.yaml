@@ -1,0 +1,109 @@
+id: epoll-pending-op-not-drained
+title: epoll 后端上 fd 被关闭的 pending op 永不落定，进而让 worker 在 shutdown 时永不退出
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: open
+blocks: linux-epoll-fallback-backend
+
+## 症状（原始可复现记录）
+
+在 Linux 上强制 epoll 后端（`MINISS_IO_BACKEND=epoll cargo test --lib`）：
+
+1. `quic::tests::dropping_owner_socket_drains_pending_receive` 在
+   `src/quic.rs` 断言失败 —— "owner drop left a receive operation live"，
+   `pending_after = 1`。
+2. 同一用例在部分运行里完全不返回：实测 `--test-threads=1` 6 次中 5 次挂住；
+   默认线程数 6 次中 4 次挂住（45 s 上限，rc=124）。整套 lib 也大面积挂死。
+
+gdb 抓到的挂死现场：测试线程停在 `MultiCoreRuntime::drop`（`src/multicore.rs:2635`）
+→ `join`；`miniss-core-0` 停在 `CpuCore::run`（`src/multicore.rs:895`）→
+`MioBackend::park` → `epoll_wait`。worker 只有在
+`pending_operation_count() == 0` 时才退出 draining（`src/multicore.rs:868-874`），
+所以「一个永不落定的 pending op」同时解释了断言失败与 join 永久阻塞。
+
+## 根因（两条，均已在代码中定位）
+
+**(1) 非属主线程上的 drop 静默跳过取消。** 用例里 socket 的最后一个 `Arc` 可能落在
+测试线程（`spawn_on` 之后 `drop` 外层引用）而不是 shard 0 上；旧代码
+（`src/quic.rs` 的 `Drop`）只在 `current_core_id() == Some(owner_core)` 时才取消，
+于是取消被跳过。剩下的唯一出路是「该 fd 上来就绪事件」，而 epoll 在 fd 关闭时会
+把它从 interest list 里静默摘掉，**不产生事件** → op 永不落定。
+
+**(2) Linux 上 mio 后端的完成事件从未被处理。** `process_io_completions`
+（`src/multicore.rs`）按**操作系统**选择 fused 路径（`#[cfg(target_os = "linux")]`），
+但 `drain_completions_fused` 只有 io_uring 实现，`IoBackend` 的默认实现返回
+`(0, false, 0)`（`src/io/mod.rs:358-364`）。因此在 Linux + epoll 上，
+**任何一个完成都不会被消费** —— `pending_ops` 只增不减，这正是整套 lib 大面积挂死
+的直接原因（之前把它归给根因 (1) 是不完整的）。
+
+## 已落地的修复
+
+- **根因 (1)：所有权语义修正。** 新增 `CoreHandle`（shard inbox sender + 唤醒，
+  `src/multicore.rs`），worker 在自己的线程上安装 TLS，供 shard 上运行的代码取回；
+  新增 `CoreMessage::CancelIoToken { token }`，在 `process_messages` 里就地
+  `cancel_and_discard`。`MinissUdpSocket` / `MinissUdpPoller` 在领取所有权时记录
+  属主 shard 的 handle，`Drop` 时若不在属主线上就把取消请求投递给属主（有界通道，
+  符合架构契约 MUST #4）。
+- **根因 (2)：按后端而非按 OS 选择 drain 路径。** fused 路径改为
+  `#[cfg(io_backend = "io_uring")]`，其余后端（Linux/epoll 与 macOS/kqueue）走可移植
+  完成队列；并在可移植路径里识别运行时**自己的 parking poll**
+  （对照 `src/io/uring.rs:429-436`）——只置 `saw_wakeup_poll` 标志、不投递给任何
+  slot，从而让 `clear_wakeup_poll` 在 mio 后端上也能正确清除 armed 状态。否则运行时
+  会永久保留一个已 armed 的内部 op，它会计入 `pending_operation_count()`。
+
+## 实测证据（Linux 6.x → io_uring；`MINISS_IO_BACKEND=epoll` → mio）
+
+修复前：epoll lib 套件 6 次中 4-5 次挂死，无法完成；目标用例 20/20 失败且常挂住。
+
+修复后（同一 VM、同一次构建）：
+
+- epoll 整套 lib 不再挂死。8 次运行：2 次 `ok. 124 passed`，6 次
+  `FAILED. 123 passed; 1 failed`，失败者全部是同一个用例（见「残留」）。
+- 目标用例单独重复 20 次：3 通过 / 7 失败 / 0 挂死（修复前 0 通过 / 20 失败 + 挂死）。
+- io_uring 未被改动：5 次运行 4 次 `ok. 125 passed`，1 次 rc=124 属于
+  `multicore-spawn-shutdown-stall` 的既有挂死（另一个卡）。
+
+## 残留（有意不掩盖）
+
+`quic::tests::dropping_owner_socket_drains_pending_receive` **本身就是竞态**，
+与后端无关。用例主体对同一个 `Arc` 有两处 `drop`：worker 上任务里的那次，和
+`spawn_on` 之后测试线程上的那次；**谁最后 drop 谁决定结果**。当测试线程是最后
+一个时，属主上的退订是**异步**的（消息要等 shard 回到 `process_messages`），
+而用例的 10×10ms 窗口是任务内的同步 `park` + `drain_completions` 循环，
+期间 shard 不可能处理消息 → `pending_after == 0` 无法成立。
+
+这不是本次改动引入的：在**未改动的基线** `c4f46a4` 上，同一用例在 macOS 上单独
+运行（`--exact --test-threads=1`）同样 **0/20 通过**；放进整套里则会通过（测试
+线程的 drop 通常先发生，于是属主拿到最后一次 drop 并同步取消）。已按 AGENTS.md
+的 `Test and process hygiene` 记入 `docs/review/runtime-safety-findings.md` #41。
+
+要让属主在自己的忙循环内就观察到退订，只有两条路，都需要设计决策，故不在本卡内
+顺手做：
+
+- **(B) drain 侧探测死 fd**：每轮 drain 对每个存活 op 多一次 `fcntl(F_GETFD)`。
+  与走 events 的正常路径形成两套完成来源，且热路径系统调用随在途 op 数线性增长，
+  在 10k 连接量级不可接受。
+- **(C) 每 shard 一个「外部取消」信箱**，由 **drain**（而非消息循环）消费：一次
+  relaxed 原子读即可在空时短路，能在任意忙循环内生效且确定性。代价是引入一份
+  跨线程共享的每 shard 结构（新增所有权/生命周期设计），需要单独评审。
+
+## 非目标
+
+- 不为了变绿而调大超时或 skip/ignore 用例
+- 不在本卡改 io_uring 的完成路径
+- 不重写 `MioBackend` 的 events 分发
+- 不修改测试用例本身（残留已记录，见上）
+
+## 推翻条件
+
+- 若 (C) 证明会显著抬高 drain 成本或与 `CoreHandle` 重复，则应改回 (B) 并接受
+  热路径代价，或重新审视「drain 退出条件依赖 pending 计数」这一设计本身。
+- 若某天该用例被改成确定性构造（例如把最后一次 drop 固定到属主线），则本卡的
+  「残留」段落即可删除。
+
+allowed_files:
+  - src/quic.rs
+  - src/io/mio_poll.rs
+  - src/multicore.rs
+  - tasks/epoll-pending-op-not-drained.yaml
+  - docs/review/runtime-safety-findings.md
+  - docs/DECISION_LOG.md
