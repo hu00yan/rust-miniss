@@ -322,8 +322,8 @@ fn linux_uring_delayed_submit_readv_survives_relocation_pressure() {
 }
 
 /// Fill a nonblocking socket without involving the runtime, so the next public
-/// `poll_write_vectored` cannot complete on its optimistic `writev(2)` fast
-/// path and must queue an io_uring Writev SQE.
+/// `poll_write` / `poll_write_vectored` cannot complete on its optimistic
+/// `write(2)` / `writev(2)` fast path and must arm POLLOUT instead.
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 fn fill_send_buffer_until_would_block(fd: std::os::fd::RawFd) {
     let bytes = [0x3Cu8; 8192];
@@ -343,10 +343,10 @@ fn fill_send_buffer_until_would_block(fd: std::os::fd::RawFd) {
     }
 }
 
-/// Kernel-executed delayed-submit writev regression.  The server does not
-/// drain until the Writev SQE has been constructed and relocation pressure has
-/// run, which exercises the actual SQE-to-terminal-CQE lifetime rather than a
-/// structural stand-in.
+/// Kernel-executed delayed-submit writev regression.  The peer does not drain
+/// until the blocking write has armed POLLOUT and relocation pressure has run,
+/// which exercises the readiness registration's SQE-to-terminal-CQE lifetime
+/// rather than a structural stand-in.
 #[test]
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 fn linux_uring_delayed_submit_writev_survives_relocation_pressure() {
@@ -430,15 +430,12 @@ fn linux_uring_delayed_submit_writev_survives_relocation_pressure() {
             let n = poll_fn(|cx| {
                 let poll = std::pin::Pin::new(&mut writer).poll_write_vectored(cx, &bufs);
                 if !queued {
-                    assert!(
-                        poll.is_pending(),
-                        "writev must queue with a full send buffer"
-                    );
+                    assert!(poll.is_pending(), "writev must block on a full send buffer");
                     queued = true;
                     relocation_pressure();
                     drain_tx
                         .send(())
-                        .expect("release peer after SQE construction");
+                        .expect("release peer after arming POLLOUT");
                 }
                 poll
             })
@@ -451,4 +448,135 @@ fn linux_uring_delayed_submit_writev_survives_relocation_pressure() {
 
         peer.join().expect("peer thread");
     }
+}
+
+/// Bounded backpressure regression for the borrowed scalar write path.
+///
+/// A full send buffer must make `poll_write` return `Pending` after arming
+/// POLLOUT — and it must stay `Pending` while the buffer is still full, so a
+/// task cannot spin. Once the peer drains, the same outstanding poll must
+/// deliver the whole payload across as many retries as the 4 KiB send buffer
+/// needs.
+#[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn linux_uring_poll_write_blocks_on_readiness_until_the_peer_drains() {
+    use futures::future::poll_fn;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    const PAYLOAD_LEN: usize = 64 * 1024;
+
+    let runtime = uring_runtime();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer listener");
+    let addr = listener.local_addr().expect("peer listener address");
+    let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+    let (drain_tx, drain_rx) = mpsc::sync_channel(1);
+
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept client");
+        // Bounded wait: a stalled peer surfaces as a read timeout instead of a
+        // hung test process.
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound peer read");
+        let receive_buffer = 4096i32;
+        // SAFETY: socket fd is live and the option value has the expected type
+        // and size for SO_RCVBUF.
+        let set_rcvbuf = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&receive_buffer as *const i32).cast(),
+                std::mem::size_of_val(&receive_buffer) as libc::socklen_t,
+            )
+        };
+        assert_eq!(set_rcvbuf, 0, "set peer receive buffer");
+        accepted_tx.send(()).expect("notify peer acceptance");
+        drain_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("release peer drain");
+        let mut scratch = [0u8; 8192];
+        let mut received = 0usize;
+        while received < PAYLOAD_LEN {
+            match socket.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(error) => panic!("peer drain failed after {received} bytes: {error}"),
+            }
+        }
+        assert_eq!(received, PAYLOAD_LEN, "peer must receive the whole payload");
+    });
+
+    let client = TcpStream::connect(addr).expect("connect client");
+    accepted_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("peer accepted client");
+
+    runtime.block_on(async {
+        use rust_miniss::AsyncWrite;
+
+        let mut writer = AsyncTcpStream::from(client);
+        let send_buffer = 4096i32;
+        // SAFETY: writer owns this live fd; the option value is valid for
+        // SO_SNDBUF and only alters this test socket's kernel buffering.
+        let set_sndbuf = unsafe {
+            libc::setsockopt(
+                writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&send_buffer as *const i32).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        };
+        assert_eq!(set_sndbuf, 0, "set client send buffer");
+        fill_send_buffer_until_would_block(writer.as_raw_fd());
+
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+        let mut written = 0usize;
+        let mut blocked = false;
+        poll_fn(|cx| loop {
+            if written == payload.len() {
+                return Poll::<()>::Ready(());
+            }
+            match std::pin::Pin::new(&mut writer).poll_write(cx, &payload[written..]) {
+                Poll::Ready(Ok(0)) => panic!(
+                    "poll_write reported no progress with {} bytes left",
+                    payload.len() - written
+                ),
+                Poll::Ready(Ok(n)) => written += n,
+                Poll::Ready(Err(error)) => {
+                    panic!("poll_write failed after {written} bytes: {error}")
+                }
+                Poll::Pending => {
+                    if !blocked {
+                        blocked = true;
+                        // Re-poll before the peer drains: a full send buffer
+                        // must not report writable, or the task would spin.
+                        let again =
+                            std::pin::Pin::new(&mut writer).poll_write(cx, &payload[written..]);
+                        assert!(
+                            again.is_pending(),
+                            "poll_write must not report writable while the send buffer is full"
+                        );
+                        drain_tx.send(()).expect("release peer drain");
+                    }
+                    return Poll::Pending;
+                }
+            }
+        })
+        .await;
+        assert_eq!(written, payload.len(), "short write after backpressure");
+        assert!(
+            blocked,
+            "a {PAYLOAD_LEN}-byte payload must not fit a 4 KiB send buffer"
+        );
+        drop(writer);
+    });
+
+    peer.join().expect("peer thread");
 }

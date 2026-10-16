@@ -154,10 +154,10 @@ fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListen
 pub struct AsyncTcpStream {
     descriptor: Option<RegisteredDescriptor>,
     readiness_token: Option<IoToken>,
-    write_token: Option<IoToken>,
-    /// Token for POLLOUT submitted after a Write returned EAGAIN.
-    /// The task is woken when the socket becomes writable, then
-    /// a fresh Write is submitted.
+    /// Token for the POLLOUT registration submitted when `poll_write` or
+    /// `poll_write_vectored` finds the send buffer full. The task is woken when
+    /// the socket may be writable and retries the syscall directly; no write is
+    /// queued and no byte is copied.
     pollout_token: Option<IoToken>,
     /// Stream I/O tokens and TLS state belong to the creating shard. The
     /// marker prevents accidental migration through an `Arc<OwnedFd>` lease.
@@ -186,7 +186,6 @@ impl AsyncTcpStream {
         Ok(Self {
             descriptor: Some(descriptor),
             readiness_token: None,
-            write_token: None,
             pollout_token: None,
             _owner_local: PhantomData,
         })
@@ -505,9 +504,6 @@ impl IntoRawFd for AsyncTcpStream {
             if let Some(token) = self.readiness_token {
                 state.cancel_and_discard(token);
             }
-            if let Some(token) = self.write_token {
-                state.cancel_and_discard(token);
-            }
             if let Some(token) = self.pollout_token {
                 state.cancel_and_discard(token);
             }
@@ -526,9 +522,6 @@ impl Drop for AsyncTcpStream {
         // just skips the body when the dropping thread has no runtime state.
         try_with_io_state(|state| unsafe {
             if let Some(token) = self.readiness_token {
-                state.cancel_and_discard(token);
-            }
-            if let Some(token) = self.write_token {
                 state.cancel_and_discard(token);
             }
             if let Some(token) = self.pollout_token {
@@ -663,88 +656,43 @@ impl AsyncWrite for AsyncTcpStream {
             // mutates fields in place and never moves them out of the pin.
             let this = self.as_mut().get_mut();
 
-            // Clear stale POLLOUT completion (fire-and-forget).
-            // POLLOUT just serves as a wakeup mechanism when the socket
-            // becomes writable after an EAGAIN; the completion itself is
-            // discarded, then poll_write submits a fresh Write SQE.
+            // Consume the readiness completion that woke us — same
+            // fire-and-forget wakeup role as `readiness_token` on the read path.
             if let Some(pollout_tok) = this.pollout_token.take() {
-                // SAFETY: pollout_tok belongs to this stream and is being cleared
-                // once before submitting/reusing any write state.
+                // SAFETY: pollout_tok belongs to this stream and is cleared
+                // once before a new readiness registration is submitted.
                 unsafe {
                     state.clear_slot(pollout_tok);
                 }
             }
 
-            if this.write_token.is_none() {
-                match try_write(this.as_raw_fd(), buf) {
-                    Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
-                    Err(err) if is_wouldblock(&err) => {}
-                    Err(err) => return Poll::Ready(Err(err)),
-                }
+            // write(2) straight from the caller's slice: one syscall, no copy.
+            // Submitting `Op::Write` would make the backend copy `buf` into an
+            // owned `Buffer` and queue that, and `buf` is borrowed, so it could
+            // not be handed to the kernel as a queued operation anyway.
+            // `poll_read` reasons the same way about the borrowed read buffer.
+            match try_write(this.as_raw_fd(), buf) {
+                Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
             }
 
-            let token = if let Some(token) = this.write_token {
-                // SAFETY: Single-threaded access.
-                if let Some(result) = unsafe { state.take_completed(token) } {
-                    this.write_token = None;
-                    return match result {
-                        Ok(crate::io::CompletionKind::Write { bytes_written }) => {
-                            Poll::Ready(Ok(bytes_written))
-                        }
-                        Ok(_) => Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Unexpected completion",
-                        ))),
-                        Err(ref e) if is_write_wouldblock(e) => {
-                            // Socket send buffer full. Submit POLLOUT to be
-                            // notified when buffer space becomes available.
-                            // Then return Pending; the task will be woken by
-                            // POLLOUT and retry the write with a fresh SQE.
-                            let pollout_op = crate::io::Op::PollAdd {
-                                fd: this.as_raw_fd(),
-                                events: libc::POLLOUT as u32,
-                                multishot: false,
-                            };
-                            let pollout_tok = match state
-                                .io_backend
-                                .submit_with_descriptor(pollout_op, this.descriptor_lease())
-                            {
-                                Ok(token) => token,
-                                Err(error) => return Poll::Ready(Err(error.into())),
-                            };
-                            this.pollout_token = Some(pollout_tok);
-                            // SAFETY: pollout_tok was just submitted on this
-                            // shard; waker/task association is shard-local.
-                            unsafe {
-                                state.store_waker_and_pending_task(
-                                    pollout_tok,
-                                    cx.waker(),
-                                    current_task_id(),
-                                );
-                            }
-                            return Poll::Pending;
-                        }
-                        Err(e) => Poll::Ready(Err(e.into())),
-                    };
-                }
-                token
-            } else {
-                let op = crate::io::Op::Write {
-                    fd: this.as_raw_fd(),
-                    offset: 0,
-                    data: Buffer::from_slice(buf),
-                };
-                let token = match state
-                    .io_backend
-                    .submit_with_descriptor(op, this.descriptor_lease())
-                {
-                    Ok(token) => token,
-                    Err(error) => return Poll::Ready(Err(error.into())),
-                };
-                this.write_token = Some(token);
-                token
+            // Send buffer full: arm POLLOUT and retry the syscall on wakeup.
+            let op = crate::io::Op::PollAdd {
+                fd: this.as_raw_fd(),
+                events: libc::POLLOUT as u32,
+                multishot: false,
             };
-            // SAFETY: Single-threaded access.
+            let token = match state
+                .io_backend
+                .submit_with_descriptor(op, this.descriptor_lease())
+            {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            this.pollout_token = Some(token);
+            // SAFETY: token was just submitted on this shard; waker/task
+            // association is shard-local.
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
@@ -770,85 +718,43 @@ impl AsyncWrite for AsyncTcpStream {
             // self-referential fields; poll never moves fields after projection.
             let this = self.as_mut().get_mut();
 
-            // Clear stale POLLOUT completion (fire-and-forget).
+            // Consume the readiness completion that woke us — same
+            // fire-and-forget wakeup role as `readiness_token` on the read path.
             if let Some(pollout_tok) = this.pollout_token.take() {
-                // SAFETY: pollout_tok belongs to this stream and is being cleared
-                // once before submitting/reusing any write state.
+                // SAFETY: pollout_tok belongs to this stream and is cleared
+                // once before a new readiness registration is submitted.
                 unsafe {
                     state.clear_slot(pollout_tok);
                 }
             }
 
-            if !bufs.is_empty() && this.write_token.is_none() {
-                match try_write_vectored(this.as_raw_fd(), bufs) {
-                    Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
-                    Err(err) if is_wouldblock(&err) => {}
-                    Err(err) => return Poll::Ready(Err(err)),
-                }
+            // writev(2) straight from the caller's slices: one syscall, no copy —
+            // the mirror of `poll_read_vectored`. Submitting `Op::WriteVectored`
+            // would have the backend copy every slice into its own `Buffer`s and
+            // then write those, which is the same double copy the readv path
+            // avoids.
+            match try_write_vectored(this.as_raw_fd(), bufs) {
+                Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
             }
 
-            let token = if let Some(token) = this.write_token {
-                // SAFETY: Single-threaded access.
-                if let Some(result) = unsafe { state.take_completed(token) } {
-                    this.write_token = None;
-                    return match result {
-                        Ok(crate::io::CompletionKind::WriteVectored { bytes_written, .. }) => {
-                            Poll::Ready(Ok(bytes_written))
-                        }
-                        Ok(_) => Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Unexpected completion",
-                        ))),
-                        Err(ref e) if is_write_wouldblock(e) => {
-                            // Same as poll_write: EAGAIN → POLLOUT → retry
-                            let pollout_op = crate::io::Op::PollAdd {
-                                fd: this.as_raw_fd(),
-                                events: libc::POLLOUT as u32,
-                                multishot: false,
-                            };
-                            let pollout_tok = match state
-                                .io_backend
-                                .submit_with_descriptor(pollout_op, this.descriptor_lease())
-                            {
-                                Ok(token) => token,
-                                Err(error) => return Poll::Ready(Err(error.into())),
-                            };
-                            this.pollout_token = Some(pollout_tok);
-                            // SAFETY: pollout_tok was just submitted on this
-                            // shard; waker/task association is shard-local.
-                            unsafe {
-                                state.store_waker_and_pending_task(
-                                    pollout_tok,
-                                    cx.waker(),
-                                    current_task_id(),
-                                );
-                            }
-                            return Poll::Pending;
-                        }
-                        Err(e) => Poll::Ready(Err(e.into())),
-                    };
-                }
-                token
-            } else {
-                let mut buffers: SmallVec<[crate::Buffer; 4]> = SmallVec::new();
-                for buf in bufs {
-                    buffers.push(crate::Buffer::from_slice(buf));
-                }
-                let op = crate::io::Op::WriteVectored {
-                    fd: this.as_raw_fd(),
-                    buffers,
-                };
-                let token = match state
-                    .io_backend
-                    .submit_with_descriptor(op, this.descriptor_lease())
-                {
-                    Ok(token) => token,
-                    Err(error) => return Poll::Ready(Err(error.into())),
-                };
-                this.write_token = Some(token);
-                token
+            // Send buffer full: arm POLLOUT and retry the syscall on wakeup.
+            let op = crate::io::Op::PollAdd {
+                fd: this.as_raw_fd(),
+                events: libc::POLLOUT as u32,
+                multishot: false,
             };
-            // SAFETY: Single-threaded access.
+            let token = match state
+                .io_backend
+                .submit_with_descriptor(op, this.descriptor_lease())
+            {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            this.pollout_token = Some(token);
+            // SAFETY: token was just submitted on this shard; waker/task
+            // association is shard-local.
             unsafe {
                 state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
             }
@@ -1121,18 +1027,6 @@ fn socket_addr_len(addr: &SocketAddr) -> libc::socklen_t {
     match addr {
         SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
         SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-    }
-}
-
-/// Check if an IoError represents a "write would block" condition (EAGAIN/EWOULDBLOCK).
-/// io_uring returns -EAGAIN when the socket send buffer is full.
-fn is_write_wouldblock(e: &crate::io::IoError) -> bool {
-    match e {
-        crate::io::IoError::Io(io_err) => {
-            io_err.raw_os_error() == Some(libc::EAGAIN)
-                || io_err.raw_os_error() == Some(libc::EWOULDBLOCK)
-        }
-        _ => false,
     }
 }
 

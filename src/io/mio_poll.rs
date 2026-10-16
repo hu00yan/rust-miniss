@@ -415,7 +415,7 @@ impl IoProvider for MioBackend {
                         pending_ops[slot] = Some((io_token, op));
                     }
                 }
-                Op::Write { fd, .. } | Op::WriteStatic { fd, .. } | Op::WriteRent { fd, .. } => {
+                Op::WriteStatic { fd, .. } | Op::WriteRent { fd, .. } => {
                     let effective_fd = leased_fd.unwrap_or(*fd);
                     let mut source = mio::unix::SourceFd(&effective_fd);
                     if let Err(e) =
@@ -1043,78 +1043,6 @@ impl IoProvider for MioBackend {
                             data,
                         })
                     }
-                    Op::Write { fd, offset, data } => {
-                        let effective_fd = leased_fd.unwrap_or(fd);
-                        let mut written = 0usize;
-                        let mut requeue = false;
-                        let result = loop {
-                            let remaining = &data[written..];
-                            if remaining.is_empty() {
-                                break Ok(CompletionKind::Write {
-                                    bytes_written: written,
-                                });
-                            }
-                            // SAFETY: remaining points to initialized bytes
-                            // owned by `data`; write reads at most len bytes.
-                            let ret = unsafe {
-                                libc::write(
-                                    effective_fd,
-                                    remaining.as_ptr() as *const libc::c_void,
-                                    remaining.len(),
-                                )
-                            };
-                            if ret < 0 {
-                                let err = io::Error::last_os_error();
-                                if err.kind() == io::ErrorKind::Interrupted {
-                                    continue;
-                                }
-                                if err.kind() == io::ErrorKind::WouldBlock {
-                                    if written == 0 {
-                                        requeue = true;
-                                        break Err(IoError::Io(err));
-                                    } else {
-                                        break Ok(CompletionKind::Write {
-                                            bytes_written: written,
-                                        });
-                                    }
-                                }
-                                break if written > 0 {
-                                    Ok(CompletionKind::Write {
-                                        bytes_written: written,
-                                    })
-                                } else {
-                                    Err(IoError::Io(err))
-                                };
-                            } else {
-                                written += ret as usize;
-                                if written == data.len() {
-                                    break Ok(CompletionKind::Write {
-                                        bytes_written: written,
-                                    });
-                                }
-                            }
-                        };
-
-                        if requeue {
-                            let mut source = SourceFd(&effective_fd);
-                            if let Err(reg_err) =
-                                poll.registry()
-                                    .register(&mut source, mio_token, Interest::WRITABLE)
-                            {
-                                eprintln!(
-                                    "Failed to re-register fd for write after WouldBlock: {reg_err}"
-                                );
-                            }
-                            // Reconstruct from the arm's own fields instead of
-                            // `op.clone()`: `Buffer::clone` copies the whole
-                            // payload, so cloning to re-arm a partial write
-                            // doubled the bytes on the wire path.
-                            pending_ops[slot] = Some((io_token, Op::Write { fd, offset, data }));
-                            continue;
-                        }
-
-                        result
-                    }
                     Op::WriteStatic { fd, data } => {
                         let effective_fd = leased_fd.unwrap_or(fd);
                         let mut written = 0usize;
@@ -1639,7 +1567,6 @@ impl AsRawFd for Op {
         match *self {
             Op::Accept { fd } => fd,
             Op::Read { fd, .. } => fd,
-            Op::Write { fd, .. } => fd,
             Op::WriteStatic { fd, .. } => fd,
             Op::Fsync { fd, .. } => fd,
             Op::Fdatasync { fd, .. } => fd,

@@ -38,8 +38,8 @@ enum PendingOp {
         /// See `ReadVectored::iovecs`.
         iovecs: Box<[iovec]>,
     },
-    Write {
-        op: Op,
+    /// An owned write whose `Buffer` is returned to the caller on completion.
+    WriteRent {
         data: Buffer,
     },
     WriteStatic,
@@ -184,7 +184,6 @@ impl UringBackend {
         match op {
             Op::Accept { fd }
             | Op::Read { fd, .. }
-            | Op::Write { fd, .. }
             | Op::WriteStatic { fd, .. }
             | Op::Fsync { fd }
             | Op::Fdatasync { fd }
@@ -654,26 +653,6 @@ impl UringBackend {
                         },
                     )
                 }
-                Op::Write { fd, offset, data } => {
-                    let entry = opcode::Write::new(
-                        types::Fd(leased_fd(fd)),
-                        data.as_ptr(),
-                        data.len() as u32,
-                    )
-                    .offset(offset)
-                    .build();
-                    (
-                        entry,
-                        PendingOp::Write {
-                            op: Op::Write {
-                                fd,
-                                offset,
-                                data: Buffer::empty(),
-                            },
-                            data,
-                        },
-                    )
-                }
                 Op::WriteFile { fd, offset, data } => {
                     let entry = opcode::Write::new(
                         types::Fd(leased_fd(fd)),
@@ -976,19 +955,7 @@ impl UringBackend {
                     )
                     .offset(0)
                     .build();
-                    (
-                        entry,
-                        PendingOp::Write {
-                            // Op::WriteRent's data field is just a placeholder —
-                            // the real buffer lives in PendingOp::Write.data and
-                            // is returned to the caller on completion.
-                            op: Op::WriteRent {
-                                fd,
-                                data: Buffer::empty(),
-                            },
-                            data,
-                        },
-                    )
+                    (entry, PendingOp::WriteRent { data })
                 }
                 Op::PollAdd {
                     fd,
@@ -1185,22 +1152,14 @@ unsafe fn reconstruct_completion(
                 }
             }
         }
-        PendingOp::Write { op, data } => {
+        PendingOp::WriteRent { data } => {
             if result < 0 {
                 Err(IoError::Io(io::Error::from_raw_os_error(-result)))
             } else {
-                match &op {
-                    Op::WriteRent { .. } => Ok(CompletionKind::WriteRent {
-                        bytes_written: result as usize,
-                        data,
-                    }),
-                    _ => {
-                        let _ = data;
-                        Ok(CompletionKind::Write {
-                            bytes_written: result as usize,
-                        })
-                    }
-                }
+                Ok(CompletionKind::WriteRent {
+                    bytes_written: result as usize,
+                    data,
+                })
             }
         }
         PendingOp::WriteStatic => {

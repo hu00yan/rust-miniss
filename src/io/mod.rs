@@ -376,11 +376,6 @@ pub enum Op {
         offset: u64,
         len: usize,
     },
-    Write {
-        fd: i32,
-        offset: u64,
-        data: Buffer,
-    },
     WriteStatic {
         fd: i32,
         data: &'static [u8],

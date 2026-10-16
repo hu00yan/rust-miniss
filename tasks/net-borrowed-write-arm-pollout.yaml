@@ -1,0 +1,107 @@
+id: net-borrowed-write-arm-pollout
+title: 借用写入路径改为就绪驱动（arm POLLOUT），不再排队 owned 拷贝
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+## 目标
+
+`futures::io::AsyncWrite`（借用形状）的 `poll_write` / `poll_write_vectored`
+在 EAGAIN 时不再把调用方的切片拷进 owned `Buffer` 并排队 `Op::Write` /
+`Op::WriteVectored`，改为 arm POLLOUT，并在可写时重试同步 `write(2)` /
+`writev(2)`。
+
+## 证据（为什么）
+
+1. **生态**：tokio（`io/poll_evented.rs:171,236`）与 glommio
+   （`net/mod.rs:30,55` + `net/stream.rs:256,301`，`yolo_send`/`yolo_recv`）的
+   借用读写都是「arm readiness + 直接系统调用」，零拷贝零分配。monoio 0.2 干脆
+   只提供 rent，不提供借用 API。compio 的借用兼容层拷贝
+   （`compio-io/compat.rs:117` `ptr::copy_nonoverlapping`），但它自己的 bench 用 rent。
+2. **成本模型（实测）**：`Buffer::from_slice(N)` 在 N≈8–9KB 时达到 130ns，正好
+   等于一次系统调用（Linux VM 实测）。即 crossover 8–9KB：以下拷贝最多赢
+   130ns/次；以上拷贝无上界地输。而运行时不认识调用方要写多大。
+3. **现状不一致**：`poll_read`（`src/net.rs:557-560`）与 `poll_read_vectored`
+   是全仓**已经**采用 arm 的两处，且前者的注释给出了同一理由——「排队的读 op
+   可能在调用方缓冲被释放后仍在途」。只有写侧还在拷贝。
+4. **最坏情况更差**：拷贝形状在排队的 `Op::Write` 自身 EAGAIN 时，**照样**要
+   arm POLLOUT 并重试——拷贝和重试两个都付。
+5. **`poll_write_vectored` 在热路径上**：`src/http.rs:382` 的
+   `send_response` 用 `write_all_slices(&header, &body)` 发**每一个** HTTP
+   响应，即走 vectored 借用写。因此只改 `poll_write` 不完整。
+
+## 实际级联（与初稿的偏差）
+
+初稿假定「`Op::Write` 与 `Op::WriteVectored` 都会成为无人构造的死变体，必须
+一并删除」。实测不成立，两点偏差已按证据收窄：
+
+- **`Op::Write` 确实必须删**（编译器强制：`poll_write` 是它唯一的构造点）。
+  一并删除 `PendingOp::Write{op,data}` 中只为区分两种写 op 而存在的 `op`
+  字段，收敛为 `PendingOp::WriteRent{data}`；删除 `AsyncTcpStream::write_token`
+  （同样只剩 `poll_write`/`poll_write_vectored` 两个使用点）与随之无用的
+  `is_write_wouldblock`。
+- **`Op::WriteVectored` 保留**，因为**不删 `write_buffers` 它就有构造者**，
+  且 `Op` 是 pub 且经 `pub use io::{..., Op}` 可达，`-D warnings` 不会为未用变体
+  报错。保留的理由是**与读侧对称**：`Op::ReadVectored` 同样已无生产构造者，
+  仅由测试维持、被有意留作后端原语。把两者的 iovec 机制一起删除属于「API 形状」
+  任务（连同 `write_buffers`、`write_all_slices` 搬进 `src/http.rs`、
+  `write_static_all` 改名）的范畴，不应混进一次 EAGAIN 行为修复。
+- 初稿写的「`-D warnings` 会失败」对 `Op::WriteVectored` 判断错误（见上），
+  对 `Op::Write` 正确。
+
+## 测试后果（实测，与初稿不同）
+
+初稿要求把
+`tests/vectored_io.rs:350 linux_uring_delayed_submit_writev_survives_relocation_pressure`
+的目标改成 `Op::WriteStatic`。**该重定向不可行**：`UringBackend` 未导出
+（`src/io/mod.rs:648` 只导出 `MioBackend`），`tests/vectored_io.rs` 拿不到
+io_uring 后端；而 mio 侧的 `tests/fallback_buffer_init.rs` 是
+`#![cfg(any(io_backend = "epoll", ...))]`，在 io_uring 上不编译。且即便可行，
+`Op::WriteStatic` 没有 iovec，**同样覆盖不到**写侧 iovec 重定位机制。
+
+实际处理：
+
+- **不删除**该测试。vectored 改 arm 后它的断言仍然全部成立且仍然有意义
+  （满发送缓冲 → 必须 Pending → 重定位压力 + 延迟提交 → 排空后全量送达），
+  变的只是所守护的 SQE：从 Writev SQE 变成就绪注册 SQE。因此只**修正其名称与
+  文档/断言消息中已经不成立的措辞**（「must queue an io_uring Writev SQE」→
+  arm POLLOUT），不改断言。
+- **已记录的覆盖代价**：io_uring 的 `Op::WriteVectored`（排队 writev SQE +
+  boxed iovec 重定位）自本改动起**无任何测试覆盖**——该测试不再构造它。它唯一
+  的构造者是全仓 0 调用者的 `write_buffers`，已列入后续 API 形状任务删除；删除
+  时该机制随之消失，不再需要覆盖。（读侧 `Op::ReadVectored` 的 io_uring 实现
+  本就处于同一状态：`poll_read_vectored` 已是 arm，其 io_uring 提交臂同样无覆盖。）
+
+## 必须新增的回归证据（已加入）
+
+`tests/vectored_io.rs::linux_uring_poll_write_blocks_on_readiness_until_the_peer_drains`
+（Linux / io_uring）：`SO_SNDBUF`/`SO_RCVBUF` 压到 4096 →
+`fill_send_buffer_until_would_block` 灌满 → 64KiB 载荷：断言 `poll_write` 在满
+缓冲下 Pending（arm 生效）→ 排空前**再次 poll 仍 Pending**（不忙等）→ 慢读端
+排空后断言**全量 64KiB 送达**（跨多次重试）。peer 侧带 10s 读超时上界，避免
+挂住测试进程。
+
+## 非目标
+
+- 不动 `write_rent` / `write_static_all` / `read_rent`（本就不拷贝）
+- 不动 `write_buffers` / `Op::WriteVectored` / 写侧 iovec 机制（后续 API 形状任务）
+- 不动既有测试的断言语义（只修正一个测试中随本改动失真的措辞）
+- 不做端到端 bench：bench 服务器 `examples/http_echo.rs:31` 用
+  `write_static_all`，既不调 `poll_write` 也不调 `poll_write_vectored`，
+  该 bench 对本改动**结构性不敏感**，跑它只会产出噪声而非证据。真正需要的
+  材料是上面的确定性背压测试与 crossover 实测。
+
+## 推翻条件
+
+若出现「同一连接上借用写 >8KB 载荷的阻塞写占主导」的真实负载，且重试
+`write(2)` 的开销超过 `Buffer::from_slice`，则回到尺寸相关的分支形状。
+
+allowed_files:
+  - src/net.rs
+  - src/io/mod.rs
+  - src/io/uring.rs
+  - src/io/mio_poll.rs
+  - tests/vectored_io.rs
+  - tasks/net-borrowed-write-arm-pollout.yaml
+  - docs/DECISION_LOG.md
+  - docs/DESIGN.md
+  - docs/review/runtime-safety-findings.md

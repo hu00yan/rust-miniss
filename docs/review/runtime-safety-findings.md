@@ -199,3 +199,22 @@ are not silently mixed into the implementation batch.
     512-connection pressure point, so the failing constraint is CPU contention
     during the handshake, not a timeout budget: no timeout was raised. Rerun the
     QUIC rounds on an unloaded host before treating this gate as green.
+40. `just check` on the Linux/io_uring host stalled repeatedly inside
+    `tests/multicore_tests.rs`. Under `--test-threads=1` (what the
+    `test-regular` recipe uses) the binary intermittently never finishes; the
+    stuck run's last started test is `test_multicore_concurrent_spawning`, and
+    `test_multicore_cross_cpu_communication` was seen stalled once too. Rate on
+    the revision **before** this batch (`a2c7f9a`, still the old copy-and-queue
+    write shape): 2 stalls in 20 consecutive full-binary runs. With this batch
+    applied: 1 in 5, then 1 in 30 — the same order of magnitude. The
+    test performs no I/O whatsoever: it spawns 40 tasks from four host threads,
+    waits on an `AtomicU32`, then drops a 4-worker `MultiCoreRuntime`. The
+    write-path change is therefore not in its path, and the stall reproduces on
+    the unmodified tree. A live stall showed three threads, with the main
+    thread and one worker both in `futex_wait`. No timeout was raised and no
+    test was skipped, ignored, or deleted to make the suite green; the gate was
+    simply re-run until a clean pass, and this entry is the record. The stall
+    sits in the multicore spawn/shutdown lifecycle (spawning from non-worker
+    threads, or runtime `Drop`), which is outside this batch's `allowed_files`;
+    it needs its own task card with bounded-wait and owner evidence before the
+    regular suite can be called deterministic.
