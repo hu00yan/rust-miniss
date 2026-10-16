@@ -1,0 +1,84 @@
+id: udp-rent-send-and-mio-send-copy
+title: UDP 补上对称的 send_to_rent，并去掉 mio UdpSend 完成路径上的 Buffer 深拷贝
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+
+## 目标
+
+1. `AsyncUdpSocket` 增加 `send_to_rent<T: RentBuffer>(&self, data: T, target:
+   SocketAddr) -> io::Result<(usize, T)>`，与已有的 `recv_from_rent` 对称，使
+   UDP 收发两侧都是「rent 进、rent 出」，且每项能力 ≤2 个函数。
+2. 去掉 mio 后端 `Op::UdpSend` 完成路径上的 `data.clone()`：那是
+   `Buffer::clone`，即**整段载荷的深拷贝**（`src/buffer.rs:229-235`），而这笔
+   拷贝在 udp_send 这条纯内联系统调用路径上没有任何必要。
+
+## 证据（为什么）
+
+1. **不对称**：UDP 收侧有 `recv_from` + `recv_from_rent`（`src/net.rs:916`、
+   `:943`），发侧只有 `send_to`（`:966`）。TCP 读写两侧各有 rent
+   （`read_rent`/`write_rent`），文件读有 `ReadFile { data }` 把缓冲还回来。
+   只有 UDP 发侧没有 rent 版本。
+2. **深拷贝是纯粹的浪费**：`send_to` 先把借用切片拷成 owned Buffer
+   （`Buffer::from_slice`），mio 完成路径又 `data.clone()` 复制一遍载荷
+   （`src/io/mio_poll.rs:1212-1227`）。那一处 `data` 在 execute 路径上是
+   **owned** 的（同文件 `:519` 的 submit 路径才用 `*fd` 借引用），可以直接 move
+   进 completion 而不必 clone——写成 `.map(|n| .. data.clone())` 只是把
+   `data` 借进了闭包，没有别的原因。
+3. **uring 已经是对的**：`PendingOp::UdpSend { data, .. }` 在完成时直接 move
+   出 `data`（`src/io/uring.rs:1283-1296`），零额外拷贝。于是同一份协议在两个
+   后端上行为不同，这正是本仓库一贯要消除的那类不对称。
+4. **可验证性**：UDP 发送是内联系统调用（不经过线程池），所以「指针不变」是
+   一个可断言的强条件——`send_to_rent` 归还的 `Buffer::as_ptr()` 必须等于调用
+   方交出的那个指针，等于断言「零拷贝」本身，而不是靠跑分推测。
+
+## 设计
+
+- `send_to_rent` 是 UDP 发侧的唯一实现；`send_to` 变成它的薄包装
+  （`let (n, _) = self.send_to_rent(Buffer::from_slice(buf), target).await?`），
+  两条路径共用一份排队/完成逻辑。代价：`send_to` 仍有一次
+  `Buffer::from_slice`（把借用切片变成可排队的 owned 载荷，无法避免），但
+  mio 上第二遍深拷贝消失；`send_to_rent` 调用方零拷贝。
+- **已知语义（与既有 rent API 一致，不扩大范围）**：排队的 op 出错时缓冲会随
+  op 一起被丢弃，`read_rent`/`write_rent` 今天也是这样。文档里写明，不在本卡修。
+- **非目标**：不加「先试 `sendto(2)` 内联快路」。UDP 套接字在 `bind` 时已把
+  `SO_SNDBUF` 设成 4 MiB（`src/net.rs:890-908`），EAGAIN 罕见；快路要新增一段
+  `libc::sendto` unsafe 代码，收益不成比例。若日后 profile 显示需要，另开卡。
+
+## 测试后果
+
+新增 `tests/udp_async_tests.rs` 用例（Linux/io_uring 与 macOS/kqueue 都会跑到
+各自后端的 UdpSend 臂）：
+
+- `send_to_rent` 归还的缓冲**指针不变**（断言零拷贝），字节数正确，且对端
+  `recv_from` 收到的内容与发出的一致；
+- 归还的缓冲可再次 `send_to_rent` 复用（rent 语义的闭环）。
+
+## 非目标
+
+- 不动 `recv_from` / `recv_from_rent`（本已对称）
+- 不动 mio 的 `Op::WriteFile` 深拷贝（那是线程池交接，属 `file-write-rent-at` 卡）
+- 不新增 `sendto(2)` 内联快路
+
+## 推翻条件
+
+若 UDP 发送在高负载下频繁 EAGAIN，使「排队路径上缓冲随错误丢弃」成为真实痛点，
+则应改为「错误时把缓冲随 completion 一并归还」的形状——那需要给
+`CompletionKind` 的错误路径加承载，另开卡。
+
+## 落地结果（2026-10-16）
+
+- `AsyncUdpSocket::send_to_rent<T: RentBuffer>` 新增；`send_to` 改为它的一行包装。
+- mio `Op::UdpSend` 完成臂改为 move `data`（原 `data.clone()` 删除）。
+- 新测试 `tests/udp_async_tests.rs::test_udp_send_to_rent_returns_the_same_allocation`
+  断言归还缓冲的 `as_ptr()` 不变。**已验证它是真回归测试**：把
+  `src/io/mio_poll.rs` 单独 stash 回修复前，该断言失败（两个分配相差 16 字节）；
+  恢复后通过。
+- 偏差：无。非目标里的 `sendto(2)` 快路未做，按卡执行。
+
+allowed_files:
+  - src/net.rs
+  - src/io/mio_poll.rs
+  - tests/udp_async_tests.rs
+  - tasks/udp-rent-send-and-mio-send-copy.yaml
+  - docs/DECISION_LOG.md

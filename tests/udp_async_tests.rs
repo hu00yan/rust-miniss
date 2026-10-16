@@ -179,3 +179,59 @@ fn test_udp_receive_can_be_reused_after_cancellation() {
         assert_eq!(&buffer[..bytes], b"after-cancel");
     });
 }
+
+/// The UDP send-side rent contract: the buffer comes back, and it is the
+/// *same* allocation rather than a copy of it.
+///
+/// The pointer assertion is the point of this test. `Buffer::clone` deep-copies
+/// the payload (`src/buffer.rs:229-235`), and the mio backend used to clone the
+/// datagram on completion, so a `send_to_rent` that copied would fail here on
+/// macOS/kqueue while passing on io_uring — which is exactly the asymmetry
+/// between the two backends this covers.
+#[test]
+fn test_udp_send_to_rent_returns_the_same_allocation() {
+    use rust_miniss::Buffer;
+
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let receiver = AsyncUdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = AsyncUdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+
+        let payload: &[u8] = b"rented datagram";
+        let owned = Buffer::from_slice(payload);
+        let original_ptr = owned.as_ref().as_ptr();
+
+        let receiving = async move {
+            let mut buffer = [0u8; 64];
+            for _ in 0..2 {
+                let (bytes, _) = receiver
+                    .recv_from(&mut buffer)
+                    .await
+                    .expect("receive rented datagram");
+                assert_eq!(&buffer[..bytes], payload);
+            }
+        };
+
+        let sending = async move {
+            let (sent, returned) = sender
+                .send_to_rent(owned, receiver_addr)
+                .await
+                .expect("send rented datagram");
+            assert_eq!(sent, payload.len());
+            assert_eq!(
+                returned.as_ref().as_ptr(),
+                original_ptr,
+                "send_to_rent must return the same allocation, not a copy"
+            );
+            // Rent semantics: what comes back is immediately reusable.
+            let (resent, _) = sender
+                .send_to_rent(returned, receiver_addr)
+                .await
+                .expect("reuse rented datagram");
+            assert_eq!(resent, payload.len());
+        };
+
+        join(receiving, sending).await;
+    });
+}

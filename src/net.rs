@@ -963,21 +963,44 @@ impl AsyncUdpSocket {
         }
     }
 
-    pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+    /// Send a datagram from an owned buffer and get that same buffer back.
+    ///
+    /// The send-side mirror of [`Self::recv_from_rent`]: the caller hands over
+    /// an owned buffer, the runtime gives it to the kernel, and completion
+    /// returns the allocation rather than a copy of it. As with the other rent
+    /// operations, a queued datagram that completes with an error drops the
+    /// buffer with the op.
+    pub async fn send_to_rent<T>(&self, data: T, target: SocketAddr) -> io::Result<(usize, T)>
+    where
+        T: RentBuffer,
+    {
         let op = crate::io::Op::UdpSend {
             fd: self.inner.as_raw_fd(),
-            data: Buffer::from_slice(buf),
+            data: data.into(),
             addr: target,
         };
         let token = with_io_state(|state| state.io_backend.submit(op));
         let future = crate::io::future::IoFuture::new(token);
         match future.await? {
-            crate::io::CompletionKind::UdpSend { bytes_written, .. } => Ok(bytes_written),
-            _ => Err(io::Error::new(
+            crate::io::CompletionKind::UdpSend {
+                bytes_written,
+                data,
+            } => Ok((bytes_written, T::from(data))),
+            other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Unexpected completion",
+                format!("Unexpected completion for send_to_rent: {other:?}"),
             )),
         }
+    }
+
+    /// Send a datagram from a borrowed slice.
+    ///
+    /// A queued datagram has to own its payload, so this pays one copy into an
+    /// owned buffer; callers that already hold an owned buffer should use
+    /// [`Self::send_to_rent`] and pay none.
+    pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let (bytes_written, _) = self.send_to_rent(Buffer::from_slice(buf), target).await?;
+        Ok(bytes_written)
     }
 }
 

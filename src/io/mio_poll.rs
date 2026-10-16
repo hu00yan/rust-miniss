@@ -1216,14 +1216,17 @@ impl IoProvider for MioBackend {
                         // SAFETY: UdpSocket temporarily wraps fd and is
                         // converted back with into_raw_fd before drop.
                         let socket = unsafe { std::net::UdpSocket::from_raw_fd(effective_fd) };
-                        let result = socket.send_to(data.as_ref(), addr).map(|bytes_written| {
-                            CompletionKind::UdpSend {
-                                bytes_written,
-                                data: data.clone(),
-                            }
-                        });
+                        // `data` is owned on this execute path (the submit path
+                        // is the one that borrows it via `*fd`), so completion
+                        // can move it back to the caller instead of cloning the
+                        // whole payload into a second allocation.
+                        let sent = socket.send_to(data.as_ref(), addr);
                         let _ = socket.into_raw_fd();
-                        result.map_err(IoError::Io)
+                        sent.map(|bytes_written| CompletionKind::UdpSend {
+                            bytes_written,
+                            data,
+                        })
+                        .map_err(IoError::Io)
                     }
                     Op::Connect { fd, addr: _ } => {
                         let raw_fd = leased_fd.unwrap_or(fd);
