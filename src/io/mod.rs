@@ -426,10 +426,6 @@ pub enum Op {
         fd: i32,
         buffers: SmallVec<[Buffer; 4]>,
     },
-    WriteVectored {
-        fd: i32,
-        buffers: SmallVec<[Buffer; 4]>,
-    },
     Connect {
         fd: i32,
         addr: SocketAddr,
@@ -530,10 +526,6 @@ pub enum CompletionKind {
     },
     ReadVectored {
         bytes_read: usize,
-        buffers: SmallVec<[Buffer; 4]>,
-    },
-    WriteVectored {
-        bytes_written: usize,
         buffers: SmallVec<[Buffer; 4]>,
     },
     Fsync,

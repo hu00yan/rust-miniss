@@ -367,6 +367,14 @@ poll_read(user_buf):
 - `write_rent`: 用户提供 owned buffer → 内核直接读取 → 返还用户（零拷贝）
 - 当前库层接口对 `Buffer` / `Vec<u8>` / `Box<[u8]>` 开放，例子不再需要自己维护专用胶水
 
+写侧因此只有三种形状，且每种都能从签名看出缓冲归谁：
+`read_rent`/`write_rent` 是**租**（交出 owned，归还同一个分配）；
+`poll_read`/`poll_read_vectored`/`poll_write`/`poll_write_vectored` 是**借**
+（直试系统调用，排队 op 永不会比调用方的缓冲活得久）；
+`write_all_static` 借的是 `&'static [u8]`，这正是它可以入队的原因。
+HTTP 响应的「写头再写体」是响应细节而非流能力，由 `src/http.rs` 的
+`send_response` 自己完成（`writev(2)` 一次写完）。
+
 ---
 
 ## Waker 设计

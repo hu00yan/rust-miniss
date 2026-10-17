@@ -1,0 +1,75 @@
+id: write-api-shape-narrowing
+title: 收窄 TCP 写侧 API 形状：删 write_buffers 与 WriteVectored 机制，write_all_slices 归 http.rs，write_static_all 改名
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+## 目标
+
+1. 删除 `AsyncTcpStream::write_buffers`（`src/net.rs:286`）以及只为它存在的
+   `Op::WriteVectored`、`PendingOp::WriteVectored`、
+   `CompletionKind::WriteVectored` 和两个后端里的 iovec 构造/重排队机制。
+2. 把 `write_all_slices`（`src/net.rs:307`）搬进 `src/http.rs`——它全仓唯一调用
+   者就是 `send_response`（`src/http.rs:382`），它不是一条通用能力，是 HTTP
+   响应的实现细节。
+3. `write_static_all`（`src/net.rs:355`）改名 `write_all_static`：
+   `write_all_*` 才是与 `write_all_slices`、`futures::AsyncWriteExt::write_all`
+   同族的命名，"static_all" 把「数据是 'static」这件实现细节放进了名字里。
+4. 在 `impl AsyncTcpStream` 上写一张所有权表：每个方法标注「借/租、是否拷贝、
+   谁在何处持有缓冲」。
+
+## 证据（为什么）
+
+1. **零调用者**：`write_buffers` 全仓 0 调用者（`grep -rn write_buffers`
+   只命中自身定义）。
+2. **零测试覆盖**：自 `d4ad1f7` 起 `Op::WriteVectored` 不再被任何测试构造
+   （见 `docs/DECISION_LOG.md` 2026-10-16 那行的「记录代价」）。留着一份既无
+   调用者又无覆盖的排队 iovec 机制，比删掉它更糟。
+3. **形状超载**：TCP 写侧今天有 5 个入口——`poll_write`、
+   `poll_write_vectored`、`write_rent`、`write_buffers`、`write_all_slices`、
+   `write_static_all`（6 个），远超「每项能力 ≤2 个函数」。删掉 `write_buffers`
+   并把 `write_all_slices` 下移到 HTTP 层后，通用层只剩
+   `poll_write`/`poll_write_vectored`（trait）+ `write_rent` + `write_all_static`。
+4. **命名**：`write_static_all` 里的 "static" 与 `write_all_slices` 里的
+   "slices" 描述的都是实现细节；`write_all_static` 与 `write_all` 同族，语义
+   是「把这一整块写完」。
+
+## 级联
+
+- `Op::WriteVectored` 删除后 `CompletionKind::WriteVectored` 无构造者 → 一并删。
+  两个后端：uring 的 submit 臂（`src/io/uring.rs:844-860`）、完成臂
+  （`:1337-1350`）、`descriptor_fd`（`:198`）、`PendingOp` 变体（`:35`）；
+  mio 的 register 臂（`src/io/mio_poll.rs:442`）、execute 臂与重排队
+  （`:1327-1420`）、`AsRawFd`（`:1581`）。
+- **`Op::ReadVectored` 保留**：它由 `tests/fallback_buffer_init.rs` 在
+  mio 后端上覆盖，删它会连带删测试，属于另一个决策。本卡只删写侧。
+- `write_static_all` 改名会波及两个示例（`examples/http_echo.rs:31`、
+  `examples/http_echo_rent.rs:21`），一并改。
+
+## 非目标
+
+- 不动 arm 写路径（`d4ad1f7` 刚落地）
+- 不动 `Op::ReadVectored` / 读侧 iovec 机制
+- 不改 `write_rent` / `write_rent_at`（后者是 `file-write-rent-at` 卡）
+
+## 测试后果
+
+`tests/vectored_io.rs` 里的 `test_tcp_write_vectored_returns_pending` 等用的是
+trait 的 `poll_write_vectored`，不构造 `Op::WriteVectored`，因此**不需要改测试**；
+`tests/integration_http.rs` / `hyper_http*.rs` 覆盖 `send_response` 的新归属地。
+
+## 推翻条件
+
+若出现「需要一次排队 writev 多个 owned Buffer」的真实调用者，则带着测试把它加
+回来，并且那时它必须同时具备使用者与覆盖，而不是像今天这样两样都没有。
+
+allowed_files:
+  - src/net.rs
+  - src/http.rs
+  - src/io/mod.rs
+  - src/io/uring.rs
+  - src/io/mio_poll.rs
+  - examples/http_echo.rs
+  - examples/http_echo_rent.rs
+  - tasks/write-api-shape-narrowing.yaml
+  - docs/DECISION_LOG.md
+  - docs/DESIGN.md

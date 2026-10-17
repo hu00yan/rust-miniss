@@ -28,7 +28,7 @@ async fn handle_client(stream: AsyncTcpStream) {
                 };
                 buf = returned_buf;
                 for _ in 0..complete {
-                    if stream.write_static_all(RESPONSE).await.is_err() {
+                    if stream.write_all_static(RESPONSE).await.is_err() {
                         return;
                     }
                 }

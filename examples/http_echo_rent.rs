@@ -18,7 +18,7 @@ async fn handle_client(stream: rust_miniss::net::AsyncTcpStream) {
         match stream.read_rent(buf).await {
             Ok((0, _)) | Err(_) => break,
             Ok((_, owned_buf)) => {
-                if stream.write_static_all(RESPONSE).await.is_err() {
+                if stream.write_all_static(RESPONSE).await.is_err() {
                     break;
                 }
                 buf = owned_buf;

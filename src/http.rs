@@ -6,10 +6,13 @@
 use crate::net::AsyncTcpStream;
 #[cfg(target_os = "linux")]
 use crate::Buffer;
+use futures::io::AsyncWrite;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::io::IoSlice;
+use std::pin::Pin;
 use std::str;
 use std::sync::Arc;
 
@@ -379,8 +382,63 @@ impl HttpConnection {
     /// Send HTTP response to the connection
     pub async fn send_response(&mut self, response: Response) -> io::Result<()> {
         let header = response.build_headers();
-        self.stream.write_all_slices(&header, &response.body).await
+        write_all_slices(&mut self.stream, &header, &response.body).await
     }
+}
+
+/// Write an HTTP response's head and body fully.
+///
+/// This is a response detail, not a stream capability: the only caller is
+/// [`HttpConnection::send_response`], and "write a head, then a body" is the
+/// shape HTTP/1.1 needs. It uses `writev(2)` when both parts are still
+/// outstanding, so the common one-syscall response stays one syscall.
+async fn write_all_slices(
+    stream: &mut AsyncTcpStream,
+    first: &[u8],
+    second: &[u8],
+) -> io::Result<()> {
+    let mut first = first;
+    let mut second = second;
+
+    while !first.is_empty() || !second.is_empty() {
+        let n = if second.is_empty() {
+            futures::future::poll_fn(|cx| AsyncWrite::poll_write(Pin::new(&mut *stream), cx, first))
+                .await?
+        } else if first.is_empty() {
+            futures::future::poll_fn(|cx| {
+                AsyncWrite::poll_write(Pin::new(&mut *stream), cx, second)
+            })
+            .await?
+        } else {
+            let bufs = [IoSlice::new(first), IoSlice::new(second)];
+            futures::future::poll_fn(|cx| {
+                AsyncWrite::poll_write_vectored(Pin::new(&mut *stream), cx, &bufs)
+            })
+            .await?
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_all_slices wrote zero bytes",
+            ));
+        }
+
+        let first_len = first.len();
+        if n < first_len {
+            first = &first[n..];
+            continue;
+        }
+
+        first = &[];
+        let remaining = n - first_len;
+        if remaining >= second.len() {
+            second = &[];
+        } else {
+            second = &second[remaining..];
+        }
+    }
+
+    Ok(())
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {

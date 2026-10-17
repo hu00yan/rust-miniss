@@ -32,12 +32,6 @@ enum PendingOp {
         /// across moves into this enum and into the pending-ops slab.
         iovecs: Box<[iovec]>,
     },
-    WriteVectored {
-        buffers: SmallVec<[Buffer; 4]>,
-        /// Kernel-visible iovec metadata in immovable heap storage.
-        /// See `ReadVectored::iovecs`.
-        iovecs: Box<[iovec]>,
-    },
     /// An owned write whose `Buffer` is returned to the caller on completion.
     WriteRent {
         data: Buffer,
@@ -195,7 +189,6 @@ impl UringBackend {
             | Op::UdpRecvVectored { fd, .. }
             | Op::UdpSendVectored { fd, .. }
             | Op::ReadVectored { fd, .. }
-            | Op::WriteVectored { fd, .. }
             | Op::Connect { fd, .. }
             | Op::PollAdd { fd, .. }
             | Op::ReadRent { fd, .. }
@@ -841,25 +834,6 @@ impl UringBackend {
                     };
                     (entry, pending_op)
                 }
-                Op::WriteVectored { fd, buffers } => {
-                    // CRITICAL (S0-4): same stable-boxed iovec pattern as ReadVectored.
-                    // Build Box<[iovec]> first, then form the SQE from its as_ptr().
-                    let iovecs: Box<[iovec]> = buffers
-                        .iter()
-                        .map(|buf| iovec {
-                            iov_base: buf.as_ptr() as *mut _,
-                            iov_len: buf.len(),
-                        })
-                        .collect();
-                    let entry = opcode::Writev::new(
-                        types::Fd(leased_fd(fd)),
-                        iovecs.as_ptr(),
-                        iovecs.len() as u32,
-                    )
-                    .build();
-                    let pending_op = PendingOp::WriteVectored { buffers, iovecs };
-                    (entry, pending_op)
-                }
                 Op::Connect { fd, addr } => {
                     let mut addr_storage: Box<sockaddr_storage> =
                         // SAFETY: sockaddr_storage is plain C storage and will be
@@ -1330,19 +1304,6 @@ unsafe fn reconstruct_completion(
                 }
                 Ok(CompletionKind::ReadVectored {
                     bytes_read,
-                    buffers,
-                })
-            }
-        }
-        PendingOp::WriteVectored {
-            buffers, iovecs, ..
-        } => {
-            let _ = iovecs;
-            if result < 0 {
-                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
-            } else {
-                Ok(CompletionKind::WriteVectored {
-                    bytes_written: result as usize,
                     buffers,
                 })
             }

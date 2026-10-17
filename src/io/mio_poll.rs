@@ -439,18 +439,6 @@ impl IoProvider for MioBackend {
                         pending_ops[slot] = Some((io_token, op));
                     }
                 }
-                Op::WriteVectored { fd, .. } => {
-                    let effective_fd = leased_fd.unwrap_or(*fd);
-                    let mut source = mio::unix::SourceFd(&effective_fd);
-                    if let Err(e) =
-                        poll.registry()
-                            .register(&mut source, mio_token, Interest::WRITABLE)
-                    {
-                        registration_error = Some(e);
-                    } else {
-                        pending_ops[slot] = Some((io_token, op));
-                    }
-                }
                 Op::Connect { fd, addr: _ } => {
                     let effective_fd = leased_fd.unwrap_or(*fd);
                     let mut source = mio::unix::SourceFd(&effective_fd);
@@ -1327,104 +1315,6 @@ impl IoProvider for MioBackend {
 
                         result
                     }
-                    Op::WriteVectored { fd, buffers } => {
-                        let effective_fd = leased_fd.unwrap_or(fd);
-                        let total_len: usize = buffers.iter().map(|b| b.len()).sum();
-                        if total_len == 0 {
-                            Ok(CompletionKind::WriteVectored {
-                                bytes_written: 0,
-                                buffers: buffers.clone(),
-                            })
-                        } else {
-                            let mut written = 0usize;
-                            let mut requeue = false;
-                            let result = loop {
-                                let iovecs: Vec<libc::iovec> = buffers
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(i, buf)| {
-                                        let buf_start: usize =
-                                            buffers[..i].iter().map(|b| b.len()).sum();
-                                        if written >= buf_start + buf.len() {
-                                            return None;
-                                        }
-                                        let offset = written.saturating_sub(buf_start);
-                                        let remaining = buf.len() - offset;
-                                        Some(libc::iovec {
-                                            // SAFETY: offset is within this
-                                            // buffer due to checks above.
-                                            iov_base: unsafe {
-                                                buf.as_ref().as_ptr().add(offset)
-                                                    as *mut libc::c_void
-                                            },
-                                            iov_len: remaining,
-                                        })
-                                    })
-                                    .collect();
-                                if iovecs.is_empty() {
-                                    break Ok(CompletionKind::WriteVectored {
-                                        bytes_written: written,
-                                        buffers: buffers.clone(),
-                                    });
-                                }
-                                // SAFETY: iovecs point to initialized bytes in
-                                // buffers and remain valid for this syscall.
-                                let ret = unsafe {
-                                    libc::writev(effective_fd, iovecs.as_ptr(), iovecs.len() as i32)
-                                };
-                                if ret < 0 {
-                                    let err = io::Error::last_os_error();
-                                    if err.kind() == io::ErrorKind::Interrupted {
-                                        continue;
-                                    }
-                                    if err.kind() == io::ErrorKind::WouldBlock {
-                                        if written > 0 {
-                                            break Ok(CompletionKind::WriteVectored {
-                                                bytes_written: written,
-                                                buffers: buffers.clone(),
-                                            });
-                                        }
-                                        requeue = true;
-                                        break Err(IoError::Io(err));
-                                    }
-                                    break if written > 0 {
-                                        Ok(CompletionKind::WriteVectored {
-                                            bytes_written: written,
-                                            buffers: buffers.clone(),
-                                        })
-                                    } else {
-                                        Err(IoError::Io(err))
-                                    };
-                                } else {
-                                    written += ret as usize;
-                                    if written >= total_len {
-                                        break Ok(CompletionKind::WriteVectored {
-                                            bytes_written: written,
-                                            buffers: buffers.clone(),
-                                        });
-                                    }
-                                }
-                            };
-
-                            if requeue {
-                                let mut source = SourceFd(&effective_fd);
-                                if let Err(reg_err) = poll.registry().register(
-                                    &mut source,
-                                    mio_token,
-                                    Interest::WRITABLE,
-                                ) {
-                                    eprintln!(
-                                        "Failed to re-register fd for writev after WouldBlock: {reg_err}"
-                                    );
-                                }
-                                pending_ops[slot] =
-                                    Some((io_token, Op::WriteVectored { fd, buffers }));
-                                continue;
-                            }
-
-                            result
-                        }
-                    }
                     Op::PollAdd { .. } => {
                         let mut readiness = 0u32;
                         if event.is_readable() {
@@ -1581,7 +1471,6 @@ impl AsRawFd for Op {
             Op::UdpRecvVectored { fd, .. } => fd,
             Op::UdpSendVectored { fd, .. } => fd,
             Op::ReadVectored { fd, .. } => fd,
-            Op::WriteVectored { fd, .. } => fd,
             Op::Connect { fd, .. } => fd,
             Op::ReadRent { fd, .. } => fd,
             Op::WriteRent { fd, .. } => fd,

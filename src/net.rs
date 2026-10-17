@@ -7,7 +7,6 @@ use libc;
 use smallvec::SmallVec;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
-use std::io::IoSlice;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::OwnedFd;
@@ -150,6 +149,20 @@ fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListen
 }
 
 /// An asynchronous TCP stream.
+///
+/// # Buffer ownership
+///
+/// The three shapes are kept apart on purpose, so a caller can tell from the
+/// signature alone whether it keeps its buffer or hands it over:
+///
+/// | method | buffer | copy | who holds the bytes while a call blocks |
+/// |---|---|---|---|
+/// | `read_rent`, `write_rent` | **rented**: the caller hands over an owned `T: RentBuffer` and gets the same allocation back | none beyond the `T`/`Buffer` conversion | the backend op, on the owning shard |
+/// | `poll_read`, `poll_read_vectored`, `poll_write`, `poll_write_vectored` | **borrowed**: the caller's slices | none — a direct `read(2)`/`write(2)`/`readv(2)`/`writev(2)`, retried on the readiness wakeup | nobody: the syscall only runs inside `poll`, so a queued op can never outlive the caller's buffer |
+/// | `write_all_static` | borrowed `&'static [u8]` | none — tries `write(2)`, then queues `Op::WriteStatic`, which points the backend straight at those bytes | the backend op; `'static` is exactly why queueing it is sound |
+///
+/// Writing a head followed by a body is an HTTP response detail, not a stream
+/// capability, so `HttpConnection::send_response` does that itself.
 #[derive(Debug)]
 pub struct AsyncTcpStream {
     descriptor: Option<RegisteredDescriptor>,
@@ -281,78 +294,8 @@ impl AsyncTcpStream {
         }
     }
 
-    /// Write multiple owned buffers in one call.
-    /// Returns the buffers so callers can recycle or reuse them.
-    pub async fn write_buffers(&self, buffers: Vec<Buffer>) -> io::Result<(usize, Vec<Buffer>)> {
-        let op = crate::io::Op::WriteVectored {
-            fd: self.as_raw_fd(),
-            buffers: buffers.into(),
-        };
-        let descriptor = self.descriptor_lease();
-        let token = with_io_state(|state| state.io_backend.submit_with_descriptor(op, descriptor));
-        let future = crate::io::future::IoFuture::new(token);
-        match future.await? {
-            crate::io::CompletionKind::WriteVectored {
-                bytes_written,
-                buffers,
-            } => Ok((bytes_written, buffers.into_vec())),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unexpected completion",
-            )),
-        }
-    }
-
-    /// Write two byte slices fully.
-    pub async fn write_all_slices(&mut self, first: &[u8], second: &[u8]) -> io::Result<()> {
-        let mut first = first;
-        let mut second = second;
-
-        while !first.is_empty() || !second.is_empty() {
-            let n = if second.is_empty() {
-                futures::future::poll_fn(|cx| {
-                    AsyncWrite::poll_write(Pin::new(&mut *self), cx, first)
-                })
-                .await?
-            } else if first.is_empty() {
-                futures::future::poll_fn(|cx| {
-                    AsyncWrite::poll_write(Pin::new(&mut *self), cx, second)
-                })
-                .await?
-            } else {
-                let bufs = [IoSlice::new(first), IoSlice::new(second)];
-                futures::future::poll_fn(|cx| {
-                    AsyncWrite::poll_write_vectored(Pin::new(&mut *self), cx, &bufs)
-                })
-                .await?
-            };
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "write_all_slices wrote zero bytes",
-                ));
-            }
-
-            let first_len = first.len();
-            if n < first_len {
-                first = &first[n..];
-                continue;
-            }
-
-            first = &[];
-            let remaining = n - first_len;
-            if remaining >= second.len() {
-                second = &[];
-            } else {
-                second = &second[remaining..];
-            }
-        }
-
-        Ok(())
-    }
-
     /// Write a static byte slice without copying it into an owned Buffer.
-    pub async fn write_static_all(&self, mut data: &'static [u8]) -> io::Result<()> {
+    pub async fn write_all_static(&self, mut data: &'static [u8]) -> io::Result<()> {
         while !data.is_empty() {
             // Tiny static responses usually fit the socket send buffer. Use the
             // nonblocking fast path first to avoid an avoidable SQE/CQE round
@@ -367,7 +310,7 @@ impl AsyncTcpStream {
                     Ok(_) => {
                         return Err(io::Error::new(
                             io::ErrorKind::WriteZero,
-                            "write_static_all wrote zero bytes",
+                            "write_all_static wrote zero bytes",
                         ));
                     }
                     Err(error) if is_wouldblock(&error) => {}
@@ -391,7 +334,7 @@ impl AsyncTcpStream {
                     if bytes_written == 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::WriteZero,
-                            "write_static_all wrote zero bytes",
+                            "write_all_static wrote zero bytes",
                         ));
                     }
                     data = &data[bytes_written..];
@@ -399,7 +342,7 @@ impl AsyncTcpStream {
                 other => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Unexpected completion for write_static_all: {other:?}"),
+                        format!("Unexpected completion for write_all_static: {other:?}"),
                     ));
                 }
             }
@@ -729,10 +672,10 @@ impl AsyncWrite for AsyncTcpStream {
             }
 
             // writev(2) straight from the caller's slices: one syscall, no copy —
-            // the mirror of `poll_read_vectored`. Submitting `Op::WriteVectored`
-            // would have the backend copy every slice into its own `Buffer`s and
+            // the mirror of `poll_read_vectored`. The queued-vectored shape this
+            // replaced had the backend copy every slice into its own `Buffer`s and
             // then write those, which is the same double copy the readv path
-            // avoids.
+            // avoids; it was retired with `Op::WriteVectored`.
             match try_write_vectored(this.as_raw_fd(), bufs) {
                 Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
                 Err(err) if is_wouldblock(&err) => {}
