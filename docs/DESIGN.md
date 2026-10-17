@@ -79,11 +79,14 @@
 | 层面 | 决策 | 理由 |
 |------|------|------|
 | **目标平台** | Linux + macOS | Linux 是 io_uring 性能路径；macOS 是 kqueue 正确性/开发路径 |
-| **内核基线** | Linux 6.12 LTS | 需 multi-shot accept/recv、provided buffer ring inc、IORING_OP_SENDZC、min timeout |
+| **内核基线** | Linux 6.12 LTS | 6.12 是**性能基线**：multi-shot accept/recv、provided buffer ring inc、IORING_OP_SENDZC、min timeout 启用后才有收益，不是能否构建的前提 |
 | **epoll/kqueue** | 保留并验证正确性 | Linux 无法使用 io_uring 时回退 epoll；macOS 使用 kqueue |
 | **硬件** | x86_64 / ARM64 | 线程 pin 到物理核 |
 
-构建时如果内核 < 6.12，编译直接报错要求升级内核。
+构建时按内核版本选择后端：≥ 6.12 选 `io_uring`，< 6.12（或版本探测失败）回退
+`epoll` 后端，**不再编译报错**。需要显式指定时用
+`MINISS_IO_BACKEND={io_uring|epoll|kqueue}` 覆盖探测（值必须对目标 OS 合法）；
+这也是在现代内核上构建并验证 epoll 后端的唯一入口，否则那段代码永远不会被编译。
 
 ### 内核特性的利用策略
 

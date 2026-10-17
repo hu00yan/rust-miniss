@@ -1,0 +1,95 @@
+id: linux-epoll-fallback-backend
+title: Linux < 6.12 回退到 MIO/epoll 后端（不再编译失败），并让该后端可被显式构建与验证
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+## 目标
+
+1. `build.rs`：Linux 内核 < 6.12 不再 `panic!`，改为选择 `io_backend = "epoll"`
+   （MIO 后端）。io_uring 仍然只在 6.12+ 上选择。
+2. 内核版本探测失败（`uname` 不可用/格式无法解析）时同样回退到 epoll，而不是
+   让构建失败。
+3. 增加 `MINISS_IO_BACKEND={io_uring|epoll|kqueue}` 环境变量覆盖探测结果，并要求
+   所选后端对目标 OS 合法。
+4. macOS 保持 `kqueue`（与 epoll 共用同一份 `src/io/mio_poll.rs`）。
+
+## 证据（为什么）
+
+1. **今天这条路径是死代码**：`build.rs` 在 Linux 上只会发出 `io_uring` 或直接
+   `panic!`，因此 `io_backend = "epoll"` 在 Linux 上**从未被编译过**。而代码里
+   确实存在只在 epoll-on-Linux 下生效的分支：`src/cpu.rs:57`、`src/cpu.rs:74`、
+   `src/multicore.rs:1752`。`tests/fallback_buffer_init.rs:7` 也只在
+   `io_backend = "epoll"`（或 macOS/kqueue）下编译。
+2. **内核基线本来就是可选的**：`docs/DESIGN.md:82-99` 把 6.12 的若干特性列为
+   「运行时探测后启用」，也就是说 6.12 是**性能基线**，不是「能否运行」的前提。
+   把它做成硬性编译错误，等于让所有旧内核机器完全无法使用这个运行时。
+3. **没有覆盖入口就无法验证**：不加 `MINISS_IO_BACKEND`，在 6.12+ 机器上永远
+   无法构建 epoll 后端，这条代码路径就永远是「写了但没跑过」。
+
+## 已落地的部分（已验证）
+
+- `build.rs` 重写：`Backend` 枚举 + `requested_backend()` + `probed_backend()`；
+  Linux < 6.12 与探测失败均回退 epoll（带警告）；`MINISS_IO_BACKEND` 覆盖并对
+  非法值/不匹配目标 OS 的值 panic。
+- 验证方式（不是「看着像对」）：`cargo clean -p rust-miniss` 后
+  `cargo check --lib -v`，直接读 rustc 命令行里的 cfg：
+  - `MINISS_IO_BACKEND=epoll` → `--cfg 'io_backend="epoll"'`，**无** `has_io_uring`；
+  - 缺省（本机 7.2 内核）→ `--cfg has_io_uring --cfg 'io_backend="io_uring"'`。
+  - 切换后端不需要 `cargo clean`：先 io_uring、再 epoll，同一 target 目录下
+    rustc 用 epoll 重跑了 lib；第三次调用被正确判定为新鲜（0 次 rustc）。
+- 非法值被拒：`MINISS_IO_BACKEND=bogus` → "unknown MINISS_IO_BACKEND=bogus"；
+  `MINISS_IO_BACKEND=kqueue` 在 Linux 上 → "kqueue is macOS-only"。
+- epoll 后端本身**编译通过且无告警**：
+  `MINISS_IO_BACKEND=epoll cargo clippy --all-targets --all-features -- -D warnings`
+  干净通过（这段代码此前从未被任何编译器看过）。
+- **< 6.12 的自动回退路径本身也被真实走通了**（不是「看着像对」）：本机内核是
+  7.2，正常探测永远不会走回退分支，所以在 `PATH` 前面放一个只伪造 `uname -r`
+  的 shim（其余调用转发给真实 `/usr/bin/uname`，避免影响 cc/ld），再读 rustc
+  命令行里的 cfg：
+  - shim 报 `5.15.0-fake` → `--cfg 'io_backend="epoll"'`，**无** `has_io_uring`；
+  - shim 报 `6.12.0-fake` → `--cfg has_io_uring --cfg 'io_backend="io_uring"'`；
+  - shim 报 `garbage`（探测失败）→ `--cfg 'io_backend="epoll"'`。
+
+## Gate 结果
+
+- `just check`：265 passed / 0 failed（含 `tests/multicore_tests.rs`，无挂死）；
+  `arch-audit` CLEAN、`unsafe-audit` CLEAN、`diff-audit` GREEN。
+- `bench-smoke`：先修正了基线本身——旧的那份 1-core 基线是在 findings #42 的泄漏进程
+  占着一个核时量的（165,764 rps）；空闲 VM 上重测为 289,730 / 285,066 / 292,485
+  rps（中位 289,730）。换序、10 秒、交错 A/B（n=3）：基线中位 286,730 rps vs
+  候选 279,517（−2.5%，在 5% 带内），p99 中位 234 vs 262 µs 但样本重叠
+  （候选 195–286 µs，基线 204–303 µs）。用干净基线跑 `just bench-smoke` 通过 3/3，
+  但同一个候选二进制本次会话里量到 253k/276k/279k/427k rps，因此这台机器上的
+  5 秒 smoke 大约只有 ±40% 的分辨率，单次结果不足以支撑 ±5% 的结论。
+- 该 commit 在 6.12+ 主机上发出的 cfg 与改动前**完全相同**，因此不可能移动 smoke
+  所测的那个 artifact；上面的测量是对「基线是否可信」的修正，不是对本次 diff 的性能主张。
+
+## 曾经的阻塞项与解除方式
+
+启用后立刻暴露了 epoll 后端的真实缺陷，见 `tasks/epoll-pending-op-not-drained.yaml`：
+`process_io_completions` 用 `target_os = "linux"` 选择 fused CQE 路径，而 mio 后端
+不实现 `drain_completions_fused`，于是 **epoll 上一份 completion 都不会被取走**，
+整个 lib 测试套件挂死；叠加 `MinissUdpSocket` 跨 shard drop 时跳过 cancel，op 泄漏。
+
+缺陷已由 `e77bd70` 修好（drain 路径改为按 `io_backend` 选择 + off-shard drop 把
+cancel 投回属主 shard）。修好之后 epoll 套件能跑完（8 次里 2 次干净 `124 passed`，
+6 次 `123 passed; 1 failed`），"挂死" 从 6 次里 4-5 次降到 0；唯一剩下的失败是测试
+自身的竞态，在未改动的 `main` 基线 `c4f46a4` 上同样失败
+（`docs/review/runtime-safety-findings.md` #41，未调大超时、未 skip）。因此本卡解除阻塞。
+
+## 非目标
+
+- 不改 io_uring 的选择条件（6.12+ 仍优先 io_uring）
+- 不为 `kqueue` 增加 Linux 支持（epoll 与 kqueue 才是各自平台的正确选择）
+- 不重写 `MioBackend`（缺陷另卡）
+
+## 推翻条件
+
+若结论是「旧内核上 MIO 后端无法可靠工作，且修复代价过高」，则应回到显式失败的
+设计，但必须改成**清晰的错误信息 + 明确的替代路径**，而不是当作已支持。
+
+allowed_files:
+  - build.rs
+  - tasks/linux-epoll-fallback-backend.yaml
+  - docs/DESIGN.md
+  - docs/DECISION_LOG.md

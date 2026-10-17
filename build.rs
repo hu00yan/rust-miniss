@@ -5,15 +5,27 @@
 //!
 //! ## Platform-specific IO Backend Selection
 //!
-//! - **Linux with kernel 6.12+**: Enables `io_uring` backend
-//! - **Linux with older kernels**: **Error** — kernel must be 6.12+
-//! - **macOS**: Enables `kqueue` backend (development only, not optimized)
-//! - **Other Unix systems**: Unsupported (the runtime currently targets Linux and macOS)
+//! - **Linux with kernel 6.12+**: Enables the `io_uring` backend.
+//! - **Linux with an older kernel**: Falls back to the `epoll` backend. The
+//!   io_uring features the runtime depends on (multi-shot accept/recv, provided
+//!   buffer ring increments, min-timeout) do not exist below 6.12, so the
+//!   fallback is the supported choice rather than a build failure.
+//! - **macOS**: Enables the `kqueue` backend (development only, not optimized).
+//!   `epoll` and `kqueue` are the same backend source (`src/io/mio_poll.rs`).
+//! - **Other Unix systems**: Unsupported (the runtime targets Linux and macOS).
+//!
+//! ## Overriding the probe
+//!
+//! Set `MINISS_IO_BACKEND` to `io_uring`, `epoll` or `kqueue` to build a specific
+//! backend on a host whose kernel would otherwise select another one. This is
+//! what makes the fallback backend testable on a modern kernel: without it,
+//! `epoll` could never be built on a Linux host, and its code would go
+//! unverified. The requested backend must be valid for the target OS.
 //!
 //! ## Assumptions
 //!
-//! - The compilation machine and runtime machine are the same (reasonable for most use cases)
-//! - Kernel version 6.12+ is required for io_uring
+//! - The compilation machine and runtime machine are the same (reasonable for
+//!   most use cases), which is also what makes the kernel probe meaningful.
 //!
 //! ## Configuration Flags
 //!
@@ -22,8 +34,26 @@
 
 use std::process::Command;
 
+/// The I/O backend this build compiles.
+enum Backend {
+    IoUring,
+    Epoll,
+    Kqueue,
+}
+
+impl Backend {
+    fn name(&self) -> &'static str {
+        match self {
+            Backend::IoUring => "io_uring",
+            Backend::Epoll => "epoll",
+            Backend::Kqueue => "kqueue",
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=MINISS_LOOM");
+    println!("cargo:rerun-if-env-changed=MINISS_IO_BACKEND");
     // Emit check-cfg hints so `cfg(io_backend = "...")` is accepted by the compiler
     println!("cargo:rustc-check-cfg=cfg(io_backend, values(\"io_uring\", \"epoll\", \"kqueue\"))");
     println!("cargo:rustc-check-cfg=cfg(has_io_uring)");
@@ -34,33 +64,72 @@ fn main() {
         println!("cargo:rustc-cfg=loom");
     }
 
+    let backend = match std::env::var("MINISS_IO_BACKEND") {
+        Ok(requested) if !requested.is_empty() => requested_backend(&requested),
+        _ => probed_backend(),
+    };
+
+    if matches!(backend, Backend::IoUring) {
+        println!("cargo:rustc-cfg=has_io_uring");
+    }
+    println!("cargo:rustc-cfg=io_backend=\"{}\"", backend.name());
+    eprintln!("Selected IO backend: {}", backend.name());
+}
+
+/// The backend named by `MINISS_IO_BACKEND`, validated against the target OS.
+fn requested_backend(requested: &str) -> Backend {
+    match requested {
+        "io_uring" if cfg!(target_os = "linux") => Backend::IoUring,
+        "epoll" if cfg!(target_os = "linux") => Backend::Epoll,
+        "kqueue" if cfg!(target_os = "macos") => Backend::Kqueue,
+        "io_uring" | "epoll" => panic!(
+            "MINISS_IO_BACKEND={requested} is Linux-only; the io_uring and epoll backends do not \
+             exist on this target"
+        ),
+        "kqueue" => panic!("MINISS_IO_BACKEND=kqueue is macOS-only"),
+        other => {
+            panic!("unknown MINISS_IO_BACKEND={other}; expected io_uring, epoll or kqueue")
+        }
+    }
+}
+
+/// The backend selected by probing the platform.
+fn probed_backend() -> Backend {
     if cfg!(target_os = "linux") {
-        match get_kernel_version() {
+        return match get_kernel_version() {
             Ok(version) => {
                 eprintln!("Detected kernel version: {version:?}");
                 if version >= (6, 12, 0) {
-                    eprintln!("Kernel 6.12+ detected: selecting io_uring backend.");
-                    println!("cargo:rustc-cfg=has_io_uring");
-                    println!("cargo:rustc-cfg=io_backend=\"io_uring\"");
+                    Backend::IoUring
                 } else {
-                    panic!(
-                        "Linux kernel {}.{}.{} is too old. rust-miniss requires kernel 6.12+ for io_uring support.",
+                    eprintln!(
+                        "Linux kernel {}.{}.{} predates 6.12: selecting the epoll backend. \
+                         io_uring support starts at 6.12.",
                         version.0, version.1, version.2
                     );
+                    Backend::Epoll
                 }
             }
             Err(e) => {
-                panic!(
-                    "Failed to determine kernel version: {e}. rust-miniss requires Linux kernel 6.12+."
+                eprintln!(
+                    "Failed to determine kernel version: {e}. Selecting the epoll backend; \
+                     io_uring requires Linux kernel 6.12+."
                 );
+                Backend::Epoll
             }
-        }
-    } else if cfg!(target_os = "macos") {
+        };
+    }
+
+    if cfg!(target_os = "macos") {
         eprintln!("Enabling kqueue backend (macOS development only)");
-        println!("cargo:rustc-cfg=io_backend=\"kqueue\"");
-    } else if cfg!(unix) {
+        return Backend::Kqueue;
+    }
+
+    if cfg!(unix) {
         panic!("unsupported Unix target: rust-miniss currently supports Linux and macOS only");
     }
+
+    panic!("unsupported target: rust-miniss currently supports Linux and macOS only");
 }
 
 /// Gets the Linux kernel version as a tuple of (major, minor, patch)
