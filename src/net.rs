@@ -1,4 +1,4 @@
-use crate::cpu::{current_task_id, try_with_io_state, with_io_state};
+use crate::cpu::{current_task_id, try_with_io_state, with_io_state, CpuIoState};
 use crate::io::{DescriptorLease, IoToken, RegisteredDescriptor};
 use crate::{Buffer, RentBuffer};
 use futures::io::{AsyncRead, AsyncWrite};
@@ -474,6 +474,65 @@ impl Drop for AsyncTcpStream {
     }
 }
 
+/// One readiness attempt, shared by every borrowed (non-rent) poll path.
+///
+/// All five call sites — scalar and vectored, read and write, plus
+/// `HyperRead::poll_read` — do the same four things in the same order, so the
+/// order only has to be correct here:
+///
+/// 1. consume the readiness completion that woke us. It carries no payload; it
+///    means "run the syscall again", nothing more;
+/// 2. run that syscall directly. A queued op could outlive the caller's buffer,
+///    so the syscall only ever runs inside `poll`;
+/// 3. on `WouldBlock`, arm `events` on `fd` and register this task's waker, so
+///    the runtime re-enters `poll` when the descriptor is ready;
+/// 4. otherwise return the result.
+///
+/// `slot` is the caller's own registration handle for *its* direction
+/// (`readiness_token` for reads, `pollout_token` for writes), so the two
+/// directions can never consume each other's registration.
+fn poll_readiness(
+    state: &CpuIoState,
+    fd: RawFd,
+    descriptor: DescriptorLease,
+    cx: &Context<'_>,
+    events: u32,
+    slot: &mut Option<IoToken>,
+    attempt: impl FnOnce() -> io::Result<usize>,
+) -> Poll<io::Result<usize>> {
+    if let Some(token) = slot.take() {
+        // SAFETY: `token` was submitted on this shard, and this is the single
+        // place it leaves `slot`, always before any replacement registration.
+        unsafe {
+            state.clear_slot(token);
+        }
+    }
+
+    match attempt() {
+        Ok(bytes) => return Poll::Ready(Ok(bytes)),
+        Err(err) if is_wouldblock(&err) => {}
+        Err(err) => return Poll::Ready(Err(err)),
+    }
+
+    let op = crate::io::Op::PollAdd {
+        fd,
+        events,
+        multishot: false,
+    };
+    let token = match state.io_backend.submit_with_descriptor(op, descriptor) {
+        Ok(token) => token,
+        Err(error) => return Poll::Ready(Err(error.into())),
+    };
+    *slot = Some(token);
+    // Register waker AND pending_task for inline completion.
+    // SAFETY: `token` was just submitted on this shard; the waker/task
+    // association is shard-local.
+    unsafe {
+        state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+    }
+    Poll::Pending
+}
+
 impl AsyncRead for AsyncTcpStream {
     #[inline]
     fn poll_read(
@@ -485,47 +544,17 @@ impl AsyncRead for AsyncTcpStream {
             // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
             // self-referential fields; poll never moves fields after projection.
             let this = self.as_mut().get_mut();
-
-            // Consume the readiness completion that woke us. It carries no
-            // payload — it exists only to re-enter this poll, exactly the way
-            // `pollout_token` does for writes below.
-            if let Some(readiness_tok) = this.readiness_token.take() {
-                // SAFETY: readiness_tok belongs to this stream and is cleared
-                // once before a new readiness registration is submitted.
-                unsafe {
-                    state.clear_slot(readiness_tok);
-                }
-            }
-
-            // The readiness wakeup carries no data, so re-issue the read here.
-            // Doing it in this call is what keeps the kernel's destination
-            // buffer valid: a queued read op could still be in flight after
-            // the future holding the caller's buffer is dropped.
-            match try_read(this.as_raw_fd(), buf) {
-                Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-
-            let op = crate::io::Op::PollAdd {
-                fd: this.as_raw_fd(),
-                events: libc::POLLIN as u32,
-                multishot: false,
-            };
-            let token = match state
-                .io_backend
-                .submit_with_descriptor(op, this.descriptor_lease())
-            {
-                Ok(token) => token,
-                Err(error) => return Poll::Ready(Err(error.into())),
-            };
-            this.readiness_token = Some(token);
-            // Register waker AND pending_task for inline completion.
-            // SAFETY: Single-threaded access.
-            unsafe {
-                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-            }
-            Poll::Pending
+            let fd = this.as_raw_fd();
+            let descriptor = this.descriptor_lease();
+            poll_readiness(
+                state,
+                fd,
+                descriptor,
+                cx,
+                libc::POLLIN as u32,
+                &mut this.readiness_token,
+                || try_read(fd, buf),
+            )
         })
     }
 
@@ -543,46 +572,21 @@ impl AsyncRead for AsyncTcpStream {
             // SAFETY: AsyncTcpStream has no self-referential fields; poll only
             // mutates fields in place and never moves them out of the pin.
             let this = self.as_mut().get_mut();
-
-            // Consume the readiness completion that woke us — same fire-and-forget
-            // wakeup role as `pollout_token` on the write path.
-            if let Some(readiness_tok) = this.readiness_token.take() {
-                // SAFETY: readiness_tok belongs to this stream and is cleared
-                // once before a new readiness registration is submitted.
-                unsafe {
-                    state.clear_slot(readiness_tok);
-                }
-            }
-
+            let fd = this.as_raw_fd();
+            let descriptor = this.descriptor_lease();
             // readv straight into the caller's slices: one syscall, one copy.
             // Submitting `Op::ReadVectored` would have the backend allocate its
             // own `Buffer`s, read into them, and then be copied a second time
             // into `bufs` on completion.
-            match try_read_vectored(this.as_raw_fd(), bufs) {
-                Ok(bytes_read) => return Poll::Ready(Ok(bytes_read)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-
-            let op = crate::io::Op::PollAdd {
-                fd: this.as_raw_fd(),
-                events: libc::POLLIN as u32,
-                multishot: false,
-            };
-            let token = match state
-                .io_backend
-                .submit_with_descriptor(op, this.descriptor_lease())
-            {
-                Ok(token) => token,
-                Err(error) => return Poll::Ready(Err(error.into())),
-            };
-            this.readiness_token = Some(token);
-            // SAFETY: token was just submitted on this shard; waker/task
-            // association is shard-local.
-            unsafe {
-                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-            }
-            Poll::Pending
+            poll_readiness(
+                state,
+                fd,
+                descriptor,
+                cx,
+                libc::POLLIN as u32,
+                &mut this.readiness_token,
+                || try_read_vectored(fd, bufs),
+            )
         })
     }
 }
@@ -598,48 +602,22 @@ impl AsyncWrite for AsyncTcpStream {
             // SAFETY: AsyncTcpStream has no self-referential fields; poll only
             // mutates fields in place and never moves them out of the pin.
             let this = self.as_mut().get_mut();
-
-            // Consume the readiness completion that woke us — same
-            // fire-and-forget wakeup role as `readiness_token` on the read path.
-            if let Some(pollout_tok) = this.pollout_token.take() {
-                // SAFETY: pollout_tok belongs to this stream and is cleared
-                // once before a new readiness registration is submitted.
-                unsafe {
-                    state.clear_slot(pollout_tok);
-                }
-            }
-
+            let fd = this.as_raw_fd();
+            let descriptor = this.descriptor_lease();
             // write(2) straight from the caller's slice: one syscall, no copy.
             // Submitting `Op::Write` would make the backend copy `buf` into an
             // owned `Buffer` and queue that, and `buf` is borrowed, so it could
             // not be handed to the kernel as a queued operation anyway.
             // `poll_read` reasons the same way about the borrowed read buffer.
-            match try_write(this.as_raw_fd(), buf) {
-                Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-
-            // Send buffer full: arm POLLOUT and retry the syscall on wakeup.
-            let op = crate::io::Op::PollAdd {
-                fd: this.as_raw_fd(),
-                events: libc::POLLOUT as u32,
-                multishot: false,
-            };
-            let token = match state
-                .io_backend
-                .submit_with_descriptor(op, this.descriptor_lease())
-            {
-                Ok(token) => token,
-                Err(error) => return Poll::Ready(Err(error.into())),
-            };
-            this.pollout_token = Some(token);
-            // SAFETY: token was just submitted on this shard; waker/task
-            // association is shard-local.
-            unsafe {
-                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-            }
-            Poll::Pending
+            poll_readiness(
+                state,
+                fd,
+                descriptor,
+                cx,
+                libc::POLLOUT as u32,
+                &mut this.pollout_token,
+                || try_write(fd, buf),
+            )
         })
     }
 
@@ -660,48 +638,22 @@ impl AsyncWrite for AsyncTcpStream {
             // SAFETY: AsyncTcpStream is Unpin in practice because it contains no
             // self-referential fields; poll never moves fields after projection.
             let this = self.as_mut().get_mut();
-
-            // Consume the readiness completion that woke us — same
-            // fire-and-forget wakeup role as `readiness_token` on the read path.
-            if let Some(pollout_tok) = this.pollout_token.take() {
-                // SAFETY: pollout_tok belongs to this stream and is cleared
-                // once before a new readiness registration is submitted.
-                unsafe {
-                    state.clear_slot(pollout_tok);
-                }
-            }
-
+            let fd = this.as_raw_fd();
+            let descriptor = this.descriptor_lease();
             // writev(2) straight from the caller's slices: one syscall, no copy —
             // the mirror of `poll_read_vectored`. The queued-vectored shape this
             // replaced had the backend copy every slice into its own `Buffer`s and
             // then write those, which is the same double copy the readv path
             // avoids; it was retired with `Op::WriteVectored`.
-            match try_write_vectored(this.as_raw_fd(), bufs) {
-                Ok(bytes_written) => return Poll::Ready(Ok(bytes_written)),
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-
-            // Send buffer full: arm POLLOUT and retry the syscall on wakeup.
-            let op = crate::io::Op::PollAdd {
-                fd: this.as_raw_fd(),
-                events: libc::POLLOUT as u32,
-                multishot: false,
-            };
-            let token = match state
-                .io_backend
-                .submit_with_descriptor(op, this.descriptor_lease())
-            {
-                Ok(token) => token,
-                Err(error) => return Poll::Ready(Err(error.into())),
-            };
-            this.pollout_token = Some(token);
-            // SAFETY: token was just submitted on this shard; waker/task
-            // association is shard-local.
-            unsafe {
-                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-            }
-            Poll::Pending
+            poll_readiness(
+                state,
+                fd,
+                descriptor,
+                cx,
+                libc::POLLOUT as u32,
+                &mut this.pollout_token,
+                || try_write_vectored(fd, bufs),
+            )
         })
     }
 
@@ -739,47 +691,28 @@ impl HyperRead for AsyncTcpStream {
             let read_buf =
                 // SAFETY: same region, `raw.len()` is its exact capacity.
                 unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
+            let fd = this.as_raw_fd();
+            let descriptor = this.descriptor_lease();
 
-            // Consume the readiness completion that woke us — fire-and-forget,
-            // same as `pollout_token` on the write path.
-            if let Some(readiness_tok) = this.readiness_token.take() {
-                // SAFETY: readiness_tok belongs to this stream and is cleared
-                // once before a new readiness registration is submitted.
-                unsafe {
-                    state.clear_slot(readiness_tok);
-                }
-            }
-
-            match try_read(this.as_raw_fd(), read_buf) {
-                Ok(bytes_read) => {
+            match poll_readiness(
+                state,
+                fd,
+                descriptor,
+                cx,
+                libc::POLLIN as u32,
+                &mut this.readiness_token,
+                || try_read(fd, read_buf),
+            ) {
+                Poll::Ready(Ok(bytes_read)) => {
                     // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
                     unsafe {
                         buf.advance(bytes_read);
                     }
-                    return Poll::Ready(Ok(()));
+                    Poll::Ready(Ok(()))
                 }
-                Err(err) if is_wouldblock(&err) => {}
-                Err(err) => return Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
             }
-
-            let op = crate::io::Op::PollAdd {
-                fd: this.as_raw_fd(),
-                events: libc::POLLIN as u32,
-                multishot: false,
-            };
-            let token = match state
-                .io_backend
-                .submit_with_descriptor(op, this.descriptor_lease())
-            {
-                Ok(token) => token,
-                Err(error) => return Poll::Ready(Err(error.into())),
-            };
-            this.readiness_token = Some(token);
-            // SAFETY: Single-threaded access.
-            unsafe {
-                state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
-            }
-            Poll::Pending
         })
     }
 }
@@ -797,15 +730,8 @@ impl HyperWrite for AsyncTcpStream {
         AsyncWrite::poll_flush(self, cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        // SAFETY: the descriptor is live for the duration of this call.
-        let result = unsafe { libc::shutdown(this.as_raw_fd(), libc::SHUT_WR) };
-        if result == 0 {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Ready(Err(io::Error::last_os_error()))
-        }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_close(self, cx)
     }
 
     fn is_write_vectored(&self) -> bool {

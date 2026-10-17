@@ -1,0 +1,123 @@
+id: read-readiness-collapse-and-close-delegate
+title: 读写共用一个就绪核心（读侧 3 处 →1），HyperWrite::poll_shutdown 委托 poll_close
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: in-progress
+
+## 目标
+
+1. `src/net.rs` 里「取走上次的就绪 token → 直试系统调用 → EAGAIN 则 arm
+   readiness → 登记 waker」这段逻辑，今天被抄了 5 遍：
+   - 读侧 3 遍：`AsyncRead::poll_read`（`:534-587`）、
+     `AsyncRead::poll_read_vectored`（`:589-644`）、`HyperRead::poll_read`
+     （`:781-841`）；
+   - 写侧 2 遍：`AsyncWrite::poll_write`（`:647-701`）、
+     `AsyncWrite::poll_write_vectored`（`:703-763`）。
+   抽成**一个**私有核心，5 处都调用它。
+2. `HyperWrite::poll_shutdown`（`:857-866`）现在是 `AsyncWrite::poll_close`
+   （`:769-778`）的逐字复制（同一段 `libc::shutdown(fd, SHUT_WR)`），改为委托。
+
+## 证据（为什么）
+
+1. **写侧已经证明该委托是对的**：`HyperWrite::poll_write`（`:850`）与
+   `poll_write_vectored`（`:877`）本来就委托给 `AsyncWrite`，只有
+   `poll_shutdown` 自己抄了一份。同一个 trait impl 里三种方法两种风格。
+2. **读侧 3 份是同一段代码**：三处都是 `readiness_token.take()` →
+   `unsafe { state.clear_slot(tok) }` → `try_*(fd, ..)` → `Op::PollAdd { events:
+   POLLIN }` → `store_waker_and_pending_task`。`HyperRead::poll_read` 与
+   `AsyncRead::poll_read` 的差别**只有** buffer 类型（hyper 的
+   `ReadBufCursor` vs `&mut [u8]`）和读完要 `buf.advance(n)`。
+3. **读侧那 3 份的注释互相指认**：三处注释都在说「same fire-and-forget wakeup
+   role as `pollout_token`/`readiness_token`」——即作者知道它们是同一件事，
+   只是抄了。
+4. 这一项直接服务于「每项能力 ≤2 个函数」「减少冗余」两个目标：改完 `src/net.rs`
+   就只剩一个就绪核心 + 每个方向各自的一行系统调用闭包。
+
+## 设计
+
+私有自由函数（`events` 与 token 槽由调用方给出，避免把 POLLIN/POLLOUT 语义写死
+进核心）：
+
+```rust
+fn poll_readiness<F>(
+    state: &mut IoState,
+    fd: RawFd,
+    descriptor: DescriptorLease,
+    cx: &mut Context<'_>,
+    events: u32,
+    slot: &mut Option<IoToken>,
+    syscall: F,
+) -> Poll<io::Result<usize>>
+where
+    F: FnOnce() -> io::Result<usize>,
+```
+
+调用方形如：
+
+```rust
+let fd = this.as_raw_fd();
+let descriptor = this.descriptor_lease();
+poll_readiness(state, fd, descriptor, cx, libc::POLLIN as u32,
+               &mut this.readiness_token, || try_read(fd, buf))
+```
+
+把 `fd`/`descriptor` 先取成 owned 值再借 `&mut this.<slot>`，规避同一结构体的双重
+借用；闭包只捕获调用方的缓冲，不捕获 `this`。
+
+`HyperRead::poll_read` 用同一个核心后要 `unsafe { buf.advance(n) }`，写法与今天
+完全一致（今天也是先算切片、读完后 advance）。
+
+## 非目标
+
+- **不改任何行为**：读/写仍是「直试系统调用 + arm readiness + 唤醒重试」
+- 不动 `read_rent`/`write_rent`（它们走完成式 io_uring op，不是 readiness）
+- 不动 `src/io/*` 后端
+
+## 测试后果
+
+不新增测试：本卡是等价重构，既有测试就是它的护栏——
+`tests/vectored_io.rs::linux_uring_poll_write_blocks_on_readiness_until_the_peer_drains`
+（`d4ad1f7` 新增的确定性背压测试）直接压写侧 arm 形状，
+`linux_uring_delayed_submit_writev_survives_relocation_pressure` 压读侧 arm 形状，
+`tests/hyper_http1.rs` / `hyper_http2.rs` 压 `HyperRead`/`HyperWrite`。
+若重构中任何一处护栏变红，说明等价性假设错了，应回退而不是改测试。
+
+## 推翻条件
+
+若 `poll_readiness` 的参数列表长到比它替换掉的三份代码更难读，或迫使调用方写出
+比今天更绕的借用规避，则退回「读侧一个 helper、写侧一个 helper」的两函数形状。
+
+## 实施记录
+
+落地形状与上面的设计一致，只有两处更具体：
+
+- 核心是 `src/net.rs` 的私有自由函数 `poll_readiness`，
+  参数顺序 `(state: &CpuIoState, fd, descriptor, cx, events, slot: &mut
+  Option<IoToken>, attempt: impl FnOnce() -> io::Result<usize>)`。
+  `state` 是 `&CpuIoState`（`with_io_state` 给的就是它），不是草图里的
+  `&mut IoState`：核心只调 `clear_slot` / `submit_with_descriptor` /
+  `store_waker_and_pending_task`，三者都取 `&self`，不需要可变借用。
+- 5 个调用点收敛成 1 个核心 + 每个方向各一行 `fd`/`descriptor` 取值：
+  `AsyncRead::poll_read`、`AsyncRead::poll_read_vectored`、
+  `HyperRead::poll_read`（读完 `buf.advance(n)`）、`AsyncWrite::poll_write`、
+  `AsyncWrite::poll_write_vectored`。方向由调用方传入的 `events`
+  （`POLLIN`/`POLLOUT`）与 token 槽（`&mut this.readiness_token` /
+  `&mut this.pollout_token`）决定，核心里没有写死。
+- `HyperWrite::poll_shutdown` 现在就是 `AsyncWrite::poll_close(self, cx)`，
+  与同一个 impl 里已经这样写的 `poll_write` / `poll_write_vectored` /
+  `poll_flush` 四种风格变成一种。
+- 5 处 SAFETY 注释收敛成核心里的 2 处（取 token / 登记 waker），
+  都改成说明**为什么**在这里成立（token 在 shard 上提交、只在核心这一处离开
+  槽位、waker 关联是 shard-local），而不是原来那句「Single-threaded access」。
+- `src/net.rs` 净 -74 行（+121/−195）。
+
+## 与 `vectored-writev-armed-registration-fd-leak` 的关系
+
+该卡的修复应该落在这个核心上：现在「取走上一次注册」只有一处
+（`poll_readiness` 开头的 `slot.take()`），因此「被放弃的 arm 要 cancel 并释放
+lease」也只需改这一处。本卡**不改**这个行为（见「非目标」），但把改它的位置从 5
+处降到 1 处。
+
+allowed_files:
+  - src/net.rs
+  - tasks/read-readiness-collapse-and-close-delegate.yaml
+  - docs/DECISION_LOG.md
