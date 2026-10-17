@@ -106,6 +106,7 @@ impl Runtime {
             match future.as_mut().poll(&mut context) {
                 Poll::Ready(output) => {
                     crate::cpu::set_current_task_id(None);
+                    retire_abandoned_registrations(&io_state, &mut io_completions);
                     return output;
                 }
                 Poll::Pending => {
@@ -117,35 +118,8 @@ impl Runtime {
                     io_state.io_backend.flush();
 
                     // Drain I/O completions
-                    io_completions.clear();
-                    if let Poll::Ready(()) = io_state
-                        .io_backend
-                        .drain_completions_into(&mut io_completions)
-                    {
-                        if !io_completions.is_empty() {
-                            // SAFETY: Single-threaded access.
-                            for (token, result) in io_completions.drain(..) {
-                                let is_accept =
-                                    matches!(result, Ok(crate::io::CompletionKind::Accept { .. }))
-                                        && io_state.io_backend.supports_multishot_accept();
-                                if is_accept {
-                                    // SAFETY: Single-threaded executor owns
-                                    // CpuIoState while polling completions.
-                                    if let Some(waker) = unsafe { io_state.take_waker(token) } {
-                                        waker.wake();
-                                    }
-                                    continue;
-                                }
-                                // SAFETY: Completion token came from this
-                                // executor's backend and is consumed once.
-                                if let Some(waker) = unsafe {
-                                    io_state.insert_completed_and_take_waker(token, result)
-                                } {
-                                    waker.wake();
-                                }
-                            }
-                            made_progress = true;
-                        }
+                    if drain_and_deliver(&io_state, &mut io_completions) {
+                        made_progress = true;
                     }
 
                     if timer_wheel.has_pending() {
@@ -176,34 +150,8 @@ impl Runtime {
                     io_state.io_backend.park(crate::config::park_timeout());
 
                     // Drain any completions that arrived during park.
-                    io_completions.clear();
-                    if let Poll::Ready(()) = io_state
-                        .io_backend
-                        .drain_completions_into(&mut io_completions)
-                    {
-                        if !io_completions.is_empty() {
-                            for (token, result) in io_completions.drain(..) {
-                                let is_accept =
-                                    matches!(result, Ok(crate::io::CompletionKind::Accept { .. }))
-                                        && io_state.io_backend.supports_multishot_accept();
-                                if is_accept {
-                                    // SAFETY: Single-threaded executor owns
-                                    // CpuIoState while polling completions.
-                                    if let Some(waker) = unsafe { io_state.take_waker(token) } {
-                                        waker.wake();
-                                    }
-                                    continue;
-                                }
-                                // SAFETY: Completion token came from this
-                                // executor's backend and is consumed once.
-                                if let Some(waker) = unsafe {
-                                    io_state.insert_completed_and_take_waker(token, result)
-                                } {
-                                    waker.wake();
-                                }
-                            }
-                            continue;
-                        }
+                    if drain_and_deliver(&io_state, &mut io_completions) {
+                        continue;
                     }
                 }
             }
@@ -252,6 +200,70 @@ impl Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// How many turns `block_on` spends retiring registrations that the completed
+/// future abandoned. Bounded so an operation that never completes cannot delay
+/// the return.
+const RETIRE_TURNS: usize = 3;
+
+/// Deliver one batch of drained I/O completions to the tasks awaiting them.
+///
+/// Returns `true` when the batch carried at least one completion, so callers
+/// can treat delivery as progress.
+fn drain_and_deliver(io_state: &CpuIoState, io_completions: &mut Vec<IoCompletion>) -> bool {
+    io_completions.clear();
+    let Poll::Ready(()) = io_state.io_backend.drain_completions_into(io_completions) else {
+        return false;
+    };
+    if io_completions.is_empty() {
+        return false;
+    }
+    for (token, result) in io_completions.drain(..) {
+        let is_accept = matches!(result, Ok(crate::io::CompletionKind::Accept { .. }))
+            && io_state.io_backend.supports_multishot_accept();
+        if is_accept {
+            // SAFETY: Single-threaded executor owns CpuIoState while polling
+            // completions.
+            if let Some(waker) = unsafe { io_state.take_waker(token) } {
+                waker.wake();
+            }
+            continue;
+        }
+        // SAFETY: Completion token came from this executor's backend and is
+        // consumed once.
+        if let Some(waker) = unsafe { io_state.insert_completed_and_take_waker(token, result) } {
+            waker.wake();
+        }
+    }
+    true
+}
+
+/// Retire readiness registrations that the completed future left behind.
+///
+/// A blocked read or write arms a readiness poll and gives its token to the
+/// stream. A later poll of that stream takes the token back, and when the retry
+/// succeeds the future finishes while the registration may still be armed in
+/// the kernel. The descriptor lease that pins the stream's fd is released only
+/// by that registration's terminal completion, so returning here without
+/// draining keeps the fd open for as long as the runtime lives: the peer of a
+/// stream the future dropped never observes EOF.
+///
+/// The abandoned registration has normally completed already and its CQE is
+/// waiting in the completion queue, so the first drain retires it. The bounded
+/// park covers the case where the kernel has yet to post that completion.
+fn retire_abandoned_registrations(io_state: &CpuIoState, io_completions: &mut Vec<IoCompletion>) {
+    for _ in 0..RETIRE_TURNS {
+        io_state.io_backend.flush();
+        let drained = drain_and_deliver(io_state, io_completions);
+        if io_state.io_backend.pending_operation_count() == 0 {
+            return;
+        }
+        if drained {
+            continue;
+        }
+        io_state.io_backend.park(crate::config::park_timeout());
     }
 }
 

@@ -1,7 +1,7 @@
 id: vectored-writev-armed-registration-fd-leak
 title: 未回收的 readiness 注册让 AsyncTcpStream 永不 close(fd)（writev 护栏 33–60% 挂死）
 branch: fix/io-backend-hygiene-and-macos-correctness
-status: in-progress
+status: done
 
 ## 现象
 
@@ -47,11 +47,7 @@ cancel，lease 永不释放，`close` 永不执行。重试落在 CQE drain 之�
 
 与 `read-readiness-collapse-and-close-delegate` 同源：把 readiness 注册收敛成
 **一个所有者**，使被放弃的 arm 走「cancel + 释放 lease」，而不是留给后续
-event-loop 回合；`AsyncTcpStream` drop 关闭 fd 不应依赖那个回合。
-
-若 (c) 的等价重构能把这件事变成单点修复，就在 (c) 内一并做完；否则本卡独立做。
-注意 `src/io/uring.rs` 的终态清理目前重复在多条路径上（review follow-up #5 记的
-就是这件事），修的时候不要只修一条。
+event-loop 回合。**（落地时这条被实测推翻，见下。）**
 
 **两个不要走的捷径**（已核对过代码）：
 
@@ -62,8 +58,13 @@ event-loop 回合；`AsyncTcpStream` drop 关闭 fd 不应依赖那个回合。
    the kernel operation is gone; retain the discard marker until a terminal CQE
    arrives」（`src/cpu.rs:504-506`）。**在这个后端里 lease 只可能被终态 CQE 释放**，
    所以只要驱动先返回，注册就必然被遗留下来。
-2. 因此也别只去改 `Runtime::block_on` 的收尾 drain：`MultiCoreRuntime` 的 worker
-   循环、shutdown 路径同样会在 armed 状态下停止，`Arc<OwnedFd>` 一样关不掉。
+2. （原写「别只去改 `Runtime::block_on` 的收尾 drain，`MultiCoreRuntime` 的
+   worker 循环、shutdown 路径同样会在 armed 状态下停止」。**这条是错的，落地时
+   用代码纠正**：worker 循环连续 drain、任务两次 poll 之间不 park，而 shutdown
+   本来就已经 `cancel_all()` + 反复 park/drain 到
+   `pending_operation_count() == 0`（`src/multicore.rs:836-844`，普通 drain 出口
+   同样以该计数为条件 `:937`、`:1000`）。数据面在停车前就已经达到 quiescence，
+   唯一漏掉这一步的是控制面兼容包装。见「实施记录」。）
 
 真正的杠杆在 `RegisteredDescriptor::lease()`（`src/io/mod.rs:88-90`）：它**故意**
 `Arc::clone` 而不 `dup(2)`（注释：without another descriptor syscall），于是「用户
@@ -72,6 +73,11 @@ event-loop 回合；`AsyncTcpStream` drop 关闭 fd 不应依赖那个回合。
 让 readiness 注册不再需要 lease（内核 poll 持有的是 `struct file` 引用，不是 fd），
 要么给 drop 一条能同步释放/作废该注册的通路。三条都要单独权衡，不要在没有测量的
 情况下选。
+
+**选择了第四条：让驱动在返回前把被放弃的注册回收干净**，即
+`Runtime::block_on` 在 future `Ready` 之后做有界 retire，其余三条（改 lease 语义 /
+让 readiness 不需要 lease / 给 drop 一条同步通路）全部拒绝，理由见
+`docs/DECISION_LOG.md` 与 `docs/review/runtime-safety-findings.md` #43。
 
 ## 非目标
 
@@ -85,6 +91,47 @@ event-loop 回合；`AsyncTcpStream` drop 关闭 fd 不应依赖那个回合。
 - `--test-threads=1 --exact` 连跑 30 次 0 挂。
 - 挂死路径上 fd 必被 `close`：对端必须能读到 EOF。
 - `just check` / `just arch-audit` 干净；无新增 hot-path 锁或 runtime 创建。
+
+## 实施记录
+
+**根因是测出来的，不是推出来的。** 临时探针：`Drop for AsyncTcpStream` 里读一次
+描述符标识的 `Arc::strong_count`，每次 arm 打一行，`release_descriptor_lease` 打
+一行。6 次单跑给出精确不变量 `refs at drop = 1 + (arms - leases released)`：
+挂的 5 次全是 `refs=2` 且 `arms/takes/releases` = 193/193/192、61/61/60、
+63/63/62、135/135/134、125/125/124；唯一通过的那次 `refs=1` 且 236/236/236。
+即**挂死运行上恰好有一个 lease（永远是最后一次 arm 的）活得比 stream 长**，
+于是 `close(2)` 从不发生、对端永不见 EOF。探针在提交前已全部删除
+（`git diff` 只剩 `src/executor.rs`，`src/net.rs` 是 (c) 自己的改动）。
+
+**修法**：`Runtime::block_on` 在 future `Ready` 之后、`return` 之前调用
+`retire_abandoned_registrations`（`src/executor.rs`）。readiness poll 是纯唤醒
+注册（不带 payload）：stream 把 token 取回后重试成功，就再没有任何人会 await 它，
+而它的 lease 只由终态 CQE 释放。这个 CQE 到那一刻通常**已经在完成队列里**——
+结束等待的那次 `write(2)`/`writev(2)` 本身就是一次内核进入，`DEFER_TASKRUN` 的完成
+task work 就在内核进入/退出时跑——所以第一次 drain 就能回收；只有内核尚未 post 的
+情况才需要那次有界的 `park(park_timeout)`。`RETIRE_TURNS = 3`，且每轮先看
+`pending_operation_count() == 0` 就退出，所以没有 I/O 的 `block_on` 一次
+`cq.sync` 就返回，不会为这个修复付出 park 代价。顺手把 `block_on` 里两份逐字
+相同的 drain-and-deliver 折成一个 `drain_and_deliver` 助手，而不是让它变成第三份。
+
+**为什么不是另外三条**：让 lease 持有独立描述符 = 阻塞读写这条常见路径每次 arm 一个
+`dup`；让 readiness 注册不带 lease = 把「lease 只管到提交为止」这条新生命周期规则
+推广到所有 op（内核在提交时对 poll 取 `struct file` 引用，不是 fd），那是比本缺陷
+大得多的语义决定；给 drop 一条同步通路 = 在 `Drop` 里做内核进入 + CQ 回收。这三条
+都要单独测量和单独决策，本卡不动 lease 语义。
+
+**修后验证**：同一探针 6/6 `rc=0` 且每次都 `releases = takes`
+（273/273/273、257/257/257、243/243/243、160/160/160、263/263/263、249/249/249），
+即每个 lease 都被回收；随后本卡验收 30/30 单跑 0 挂、每次 0–1 s，整包
+`vectored_io` 连跑 3 次全绿（各约 3 s）。注意探针的口径：这 6 次里仍有 5 次在
+`drop(writer)` 处 `refs > 1`（有一次 60），因为探针在 future **内部**触发，那时
+retire 还没跑；stream 自己的 drop 关不掉 fd，是 `block_on` 返回前的 retire 关掉的，
+而测试的 `peer.join()` 在 `block_on` 之后。
+
+**残留（记录而非隐藏）**：若被放弃的注册的完成永远不会到达（例如被完成的 future
+丢下的、socket 永不可读的 read 注册），它的 lease 仍然保留到 runtime 自己被 drop，
+那也是所有 lease 的释放点。没有放宽/跳过/ignore 任何测试，没有调大
+`park_timeout`，`tests/vectored_io.rs` 一行未改。
 
 allowed_files:
   - src/net.rs

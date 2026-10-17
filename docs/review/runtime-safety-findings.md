@@ -211,7 +211,26 @@ are not silently mixed into the implementation batch.
     waits on an `AtomicU32`, then drops a 4-worker `MultiCoreRuntime`. The
     write-path change is therefore not in its path, and the stall reproduces on
     the unmodified tree. A live stall showed three threads, with the main
-    thread and one worker both in `futex_wait`. No timeout was raised and no
+    thread and one worker both in `futex_wait`. That capture was taken with the
+    worker parked, and a later one is not so benign: during the gate for the
+    readiness-collapse and abandoned-registration-retirement commits, `cargo
+    test --lib` (same `--test-threads=1` recipe, io_uring backend, idle VM)
+    reached `multicore::tests::test_runtime_creation` with every preceding lib
+    test green and then stalled for 3 m 36 s. `gdb -p <pid> -batch -ex "thread
+    apply all bt"` shows the main thread in `MultiCoreRuntime::drop` →
+    `JoinHandle::join` (`src/multicore.rs:2729`) while the worker
+    `miniss-core-0` is in state `R` with 22.6 s of CPU already burned, spinning
+    in `CpuCore::run` (`src/multicore.rs:879`) → `CpuCore::process_io_completions
+    (after_park=false)` (`src/multicore.rs:1310`) → `config::io_drain_limit()`
+    (`src/config.rs:63`) → `std::env::var(..).ok()` and the drop of its
+    `Result<String, VarError>`. So the stall and the busy-spin are one defect
+    seen from two sides: the worker keeps taking the `process_io_completions`
+    path — which re-reads an environment variable on every call — and never
+    reaches its `draining` exit condition, while `Drop` blocks in `join` with no
+    bound. This is the live capture
+    `tasks/multicore-spawn-shutdown-stall.yaml` asked for, and it is a different
+    defect from the epoll spin in #42 (this is the io_uring backend, and nothing
+    here consumes an already-drained completion). No timeout was raised and no
     test was skipped, ignored, or deleted to make the suite green; the gate was
     simply re-run until a clean pass, and this entry is the record. The stall
     sits in the multicore spawn/shutdown lifecycle (spawning from non-worker
@@ -316,12 +335,62 @@ are not silently mixed into the implementation batch.
     and returns instead of waiting for EOF, so a retained lease is invisible
     there; the writev test is simply the only test that makes lease retention
     observable. No timeout was raised and no test was skipped, ignored or deleted;
-    (b) was exonerated by the stash control above, and the gate was re-run. The
-    fix belongs with the readiness-core collapse (card
-    `read-readiness-collapse-and-close-delegate`): one owner for the readiness
-    registration, so an abandoned arm is cancelled and its lease released rather
-    than left to a later event-loop turn, and a dropped stream closes its fd
-    without depending on that turn. Tracked by
+    (b) was exonerated by the stash control above, and the gate was re-run.
+
+    **Cause proven by measurement.** A temporary probe — an `Arc::strong_count`
+    read of the descriptor identity in `Drop for AsyncTcpStream`, plus a print at
+    every readiness arm and at `release_descriptor_lease` — turned the mechanism
+    above into an arithmetic invariant over 6 standalone runs on an idle VM:
+    `refs at drop = 1 + (arms - lease releases)`. Every hanging run reported
+    `refs=2` with `arms/takes/releases` of 193/193/192, 61/61/60, 63/63/62,
+    135/135/134 and 125/125/124; the single passing run reported `refs=1` with
+    236/236/236. So on a hanging run exactly one lease — always the last arm's —
+    outlives the stream, and `close(2)` is therefore never issued: the cause is
+    confirmed at the point of failure rather than inferred from the design. The
+    probes were removed before the fix was committed.
+
+    **Fix.** `Runtime::block_on` now retires the registrations its completed
+    future abandoned before it returns (`retire_abandoned_registrations`,
+    `src/executor.rs`). A readiness poll is a pure wakeup registration: it carries
+    no payload, so once the stream takes the token back and the retry succeeds
+    nothing will ever await it, yet its descriptor lease is released only by its
+    terminal completion. That completion has normally been posted already by the
+    time the future finishes — the successful `write(2)`/`writev(2)` that ended the
+    wait is itself a kernel entry, and with `DEFER_TASKRUN` the completion task
+    work for the poll runs on kernel entry/exit — so the first drain retires it,
+    with a bounded three-turn `park_timeout` park covering the case where the
+    kernel has yet to post it. The two identical drain-and-deliver blocks in
+    `block_on` were folded into one helper (`drain_and_deliver`) rather than copied
+    a third time. Verification, same probe re-run after the fix: 6/6 runs `rc=0`
+    with `releases = takes` every time (273/273/273, 257/257/257, 243/243/243,
+    160/160/160, 263/263/263, 249/249/249) — every lease retired — and then the
+    card's acceptance loop: **30 consecutive `--test-threads=1 --exact` runs with
+    0 hangs** (0–1 s each) plus 3 full `vectored_io` binary runs clean in ~3 s.
+    Note what the probe shows and does not: `refs` is still >1 at
+    `drop(writer)` on 5 of those 6 runs (60 on one run), because the probe fires
+    inside the future, *before* the retire pass. The stream's own drop cannot close
+    the fd there; the retire pass is what closes it before `block_on` returns, and
+    the test's `peer.join()` runs after that.
+
+    The card had warned that a `block_on`-only drain cannot be the whole answer,
+    because "the worker loop and the shutdown path also stop with an armed
+    registration". That objection is refuted by the data-plane driver's own code:
+    the `MultiCoreRuntime` worker loop drains continuously and does not park
+    between a task's poll and the next completion, and its escalated shutdown
+    already calls `cancel_all()`, flushes, and then parks and re-drains until
+    `pending_operation_count() == 0` (`src/multicore.rs:836-844`), with the ordinary
+    drain exit gated on the same counter (`:937`, `:1000`). That counter — the same
+    one this fix consults — is exactly "the shard still owes work", so the data
+    plane was already retiring to quiescence before stopping; only the
+    control-plane compat wrapper returned without that step. The lease semantics
+    (`RegisteredDescriptor::lease()` cloning rather than `dup(2)`, so that fd
+    ownership follows op retirement) are deliberately left alone: making the lease
+    submission-scoped instead of completion-scoped would change the lifetime rule
+    for every operation, which is a larger decision than the defect measured here.
+    Residual, recorded rather than hidden: a registration whose completion never
+    arrives (an armed read poll on a socket that never becomes readable, dropped by
+    the completed future) still holds its lease until the runtime itself is
+    dropped, which is where every lease is released. Tracked by
     `tasks/vectored-writev-armed-registration-fd-leak.yaml`. Review follow-up #5
     ("io_uring terminal cleanup is duplicated across completion paths") is the
     same hazard seen from the other side.
