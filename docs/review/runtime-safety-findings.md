@@ -279,3 +279,49 @@ are not silently mixed into the implementation batch.
     `3 passed; 0 failed` in 0.02 s, 5 runs out of 5, so the hang is attributed to
     the stolen core rather than to a defect of its own; it is not counted against
     the multicore-stall card. The VM now runs nothing but its own daemons.
+43. `tests/vectored_io.rs::linux_uring_delayed_submit_writev_survives_relocation_pressure`
+    hangs on Linux/io_uring and stalled card (b)'s `just check`. Measured
+    standalone under `--test-threads=1` on an idle VM: 6 hangs in 11 runs with
+    (b) applied, and 6 in 10 runs with (b)'s source changes stashed away, so the
+    write-API shape change is not the trigger. That is also what the diff says:
+    the test drives `AsyncWrite::poll_write_vectored`, which (b) does not touch.
+    The hang is **not** in the writev. `Runtime::block_on` returns, every
+    assertion passes, and the test body is then parked in `peer.join()` (gdb:
+    `tests/vectored_io.rs:449`) while the peer thread is parked in its blocking
+    `read()` at `tests/vectored_io.rs:389`. `ss -tinp` on the hung process shows
+    the client socket still open on fd 5 in `ESTAB` with `send-q 0`/`recv-q 0`:
+    the payload was delivered and drained, and **`close(2)` was never issued**, so
+    the peer's EOF read can never return. Root cause: the descriptor is an
+    `Arc<OwnedFd>` (`src/io/mod.rs:59`) and every submitted op clones it into a
+    `DescriptorLease` that the backend holds in `descriptor_leases[slot]` until
+    that op's terminal CQE is drained (`src/io/uring.rs` 426/513/1005/1668). An
+    op that is never reaped therefore keeps the fd — and the TCP connection —
+    alive, and `drop(AsyncTcpStream)` cannot close it. Three existing design
+    choices combine to leave one armed: `UringBackend::submit_inner` deliberately
+    does not flush (`src/io/uring.rs:994-995`) and `flush()` is a no-op below
+    `FLUSH_BATCH_SIZE = 61` (`src/io/uring.rs:170`, 1349-1362), so the arm's SQE
+    is normally submitted by `park`, not by the poll; `park_timeout` is **100 µs**
+    (`src/config.rs:50`); and when `park` returns with no completion
+    `Runtime::block_on` falls through and re-polls the future **with no waker**
+    (`src/executor.rs:176-209`). That unsolicited re-poll takes `pollout_token`
+    (`src/net.rs:666-672`) — `clear_slot` clears only the cpu-side slot and frees
+    nothing in the backend (`src/cpu.rs:537-548`) — and if that retry's `writev`
+    succeeds the future is `Ready` and `block_on` returns immediately
+    (`src/executor.rs:107-110`) with the registration still armed and undrained.
+    Nothing holds its token any more, so `Drop for AsyncTcpStream`
+    (`src/net.rs:463-475`) has nothing to cancel, the lease is never released, and
+    `close` never runs. Whether the retry lands before or after the CQE is drained
+    is a pure timing race, which is the 33–60% rate. The readv sibling of the same
+    test never shows it because its peer (`tests/vectored_io.rs:279-286`) writes
+    and returns instead of waiting for EOF, so a retained lease is invisible
+    there; the writev test is simply the only test that makes lease retention
+    observable. No timeout was raised and no test was skipped, ignored or deleted;
+    (b) was exonerated by the stash control above, and the gate was re-run. The
+    fix belongs with the readiness-core collapse (card
+    `read-readiness-collapse-and-close-delegate`): one owner for the readiness
+    registration, so an abandoned arm is cancelled and its lease released rather
+    than left to a later event-loop turn, and a dropped stream closes its fd
+    without depending on that turn. Tracked by
+    `tasks/vectored-writev-armed-registration-fd-leak.yaml`. Review follow-up #5
+    ("io_uring terminal cleanup is duplicated across completion paths") is the
+    same hazard seen from the other side.
