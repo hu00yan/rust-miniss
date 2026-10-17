@@ -239,3 +239,43 @@ are not silently mixed into the implementation batch.
     per-shard cancellation mailbox consumed by the drain, which is a design
     change recorded in `tasks/epoll-pending-op-not-drained.yaml` rather than
     smuggled into this batch.
+    Re-measured on an idle VM after the leak in #42 was killed: 20 consecutive
+    full-suite runs gave **0 hangs**, 5 runs `124 passed`, 14 runs
+    `123 passed; 1 failed` on exactly this test, and 1 run with this test plus
+    `io::accept_ownership_tests::accepted_descriptor_closes_when_completion_is_dropped`.
+    So the hang counts recorded above were taken with a core stolen by #42; the
+    racy test's own in-suite failure rate is ~75% on epoll and 0% standalone on
+    macOS. Still no timeout raised and no test skipped.
+42. The Linux/epoll investigation behind #40 and #41 left a test binary running
+    for **19 h 21 m** with a worker thread **busy-spinning at 100% of a core**.
+    The process (`cargo test --lib` from `/mnt/mac/.../rust-miniss`, binary
+    `target/debug/deps/rust_miniss-24beb5d344a06b46`, PID 78612) started
+    2026-10-16 14:06:38 and was still alive on 2026-10-17 09:28. Its started
+    test was `quic::tests::dr…` (the test in #41) and its parked threads sat in
+    `arm64_sys_epoll_pwait`/`futex_wait`, so it was an **epoll-backend** build.
+    Thread `miniss-core-0` (TID 78877) was in state `R` with a live `wchan` of
+    `-`, and `/proc/78877/stat` showed `utime 6476127 + stime 33188` ticks =
+    **~18.0 CPU-hours**, all of it in that one thread; every other worker and the
+    metrics thread were parked. It was launched at 14:06 on 2026-10-16, and the
+    drain-path fix (`e77bd70`) was committed at 15:28 the same day, so the spin
+    belongs to the code #41 fixed: on epoll the fused completion path consumed
+    nothing, so the worker always had a completion to look at, could never
+    retire it, and never reached `park` — a busy loop rather than a sleep. On
+    the current revision the same suite is clean: `MINISS_IO_BACKEND=epoll cargo
+    test --lib` gives `124 passed; 0 failed; 0 ignored` in 1.30 s, sampled
+    per-thread CPU never exceeded 50%, and 20 consecutive runs produced 0 hangs
+    (#41). Two consequences are recorded rather than hidden: (i) on a 7-vCPU VM
+    one core was saturated for 19 h, so **every Linux timing measurement taken in
+    that window was taken with a stolen core** — including the `main` `c4f46a4`
+    baseline spread of 275k–397k rps cited in the UDP rent-send decision row;
+    those conclusions were cross-checked on macOS and against the untouched
+    baseline, but Linux timing evidence should be re-collected on an idle VM
+    before it is used for a regression claim; (ii) this is exactly the leak the
+    `Test and process hygiene` rule forbids. The process was killed, together
+    with its parent `cargo test --lib` and `tail`, and with the hung
+    `tokio_compat_tests` binary plus the `just check`/`cargo test` pair left by
+    this card's first gate attempt, whose `test_tokio_futures_interop` had been
+    spinning for 2 m 43 s at 45% CPU. On the idle VM that same test then passed
+    `3 passed; 0 failed` in 0.02 s, 5 runs out of 5, so the hang is attributed to
+    the stolen core rather than to a defect of its own; it is not counted against
+    the multicore-stall card. The VM now runs nothing but its own daemons.

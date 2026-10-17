@@ -1,8 +1,7 @@
 id: epoll-pending-op-not-drained
 title: epoll 后端上 fd 被关闭的 pending op 永不落定，进而让 worker 在 shutdown 时永不退出
 branch: fix/io-backend-hygiene-and-macos-correctness
-status: open
-blocks: linux-epoll-fallback-backend
+status: done
 
 ## 症状（原始可复现记录）
 
@@ -62,6 +61,25 @@ gdb 抓到的挂死现场：测试线程停在 `MultiCoreRuntime::drop`（`src/m
 - io_uring 未被改动：5 次运行 4 次 `ok. 125 passed`，1 次 rc=124 属于
   `multicore-spawn-shutdown-stall` 的既有挂死（另一个卡）。
 
+### 复测（2026-10-17，空闲 VM）
+
+上面那批数字是在**被偷走一个核**的环境里量的：上一次调查（第 41 条）留下了一个
+epoll 后端的 `cargo test --lib` 进程，其中一个 `miniss-core-0` 线程一直在
+**空转**，19 小时 21 分里烧掉 **约 18 CPU 小时**（详见
+`docs/review/runtime-safety-findings.md` #42）。那正是本卡根因 (2) 的前置版本
+——completion 取不走 → 永远有活可看 → 从不 park。
+
+杀掉该进程后重测（`MINISS_IO_BACKEND=epoll cargo test --lib`，连续 20 次）：
+
+- **0 次挂死**（修复前 6 次里 4-5 次），单次 1.26–1.30 s；
+- 5 次 `ok. 124 passed`，14 次 `FAILED. 123 passed; 1 failed`（只有「残留」那一个
+  用例），1 次额外叠加 `io::accept_ownership_tests::accepted_descriptor_closes_when_completion_is_dropped`；
+- 采样 per-thread CPU 从未超过 50%：**空转已消失**。
+
+顺带解释了另一件事：同一次 `just check` 里 `tests/tokio_compat_tests.rs::test_tokio_futures_interop`
+曾卡住 2 分 43 秒，空闲 VM 上同一用例 5/5 通过、每次 0.02 s。该卡住归因于被偷走的
+核，不计入 `multicore-spawn-shutdown-stall`。
+
 ## 残留（有意不掩盖）
 
 `quic::tests::dropping_owner_socket_drains_pending_receive` **本身就是竞态**，
@@ -76,15 +94,15 @@ gdb 抓到的挂死现场：测试线程停在 `MultiCoreRuntime::drop`（`src/m
 线程的 drop 通常先发生，于是属主拿到最后一次 drop 并同步取消）。已按 AGENTS.md
 的 `Test and process hygiene` 记入 `docs/review/runtime-safety-findings.md` #41。
 
-要让属主在自己的忙循环内就观察到退订，只有两条路，都需要设计决策，故不在本卡内
-顺手做：
+要让属主在自己的**忙循环**内就观察到退订，只有两条路，本卡**决定都不做**：
 
-- **(B) drain 侧探测死 fd**：每轮 drain 对每个存活 op 多一次 `fcntl(F_GETFD)`。
-  与走 events 的正常路径形成两套完成来源，且热路径系统调用随在途 op 数线性增长，
-  在 10k 连接量级不可接受。
-- **(C) 每 shard 一个「外部取消」信箱**，由 **drain**（而非消息循环）消费：一次
-  relaxed 原子读即可在空时短路，能在任意忙循环内生效且确定性。代价是引入一份
-  跨线程共享的每 shard 结构（新增所有权/生命周期设计），需要单独评审。
+- **(B) drain 侧探测死 fd**（每轮 drain 对每个存活 op 一次 `fcntl(F_GETFD)`）：否决。
+  热路径系统调用随在途 op 数线性增长，且与 events 路径形成两套完成来源。
+- **(C) 每 shard 一个「外部取消」信箱**、由 drain 消费：暂不引入。它确实能解决
+  「忙循环内可见」，但真实产品路径不需要——属主**下一次**回到 `process_messages`
+  时就完成退订（有界延迟），而用例要求的是「在不处理消息的 10×10 ms 窗口内可见」，
+  那只是用例自身的构造假设。为一个测试假设新增一份跨线程共享的每 shard 结构，
+  代价与收益不匹配，也违反「不为变绿改设计」。
 
 ## 非目标
 
@@ -95,10 +113,10 @@ gdb 抓到的挂死现场：测试线程停在 `MultiCoreRuntime::drop`（`src/m
 
 ## 推翻条件
 
-- 若 (C) 证明会显著抬高 drain 成本或与 `CoreHandle` 重复，则应改回 (B) 并接受
-  热路径代价，或重新审视「drain 退出条件依赖 pending 计数」这一设计本身。
-- 若某天该用例被改成确定性构造（例如把最后一次 drop 固定到属主线），则本卡的
-  「残留」段落即可删除。
+- 若出现真实场景（而非测试构造）要求「在属主不处理消息的忙循环内观察到外部退订」，
+  再评估 (C)；届时它必须带着该场景的测量，而不是只为让一个用例变绿。
+- 若某天该用例被改成确定性构造（例如把最后一次 drop 固定到属主线，或让属主有机会
+  跑一轮消息循环），则本卡的「残留」段落即可删除。
 
 allowed_files:
   - src/quic.rs
