@@ -237,6 +237,56 @@ are not silently mixed into the implementation batch.
     threads, or runtime `Drop`), which is outside this batch's `allowed_files`;
     it needs its own task card with bounded-wait and owner evidence before the
     regular suite can be called deterministic.
+    **Resolved** (card `tasks/multicore-spawn-shutdown-stall.yaml`). Root cause,
+    from a second live capture of the same stall (`cargo test --lib`, io_uring,
+    idle VM, with `multicore::tests::metrics_aggregator_does_not_extend_runtime_lifetime`
+    as the started test): the main thread sat in `MultiCoreRuntime::join`
+    (`src/multicore.rs:2562`) while `miniss-core-0` burned 99.5% of a core *inside
+    the post-park exit predicate itself* — `CpuCore::run` →
+    `pending_operation_count()` (`src/io/uring.rs:1377`, folding `accept_results`)
+    at `src/multicore.rs:1000`. So the earlier reading ("the worker never reaches
+    its `draining` exit") was wrong in an important way: the check *was* reached,
+    and it was unsatisfiable. A running shard parks with a `PollAdd` on its own
+    wakeup eventfd (`arm_wakeup_poll`, `src/multicore.rs:760`), and that poll is an
+    ordinary `pending_ops` entry, counted by `pending_operation_count`
+    (`src/io/uring.rs:1380`), so an armed poll that has not completed reads as one
+    pending operation indefinitely. The drain path did try to clear it — the
+    `if self.draining { cancel_wakeup_poll() }` immediately before the post-park
+    check — but `cancel` only pushes an `AsyncCancel` SQE
+    (`src/io/uring.rs:1401`): the slot leaves `pending_ops` only when its terminal
+    CQE is *drained*, so the check counted the poll it had just cancelled. The next
+    iteration then armed a *fresh* poll (`arm_wakeup_poll` at `:958` was
+    unconditional), which is what makes the state self-sustaining: each iteration
+    cancels one poll and arms another, and no iteration can look quiescent. The two
+    CPU profiles this stall showed are both this loop — 99.5% when each park finds
+    the just-cancelled poll's `-ECANCELED` CQE already ready (`park` returns
+    `ring.completion().len()` without sleeping), and the earlier 22.6 s of CPU over
+    3 m 36 s (~10%, one 100 µs park-timeout round per iteration) when no CQE is
+    ready. It also explains the intermittency and the no-I/O corpus: any runtime
+    that goes idle parks, hence arms, and the shard only quiesces when the shutdown
+    notification happens to land while it is *in* the park, because
+    `CoreWakeup::notify` writes the eventfd only when the sleep gate says the worker
+    is sleeping (`src/multicore.rs:209`).
+    Fix, entirely inside the card's `allowed_files` (`src/multicore.rs`): a draining
+    shard no longer arms a fresh parking poll; `cancel_wakeup_poll` became
+    `retire_wakeup_poll`, which cancels *and* pumps the ring for a bounded window
+    (`reap_pending_operations`, 8 × `park(1ms)` — the same shape the escalated
+    `force_shutdown` teardown already used) so the poll's CQE is drained in the same
+    turn, with the token deliberately left installed so the drain recognises that
+    CQE as the parking poll and retires the slot itself; and acceptance #3: `join`
+    and `Drop` wait for the `core_exited` acknowledgements through one bounded
+    helper (10 s graceful, then the forced teardown, then 10 s more) and *report* the
+    still-running cores instead of blocking forever. The `core_exited` ack is now
+    published by a drop guard, so early start-up errors and panics are visible to
+    that wait rather than looking like a stuck worker.
+    Evidence: **50/50** consecutive full runs of the cited `multicore_tests` binary
+    (`--test-threads=1`, each bounded at 120 s, 0 failures, 0.59 s per run); the
+    tests that stalled here — `multicore::tests::test_runtime_creation` and
+    `metrics_aggregator_does_not_extend_runtime_lifetime` — are green in a 2.9 s
+    `cargo test --lib multicore::` run; and a new
+    `parked_shards_shut_down_and_join` regression test asserts each shard is parked
+    (via `CoreWakeup::is_sleeping`) before 16 shutdown+join cycles. No timeout was
+    raised and no test was skipped, ignored or deleted.
 41. `quic::tests::dropping_owner_socket_drains_pending_receive` is racy by
     construction, on every backend. The test body releases the socket's last
     `Arc` from two places: inside the task on the owning worker shard, and on

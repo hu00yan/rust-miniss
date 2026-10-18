@@ -54,6 +54,25 @@ type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 const LOCAL_SPAWN_QUEUE_CAPACITY: usize = 65_536;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Bounded owner-thread reaping rounds used after asking the kernel to cancel
+/// an operation.
+///
+/// A cancel is a request: the operation leaves `pending_ops` — and so stops
+/// counting in `pending_operation_count` — only when its terminal CQE is
+/// drained on the owning thread.  Teardown paths that need the count to reach
+/// zero in the same turn pump the ring for at most this many rounds, so a
+/// kernel that never answers delays shutdown by a bounded few milliseconds
+/// instead of blocking it.
+const CANCEL_REAP_ROUNDS: usize = 8;
+
+/// How long `join` and `Drop` wait for workers to acknowledge exit, and how
+/// long they then wait after escalating to the owner-local forced teardown.
+///
+/// Worker exit is a millisecond-scale drain, so this is a diagnosis bound, not
+/// a latency budget: it exists to turn a worker that cannot quiesce into a
+/// reported failure instead of a process that never exits.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a scrape caller waits for an idle aggregator to answer `View`.
 const METRICS_VIEW_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 const ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
@@ -133,6 +152,21 @@ pub(crate) struct AdmissionGuard {
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Publishes a worker's exit to the control plane on every exit path.
+///
+/// [`MultiCoreRuntime::join`] and `Drop` gate on the `core_exited` flags, so
+/// every way out of a worker thread — the normal drain, an early start-up error,
+/// or a panic — has to leave the worker visible as exited.  Same shape and same
+/// reason as [`AdmissionGuard`]: cleanup that must run even when the happy path
+/// does not.
+struct CoreExitGuard(Arc<AtomicBool>);
+
+impl Drop for CoreExitGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -781,15 +815,47 @@ impl CpuCore {
         drain_wakeup_eventfd(self.wakeup_eventfd);
     }
 
+    /// Bounded owner-thread drain window: give terminal CQEs a chance to land
+    /// so an operation the kernel was asked to cancel can leave `pending_ops`.
+    ///
+    /// Run by the two teardown paths that must observe
+    /// [`IoBackend::pending_operation_count`] reach zero on this thread.  The
+    /// bound is what keeps a kernel that never answers from turning into an
+    /// unbounded wait.
+    fn reap_pending_operations(&mut self, rounds: usize) {
+        for _ in 0..rounds {
+            if self.io_state.io_backend.pending_operation_count() == 0 {
+                return;
+            }
+            let _ = self.io_state.io_backend.park(Duration::from_millis(1));
+            let _ = self.process_io_completions(true);
+        }
+    }
+
+    /// Retire this shard's parking poll so a draining shard can quiesce.
+    ///
+    /// While running the poll is what wakes a parked worker.  While draining it
+    /// is the one pending operation that can keep the drain-exit predicate false
+    /// forever: `arm_wakeup_poll` submits it for the park, `cancel` only *asks*
+    /// the kernel to retire it, and its slot leaves `pending_ops` — and with it
+    /// [`IoBackend::pending_operation_count`] — only when its terminal CQE is
+    /// drained here.  The token is deliberately left installed through the reap:
+    /// the drain recognises that completion as the parking poll and retires the
+    /// bookkeeping itself, the same way it does when the poll fires a wakeup.
     #[cfg(target_os = "linux")]
-    fn cancel_wakeup_poll(&mut self) {
-        let Some(token) = self.wakeup_poll_token.take() else {
+    fn retire_wakeup_poll(&mut self) {
+        if !self.wakeup_poll_armed {
             return;
-        };
-        self.wakeup_poll_armed = false;
-        let _ = self.io_state.io_backend.cancel(token);
-        self.io_state.io_backend.flush();
-        drain_wakeup_eventfd(self.wakeup_eventfd);
+        }
+        if let Some(token) = self.wakeup_poll_token {
+            let _ = self.io_state.io_backend.cancel(token);
+            self.io_state.io_backend.flush();
+        }
+        self.reap_pending_operations(CANCEL_REAP_ROUNDS);
+        // `reap_pending_operations` clears the armed bookkeeping when it drains
+        // the completion; do it here too for the case where the poll was already
+        // terminal before the cancel reached the kernel and no CQE remained.
+        self.clear_wakeup_poll();
     }
 
     /// Main event loop - shared-nothing execution
@@ -835,13 +901,7 @@ impl CpuCore {
                 // bounded owner-thread drain window before reclaiming tasks.
                 self.io_state.io_backend.cancel_all();
                 self.io_state.io_backend.flush();
-                for _ in 0..8 {
-                    if self.io_state.io_backend.pending_operation_count() == 0 {
-                        break;
-                    }
-                    let _ = self.io_state.io_backend.park(Duration::from_millis(1));
-                    let _ = self.process_io_completions(true);
-                }
+                self.reap_pending_operations(CANCEL_REAP_ROUNDS);
                 self.task_queue.clear();
                 while self.ready_queue.pop().is_some() {}
                 self.timer_wheel.clear();
@@ -954,8 +1014,17 @@ impl CpuCore {
                 self.sleep_gate.end_sleep();
                 continue;
             }
+            // A draining shard must not arm a fresh parking poll: the poll is an
+            // ordinary pending operation to `pending_operation_count`, which is
+            // exactly what the drain-exit predicate below asks, so re-arming one
+            // races the shard's own exit (and the cancel-and-reap that follows
+            // the park would arm another, forever).  Admission is already closed
+            // by the time `draining` is set, so no control message depends on
+            // the poll to interrupt this park; the park timeout still bounds it.
             #[cfg(target_os = "linux")]
-            self.arm_wakeup_poll();
+            if !self.draining {
+                self.arm_wakeup_poll();
+            }
             self.metrics.parks += 1;
             let park_started = Instant::now();
             let n_completions = self.io_state.io_backend.park(self.park_timeout);
@@ -988,9 +1057,13 @@ impl CpuCore {
                 self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
             }
 
+            // Cancel the parking poll and reap it *before* the exit check below:
+            // that check counts the poll, so a draining shard whose poll is
+            // still armed can never look quiescent, and the loop would park
+            // forever instead of exiting (finding #40).
             #[cfg(target_os = "linux")]
             if self.draining {
-                self.cancel_wakeup_poll();
+                self.retire_wakeup_poll();
             }
 
             if self.draining
@@ -1650,6 +1723,9 @@ impl MultiCoreRuntime {
             let handle = thread::Builder::new()
                 .name(format!("miniss-core-{core_id}"))
                 .spawn(move || {
+                    // Publish this worker's exit however it leaves, so the
+                    // bounded waits in `join`/`Drop` observe it.
+                    let _exit = CoreExitGuard(core_exited_flag.clone());
                     install_core_handle(CoreHandle {
                         sender: core_sender,
                         wakeup: wakeup.clone(),
@@ -1702,7 +1778,8 @@ impl MultiCoreRuntime {
                     // Publish worker teardown before the coordinator observes
                     // the shutdown flag and returns from its deadline wait.
                     core_shutdown.store(true, Ordering::Release);
-                    core_exited_flag.store(true, Ordering::Release);
+                    // `_exit` publishes `core_exited` as this closure returns,
+                    // which is after the snapshot above.
                     result
                 })
                 .map_err(|e| {
@@ -2553,9 +2630,62 @@ impl MultiCoreRuntime {
             .map_err(RuntimeError::TaskFailed)
     }
 
+    /// Wait, bounded, for every worker to acknowledge exit.
+    ///
+    /// `join` and `Drop` are the two paths that block on worker exit, and a
+    /// worker that cannot quiesce must surface as a diagnosis on the caller's
+    /// thread rather than as a process that never exits.  So this waits one
+    /// window for the graceful drain, escalates to the owner-local forced
+    /// teardown (the escape hatch that makes workers leave their loop
+    /// unconditionally), waits one more, and then reports which cores are still
+    /// running.
+    fn wait_for_core_exit(&self, timeout: Duration) -> Result<()> {
+        let all_exited = || {
+            self.core_exited
+                .iter()
+                .all(|flag| flag.load(Ordering::Acquire))
+        };
+        for _ in 0..2 {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if all_exited() {
+                    return Ok(());
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                thread::sleep((deadline - now).min(Duration::from_millis(1)));
+            }
+            for force in &self.force_shutdowns {
+                force.store(true, Ordering::Release);
+            }
+            for core_id in 0..self.num_cores {
+                self.notify_core(core_id);
+            }
+        }
+        let stuck: Vec<usize> = self
+            .core_exited
+            .iter()
+            .enumerate()
+            .filter(|(_, flag)| !flag.load(Ordering::Acquire))
+            .map(|(core_id, _)| core_id)
+            .collect();
+        Err(RuntimeError::TaskFailed(format!(
+            "cores {stuck:?} did not exit within {timeout:?}, twice: the graceful drain \
+             and the escalated forced teardown both expired (see runtime-safety finding #40)"
+        )))
+    }
+
     /// Wait for all cores to complete
     pub fn join(&self) -> Result<()> {
         tracing::info!("Waiting for all cores to complete");
+
+        // Bounded, and escalating: a worker that cannot quiesce returns the
+        // diagnosis above instead of blocking this call forever.  `Drop` gates
+        // on the same helper, so a runtime that is only dropped cannot hang the
+        // process either.
+        self.wait_for_core_exit(SHUTDOWN_JOIN_TIMEOUT)?;
 
         let mut failures = Vec::new();
         for (core_id, handle) in self.join_handles.lock().drain(..).enumerate() {
@@ -2719,6 +2849,16 @@ impl Drop for MultiCoreRuntime {
             tracing::warn!("Runtime dropped without explicit shutdown");
             let _ = self.shutdown();
         }
+        // Bounded, for the same reason as `join`: a worker that cannot quiesce
+        // must not make `Drop` block forever.  Panicking while already
+        // unwinding would abort the process, so report instead in that case.
+        if let Err(err) = self.wait_for_core_exit(SHUTDOWN_JOIN_TIMEOUT) {
+            if thread::panicking() {
+                tracing::error!("runtime drop: workers did not exit: {err}");
+            } else {
+                panic!("runtime drop: {err}");
+            }
+        }
         // Worker owns raw eventfd numbers borrowed from `core_wakeups`;
         // always join before those OwnedFd values are dropped.  Drop is a
         // control-plane blocking path, never a data-plane operation.  The
@@ -2856,6 +2996,37 @@ mod tests {
         let stats = runtime.stats();
         assert_eq!(stats.num_cores, 2);
         assert!(!stats.is_shutdown);
+    }
+
+    /// Finding #40: a shard that has parked — and so armed its own wakeup poll —
+    /// must still reach quiescence on shutdown.
+    ///
+    /// The parking poll is an ordinary pending operation to the drain-exit
+    /// predicate, so an armed one used to be enough to keep a worker in its
+    /// event loop indefinitely while `join` waited on it.  `join` is bounded, so
+    /// a regression fails here with a diagnosis instead of hanging the suite.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parked_shards_shut_down_and_join() {
+        for _ in 0..16 {
+            let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
+            // Park every worker first: arming happens on the way into the park,
+            // so a sleeping worker is one whose poll is in flight, which is the
+            // state the drain has to retire from.
+            for core in 0..2 {
+                let sleeping = &runtime.core_wakeups[core];
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !sleeping.is_sleeping() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "core {core} did not enter the parked state"
+                    );
+                    thread::yield_now();
+                }
+            }
+            runtime.shutdown().unwrap();
+            runtime.join().unwrap();
+        }
     }
 
     #[test]

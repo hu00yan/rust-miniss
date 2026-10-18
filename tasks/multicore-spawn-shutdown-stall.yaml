@@ -1,0 +1,126 @@
+id: multicore-spawn-shutdown-stall
+title: 消除 multicore_tests 间歇性卡死（多核 spawn/shutdown 生命周期）
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+## 目标
+
+找出并修掉 `tests/multicore_tests.rs` 在 Linux/io_uring 上间歇性永不结束的原因。
+验收标准（三条都要）：
+
+1. `multicore_tests` 二进制**连续 50 次**完整运行无一次卡住（今天的复现率约
+   1/5 ～ 1/10，所以 50 次全过是有意义的量）；
+2. `just check` **连续 3 次**干净通过；
+3. 给卡住的那条路径加上**有界等待**：再出问题必须是「测试失败并给出诊断」，而
+   不是「进程永远挂着」——按本仓库 `Test and process hygiene` 的要求，能挂住
+   worker/server/客户端的测试不可接受。
+
+## 证据（现状，已记录）
+
+见 `docs/review/runtime-safety-findings.md` 第 40 条。要点：
+
+- 卡住的用例：`test_multicore_concurrent_spawning`（另见一次
+  `test_multicore_cross_cpu_communication`）；
+- **不是本批次写路径改动造成的**：在改动之前的那版（`a2c7f9a`，旧拷贝形状）上
+  同样复现，20 次里 2 次；带改动是 1/5 与 1/30，同一量级；
+- **该用例完全不碰 I/O**：4 条宿主线程各 spawn 10 个任务（共 40），等一个
+  `AtomicU32` 到 40，然后在作用域结束时 drop 一个 4 worker 的
+  `MultiCoreRuntime`。写路径、网络、文件都不在它的路径上；
+- 现场停住时有 3 条线程，主线程与一个 worker 均处于 `futex_wait`；
+- 复现配方（VM 内）：`target/debug/deps/multicore_tests-*` 反复跑，`--test-threads=1`，
+  约每 5～10 次命中一次。
+
+## 待查方向（按嫌疑排序，未定论）
+
+1. **非 worker 线程 spawn**：4 条宿主线程并发调用 `runtime.spawn(..)`，跨核投递
+   到 4 个 worker 的有界通道。若某条 worker 已进入 shutdown，投递可能既不入队也
+   不返回错误（`spawn` 返回 `io::Result`，被 `.unwrap()`），任务计数就永远到不了 40。
+   注意 `test_multicore_concurrent_spawning` 的最后若干秒是在等计数器，卡住更可能
+   出现在 4 个 spawn 线程的 `join()` 或 runtime 的 Drop。
+2. **Drop/graceful shutdown 与在途任务**：`Arc<MultiCoreRuntime>` 最后一个引用
+   drop 时关停 4 个 worker；若某 worker 正在等一个永远不会到来的唤醒（例如跨核
+   通道的两端在同一时刻关闭），就会停在 `futex_wait`。
+3. **测试内并发的 runtime 干扰**：该文件有 `runtime_test_lock()` 串行化，但要确认
+   所有 runtime 用例都取了锁，且锁在 panic 路径上也能释放。
+
+诊断手段：把卡住现场的线程按 `wchan` + 栈抓出来（`gdb -p <pid> -batch -ex "thread
+apply all bt"`，VM 里 gdb 已确认可用），拿到具体挂点再动代码。
+
+## 硬约束（不得违反）
+
+- 不得用「调大超时」或「skip/ignore 该用例」让它变绿——这正是本条记录要防的事；
+- 修复必须符合本仓库架构契约：thread-per-core、热路径无 `Arc<Mutex>`、跨核通信
+  只用有界通道。若诊断结论指向「需要一个跨核锁」，那说明所有权设计错了，应改设计
+  而不是加锁；
+- 不删任何既有测试。
+
+## 非目标
+
+- 不重写多核调度策略（那是独立决策）
+- 不动 `RuntimeState`（`src/multicore.rs:1353`）的状态语义，除非诊断证明它就是
+  挂点
+
+## 推翻条件
+
+若诊断结论是「该用例本身在验证一个不成立的假设」（例如它依赖 spawn 的完成顺序，
+而文档从未承诺顺序），则应修的是用例的假设，并在卡里写明原假设为何不成立；此时
+验收标准 1/3 依然要满足。
+
+## 实施记录
+
+诊断结论推翻了「待查方向」全部三条：挂点不是 spawn 投递、不是 `futex_wait`、
+也不是测试锁。第二次抓现场时主线程停在 `MultiCoreRuntime::join`
+（`src/multicore.rs:2562`），而 worker `miniss-core-0` 烧着 99.5% 单核 CPU，栈
+**就在** drain 的退出判定里：`CpuCore::run` → `pending_operation_count()`
+（`src/io/uring.rs:1377`，正在折 `accept_results`）于 `src/multicore.rs:1000`。
+判定被**执行到了**，只是永远不可能成立——所以旧结论「worker 到不了 draining 退出」
+是错的：它到了，是那条判定不可满足。
+
+原因：运行中的 shard 进 park 前会在自己的 wakeup eventfd 上 arm 一个 poll
+（`arm_wakeup_poll`，`src/multicore.rs:760`），该 poll 是 `pending_ops` 里的普通一项，
+被 `pending_operation_count` 计入（`src/io/uring.rs:1380`），所以「arm 过但未完成」的
+poll 长期读作「有 1 个 pending op」。退出路径本来就想清掉它
+（`if self.draining { cancel_wakeup_poll() }`，紧接在 park 后的判定之前），但 `cancel`
+只压一个 `AsyncCancel` SQE（`src/io/uring.rs:1401`）：slot 要等终态 CQE 被 drain 才
+离开 `pending_ops`，于是判定数的还是刚被取消的那个 poll；下一轮 `arm_wakeup_poll`
+（`:958`，当时无条件）又 arm 一个新的——**每轮取消一个、arm 一个，自身维持，任何
+一轮都不可能是 quiescent**。两种 CPU 画像都是这个循环：某轮 park 发现刚取消的 poll
+的 `-ECANCELED` CQE 已就绪（`park` 直接返回 `ring.completion().len()`，不睡）→
+99.5% 单核；没有 CQE 就绪时每轮是一次 100 µs park 超时 → 即先前那次 3 m 36 s 烧
+22.6 s（约 10%）。这也解释了间歇性与「用例完全不碰 I/O」：任何 runtime 闲下来就会
+park，因而就 arm；只有关停通知恰好落在它**正在 park** 的窗口里，
+`CoreWakeup::notify` 才会写 eventfd（`src/multicore.rs:209`，写不写取决于 sleep
+gate），否则这一轮就进不了那条能退出的平静路径。
+
+修法（全在 `src/multicore.rs`，未越界）：
+
+1. `draining` 的 shard 不再 arm 新的 parking poll：admission 此前已关闭，没有控制消息
+   需要靠它打断 park，park 自身超时仍在兜底；
+2. `cancel_wakeup_poll` → `retire_wakeup_poll`：取消之后**有界地泵一轮环**（新抽出的
+   `reap_pending_operations`，8 × `park(1ms)`；被升级的 `force_shutdown` 清理路径本来
+   就是同一形状，现在两者共用一个函数），把 poll 的终态 CQE 在同一轮内 drain 掉；
+   token 特意**不**提前取走，drain 照旧把它认成 parking poll 并自行回收 slot（走的
+   还是原来那条 wakeup 分支）；
+3. 验收 3：`join` 与 `Drop` 改走一个有界等待 helper——先等 10 s graceful，再置
+   `force_shutdown` 并唤醒后等 10 s——超时**报告**仍在运行的 core id，而不是永久阻塞；
+   `core_exited` 改由 drop guard（`CoreExitGuard`）发布，启动期早退与 panic 也不会被
+   误判成「卡住的 worker」。
+
+证据见 `docs/review/runtime-safety-findings.md` #40 的 Resolved 段：50/50 次
+`multicore_tests` 连续全绿（每次 120 s 有界，0.59 s/次），先前必挂的
+`multicore::tests::test_runtime_creation` 与
+`metrics_aggregator_does_not_extend_runtime_lifetime` 在 2.9 s 的
+`cargo test --lib multicore::` 中全部通过，另有回归用例
+`parked_shards_shut_down_and_join`（先断言 shard 已 park，再跑 16 轮 shutdown+join）。
+没有调大任何超时，没有 skip/ignore/删除任何测试。
+
+推翻条件自查：不是「用例的假设不成立」——用例断言的「关停能完成」本来就是承诺，
+修的是运行时的退出判定。
+
+allowed_files:
+  - src/multicore.rs
+  - src/cpu.rs
+  - tests/multicore_tests.rs
+  - docs/review/runtime-safety-findings.md
+  - tasks/multicore-spawn-shutdown-stall.yaml
+  - docs/DECISION_LOG.md
