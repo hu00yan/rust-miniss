@@ -11,7 +11,6 @@
 
 check:
     cargo fmt --all -- --check
-    just docs-audit
     ./scripts/check_no_ignored_tests.sh
     cargo clippy --all-targets -- -D warnings
     cargo check --all-targets --all-features

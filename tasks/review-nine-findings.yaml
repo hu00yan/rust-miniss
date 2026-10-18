@@ -1,11 +1,11 @@
 id: review-nine-findings
-title: 处理 7 月 15 日至今 review 的九项问题并补齐验证门禁
+title: 修复 7 月 15 日至今 review 的九项问题并记录本地验证方法
 branch: fix/io-backend-hygiene-and-macos-correctness
 status: done
 
 ## 目标
 
-修复完整 review 发现的九项问题，并记录此前 Linux mio/epoll 基线风险未被验证流水线覆盖的原因及拦截方案。
+修复完整 review 发现的九项问题，并记录此前 Linux mio/epoll 基线风险未被既有验证覆盖的原因及可选的本地正确性检查；不新增 GitHub Actions 工作流。
 
 ## 变更
 
@@ -16,7 +16,7 @@ status: done
 5. 默认 TLS 使用 Rustls safe default versions，恢复 TLS 1.2/1.3；增加 TLS 1.2-only 对端握手测试。
 6. TLS 网络测试的客户端等待增加 4 秒有界 deadline（服务端既有 5 秒边界未延长）。
 7. README 的 close matrix 数字更正，并链接规范数据来源；删除不存在的 2026-07-15 文件链接。
-8. CI 增加 Linux epoll 全特性 job、真实 `/metrics` + Prometheus `promtool v3.5.0` 校验和 README 文档审计。
+8. 本地验证 Linux epoll 正确性，并提供真实 `/metrics` + Prometheus `promtool v3.5.0` 校验与 README 文档审计命令；不接入 GitHub Actions。epoll 是共享 mio 实现带来的兼容后端，不作性能目标。
 9. 在 `docs/review/validation-pipeline-gaps-2026-10.md` 记录 mio/epoll 风险未被此前流水线发现的具体覆盖缺口及建议。
 
 ## 验收证据
@@ -29,7 +29,7 @@ status: done
 
 ## 非目标 / 限制
 
-本卡没有宣称修复 validation gaps 文档中额外列出的四项历史 mio lifecycle 风险（并发 positioned I/O offset、已 dispatch 文件线程池工作退出计数、长期 slot 增长、UDP register failure 注入）；它们作为后续专项测试/修复列明。未运行用户此前拒绝的端到端 A/B。
+本卡没有宣称修复 validation gaps 文档中额外列出的四项历史 mio lifecycle 风险（并发 positioned I/O offset、已 dispatch 文件线程池工作退出计数、长期 slot 增长、UDP register failure 注入）；它们作为后续专项测试/修复列明。epoll 仅按共享 mio 后端的兼容性做正确性验证，不要求性能指标，也未运行性能基准。未运行用户此前拒绝的端到端 A/B。
 
 allowed_files:
   - .github/workflows/ci.yml

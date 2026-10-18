@@ -24,8 +24,6 @@ jobs:
         run: cargo test --no-default-features --lib --tests --examples
       - name: Feature matrix
         run: just test-feature-matrix
-      - name: Documentation audit
-        run: just docs-audit
       - name: No ignored tests
         run: bash scripts/check_no_ignored_tests.sh
       - name: Architecture audit
@@ -88,8 +86,6 @@ jobs:
         run: cargo test --no-default-features --lib --tests --examples
       - name: Feature matrix
         run: just test-feature-matrix
-      - name: Documentation audit
-        run: just docs-audit
       - name: No ignored tests
         run: bash scripts/check_no_ignored_tests.sh
       - name: Architecture audit
@@ -98,43 +94,3 @@ jobs:
         run: sh scripts/linux_safety.sh
       - name: Sustained pressure gate
         run: just stress
-
-  linux-epoll:
-    name: Linux epoll fallback
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      MINISS_IO_BACKEND: epoll
-      CARGO_TARGET_DIR: target/epoll
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Documentation audit
-        run: just docs-audit
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Compile all targets
-        run: cargo check --all-targets --all-features
-      - name: Tests
-        run: cargo test --all-features --lib --tests --examples -- --test-threads=1
-      - name: Feature matrix
-        run: just test-feature-matrix
-      - name: No ignored tests
-        run: bash scripts/check_no_ignored_tests.sh
-      - name: Architecture audit
-        run: bash scripts/audit_architecture.sh
-
-  prometheus:
-    name: Prometheus text exposition compatibility
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Pull pinned promtool
-        run: docker pull prom/prometheus:v3.5.0
-      - name: Scrape the live metrics example and validate it
-        run: bash scripts/check_prometheus_metrics.sh
