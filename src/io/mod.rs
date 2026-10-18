@@ -121,6 +121,12 @@ impl DescriptorLease {
         RegisteredDescriptor::acquire(fd).map(|registered| registered.lease())
     }
 
+    /// Create another operation-local lease without duplicating the descriptor.
+    #[inline]
+    pub(crate) fn lease(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+
     #[inline]
     pub(crate) fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()

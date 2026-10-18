@@ -41,26 +41,22 @@ See `docs/review/performance-baseline-2026-07-14.md` and
 
 ## Metrics
 
-Every `MultiCoreRuntime` owns one control-plane aggregator thread, started in
-`MultiCoreRuntime::new` and joined when the runtime drops. There is no
-process-global registry — see `src/metrics.rs` for why a global is both
-forbidden by `AGENTS.md` MUST NOT #4 and wrong for a thread-per-core runtime.
+The runtime keeps counters shard-local and exposes snapshots independently of
+any monitoring vendor. Read a fresh per-shard snapshot with
+`MultiCoreRuntime::metrics_snapshot(timeout)`, or use `metrics_view()` for the
+latest periodically aggregated view; `metrics_refresh(timeout)` requests a
+fresh bounded sample. Applications can map `RuntimeMetrics` and
+`CoreMetricsSnapshot` into their own registry, telemetry SDK, logs, or another
+backend. Sampling is a control-plane operation, not a per-request hook.
 
-```rust
-// Serve this from any /metrics handler you own; the runtime only owns numbers.
-let body = runtime.metrics_view()?.render_prometheus();
-
-// Or force a fresh, bounded aggregation pass instead of reading the last one.
-let body = runtime.metrics_refresh(Duration::from_secs(1))?.render_prometheus();
-```
-
-Each exported metric is emitted as `# HELP` / `# TYPE`, one
-`name{shard="N"} value` line per shard, and one unlabelled `name value` line
-holding the runtime-wide merge (sum for counters and gauges, max for
-high-water marks). The interval defaults to 1s and is set at startup with
+There is no process-global registry or HTTP endpoint owned by the runtime.
+For convenience, `MetricsView::render_prometheus()` formats the latest view as
+Prometheus text, but Prometheus is optional and no Prometheus client dependency
+is required. The interval defaults to 1s and is set at startup with
 `MINISS_METRICS_INTERVAL_MS`.
 
-See `examples/metrics_export.rs` for a runnable scrape endpoint.
+See [the metrics integration guide](docs/METRICS.md) for the generic snapshot
+API and the optional Prometheus example in `examples/metrics_export.rs`.
 
 Performance is tracked as reproducible Linux snapshots, not as a permanent
 throughput claim. See the [2026-07-15 source matrix](docs/review/performance-baseline-2026-07-14.md)

@@ -17,8 +17,10 @@ use crate::io::{CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, O
 use crate::Buffer;
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use std::cell::UnsafeCell;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::collections::HashMap;
+use std::io;
 use std::mem;
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -127,6 +129,54 @@ fn dup_owned_file(fd: RawFd) -> io::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(dup_fd) })
 }
 
+/// Read a file at an explicit offset without changing the shared open-file
+/// description offset (which `dup` would otherwise share with the caller).
+fn read_file_at(file: &std::fs::File, offset: u64, len: usize) -> io::Result<CompletionKind> {
+    let mut buffer = Buffer::new_zeroed(len);
+    let bytes_read = file.read_at(buffer.as_mut(), offset)?;
+    if buffer.publish_read_len(bytes_read) {
+        Ok(CompletionKind::ReadFile {
+            bytes_read,
+            data: buffer,
+        })
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file read exceeded buffer capacity",
+        ))
+    }
+}
+
+/// Write a file at an explicit offset without changing the shared open-file
+/// description offset (which `dup` would otherwise share with the caller).
+fn write_file_at(file: &std::fs::File, offset: u64, data: Buffer) -> io::Result<CompletionKind> {
+    let bytes_written = file.write_at(data.as_ref(), offset)?;
+    Ok(CompletionKind::WriteFile {
+        bytes_written,
+        data,
+    })
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BlockingTestGate {
+    started: std::sync::Barrier,
+    release: std::sync::Barrier,
+    sent: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl BlockingTestGate {
+    fn before_work(&self) {
+        self.started.wait();
+        self.release.wait();
+    }
+
+    fn after_send(&self) {
+        self.sent.wait();
+    }
+}
+
 /// A readiness-based `IoBackend` implementation using `mio`.
 #[derive(Debug)]
 pub struct MioBackend {
@@ -143,8 +193,16 @@ pub struct MioBackend {
     descriptor_lease_tokens: UnsafeCell<Vec<Option<IoToken>>>,
     /// UDP receive buffers indexed by the `mio::Token` slot.
     udp_recv_buffers: UnsafeCell<Vec<Option<crate::buffer::Buffer>>>,
-    /// A counter to generate unique `mio::Token` values.
+    /// A counter to generate unique `mio::Token` values. Tokens are never
+    /// reused, so stale events cannot target a recycled operation slot.
     next_token: UnsafeCell<usize>,
+    /// Reusable operation slots. A slot is returned only after its last event,
+    /// job, and owner-drained completion can no longer refer to it.
+    free_slots: UnsafeCell<Vec<usize>>,
+    /// Active mio token for each reusable operation slot.
+    mio_tokens: UnsafeCell<Vec<Option<Token>>>,
+    /// Direct event-token lookup, bounded by peak concurrent accepted work.
+    active_mio_slots: UnsafeCell<HashMap<Token, usize>>,
     /// Shard-local IoToken counter.
     next_io_token: std::cell::Cell<u64>,
     /// Thread pool for blocking file I/O operations
@@ -158,6 +216,8 @@ pub struct MioBackend {
     flush_syscalls: std::cell::Cell<u64>,
     /// Same-thread completed operations.
     completed_local: UnsafeCell<Vec<IoCompletion>>,
+    /// Accepted file/flush jobs whose completion has not yet been drained.
+    blocking_operations: std::cell::Cell<usize>,
     /// Completed operations from the file I/O thread pool.
     completed_tx: SyncSender<IoCompletion>,
     completed_rx: UnsafeCell<Receiver<IoCompletion>>,
@@ -167,7 +227,23 @@ pub struct MioBackend {
     /// zero-timeout poll would report zero new events and drop the ones park
     /// just harvested.
     park_left_events: std::cell::Cell<bool>,
+    #[cfg(test)]
+    blocking_test_gate: UnsafeCell<Option<Arc<BlockingTestGate>>>,
+    #[cfg(test)]
+    fail_udp_send_registration: std::cell::Cell<bool>,
+    #[cfg(test)]
+    fail_udp_recv_registration: std::cell::Cell<bool>,
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+struct SlotTables<'a> {
+    pending_ops: &'a mut Vec<Option<(IoToken, Op)>>,
+    descriptor_leases: &'a mut Vec<Option<DescriptorLease>>,
+    descriptor_lease_tokens: &'a mut Vec<Option<IoToken>>,
+    udp_recv_buffers: &'a mut Vec<Option<Buffer>>,
+    mio_tokens: &'a mut Vec<Option<Token>>,
+    active_mio_slots: &'a mut HashMap<Token, usize>,
+    free_slots: &'a mut Vec<usize>,
 }
 
 impl MioBackend {
@@ -186,15 +262,25 @@ impl MioBackend {
             descriptor_lease_tokens: UnsafeCell::new(Vec::with_capacity(1024)),
             udp_recv_buffers: UnsafeCell::new(Vec::with_capacity(1024)),
             next_token: UnsafeCell::new(0),
+            free_slots: UnsafeCell::new(Vec::new()),
+            mio_tokens: UnsafeCell::new(Vec::with_capacity(1024)),
+            active_mio_slots: UnsafeCell::new(HashMap::new()),
             next_io_token: std::cell::Cell::new(1),
             thread_pool,
             flush_groups: UnsafeCell::new(Vec::new()),
             flush_requests: std::cell::Cell::new(0),
             flush_syscalls: std::cell::Cell::new(0),
             completed_local: UnsafeCell::new(Vec::new()),
+            blocking_operations: std::cell::Cell::new(0),
             completed_tx,
             completed_rx: UnsafeCell::new(completed_rx),
             park_left_events: std::cell::Cell::new(false),
+            #[cfg(test)]
+            blocking_test_gate: UnsafeCell::new(None),
+            #[cfg(test)]
+            fail_udp_send_registration: std::cell::Cell::new(false),
+            #[cfg(test)]
+            fail_udp_recv_registration: std::cell::Cell::new(false),
             _local: std::marker::PhantomData,
         })
     }
@@ -211,6 +297,24 @@ impl MioBackend {
         if idx >= vec.len() {
             vec.resize_with(idx + 1, || None);
         }
+    }
+
+    fn recycle_slot(slot: usize, tables: &mut SlotTables<'_>) {
+        if let Some(token) = tables.mio_tokens[slot].take() {
+            tables.active_mio_slots.remove(&token);
+        }
+        tables.pending_ops[slot] = None;
+        tables.descriptor_leases[slot] = None;
+        tables.descriptor_lease_tokens[slot] = None;
+        tables.udp_recv_buffers[slot] = None;
+        tables.free_slots.push(slot);
+    }
+
+    #[cfg(test)]
+    fn blocking_test_gate(&self) -> Option<Arc<BlockingTestGate>> {
+        // SAFETY: tests set the gate before submit on the backend owner thread;
+        // submissions clone it before handing work to a pool thread.
+        unsafe { (&*self.blocking_test_gate.get()).clone() }
     }
 
     /// Number of `fsync(2)`/`fdatasync(2)` syscalls this shard has issued.
@@ -282,13 +386,21 @@ impl MioBackend {
                 waiters,
                 ..
             } = group;
+            self.blocking_operations
+                .set(self.blocking_operations.get() + waiters.len());
             let completed_tx = self.completed_tx.clone();
             let thread_pool = self.thread_pool.clone();
+            #[cfg(test)]
+            let test_gate = self.blocking_test_gate();
             // The syscall runs once for the whole group; every waiter is
             // published only after it returned, so no caller can observe
             // durability for a flush that has not happened yet.
             self.flush_syscalls.set(self.flush_syscalls.get() + 1);
             thread_pool.execute(move || {
+                #[cfg(test)]
+                if let Some(gate) = &test_gate {
+                    gate.before_work();
+                }
                 let outcome = match dup_owned_file(lease.as_raw_fd()) {
                     Ok(file) => match mode {
                         FlushMode::Data => file.sync_data(),
@@ -299,6 +411,10 @@ impl MioBackend {
                 // `io::Error` is not `Clone`, so the failure is carried as a
                 // raw code and rebuilt per waiter.
                 let failure = outcome.as_ref().err().map(|error| error.raw_os_error());
+                // The syscall is finished, so drop the lease before publishing
+                // any waiter completion. The owner still retains each token slot
+                // until it drains that completion.
+                drop(lease);
                 for (token, waiter_mode) in waiters {
                     let completion = match failure {
                         None => Ok(waiter_mode.completion()),
@@ -306,6 +422,10 @@ impl MioBackend {
                         Some(None) => Err(IoError::Io(io::Error::other("file flush failed"))),
                     };
                     let _ = completed_tx.send((token, completion));
+                }
+                #[cfg(test)]
+                if let Some(gate) = &test_gate {
+                    gate.after_send();
                 }
             });
         }
@@ -318,42 +438,53 @@ impl IoProvider for MioBackend {
     fn submit(&self, op: Op) -> Result<IoToken, IoError> {
         let io_token = IoToken::next_from(&self.next_io_token);
 
-        // SAFETY: We have exclusive, single-threaded access.
-        let next_token = unsafe { &mut *self.next_token.get() };
-        // SAFETY: `poll` is shard-local; `submit` runs on this backend's owner thread.
-        let poll = unsafe { &mut *self.poll.get() };
-        // SAFETY: shard-local pending-op slots; this thread is their only accessor.
-        let pending_ops = unsafe { &mut *self.pending_ops.get() };
-        // SAFETY: shard-local descriptor leases; this thread is their only accessor.
-        let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
-        // SAFETY: shard-local lease→token map; this thread is its only accessor.
-        let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
-
-        let mio_token = Token(*next_token);
-        *next_token += 1;
-        let slot = mio_token.0;
-        Self::ensure_slot_capacity(pending_ops, slot);
-        Self::ensure_slot_capacity(descriptor_leases, slot);
-        Self::ensure_slot_capacity(descriptor_lease_tokens, slot);
-        // SAFETY: udp_recv_buffers is shard-local and only accessed from this
-        // backend owner thread while submitting operations.
-        Self::ensure_slot_capacity(unsafe { &mut *self.udp_recv_buffers.get() }, slot);
-
-        // Acquire the lease before registration/queueing.  File operations
-        // move it into the worker closure; readiness operations retain it in
-        // the slot until their terminal completion.
-        let descriptor_lease = if matches!(op, Op::Nop | Op::Close { .. }) {
+        // Acquire the lease before allocating a slot. File operations retain it
+        // there until their worker completion is drained by the owner thread.
+        let descriptor_lease = if matches!(&op, Op::Nop | Op::Close { .. }) {
             None
         } else {
             match DescriptorLease::acquire(op.as_raw_fd()) {
                 Ok(lease) => Some(lease),
-                Err(error) => {
-                    return Err(IoError::Io(error));
-                }
+                Err(error) => return Err(IoError::Io(error)),
             }
         };
+
+        // SAFETY: The owner thread is the only accessor to token allocation.
+        let next_token = unsafe { &mut *self.next_token.get() };
+        let token_value = *next_token;
+        *next_token = next_token
+            .checked_add(1)
+            .ok_or_else(|| IoError::Io(io::Error::other("mio token space exhausted")))?;
+        // SAFETY: mio token, slot, and token-index tables are shard-local and
+        // accessed only by this backend's owner thread.
+        let poll = unsafe { &mut *self.poll.get() };
+        // SAFETY: `submit` runs on this backend's owner thread, the sole accessor to these slots.
+        let pending_ops = unsafe { &mut *self.pending_ops.get() };
+        // SAFETY: `submit` runs on this backend's owner thread, the sole accessor to descriptor leases.
+        let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
+        // SAFETY: `submit` runs on this backend's owner thread, the sole accessor to the lease-token map.
+        let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
+        // SAFETY: `submit` runs on this backend's owner thread, the sole accessor to mio tokens.
+        let mio_tokens = unsafe { &mut *self.mio_tokens.get() };
+        // SAFETY: `submit` runs on this backend's owner thread, the sole accessor to token lookup.
+        let active_mio_slots = unsafe { &mut *self.active_mio_slots.get() };
+        // SAFETY: `submit` runs on this backend's owner thread, the sole accessor to reusable slots.
+        let free_slots = unsafe { &mut *self.free_slots.get() };
+        let slot = free_slots.pop().unwrap_or(pending_ops.len());
+        let mio_token = Token(token_value);
+        Self::ensure_slot_capacity(pending_ops, slot);
+        Self::ensure_slot_capacity(descriptor_leases, slot);
+        Self::ensure_slot_capacity(descriptor_lease_tokens, slot);
+        Self::ensure_slot_capacity(mio_tokens, slot);
+        // SAFETY: udp_recv_buffers is shard-local and only accessed by this
+        // backend owner thread while submitting operations.
+        let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
+        Self::ensure_slot_capacity(udp_recv_buffers, slot);
+
         descriptor_leases[slot] = descriptor_lease;
         descriptor_lease_tokens[slot] = Some(io_token);
+        mio_tokens[slot] = Some(mio_token);
+        active_mio_slots.insert(mio_token, slot);
         let mut registration_error = None;
         let leased_fd = descriptor_leases[slot]
             .as_ref()
@@ -363,11 +494,21 @@ impl IoProvider for MioBackend {
                 // Register the UDP socket for read events.
                 let effective_fd = leased_fd.unwrap_or(fd);
                 let mut source = mio::unix::SourceFd(&effective_fd);
-                if let Err(e) =
+                #[cfg(test)]
+                let registration = if self.fail_udp_recv_registration.replace(false) {
+                    Err(io::Error::other(
+                        "injected UDP receive registration failure",
+                    ))
+                } else {
                     poll.registry()
                         .register(&mut source, mio_token, mio::Interest::READABLE)
-                {
-                    registration_error = Some(e);
+                };
+                #[cfg(not(test))]
+                let registration =
+                    poll.registry()
+                        .register(&mut source, mio_token, mio::Interest::READABLE);
+                if let Err(error) = registration {
+                    registration_error = Some(error);
                 }
                 // SAFETY: udp_recv_buffers is shard-local and only touched by
                 // the owning runtime thread while submitting/draining.
@@ -452,58 +593,72 @@ impl IoProvider for MioBackend {
                     }
                 }
                 // File operations are handled asynchronously in thread pool
-                Op::ReadFile { fd, offset, len } => {
+                Op::ReadFile { fd: _, offset, len } => {
                     let completed_tx = self.completed_tx.clone();
                     let thread_pool = self.thread_pool.clone();
                     let io_token_copy = io_token;
-                    let fd_copy = leased_fd.unwrap_or(*fd);
+                    let worker_lease = descriptor_leases[slot]
+                        .as_ref()
+                        .expect("accepted file read retains its descriptor lease")
+                        .lease();
+                    let fd_copy = worker_lease.as_raw_fd();
                     let offset_copy = *offset;
                     let len_copy = *len;
+                    #[cfg(test)]
+                    let test_gate = self.blocking_test_gate();
+                    self.blocking_operations
+                        .set(self.blocking_operations.get() + 1);
 
                     thread_pool.execute(move || {
+                        #[cfg(test)]
+                        if let Some(gate) = &test_gate {
+                            gate.before_work();
+                        }
                         let result = dup_owned_file(fd_copy)
-                            .and_then(|mut file| {
-                                file.seek(SeekFrom::Start(offset_copy))?;
-                                let mut buf = Buffer::new_zeroed(len_copy);
-                                let bytes_read = file.read(buf.as_mut())?;
-                                if buf.publish_read_len(bytes_read) {
-                                    Ok(CompletionKind::ReadFile {
-                                        bytes_read,
-                                        data: buf,
-                                    })
-                                } else {
-                                    Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "file read exceeded buffer capacity",
-                                    ))
-                                }
-                            })
+                            .and_then(|file| read_file_at(&file, offset_copy, len_copy))
                             .map_err(IoError::Io);
-
+                        drop(worker_lease);
                         let _ = completed_tx.send((io_token_copy, result));
+                        #[cfg(test)]
+                        if let Some(gate) = &test_gate {
+                            gate.after_send();
+                        }
                     });
                 }
-                Op::WriteFile { fd, offset, data } => {
+                Op::WriteFile {
+                    fd: _,
+                    offset,
+                    data,
+                } => {
                     let completed_tx = self.completed_tx.clone();
                     let thread_pool = self.thread_pool.clone();
                     let io_token_copy = io_token;
-                    let fd_copy = leased_fd.unwrap_or(*fd);
+                    let worker_lease = descriptor_leases[slot]
+                        .as_ref()
+                        .expect("accepted file write retains its descriptor lease")
+                        .lease();
+                    let fd_copy = worker_lease.as_raw_fd();
                     let offset_copy = *offset;
                     let data_clone = data.clone();
+                    #[cfg(test)]
+                    let test_gate = self.blocking_test_gate();
+                    self.blocking_operations
+                        .set(self.blocking_operations.get() + 1);
 
                     thread_pool.execute(move || {
+                        #[cfg(test)]
+                        if let Some(gate) = &test_gate {
+                            gate.before_work();
+                        }
                         let result = dup_owned_file(fd_copy)
-                            .and_then(|mut file| {
-                                file.seek(SeekFrom::Start(offset_copy))?;
-                                let bytes_written = file.write(data_clone.as_ref())?;
-                                Ok(CompletionKind::WriteFile {
-                                    bytes_written,
-                                    data: data_clone,
-                                })
-                            })
+                            .and_then(|file| write_file_at(&file, offset_copy, data_clone))
                             .map_err(IoError::Io);
-
+                        drop(worker_lease);
                         let _ = completed_tx.send((io_token_copy, result));
+                        #[cfg(test)]
+                        if let Some(gate) = &test_gate {
+                            gate.after_send();
+                        }
                     });
                 }
                 Op::UdpSend {
@@ -511,17 +666,27 @@ impl IoProvider for MioBackend {
                     data: _data,
                     addr: _addr,
                 } => {
-                    // Register the UDP socket for write events, make it asynchronous
+                    // Register the UDP socket for write events before staging
+                    // the operation. A failure is returned by the common cleanup
+                    // path below, which releases its lease and reusable slot.
                     let effective_fd = leased_fd.unwrap_or(*fd);
                     let mut source = mio::unix::SourceFd(&effective_fd);
-                    if let Err(e) =
+                    #[cfg(test)]
+                    let registration = if self.fail_udp_send_registration.replace(false) {
+                        Err(io::Error::other("injected UDP send registration failure"))
+                    } else {
                         poll.registry()
                             .register(&mut source, mio_token, mio::Interest::WRITABLE)
-                    {
-                        eprintln!("Failed to register UDP socket with mio for send: {e}");
+                    };
+                    #[cfg(not(test))]
+                    let registration =
+                        poll.registry()
+                            .register(&mut source, mio_token, mio::Interest::WRITABLE);
+                    if let Err(error) = registration {
+                        registration_error = Some(error);
+                    } else {
+                        pending_ops[slot] = Some((io_token, op));
                     }
-                    // Store the data buffer and address with the op. The op contains the Buffer.
-                    pending_ops[slot] = Some((io_token, op));
                 }
                 // A flush is never issued here. `fsync(2)`/`fdatasync(2)` can
                 // block for milliseconds, and running either inline would stall
@@ -537,7 +702,7 @@ impl IoProvider for MioBackend {
                     };
                     // The group owns the acceptance lease outright: it must
                     // outlive every waiter's slot until the syscall returns.
-                    match descriptor_leases[slot].take() {
+                    match descriptor_leases[slot].as_ref().map(DescriptorLease::lease) {
                         Some(lease) => {
                             if let Err(error) = self.enqueue_flush(io_token, mode, lease) {
                                 registration_error = Some(error);
@@ -562,8 +727,18 @@ impl IoProvider for MioBackend {
                         }
                     };
                     self.complete_local((io_token, result));
-                    descriptor_leases[slot] = None;
-                    descriptor_lease_tokens[slot] = None;
+                    Self::recycle_slot(
+                        slot,
+                        &mut SlotTables {
+                            pending_ops: &mut *pending_ops,
+                            descriptor_leases: &mut *descriptor_leases,
+                            descriptor_lease_tokens: &mut *descriptor_lease_tokens,
+                            udp_recv_buffers: &mut *udp_recv_buffers,
+                            mio_tokens: &mut *mio_tokens,
+                            active_mio_slots: &mut *active_mio_slots,
+                            free_slots: &mut *free_slots,
+                        },
+                    );
                 }
                 Op::PollAdd {
                     fd,
@@ -592,25 +767,25 @@ impl IoProvider for MioBackend {
                         io::ErrorKind::Unsupported,
                         "Operation not supported by the mio readiness backend",
                     ));
-                    descriptor_leases[slot] = None;
-                    descriptor_lease_tokens[slot] = None;
                 }
             },
         };
 
-        // Registration failures and unsupported/immediate operations do not
-        // leave a pending slot.  Release their acceptance lease here; file
-        // jobs retain theirs until the completion token is drained.
+        // Registration failures and unsupported operations do not leave a
+        // pending slot. File/flush jobs retain theirs until owner drain.
         if let Some(error) = registration_error {
-            pending_ops[slot] = None;
-            // A failed UDP registration may have staged its buffer before the
-            // error was observed; discard that staged state with the lease.
-            // SAFETY: shard-local `udp_recv_buffers`, cleared on this owner thread.
-            unsafe {
-                (&mut *self.udp_recv_buffers.get())[slot] = None;
-            }
-            descriptor_leases[slot] = None;
-            descriptor_lease_tokens[slot] = None;
+            Self::recycle_slot(
+                slot,
+                &mut SlotTables {
+                    pending_ops: &mut *pending_ops,
+                    descriptor_leases: &mut *descriptor_leases,
+                    descriptor_lease_tokens: &mut *descriptor_lease_tokens,
+                    udp_recv_buffers: &mut *udp_recv_buffers,
+                    mio_tokens: &mut *mio_tokens,
+                    active_mio_slots: &mut *active_mio_slots,
+                    free_slots: &mut *free_slots,
+                },
+            );
             return Err(IoError::Io(error));
         }
 
@@ -623,11 +798,6 @@ impl IoProvider for MioBackend {
             .iter()
             .filter(|entry| entry.is_some())
             .count();
-        // SAFETY: same owner-thread-only query as `pending_ops` above.
-        let udp = unsafe { &*self.udp_recv_buffers.get() }
-            .iter()
-            .filter(|entry| entry.is_some())
-            .count();
         // Flush requests waiting for the next event-loop boundary to dispatch
         // their group are accepted work the owner still owes a completion.
         // SAFETY: same owner-thread-only query; `flush_groups` is shard-local.
@@ -637,7 +807,9 @@ impl IoProvider for MioBackend {
             .sum::<usize>();
         // SAFETY: same owner-thread-only query; `completed_local` is shard-local.
         let completed = unsafe { &*self.completed_local.get() }.len();
-        pending + udp + flushes + completed
+        // Pool jobs and already-published channel completions remain outstanding
+        // until this owner drains them, independent of channel capacity.
+        pending + flushes + completed + self.blocking_operations.get()
     }
 
     fn retained_descriptor_count(&self) -> usize {
@@ -654,13 +826,11 @@ impl IoProvider for MioBackend {
             .iter()
             .filter(|(_, result)| matches!(result, Ok(CompletionKind::Accept { .. })))
             .count();
-        // An undispatched flush group holds the lease its syscall will run
-        // against, moved out of the waiter slot that accepted it. Descriptors
-        // already handed to the thread pool are not counted: that in-flight
-        // window was never included for file reads and writes either.
-        // SAFETY: same owner-thread-exclusive access as above; termination-time count.
-        let flush_groups = unsafe { &*self.flush_groups.get() }.len();
-        leases + accepted + flush_groups
+        // File and flush workers hold a shared lease until their syscall ends;
+        // the owner slot retains its own lease until the completion is drained.
+        // A flush group's lease shares one of those slot-owned descriptors, so
+        // it must not be counted as another descriptor.
+        leases + accepted
     }
 
     fn cancel(&self, token: IoToken) -> bool {
@@ -682,15 +852,36 @@ impl IoProvider for MioBackend {
             .map(DescriptorLease::as_raw_fd)
             .or(op_fd)
             .unwrap_or(-1);
+        // SAFETY: `cancel` runs on the owning event-loop thread, the sole accessor to `mio_tokens`.
+        let has_mio_token = unsafe { (&*self.mio_tokens.get())[slot].is_some() };
         let mut source = mio::unix::SourceFd(&fd);
-        let _ = poll.registry().deregister(&mut source);
-        pending_ops[slot] = None;
-        // SAFETY: the same three shard-local tables as above, written on this owner thread.
-        unsafe {
-            (&mut *self.udp_recv_buffers.get())[slot] = None;
-            (&mut *self.descriptor_leases.get())[slot] = None;
-            (&mut *self.descriptor_lease_tokens.get())[slot] = None;
+        if has_mio_token {
+            let _ = poll.registry().deregister(&mut source);
         }
+        // SAFETY: deregistration has completed, and this owner thread is the sole accessor to descriptor leases.
+        let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
+        // SAFETY: `cancel` runs on the owning event-loop thread, the sole accessor to the lease-token map.
+        let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
+        // SAFETY: `cancel` runs on the owning event-loop thread, the sole accessor to UDP receive buffers.
+        let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
+        // SAFETY: `cancel` runs on the owning event-loop thread, the sole accessor to mio tokens.
+        let mio_tokens = unsafe { &mut *self.mio_tokens.get() };
+        // SAFETY: `cancel` runs on the owning event-loop thread, the sole accessor to token lookup.
+        let active_mio_slots = unsafe { &mut *self.active_mio_slots.get() };
+        // SAFETY: `cancel` runs on the owning event-loop thread, the sole accessor to free slots.
+        let free_slots = unsafe { &mut *self.free_slots.get() };
+        Self::recycle_slot(
+            slot,
+            &mut SlotTables {
+                pending_ops: &mut *pending_ops,
+                descriptor_leases: &mut *descriptor_leases,
+                descriptor_lease_tokens: &mut *descriptor_lease_tokens,
+                udp_recv_buffers: &mut *udp_recv_buffers,
+                mio_tokens: &mut *mio_tokens,
+                active_mio_slots: &mut *active_mio_slots,
+                free_slots: &mut *free_slots,
+            },
+        );
         true
     }
 
@@ -779,6 +970,14 @@ impl IoProvider for MioBackend {
         let descriptor_leases = unsafe { &mut *self.descriptor_leases.get() };
         // SAFETY: shard-local lease→token map; this thread is its only accessor.
         let descriptor_lease_tokens = unsafe { &mut *self.descriptor_lease_tokens.get() };
+        // SAFETY: `drain_completions` runs on the backend owner thread, the sole accessor to UDP buffers.
+        let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
+        // SAFETY: `drain_completions` runs on the backend owner thread, the sole accessor to mio tokens.
+        let mio_tokens = unsafe { &mut *self.mio_tokens.get() };
+        // SAFETY: `drain_completions` runs on the backend owner thread, the sole accessor to token lookup.
+        let active_mio_slots = unsafe { &mut *self.active_mio_slots.get() };
+        // SAFETY: `drain_completions` runs on the backend owner thread, the sole accessor to free slots.
+        let free_slots = unsafe { &mut *self.free_slots.get() };
         // SAFETY: shard-local completion staging; this thread is its only accessor.
         let completed_local = unsafe { &mut *self.completed_local.get() };
         // SAFETY: shard-local pool completion channel; this thread is its only receiver.
@@ -794,9 +993,22 @@ impl IoProvider for MioBackend {
                         .iter()
                         .position(|token| *token == Some(completion.0))
                     {
-                        descriptor_lease_tokens[slot] = None;
-                        descriptor_leases[slot] = None;
+                        Self::recycle_slot(
+                            slot,
+                            &mut SlotTables {
+                                pending_ops: &mut *pending_ops,
+                                descriptor_leases: &mut *descriptor_leases,
+                                descriptor_lease_tokens: &mut *descriptor_lease_tokens,
+                                udp_recv_buffers: &mut *udp_recv_buffers,
+                                mio_tokens: &mut *mio_tokens,
+                                active_mio_slots: &mut *active_mio_slots,
+                                free_slots: &mut *free_slots,
+                            },
+                        );
                     }
+                    let outstanding = self.blocking_operations.get();
+                    debug_assert!(outstanding > 0, "untracked blocking I/O completion");
+                    self.blocking_operations.set(outstanding.saturating_sub(1));
                     completions.push(completion)
                 }
                 Err(TryRecvError::Empty) => break,
@@ -825,7 +1037,11 @@ impl IoProvider for MioBackend {
         // First, handle any events from mio
         for event in events.iter() {
             let mio_token = event.token();
-            let slot = mio_token.0;
+            let Some(slot) = active_mio_slots.get(&mio_token).copied() else {
+                // A canceled/recycled slot may still have an older event in
+                // this harvested batch. Mio tokens are unique, so ignore it.
+                continue;
+            };
             if let Some((io_token, op)) = pending_ops.get_mut(slot).and_then(Option::take) {
                 let leased_fd = descriptor_leases
                     .get(slot)
@@ -1102,44 +1318,21 @@ impl IoProvider for MioBackend {
                         result
                     }
                     Op::ReadFile { fd, offset, len } => {
-                        // This path should ideally not be hit as these are handled sync in submit
-                        // but included for completeness if event-driven file I/O were enabled.
+                        // This fallback is retained for event-driven file I/O.
                         let effective_fd = leased_fd.unwrap_or(fd);
-                        // SAFETY: File temporarily wraps fd for std APIs, then
-                        // into_raw_fd prevents closing so ownership stays outside.
-                        let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
-                        let result = file.seek(SeekFrom::Start(offset)).and_then(|_| {
-                            let mut buf = Buffer::new_zeroed(len);
-                            file.read(buf.as_mut()).and_then(|bytes_read| {
-                                if buf.publish_read_len(bytes_read) {
-                                    Ok(CompletionKind::ReadFile {
-                                        bytes_read,
-                                        data: buf,
-                                    })
-                                } else {
-                                    Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "file read exceeded buffer capacity",
-                                    ))
-                                }
-                            })
-                        });
+                        // SAFETY: File temporarily wraps fd, then into_raw_fd
+                        // prevents closing the descriptor owned by its lease.
+                        let file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
+                        let result = read_file_at(&file, offset, len);
                         let _ = file.into_raw_fd();
                         result.map_err(IoError::Io)
                     }
                     Op::WriteFile { fd, offset, data } => {
-                        // This path should ideally not be hit.
                         let effective_fd = leased_fd.unwrap_or(fd);
-                        // SAFETY: File temporarily wraps fd for std APIs, then
-                        // into_raw_fd prevents closing so ownership stays outside.
-                        let mut file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
-                        let result = file
-                            .seek(SeekFrom::Start(offset))
-                            .and_then(|_| file.write(data.as_ref()))
-                            .map(|bytes_written| CompletionKind::WriteFile {
-                                bytes_written,
-                                data,
-                            });
+                        // SAFETY: File temporarily wraps fd, then into_raw_fd
+                        // prevents closing the descriptor owned by its lease.
+                        let file = unsafe { std::fs::File::from_raw_fd(effective_fd) };
+                        let result = write_file_at(&file, offset, data);
                         let _ = file.into_raw_fd();
                         result.map_err(IoError::Io)
                     }
@@ -1335,13 +1528,20 @@ impl IoProvider for MioBackend {
                     _ => continue,
                 };
 
-                // SAFETY: the lease is retained across every readiness requeue and
-                // released only at this terminal result; the lease vectors are
-                // backend-owned and remain valid for this owner-thread drain pass.
-                unsafe {
-                    (&mut *self.descriptor_leases.get())[slot] = None;
-                    (&mut *self.descriptor_lease_tokens.get())[slot] = None;
-                }
+                // The terminal result no longer references its operation slot.
+                // Readiness requeues `continue` above and retain the slot.
+                Self::recycle_slot(
+                    slot,
+                    &mut SlotTables {
+                        pending_ops: &mut *pending_ops,
+                        descriptor_leases: &mut *descriptor_leases,
+                        descriptor_lease_tokens: &mut *descriptor_lease_tokens,
+                        udp_recv_buffers: &mut *udp_recv_buffers,
+                        mio_tokens: &mut *mio_tokens,
+                        active_mio_slots: &mut *active_mio_slots,
+                        free_slots: &mut *free_slots,
+                    },
+                );
                 completions.push((io_token, result));
             }
         }
@@ -2030,5 +2230,410 @@ mod flush_group_commit_tests {
     fn flush_identity_rejects_a_descriptor_it_cannot_stat() {
         let error = super::flush_identity(-1).expect_err("fstat(-1) must fail");
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod mio_regression_tests {
+    use super::{BlockingTestGate, MioBackend};
+    use crate::buffer::Buffer;
+    use crate::io::{CompletionKind, IoProvider, IoToken, Op};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::{Arc, Barrier};
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+
+    struct TempFile {
+        path: std::path::PathBuf,
+        file: std::fs::File,
+    }
+
+    impl TempFile {
+        fn new(tag: &str, data: &[u8]) -> Self {
+            let scratch = std::env::current_dir()
+                .expect("resolve workspace directory")
+                .join(".scratch");
+            std::fs::create_dir_all(&scratch).expect("create .scratch directory");
+            let path = scratch.join(format!("miniss-mio-{tag}-{}.bin", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("create temp file");
+            file.write_all(data).expect("write temp file");
+            Self { path, file }
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn blocking_gate() -> Arc<BlockingTestGate> {
+        Arc::new(BlockingTestGate {
+            started: Barrier::new(2),
+            release: Barrier::new(2),
+            sent: Barrier::new(2),
+        })
+    }
+
+    fn drain_one(
+        backend: &MioBackend,
+    ) -> Vec<(IoToken, Result<CompletionKind, crate::io::IoError>)> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match backend.drain_completions() {
+                Poll::Ready(batch) if !batch.is_empty() => return batch,
+                Poll::Ready(_) | Poll::Pending => {
+                    assert!(Instant::now() < deadline, "operation did not complete");
+                    let _ = backend.park(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlotSnapshot {
+        pending_len: usize,
+        pending_empty: bool,
+        mio_tokens_len: usize,
+        descriptor_leases_len: usize,
+        descriptor_leases_empty: bool,
+        descriptor_lease_tokens_empty: bool,
+        udp_recv_buffers_empty: bool,
+        free_slots: Vec<usize>,
+    }
+
+    fn slot_snapshot(backend: &MioBackend) -> SlotSnapshot {
+        // SAFETY: this helper is called synchronously on the test thread; the
+        // pool workers only use their captured leases and completion channel,
+        // never these owner-thread-only slot tables.
+        unsafe {
+            let pending_ops = &*backend.pending_ops.get();
+            let descriptor_leases = &*backend.descriptor_leases.get();
+            let descriptor_lease_tokens = &*backend.descriptor_lease_tokens.get();
+            let udp_recv_buffers = &*backend.udp_recv_buffers.get();
+            SlotSnapshot {
+                pending_len: pending_ops.len(),
+                pending_empty: pending_ops.iter().all(Option::is_none),
+                mio_tokens_len: (&*backend.mio_tokens.get()).len(),
+                descriptor_leases_len: descriptor_leases.len(),
+                descriptor_leases_empty: descriptor_leases.iter().all(Option::is_none),
+                descriptor_lease_tokens_empty: descriptor_lease_tokens.iter().all(Option::is_none),
+                udp_recv_buffers_empty: udp_recv_buffers.iter().all(Option::is_none),
+                free_slots: (&*backend.free_slots.get()).clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn pool_and_inline_file_io_preserve_the_shared_file_offset() {
+        let mut temp = TempFile::new("positioned", b"abcdefgh");
+        let backend = MioBackend::new().expect("mio backend");
+        temp.file
+            .seek(SeekFrom::Start(6))
+            .expect("set shared offset");
+        let fd = temp.file.as_raw_fd();
+        let read_token = backend
+            .submit(Op::ReadFile {
+                fd,
+                offset: 1,
+                len: 3,
+            })
+            .expect("submit positioned read");
+        let write_token = backend
+            .submit(Op::WriteFile {
+                fd,
+                offset: 4,
+                data: Buffer::from_slice(b"XYZ"),
+            })
+            .expect("submit positioned write");
+
+        let mut completions = Vec::new();
+        while completions.len() < 2 {
+            completions.extend(drain_one(&backend));
+        }
+        let mut saw_read = false;
+        let mut saw_write = false;
+        for (token, result) in completions {
+            match (token, result.expect("positioned I/O succeeds")) {
+                (token, CompletionKind::ReadFile { bytes_read, data }) if token == read_token => {
+                    assert_eq!(bytes_read, 3);
+                    assert_eq!(&data[..], b"bcd");
+                    saw_read = true;
+                }
+                (token, CompletionKind::WriteFile { bytes_written, .. })
+                    if token == write_token =>
+                {
+                    assert_eq!(bytes_written, 3);
+                    saw_write = true;
+                }
+                other => panic!("unexpected positioned I/O completion: {other:?}"),
+            }
+        }
+        assert!(saw_read && saw_write, "missing a positioned I/O completion");
+        assert_eq!(temp.file.stream_position().expect("read file position"), 6);
+
+        // The same helpers are used by the inline fallback arms in drain.
+        temp.file
+            .seek(SeekFrom::Start(7))
+            .expect("reset shared offset");
+        let read = super::read_file_at(&temp.file, 0, 2).expect("inline positioned read");
+        assert!(matches!(
+            read,
+            CompletionKind::ReadFile { bytes_read: 2, .. }
+        ));
+        let write = super::write_file_at(&temp.file, 2, Buffer::from_slice(b"!!"))
+            .expect("inline positioned write");
+        assert!(matches!(
+            write,
+            CompletionKind::WriteFile {
+                bytes_written: 2,
+                ..
+            }
+        ));
+        assert_eq!(temp.file.stream_position().expect("read file position"), 7);
+        let mut content = [0u8; 8];
+        assert_eq!(temp.file.read_at(&mut content, 0).unwrap(), 8);
+        assert_eq!(&content, b"ab!!XYZh");
+    }
+
+    #[test]
+    fn blocking_file_and_flush_work_count_until_owner_drains_completion() {
+        let temp = TempFile::new("count-file", b"payload");
+        let backend = MioBackend::new().expect("mio backend");
+        let gate = blocking_gate();
+        // SAFETY: this test sets the per-instance gate before any jobs are
+        // submitted, and no other thread accesses the backend field.
+        unsafe { *backend.blocking_test_gate.get() = Some(gate.clone()) };
+        backend
+            .submit(Op::ReadFile {
+                fd: temp.file.as_raw_fd(),
+                offset: 0,
+                len: 7,
+            })
+            .expect("submit file read");
+        gate.started.wait();
+        assert_eq!(backend.pending_operation_count(), 1);
+        gate.release.wait();
+        gate.sent.wait();
+        assert_eq!(backend.pending_operation_count(), 1);
+        assert_eq!(drain_one(&backend).len(), 1);
+        assert_eq!(backend.pending_operation_count(), 0);
+
+        let flush_backend = MioBackend::new().expect("mio backend");
+        let flush_gate = blocking_gate();
+        // SAFETY: as above, the gate is set once before work is dispatched.
+        unsafe { *flush_backend.blocking_test_gate.get() = Some(flush_gate.clone()) };
+        for _ in 0..3 {
+            flush_backend
+                .submit(Op::Fsync {
+                    fd: temp.file.as_raw_fd(),
+                })
+                .expect("submit fsync");
+        }
+        assert_eq!(flush_backend.pending_operation_count(), 3);
+        assert!(matches!(flush_backend.drain_completions(), Poll::Pending));
+        flush_gate.started.wait();
+        assert_eq!(flush_backend.pending_operation_count(), 3);
+        flush_gate.release.wait();
+        flush_gate.sent.wait();
+        assert_eq!(flush_backend.pending_operation_count(), 3);
+        assert_eq!(drain_one(&flush_backend).len(), 3);
+        assert_eq!(flush_backend.pending_operation_count(), 0);
+    }
+
+    #[test]
+    fn file_worker_keeps_its_descriptor_lease_if_backend_drops_early() {
+        let temp = TempFile::new("drop-lease", b"before");
+        let backend = MioBackend::new().expect("mio backend");
+        let gate = blocking_gate();
+        // SAFETY: this test sets the per-instance gate before submission; the
+        // backend owner is the only thread that accesses the field.
+        unsafe { *backend.blocking_test_gate.get() = Some(gate.clone()) };
+        backend
+            .submit(Op::WriteFile {
+                fd: temp.file.as_raw_fd(),
+                offset: 0,
+                data: Buffer::from_slice(b"after!"),
+            })
+            .expect("submit gated file write");
+        gate.started.wait();
+
+        // The worker is paused before it duplicates the accepted descriptor.
+        // Dropping the backend releases its slot state; the worker's explicit
+        // lease must keep that same descriptor alive until the write finishes.
+        drop(backend);
+        gate.release.wait();
+        gate.sent.wait();
+
+        let mut contents = [0; 6];
+        assert_eq!(temp.file.read_at(&mut contents, 0).expect("read result"), 6);
+        assert_eq!(&contents, b"after!");
+    }
+
+    #[test]
+    fn operation_slots_are_reused_and_stale_harvested_events_are_ignored() {
+        let backend = MioBackend::new().expect("mio backend");
+        for _ in 0..64 {
+            let mut fds = [0; 2];
+            // SAFETY: fds is a valid pair of slots for pipe(2).
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let token = backend
+                .submit(Op::Read {
+                    fd: fds[0],
+                    offset: 0,
+                    len: 1,
+                })
+                .expect("submit pending pipe read");
+            assert!(backend.cancel(token));
+            // SAFETY: both pipe ends belong to this test.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+        }
+        // Repeatedly completed/canceled work uses one slot, not a new vector
+        // entry per operation.
+        let slots = slot_snapshot(&backend);
+        assert_eq!(slots.pending_len, 1);
+        assert_eq!(slots.mio_tokens_len, 1);
+        assert_eq!(slots.descriptor_leases_len, 1);
+
+        let mut old_fds = [0; 2];
+        // SAFETY: old_fds is a valid pair of slots for pipe(2).
+        assert_eq!(unsafe { libc::pipe(old_fds.as_mut_ptr()) }, 0);
+        // SAFETY: `old_fds[1]` is a live pipe write end and `b"o"` is a
+        // one-byte initialized source for the duration of the call.
+        let old_written = unsafe { libc::write(old_fds[1], b"o".as_ptr().cast(), 1) };
+        assert_eq!(old_written, 1);
+        let old_token = backend
+            .submit(Op::Read {
+                fd: old_fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("submit old read");
+        assert!(backend.park(Duration::from_millis(100)) > 0);
+        assert!(backend.cancel(old_token));
+        // SAFETY: cancellation released the backend lease; these descriptors
+        // are still owned by this test and are now closed exactly once.
+        unsafe {
+            libc::close(old_fds[0]);
+            libc::close(old_fds[1]);
+        }
+
+        let mut new_fds = [0; 2];
+        // SAFETY: new_fds is a valid pair of slots for pipe(2).
+        assert_eq!(unsafe { libc::pipe(new_fds.as_mut_ptr()) }, 0);
+        // SAFETY: `new_fds[1]` is a live pipe write end and `b"n"` is a
+        // one-byte initialized source for the duration of the call.
+        let new_written = unsafe { libc::write(new_fds[1], b"n".as_ptr().cast(), 1) };
+        assert_eq!(new_written, 1);
+        let new_token = backend
+            .submit(Op::Read {
+                fd: new_fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("submit recycled-slot read");
+        assert!(matches!(backend.drain_completions(), Poll::Pending));
+        let completions = drain_one(&backend);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, new_token);
+        assert!(matches!(
+            &completions[0].1,
+            Ok(CompletionKind::Read { data, .. }) if &data[..] == b"n"
+        ));
+        // SAFETY: both descriptors remain owned by this test.
+        unsafe {
+            libc::close(new_fds[0]);
+            libc::close(new_fds[1]);
+        }
+    }
+
+    #[test]
+    fn immediate_close_recycles_its_slot_after_staging_completion() {
+        let backend = MioBackend::new().expect("mio backend");
+        let mut fds = [0; 2];
+        // SAFETY: fds is a valid pair of slots for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        backend
+            .submit(Op::Close { fd: fds[0] })
+            .expect("submit immediate close");
+        assert_eq!(backend.pending_operation_count(), 1);
+        let closed = slot_snapshot(&backend);
+        assert_eq!(closed.free_slots.as_slice(), &[0]);
+        let completions = drain_one(&backend);
+        assert!(matches!(completions[0].1, Ok(CompletionKind::Close)));
+        assert_eq!(backend.pending_operation_count(), 0);
+        assert_eq!(slot_snapshot(&backend).pending_len, 1);
+        // SAFETY: only the write descriptor remains owned by this test.
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn udp_send_registration_failure_returns_error_and_recycles_state() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
+        let backend = MioBackend::new().expect("mio backend");
+        backend.fail_udp_send_registration.set(true);
+        let result = backend.submit(Op::UdpSend {
+            fd: socket.as_raw_fd(),
+            data: Buffer::from_slice(b"payload"),
+            addr: "127.0.0.1:9".parse().expect("parse destination"),
+        });
+        assert!(matches!(result, Err(crate::io::IoError::Io(_))));
+        assert_eq!(backend.pending_operation_count(), 0);
+        let failed = slot_snapshot(&backend);
+        assert!(failed.descriptor_leases_empty);
+        assert!(failed.descriptor_lease_tokens_empty);
+        assert!(failed.udp_recv_buffers_empty);
+        assert_eq!(failed.pending_len, 1);
+        assert_eq!(failed.free_slots.as_slice(), &[0]);
+
+        let mut fds = [0; 2];
+        // SAFETY: fds is a valid pair of slots for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let reused = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("reuse slot after failed UDP send registration");
+        let reused_state = slot_snapshot(&backend);
+        assert_eq!(reused_state.pending_len, 1);
+        assert!(reused_state.free_slots.is_empty());
+        assert!(backend.cancel(reused));
+        // SAFETY: both descriptors belong to this test.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn udp_receive_registration_failure_discards_staged_buffer() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
+        let backend = MioBackend::new().expect("mio backend");
+        backend.fail_udp_recv_registration.set(true);
+        let result = backend.submit(Op::UdpRecv {
+            fd: socket.as_raw_fd(),
+            buffer: Buffer::with_capacity(32),
+        });
+        assert!(matches!(result, Err(crate::io::IoError::Io(_))));
+        assert_eq!(backend.pending_operation_count(), 0);
+        let failed = slot_snapshot(&backend);
+        assert!(failed.descriptor_leases_empty);
+        assert!(failed.descriptor_lease_tokens_empty);
+        assert!(failed.udp_recv_buffers_empty);
+        assert!(failed.pending_empty);
+        assert_eq!(failed.free_slots.as_slice(), &[0]);
     }
 }

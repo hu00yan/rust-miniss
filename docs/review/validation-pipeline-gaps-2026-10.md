@@ -8,17 +8,17 @@ but not Linux epoll's platform-specific path. Passing those checks did not prove
 the Linux epoll configuration compiled or behaved correctly. This is a coverage
 gap, not evidence that epoll should match io_uring performance.
 
-| Risk | Why prior checks did not expose it | Useful correctness check |
-|---|---|---|
-| Linux epoll fallback | No Linux epoll build/test leg was part of the normal validation; macOS kqueue does not compile Linux-specific epoll branches. | On Linux, explicitly compile and run relevant tests with `MINISS_IO_BACKEND=epoll` and an isolated Cargo target directory. This is for correctness only; no throughput or latency target is implied. |
-| Positioned file I/O sharing an open-file-description offset | Existing file tests exercised ordinary writes/reads and offset cases serially; duplicated descriptors share the underlying file offset. | Add concurrent different-offset operations on one inode and assert exact contents on both io_uring and mio backends. |
-| File jobs outliving mio shutdown/quiescence accounting | Tests did not hold a blocking file job in flight while cancellation or runtime shutdown checked pending work. | Use a deterministic blocked-job seam and assert shutdown does not claim quiescence before completion is published. |
-| Mio token/slot growth over a long-lived runtime | Existing tests did not exercise enough sequential registrations to assert slots are reused or retained storage stays bounded. | Add a long-lived sequential-I/O test with an explicit retained-slot/capacity assertion. |
-| UDP send registration error handling | Tests covered successful registration, not a forced `Poll::register` failure after pending state was created. | Inject failure at registration and assert pending state and descriptor lease are removed. |
+| Risk | Why prior checks did not expose it | Useful correctness check | Status in this change |
+|---|---|---|---|
+| Linux epoll fallback | No Linux epoll build/test leg was part of the normal validation; macOS kqueue does not compile Linux-specific epoll branches. | On Linux, run `MINISS_IO_BACKEND=epoll CARGO_TARGET_DIR="$HOME/miniss-target" just check`. Correctness only; no throughput or latency target. | OrbStack Ubuntu `just check` passed on the existing `/mnt/mac/Users/huyan00/mycode/rust-miniss` mount; no source copy, CI job, or benchmark. |
+| Positioned file I/O sharing an open-file-description offset | Existing file tests exercised ordinary writes/reads and offset cases serially; duplicated descriptors share the underlying file offset. | Concurrent different-offset operations on one inode, exact content assertions, and check that the caller's shared offset stays unchanged. | Fixed with `FileExt::read_at`/`write_at` in the pool and inline paths; `pool_and_inline_file_io_preserve_the_shared_file_offset` passes. |
+| File jobs outliving mio shutdown/quiescence accounting | Tests did not hold a blocking file job in flight while cancellation or runtime shutdown checked pending work. | Gate a worker job; assert pending stays nonzero through publication and until owner drain, and descriptor lifetime survives backend drop. | Fixed with shard-local in-flight completion accounting and shared `DescriptorLease`s; `blocking_file_and_flush_work_count_until_owner_drains_completion` and `file_worker_keeps_its_descriptor_lease_if_backend_drops_early` pass. |
+| Mio token/slot growth over a long-lived runtime | Existing tests did not exercise enough sequential registrations to assert slots are reused or retained storage stays bounded. | Repeated sequential cancellation/completion, assert retained slot vectors stay bounded, and deliver an old harvested event after slot reuse. | Fixed with reusable slots plus monotonically unique mio tokens; `operation_slots_are_reused_and_stale_harvested_events_are_ignored` passes. |
+| UDP send registration error handling | Tests covered successful registration, not a forced `Poll::register` failure after pending state was created. | Inject send and receive registration failures; assert operation state, receive buffer and lease are cleared and the slot is reusable. | Fixed: send registration failures return `IoError`; both UDP send and receive failure regressions pass. |
 
-These mio lifecycle risks remain separate from the nine findings fixed in this
-review. The earlier checks covered their selected backends; they did not exercise
-the unselected Linux epoll path or these unusual lifecycle transitions.
+The four mio lifecycle risks are closed by this change. Their earlier absence was a
+validation-coverage gap, not evidence that the mio backend should match io_uring
+performance.
 
 ## Suggested validation workflow
 
@@ -46,7 +46,8 @@ does not add or enable GitHub Actions jobs.
 5. Use deterministic fault-injection seams for rare startup and registration
    failures. Do not make tests pass by skipping cases or increasing timeouts.
 
-The epoll checks above establish only that the shared mio backend compiles and
-passes correctness tests on Linux. No epoll performance claim is made. The four
-mio risks in the table remain open; backend coverage alone does not fix or fully
-test them.
+The epoll check establishes that the shared mio backend compiles and passes its
+correctness suite on Linux. No epoll performance claim is made. The Linux run is
+local-only; no GitHub Actions workflow or performance gate was added. The
+Prometheus formatter remains an optional integration path over the provider-neutral
+runtime snapshot API; see [`docs/METRICS.md`](../METRICS.md).

@@ -1,0 +1,66 @@
+id: mio-lifecycle-correctness
+title: Close four mio file-I/O and readiness lifecycle correctness gaps
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+## Objective
+
+Resolve the four known correctness gaps in the shared mio backend (Linux epoll
+compatibility path and macOS/kqueue path): positioned file I/O must not mutate a
+shared open-file-description offset; dispatched pool work must remain visible to
+quiescence accounting; completed slots must be reusable; UDP-send registration
+failure must be returned to the caller rather than left pending.
+
+## Required changes
+
+1. Use offset-preserving file operations (`read_at`/`write_at` or `pread`/`pwrite`)
+   in both thread-pool and inline fallback paths; add concurrent distinct-offset
+   regression coverage.
+2. Count dispatched file and flush completions as pending until the owner drains
+   each completion; worker closures must retain an explicit descriptor lease so
+   bounded forced shutdown cannot close/reuse the fd before queued work starts.
+   Add deterministic in-flight accounting and backend-drop lease regressions.
+3. Recycle mio token slots only after every operation, lease, buffer and completion
+   reference is retired; verify many sequential operations do not grow retained
+   slot storage beyond the required peak concurrency.
+4. Propagate UDP-send `Poll::register` errors and clear operation state/leases;
+   add deterministic registration-failure coverage.
+
+## Constraints
+
+- Correctness only: epoll is compatibility support through mio, not a performance
+  target. Do not add GitHub Actions jobs or performance gates.
+- Do not increase existing timeouts, skip tests, or weaken assertions.
+- Read and update each changed SAFETY/comment site individually.
+
+## Acceptance evidence
+
+- macOS/kqueue: `just check` passed; after the final `.scratch` test-fixture path
+  adjustment, `cargo test --lib io::mio_poll` passed 20/20. `cargo check --lib`,
+  targeted rustfmt, and `git diff --check` passed.
+- OrbStack Ubuntu on the existing shared source mount (no source copy):
+  `MINISS_IO_BACKEND=epoll CARGO_TARGET_DIR="$HOME/miniss-target" just check`
+  passed, including all 20 `io::mio_poll` tests, Clippy, all-target/all-feature
+  check, and regular library/integration/example tests. No performance benchmark
+  or GitHub Actions job was run or added.
+- `just docs-audit`, `just arch-audit`, and `just unsafe-audit` passed CLEAN.
+  The decision log explains the locality and lifetime contracts: new counters
+  and slot tables remain shard-local, and `DescriptorLease::lease` shares only
+  immutable fd ownership. No locks, atomics, runtime creation, or new cross-core
+  messages were added. `git diff --check` is clean.
+
+## Metrics integration decision
+
+Keep `RuntimeMetrics` and `CoreMetricsSnapshot` as the provider-neutral integration
+surface. Document `MetricsView::render_prometheus()` as an optional, dependency-free
+formatting convenience; do not add a Prometheus client/registry dependency, global
+hook, or generic plugin abstraction without a second concrete integration.
+
+allowed_files:
+  - src/io/mio_poll.rs
+  - src/io/mod.rs
+  - README.md
+  - docs/METRICS.md
+  - docs/DECISION_LOG.md
+  - docs/review/validation-pipeline-gaps-2026-10.md
+  - tasks/mio-lifecycle-correctness.yaml
