@@ -4,11 +4,31 @@ mod tls_tests {
     use rcgen::generate_simple_self_signed;
     use rust_miniss::net::AsyncTcpStream;
     use rust_miniss::tls::TlsStream;
-    use rust_miniss::Runtime;
+    use rust_miniss::Runtime as MinissRuntime;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::future::Future;
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::time::Duration;
+
+    const CLIENT_TIMEOUT: Duration = Duration::from_secs(4);
+
+    // Every TLS client block_on in this module inherits the explicit deadline.
+    type Runtime = BoundedRuntime;
+
+    struct BoundedRuntime(MinissRuntime);
+
+    impl BoundedRuntime {
+        fn new() -> Self {
+            Self(MinissRuntime::new())
+        }
+
+        fn block_on<F: Future>(&self, future: F) -> F::Output {
+            self.0
+                .block_on(rust_miniss::timer::timeout(CLIENT_TIMEOUT, future))
+                .unwrap_or_else(|_| panic!("TLS client flow exceeded its 4-second bound"))
+        }
+    }
 
     #[test]
     fn test_tls_compiles() {

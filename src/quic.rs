@@ -1,6 +1,6 @@
 use crate::cpu::{current_core_id, current_task_id, with_io_state};
 use crate::io::IoToken;
-use crate::multicore::{current_core_handle, CoreHandle, CoreMessage, MultiCoreRuntime};
+use crate::multicore::{current_core_handle, CoreHandle, MultiCoreRuntime};
 use crate::timer::SleepFuture;
 use libc;
 use quinn::udp::{RecvMeta, Transmit, UdpSockRef};
@@ -12,7 +12,7 @@ use std::net::UdpSocket;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, OnceLock,
 };
 use std::task::{Context, Poll};
@@ -113,6 +113,7 @@ pub struct MinissUdpSocket {
     inner: UdpSocket,
     state: quinn::udp::UdpSocketState,
     recv_token: AtomicU64,
+    retirement_reserved: AtomicBool,
     owner_core: AtomicUsize,
     /// The owning shard's inbox, captured when ownership is claimed - which
     /// happens on that shard. `Drop` needs it when the last reference is
@@ -134,17 +135,44 @@ fn capture_shard(slot: &OnceLock<CoreHandle>) {
     }
 }
 
-/// Retire `token` on the shard that owns it.
-///
-/// On the owning shard the token can be cancelled directly. Anywhere else it
-/// has to be posted back, because the token names backend state that only the
-/// owning shard may touch. Handing it back is not optional on every backend:
-/// epoll silently removes a closed descriptor from its interest list, so no
-/// readiness event will arrive to resolve the pending operation, and the
-/// shard's shutdown then waits on that operation forever.
-fn retire_token(owner_shard: &OnceLock<CoreHandle>, token: IoToken) {
+/// Reserve bounded capacity before submitting each QUIC I/O token. The owner
+/// shard's retirement lane can then accept exactly one cross-thread cancel for
+/// every admitted token, even when the ordinary inbox is full.
+fn reserve_retirement(owner_shard: &OnceLock<CoreHandle>) -> io::Result<CoreHandle> {
+    let handle = owner_shard
+        .get()
+        .cloned()
+        .ok_or_else(|| io::Error::other("QUIC owner shard was not captured"))?;
+    if !handle.reserve_io_retirement() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "QUIC pending-operation retirement capacity is full",
+        ));
+    }
+    Ok(handle)
+}
+
+fn release_retirement(owner_shard: &OnceLock<CoreHandle>, reserved: &AtomicBool) {
+    if reserved.swap(false, Ordering::AcqRel) {
+        if let Some(handle) = owner_shard.get() {
+            handle.release_io_retirement();
+        }
+    }
+}
+
+/// Retire `token` on the shard that owns it. Each successful QUIC operation
+/// already owns a capacity reservation, so cross-shard drop never blocks and
+/// never competes with ordinary bounded mailbox traffic.
+fn retire_token(owner_shard: &OnceLock<CoreHandle>, reserved: &AtomicBool, token: IoToken) {
     if let Some(handle) = owner_shard.get() {
-        handle.post(CoreMessage::CancelIoToken { token });
+        if reserved.swap(false, Ordering::AcqRel) {
+            // A full retirement queue would violate the admission reservation
+            // invariant: queued tokens cannot outnumber all outstanding slots.
+            assert!(
+                handle.retire_io_token(token),
+                "reserved QUIC retirement slot was unavailable"
+            );
+        }
     }
 }
 
@@ -172,6 +200,7 @@ impl MinissUdpSocket {
             inner: socket,
             state,
             recv_token: AtomicU64::new(0),
+            retirement_reserved: AtomicBool::new(false),
             owner_core: AtomicUsize::new(UNOWNED_CORE),
             owner_shard: OnceLock::new(),
         })
@@ -190,10 +219,10 @@ impl MinissUdpSocket {
         self.recv_token.store(token.id(), Ordering::Release);
     }
 
-    fn clear_recv_token(&self, token: IoToken) {
-        let _ =
-            self.recv_token
-                .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire);
+    fn clear_recv_token(&self, token: IoToken) -> bool {
+        self.recv_token
+            .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     fn ensure_owner(&self) -> io::Result<()> {
@@ -230,9 +259,10 @@ impl Drop for MinissUdpSocket {
             with_io_state(|state| unsafe {
                 state.cancel_and_discard(token);
             });
+            release_retirement(&self.owner_shard, &self.retirement_reserved);
             return;
         }
-        retire_token(&self.owner_shard, token);
+        retire_token(&self.owner_shard, &self.retirement_reserved, token);
     }
 }
 
@@ -267,7 +297,9 @@ impl AsyncUdpSocket for MinissUdpSocket {
                     // SAFETY: same live shard-local token; this is the shared-table fallback.
                     .or_else(|| unsafe { state.take_completed(token) })
                 {
-                    self.clear_recv_token(token);
+                    if self.clear_recv_token(token) {
+                        release_retirement(&self.owner_shard, &self.retirement_reserved);
+                    }
                     match result {
                         Ok(_) => {}
                         Err(err) => return Poll::Ready(Err(err.into())),
@@ -290,10 +322,18 @@ impl AsyncUdpSocket for MinissUdpSocket {
                         events: libc::POLLIN as u32,
                         multishot: false,
                     };
+                    let reservation = match reserve_retirement(&self.owner_shard) {
+                        Ok(handle) => handle,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    };
                     let token = match state.io_backend.submit(op) {
                         Ok(token) => token,
-                        Err(error) => return Poll::Ready(Err(error.into())),
+                        Err(error) => {
+                            reservation.release_io_retirement();
+                            return Poll::Ready(Err(error.into()));
+                        }
                     };
+                    self.retirement_reserved.store(true, Ordering::Release);
                     self.store_recv_token(token);
                     // SAFETY: `token` was just returned by `submit` on this same shard and
                     // has no completion yet, so no slot reuse can race the store.
@@ -330,6 +370,8 @@ struct MinissUdpPoller {
     socket: Arc<MinissUdpSocket>,
     #[cfg(not(target_os = "macos"))]
     token: AtomicU64,
+    #[cfg(not(target_os = "macos"))]
+    retirement_reserved: AtomicBool,
     #[cfg(target_os = "macos")]
     retry_timer: Option<MinissSleep>,
     owner_core: AtomicUsize,
@@ -343,6 +385,8 @@ impl MinissUdpPoller {
             socket,
             #[cfg(not(target_os = "macos"))]
             token: AtomicU64::new(0),
+            #[cfg(not(target_os = "macos"))]
+            retirement_reserved: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
             retry_timer: None,
             owner_core: AtomicUsize::new(UNOWNED_CORE),
@@ -366,10 +410,10 @@ impl MinissUdpPoller {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn clear_token(&self, token: IoToken) {
-        let _ = self
-            .token
-            .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire);
+    fn clear_token(&self, token: IoToken) -> bool {
+        self.token
+            .compare_exchange(token.id(), 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     fn ensure_owner(&self) -> io::Result<()> {
@@ -408,9 +452,10 @@ impl Drop for MinissUdpPoller {
                 with_io_state(|state| unsafe {
                     state.cancel_and_discard(token);
                 });
+                release_retirement(&self.owner_shard, &self.retirement_reserved);
                 return;
             }
-            retire_token(&self.owner_shard, token);
+            retire_token(&self.owner_shard, &self.retirement_reserved, token);
         }
     }
 }
@@ -475,7 +520,9 @@ impl UdpPoller for MinissUdpPoller {
                         // SAFETY: same live shard-local token; this is the shared-table fallback.
                         .or_else(|| unsafe { state.take_completed(token) })
                     {
-                        self.clear_token(token);
+                        if self.clear_token(token) {
+                            release_retirement(&self.owner_shard, &self.retirement_reserved);
+                        }
                         return match result {
                             Ok(_) => Poll::Ready(Ok(())),
                             Err(err) => Poll::Ready(Err(err.into())),
@@ -494,10 +541,18 @@ impl UdpPoller for MinissUdpPoller {
                     events: libc::POLLOUT as u32,
                     multishot: false,
                 };
+                let reservation = match reserve_retirement(&self.owner_shard) {
+                    Ok(handle) => handle,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
                 let token = match state.io_backend.submit(op) {
                     Ok(token) => token,
-                    Err(error) => return Poll::Ready(Err(error.into())),
+                    Err(error) => {
+                        reservation.release_io_retirement();
+                        return Poll::Ready(Err(error.into()));
+                    }
                 };
+                self.retirement_reserved.store(true, Ordering::Release);
                 self.store_token(token);
                 // SAFETY: `token` was just returned by `submit` on this same shard and
                 // has no completion yet, so no slot reuse can race the store.
@@ -514,8 +569,109 @@ impl UdpPoller for MinissUdpPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multicore::CoreMessage;
     use futures::channel::oneshot;
     use std::time::Duration;
+
+    #[test]
+    fn cross_shard_socket_drop_retires_under_full_inbox_pressure() {
+        let runtime = MultiCoreRuntime::new(Some(2)).expect("two worker shards");
+        let socket = Arc::new(
+            MinissUdpSocket::new(UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"))
+                .expect("create miniss UDP socket"),
+        );
+        let (setup_tx, setup_rx) = std::sync::mpsc::channel();
+        runtime
+            .spawn_on(0, {
+                let socket = Arc::clone(&socket);
+                async move {
+                    let handle = current_core_handle().expect("owner shard handle");
+                    let mut bytes = [0_u8; 128];
+                    let mut bufs = [IoSliceMut::new(&mut bytes)];
+                    let mut meta = [RecvMeta::default()];
+                    let waker = std::task::Waker::noop().clone();
+                    let mut cx = Context::from_waker(&waker);
+                    let pending = socket.poll_recv(&mut cx, &mut bufs, &mut meta).is_pending();
+                    setup_tx.send((handle, pending)).expect("test remains live");
+                }
+            })
+            .expect("submit pending receive setup");
+        let (handle, pending) = setup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive setup result");
+        assert!(pending, "empty UDP socket completed receive");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        runtime
+            .spawn_on(0, async move {
+                std::future::poll_fn(move |_| {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("release blocked shard task");
+                    Poll::Ready(())
+                })
+                .await;
+            })
+            .expect("submit shard blocker");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owner shard did not enter blocker");
+
+        let mut ordinary_inbox_full = false;
+        for from_core in 0..5000 {
+            if !handle.post(CoreMessage::Ping { from_core }) {
+                ordinary_inbox_full = true;
+                break;
+            }
+        }
+        drop(socket);
+        release_tx.send(()).expect("release owner shard");
+        assert!(ordinary_inbox_full, "ordinary inbox did not reach capacity");
+
+        let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut submitted = false;
+        while std::time::Instant::now() < deadline {
+            let retired_tx = retired_tx.clone();
+            if runtime
+                .spawn_on(0, async move {
+                    let mut pending = usize::MAX;
+                    for _ in 0..10 {
+                        with_io_state(|state| {
+                            state.io_backend.park(Duration::from_millis(10));
+                            let _ = state.io_backend.drain_completions();
+                            pending = state.io_backend.pending_operation_count();
+                        });
+                        if pending == 0 {
+                            break;
+                        }
+                    }
+                    let _ = retired_tx.send(pending);
+                })
+                .is_ok()
+            {
+                submitted = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(submitted, "could not submit bounded retirement check");
+        let pending_after = retired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retirement check timed out");
+        let (queued_retirements, reserved_retirements) = handle.io_retirement_counts();
+        assert_eq!(
+            pending_after, 0,
+            "cross-shard drop left the pending QUIC receive registered; queued={queued_retirements}, reserved={reserved_retirements}"
+        );
+
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .expect("shutdown workers");
+        runtime.join().expect("join workers");
+    }
 
     #[test]
     fn udp_socket_and_poller_reject_foreign_shards() {

@@ -138,14 +138,14 @@ const SERIES: &[SeriesDescriptor] = &[
         |s| s.local_task_count as u64,
     ),
     series(
-        "miniss_ready_queue_len",
+        "miniss_ready_queue_tasks",
         "Tasks currently runnable on the shard.",
         MetricType::Gauge,
         Merge::Sum,
         |s| s.ready_queue_len as u64,
     ),
     series(
-        "miniss_max_ready_queue_len",
+        "miniss_max_ready_queue_tasks",
         "High-water mark of the shard ready queue.",
         MetricType::Gauge,
         Merge::Max,
@@ -194,8 +194,8 @@ const SERIES: &[SeriesDescriptor] = &[
         |s| s.message_batches,
     ),
     series(
-        "miniss_max_message_inbox_len",
-        "High-water mark of the shard message inbox.",
+        "miniss_max_message_inbox_messages",
+        "High-water mark of the shard message inbox, in messages.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_message_inbox_len as u64,
@@ -215,15 +215,15 @@ const SERIES: &[SeriesDescriptor] = &[
         |s| s.flushes,
     ),
     series(
-        "miniss_flush_total_us",
-        "Cumulative time spent flushing submissions.",
+        "miniss_flush_duration_microseconds_total",
+        "Cumulative time spent flushing submissions, in microseconds.",
         MetricType::Counter,
         Merge::Sum,
         |s| s.flush_total_us,
     ),
     series(
-        "miniss_max_flush_us",
-        "Slowest single submission flush.",
+        "miniss_flush_duration_microseconds",
+        "Slowest single submission flush, in microseconds.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_flush_us,
@@ -236,15 +236,15 @@ const SERIES: &[SeriesDescriptor] = &[
         |s| s.park_flushes,
     ),
     series(
-        "miniss_park_flush_total_us",
-        "Cumulative flush time inside the park syscall.",
+        "miniss_park_flush_duration_microseconds_total",
+        "Cumulative flush time inside the park syscall, in microseconds.",
         MetricType::Counter,
         Merge::Sum,
         |s| s.park_flush_total_us,
     ),
     series(
-        "miniss_max_park_flush_us",
-        "Slowest flush performed inside the park syscall.",
+        "miniss_park_flush_duration_microseconds",
+        "Slowest flush performed inside the park syscall, in microseconds.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_park_flush_us,
@@ -257,50 +257,50 @@ const SERIES: &[SeriesDescriptor] = &[
         |s| s.io_completion_batches,
     ),
     series(
-        "miniss_io_completion_total_ns",
-        "Cumulative time spent draining IO completions.",
+        "miniss_io_completion_duration_nanoseconds_total",
+        "Cumulative time spent draining IO completions, in nanoseconds.",
         MetricType::Counter,
         Merge::Sum,
         |s| s.io_completion_total_ns,
     ),
     series(
-        "miniss_max_io_completion_batch_ns",
-        "Slowest IO completion batch.",
+        "miniss_io_completion_batch_duration_nanoseconds",
+        "Slowest IO completion batch, in nanoseconds.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_io_completion_batch_ns,
     ),
     series(
-        "miniss_max_io_completion_batch_len",
-        "Largest IO completion batch.",
+        "miniss_max_io_completion_batch_items",
+        "Largest IO completion batch, in items.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_io_completion_batch_len as u64,
     ),
     series(
-        "miniss_inline_poll_total_ns",
-        "Cumulative time spent polling inline completions.",
+        "miniss_inline_poll_duration_nanoseconds_total",
+        "Cumulative time spent polling inline completions, in nanoseconds.",
         MetricType::Counter,
         Merge::Sum,
         |s| s.inline_poll_total_ns,
     ),
     series(
-        "miniss_max_inline_poll_ns",
-        "Slowest inline completion poll.",
+        "miniss_inline_poll_duration_nanoseconds",
+        "Slowest inline completion poll, in nanoseconds.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_inline_poll_ns,
     ),
     series(
-        "miniss_wake_total_ns",
-        "Cumulative time spent waking tasks.",
+        "miniss_wake_duration_nanoseconds_total",
+        "Cumulative time spent waking tasks, in nanoseconds.",
         MetricType::Counter,
         Merge::Sum,
         |s| s.wake_total_ns,
     ),
     series(
-        "miniss_max_wake_ns",
-        "Slowest single wake.",
+        "miniss_wake_duration_nanoseconds",
+        "Slowest single wake, in nanoseconds.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_wake_ns,
@@ -327,15 +327,15 @@ const SERIES: &[SeriesDescriptor] = &[
         |s| s.park_completions,
     ),
     series(
-        "miniss_park_total_us",
-        "Cumulative time parked.",
+        "miniss_park_duration_microseconds_total",
+        "Cumulative time parked, in microseconds.",
         MetricType::Counter,
         Merge::Sum,
         |s| s.park_total_us,
     ),
     series(
-        "miniss_max_park_us",
-        "Slowest single park.",
+        "miniss_park_duration_microseconds",
+        "Slowest single park, in microseconds.",
         MetricType::Gauge,
         Merge::Max,
         |s| s.max_park_us,
@@ -361,6 +361,60 @@ const SERIES: &[SeriesDescriptor] = &[
         Merge::Sum,
         |s| s.waker_wakeups,
     ),
+];
+
+/// Previous exposition names accepted only by [`MetricsView::value`] lookups.
+/// The exporter emits only the canonical names in `SERIES`.
+const LEGACY_NAME_ALIASES: &[(&str, &str)] = &[
+    ("miniss_ready_queue_len", "miniss_ready_queue_tasks"),
+    ("miniss_max_ready_queue_len", "miniss_max_ready_queue_tasks"),
+    (
+        "miniss_max_message_inbox_len",
+        "miniss_max_message_inbox_messages",
+    ),
+    (
+        "miniss_flush_total_us",
+        "miniss_flush_duration_microseconds_total",
+    ),
+    ("miniss_max_flush_us", "miniss_flush_duration_microseconds"),
+    (
+        "miniss_park_flush_total_us",
+        "miniss_park_flush_duration_microseconds_total",
+    ),
+    (
+        "miniss_max_park_flush_us",
+        "miniss_park_flush_duration_microseconds",
+    ),
+    (
+        "miniss_io_completion_total_ns",
+        "miniss_io_completion_duration_nanoseconds_total",
+    ),
+    (
+        "miniss_max_io_completion_batch_ns",
+        "miniss_io_completion_batch_duration_nanoseconds",
+    ),
+    (
+        "miniss_max_io_completion_batch_len",
+        "miniss_max_io_completion_batch_items",
+    ),
+    (
+        "miniss_inline_poll_total_ns",
+        "miniss_inline_poll_duration_nanoseconds_total",
+    ),
+    (
+        "miniss_max_inline_poll_ns",
+        "miniss_inline_poll_duration_nanoseconds",
+    ),
+    (
+        "miniss_wake_total_ns",
+        "miniss_wake_duration_nanoseconds_total",
+    ),
+    ("miniss_max_wake_ns", "miniss_wake_duration_nanoseconds"),
+    (
+        "miniss_park_total_us",
+        "miniss_park_duration_microseconds_total",
+    ),
+    ("miniss_max_park_us", "miniss_park_duration_microseconds"),
 ];
 
 /// Every exported series descriptor.
@@ -468,7 +522,13 @@ impl MetricsView {
 
     /// Read one value by metric name, for one shard or for the merged total.
     pub fn value(&self, name: &str, shard: Option<usize>) -> Option<u64> {
-        let descriptor = SERIES.iter().find(|descriptor| descriptor.name == name)?;
+        let canonical_name = LEGACY_NAME_ALIASES
+            .iter()
+            .find_map(|(legacy, canonical)| (*legacy == name).then_some(*canonical))
+            .unwrap_or(name);
+        let descriptor = SERIES
+            .iter()
+            .find(|descriptor| descriptor.name == canonical_name)?;
         Some(match shard {
             Some(core_id) => descriptor.read(
                 self.runtime
@@ -620,8 +680,11 @@ impl Aggregator {
                     failures = self.consecutive_failures,
                     "metrics sampling pass failed: {err}"
                 );
-                match self.latest.clone() {
-                    Some(view) => Ok(view),
+                match self.latest.as_mut() {
+                    Some(view) => {
+                        view.consecutive_failures = self.consecutive_failures;
+                        Ok(view.clone())
+                    }
                     None => Err(MetricsError::SampleFailed(err)),
                 }
             }
@@ -866,10 +929,10 @@ mod tests {
         // A maximum must not be summed.
         assert!(
             rendered.contains(
-                "# TYPE miniss_max_ready_queue_len gauge\n\
-                 miniss_max_ready_queue_len{shard=\"0\"} 3\n\
-                 miniss_max_ready_queue_len{shard=\"1\"} 99\n\
-                 miniss_max_ready_queue_len 99\n"
+                "# TYPE miniss_max_ready_queue_tasks gauge\n\
+                 miniss_max_ready_queue_tasks{shard=\"0\"} 3\n\
+                 miniss_max_ready_queue_tasks{shard=\"1\"} 99\n\
+                 miniss_max_ready_queue_tasks 99\n"
             ),
             "max series must merge by maximum:\n{rendered}"
         );
@@ -884,6 +947,125 @@ mod tests {
             ),
             "gauge series must merge by summation:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn renamed_prometheus_series_keep_units_types_and_merge_semantics() {
+        let renamed = [
+            ("miniss_ready_queue_tasks", MetricType::Gauge, Merge::Sum),
+            (
+                "miniss_max_ready_queue_tasks",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_max_message_inbox_messages",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_flush_duration_microseconds_total",
+                MetricType::Counter,
+                Merge::Sum,
+            ),
+            (
+                "miniss_flush_duration_microseconds",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_park_flush_duration_microseconds_total",
+                MetricType::Counter,
+                Merge::Sum,
+            ),
+            (
+                "miniss_park_flush_duration_microseconds",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_io_completion_duration_nanoseconds_total",
+                MetricType::Counter,
+                Merge::Sum,
+            ),
+            (
+                "miniss_io_completion_batch_duration_nanoseconds",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_max_io_completion_batch_items",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_inline_poll_duration_nanoseconds_total",
+                MetricType::Counter,
+                Merge::Sum,
+            ),
+            (
+                "miniss_inline_poll_duration_nanoseconds",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_wake_duration_nanoseconds_total",
+                MetricType::Counter,
+                Merge::Sum,
+            ),
+            (
+                "miniss_wake_duration_nanoseconds",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+            (
+                "miniss_park_duration_microseconds_total",
+                MetricType::Counter,
+                Merge::Sum,
+            ),
+            (
+                "miniss_park_duration_microseconds",
+                MetricType::Gauge,
+                Merge::Max,
+            ),
+        ];
+        for (name, metric_type, merge) in renamed {
+            let descriptor = SERIES
+                .iter()
+                .find(|descriptor| descriptor.name == name)
+                .unwrap_or_else(|| panic!("renamed metric {name} is missing"));
+            assert_eq!(descriptor.metric_type, metric_type, "{name} type");
+            assert_eq!(descriptor.merge, merge, "{name} merge");
+        }
+
+        let view = two_shard_view();
+        let rendered = view.render_prometheus();
+        for (legacy, canonical) in LEGACY_NAME_ALIASES {
+            assert_eq!(
+                view.value(legacy, None),
+                view.value(canonical, None),
+                "legacy lookup {legacy} must retain the canonical value"
+            );
+            assert!(
+                !rendered.contains(legacy),
+                "legacy name {legacy} must not be re-exported"
+            );
+        }
+
+        for descriptor in SERIES {
+            match descriptor.metric_type {
+                MetricType::Counter => assert!(
+                    descriptor.name.ends_with("_total"),
+                    "counter {} must end in _total",
+                    descriptor.name
+                ),
+                MetricType::Gauge => assert!(
+                    !descriptor.name.ends_with("_total"),
+                    "gauge {} must not end in _total",
+                    descriptor.name
+                ),
+            }
+        }
     }
 
     #[test]

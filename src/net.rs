@@ -501,10 +501,26 @@ fn poll_readiness(
     attempt: impl FnOnce() -> io::Result<usize>,
 ) -> Poll<io::Result<usize>> {
     if let Some(token) = slot.take() {
-        // SAFETY: `token` was submitted on this shard, and this is the single
-        // place it leaves `slot`, always before any replacement registration.
-        unsafe {
-            state.clear_slot(token);
+        // Consume a completion already delivered to the task before attempting
+        // to cancel; completion-based backends retain discarded slots until
+        // terminal completion, which has already happened in this case.
+        // SAFETY: `token` belongs to this shard and the poll owns its slot.
+        let completed = unsafe { state.has_completed(token) }
+            || unsafe { state.take_owner_completion(token) }.is_some();
+        if completed {
+            // SAFETY: same live shard-local token; its completion is consumed.
+            unsafe { state.clear_slot(token) };
+        } else if state.io_backend.uses_completion_io() {
+            // SAFETY: `token` was submitted on this shard; async cancellation
+            // must retain its slot until the backend reports terminal completion.
+            unsafe { state.cancel_and_discard(token) };
+        } else {
+            // Readiness backends cancel synchronously, releasing the registration
+            // and descriptor lease before a replacement PollAdd is submitted.
+            let _ = state.io_backend.cancel(token);
+            // SAFETY: this token was submitted on this shard and synchronous
+            // cancellation (or prior backend retirement) makes its slot reusable.
+            unsafe { state.clear_slot(token) };
         }
     }
 
@@ -1094,4 +1110,154 @@ mod locality_contract_tests {
     use super::AsyncTcpStream;
 
     static_assertions::assert_not_impl_any!(AsyncTcpStream: Send, Sync);
+}
+
+#[cfg(test)]
+mod readiness_repoll_tests {
+    use super::poll_readiness;
+    use crate::cpu::test_io_state;
+    use crate::io::{
+        CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op, RegisteredDescriptor,
+    };
+    use std::cell::RefCell;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct BackendState {
+        pending: Vec<PendingPoll>,
+        cancellations: usize,
+    }
+
+    struct PendingPoll {
+        token: IoToken,
+        fd: i32,
+        _descriptor: DescriptorLease,
+    }
+
+    struct DuplicatePollBackend(Rc<RefCell<BackendState>>);
+
+    impl DuplicatePollBackend {
+        fn register(&self, fd: i32, descriptor: DescriptorLease) -> Result<IoToken, IoError> {
+            let mut state = self.0.borrow_mut();
+            if state.pending.iter().any(|pending| pending.fd == fd) {
+                return Err(IoError::Io(std::io::Error::from_raw_os_error(libc::EEXIST)));
+            }
+            let token = IoToken::new();
+            state.pending.push(PendingPoll {
+                token,
+                fd,
+                _descriptor: descriptor,
+            });
+            Ok(token)
+        }
+    }
+
+    impl IoProvider for DuplicatePollBackend {
+        type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+        fn submit(&self, op: Op) -> Result<IoToken, IoError> {
+            let Op::PollAdd { fd, .. } = op else {
+                return Err(IoError::Other("readiness poll expected".into()));
+            };
+            self.register(fd, DescriptorLease::acquire(fd).map_err(IoError::Io)?)
+        }
+
+        fn submit_with_descriptor(
+            &self,
+            op: Op,
+            descriptor: DescriptorLease,
+        ) -> Result<IoToken, IoError> {
+            let Op::PollAdd { fd, .. } = op else {
+                return Err(IoError::Other("readiness poll expected".into()));
+            };
+            self.register(fd, descriptor)
+        }
+
+        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+            Poll::Pending
+        }
+
+        fn cancel(&self, token: IoToken) -> bool {
+            let mut state = self.0.borrow_mut();
+            let Some(index) = state
+                .pending
+                .iter()
+                .position(|pending| pending.token == token)
+            else {
+                return false;
+            };
+            state.pending.swap_remove(index);
+            state.cancellations += 1;
+            true
+        }
+
+        fn pending_operation_count(&self) -> usize {
+            self.0.borrow().pending.len()
+        }
+
+        fn retained_descriptor_count(&self) -> usize {
+            self.0.borrow().pending.len()
+        }
+    }
+
+    #[test]
+    fn repoll_after_unrelated_wake_cancels_the_previous_readiness_registration() {
+        let state = Rc::new(RefCell::new(BackendState::default()));
+        let io_state = test_io_state(DuplicatePollBackend(state.clone()));
+        let mut fds = [0; 2];
+        // SAFETY: `fds` contains two writable slots for `pipe` to fill.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the successful pipe call transferred each endpoint to this test.
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: same as above for the other endpoint.
+        let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let descriptor = RegisteredDescriptor::acquire(read_end.as_raw_fd()).expect("lease fd");
+        let waker = futures::task::noop_waker();
+        let cx = Context::from_waker(&waker);
+        let mut slot = None;
+        let would_block = || Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+
+        assert!(matches!(
+            poll_readiness(
+                &io_state,
+                read_end.as_raw_fd(),
+                descriptor.lease(),
+                &cx,
+                libc::POLLIN as u32,
+                &mut slot,
+                would_block,
+            ),
+            Poll::Pending
+        ));
+        let first_token = slot.expect("first readiness registration");
+
+        // Model the task being polled again by an unrelated wake before this
+        // readiness token has completed.
+        let repoll = poll_readiness(
+            &io_state,
+            read_end.as_raw_fd(),
+            descriptor.lease(),
+            &cx,
+            libc::POLLIN as u32,
+            &mut slot,
+            would_block,
+        );
+        assert!(
+            matches!(repoll, Poll::Pending),
+            "re-poll should replace the old registration, not return EEXIST: {repoll:?}"
+        );
+        let second_token = slot.expect("replacement readiness registration");
+
+        assert_ne!(first_token, second_token);
+        assert_eq!(io_state.io_backend.pending_operation_count(), 1);
+        assert_eq!(io_state.io_backend.retained_descriptor_count(), 1);
+        assert_eq!(state.borrow().cancellations, 1);
+
+        assert!(io_state.io_backend.cancel(second_token));
+        // SAFETY: the test owns this token on the same shard; the mock backend
+        // synchronously removed its registration above.
+        unsafe { io_state.clear_slot(second_token) };
+    }
 }

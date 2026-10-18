@@ -17,9 +17,9 @@ monio/compio/tokio/glommio on Orb Linux with 8 vCPUs, server CPUs
 | keep-alive 32 | 399,792 | 493,650 | 493,650 (monoio) | 273 us | 237 us (compio) |
 | keep-alive 200 | 760,140 | 734,245 | 760,140 (miniss) | 3.69 ms | 0.87 ms (tokio) |
 | keep-alive 800 | 816,255 | 816,039 | 816,255 (miniss) | 8.56 ms | 4.55 ms (monoio) |
-| close 8 | 127,143 | (data) | (data) | 161 us | (data) |
-| close 32 | 326,474 | (data) | (data) | 4.26 ms | (data) |
-| close 800 | 730,778 | (data) | (data) | 9.20 ms | (data) |
+| close 8 | 134,749 | 151,675 | 275,758 (glommio) | 135 us | 130 us (monoio) |
+| close 32 | 403,802 | 480,935 | 480,935 (monoio) | 216 us | 182 us (tokio) |
+| close 800 | 848,422 | 831,552 | 848,422 (miniss) | 9.41 ms | 4.32 ms (tokio) |
 
 ### Key observations from the baseline:
 
@@ -27,7 +27,7 @@ monio/compio/tokio/glommio on Orb Linux with 8 vCPUs, server CPUs
 - **keep-alive 200**: miniss leads at 760,140 vs monoio's 734,245, with tokio having best p99 (0.87 ms)
 - **keep-alive 32**: monoio achieves peak RPS (493,650) vs miniss's 399,792, with compio having best p99 (237 us)
 - **keep-alive 8**: glommio leads RPS (237,549) vs miniss/monoio (152K/150K), with best p99 at 133 us
-- **close scenarios**: miniss data available; other runtimes not in single-round matrix
+- **close 8/32/800**: the full single-round matrix includes other runtimes; glommio leads close-8 RPS, monoio leads close-32 RPS, and miniss leads close-800 RPS, while tokio has the best close-32/800 p99
 
 The verdict from the comparison was "failed for stability, not correctness":
 miniss had a 1.56 ms p99 in one round while its other two rounds were 155 us and 191 us.
@@ -63,4 +63,5 @@ high-water marks). The interval defaults to 1s and is set at startup with
 See `examples/metrics_export.rs` for a runnable scrape endpoint.
 
 Performance is tracked as reproducible Linux snapshots, not as a permanent
-throughput claim. See [the current baseline](docs/review/performance-baseline-2026-07-15.md).
+throughput claim. See the [2026-07-15 source matrix](docs/review/performance-baseline-2026-07-14.md)
+and the [latest same-host A/B record](docs/review/performance-baseline-2026-10-15-vm.md).

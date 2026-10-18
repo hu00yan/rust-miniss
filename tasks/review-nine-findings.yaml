@@ -1,0 +1,49 @@
+id: review-nine-findings
+title: 处理 7 月 15 日至今 review 的九项问题并补齐验证门禁
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+## 目标
+
+修复完整 review 发现的九项问题，并记录此前 Linux mio/epoll 基线风险未被验证流水线覆盖的原因及拦截方案。
+
+## 变更
+
+1. readiness 重 poll 在替换注册前消费完成，按 backend 同步取消或 cancel-and-discard；增加 unrelated-wake 回归。
+2. QUIC I/O token 预留有界 owner-shard retirement 容量，避免普通 inbox 满时静默丢弃取消；忙轮次也优先消费 retirement。
+3. metrics 采样失败时更新并返回最新 `consecutive_failures`；Prometheus series 名称规范化，保留 `MetricsView::value` 旧名查找别名。
+4. metrics sampler 启动失败时通知并 join 已启动 workers；增加失败注入覆盖。
+5. 默认 TLS 使用 Rustls safe default versions，恢复 TLS 1.2/1.3；增加 TLS 1.2-only 对端握手测试。
+6. TLS 网络测试的客户端等待增加 4 秒有界 deadline（服务端既有 5 秒边界未延长）。
+7. README 的 close matrix 数字更正，并链接规范数据来源；删除不存在的 2026-07-15 文件链接。
+8. CI 增加 Linux epoll 全特性 job、真实 `/metrics` + Prometheus `promtool v3.5.0` 校验和 README 文档审计。
+9. 在 `docs/review/validation-pipeline-gaps-2026-10.md` 记录 mio/epoll 风险未被此前流水线发现的具体覆盖缺口及建议。
+
+## 验收证据
+
+- 在旧实现上，TLS 1.2-only 握手回归失败，报告 `Tls12NotOfferedOrEnabled`；修复后通过。
+- OrbStack Ubuntu 同一挂载工作树：io_uring 格式/文档、Clippy、全目标检查、全特性库/集成/示例测试全过（132 个库测试）；epoll 相同门禁全过（131 个库测试）。
+- macOS/kqueue 格式/文档、Clippy、全目标检查和全特性库/集成/示例测试全过（127 个库测试）。
+- 真实 metrics exporter scrape 经 Prometheus 3.5.0 `promtool check metrics` 通过；README 本地链接及七个 matrix 行的 canonical-source audit 通过。
+- 架构审计、unsafe 审计和 `git diff --check` 均 CLEAN。
+
+## 非目标 / 限制
+
+本卡没有宣称修复 validation gaps 文档中额外列出的四项历史 mio lifecycle 风险（并发 positioned I/O offset、已 dispatch 文件线程池工作退出计数、长期 slot 增长、UDP register failure 注入）；它们作为后续专项测试/修复列明。未运行用户此前拒绝的端到端 A/B。
+
+allowed_files:
+  - .github/workflows/ci.yml
+  - README.md
+  - justfile
+  - src/metrics.rs
+  - src/multicore.rs
+  - src/net.rs
+  - src/quic.rs
+  - src/tls.rs
+  - tests/metrics_aggregation.rs
+  - tests/tls_tests.rs
+  - docs/DECISION_LOG.md
+  - docs/review/validation-pipeline-gaps-2026-10.md
+  - scripts/check_prometheus_metrics.sh
+  - scripts/check_readme_references.py
+  - tasks/review-nine-findings.yaml

@@ -280,41 +280,38 @@ fn a_stopped_aggregator_reports_instead_of_hanging() {
     init_tracing();
 
     let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+    let successful = runtime.metrics_refresh(Duration::from_secs(2)).unwrap();
+    assert_eq!(successful.consecutive_failures, 0);
+
     let started = Instant::now();
     runtime
         .shutdown_with_timeout(Duration::from_secs(5))
         .unwrap();
     runtime.join().unwrap();
 
-    // A pass against terminated shards cannot succeed.  The aggregator must
-    // report that (and keep serving the last good view) instead of blocking.
-    let refreshed = runtime.metrics_refresh(Duration::from_millis(500));
+    // A pass against terminated shards cannot succeed. The aggregator must
+    // return the last good view with an updated failure count, not block or
+    // return a stale view that still looks fresh.
+    let stale = runtime
+        .metrics_refresh(Duration::from_millis(500))
+        .unwrap_or_else(|err| panic!("must retain the prior good view: {err}"));
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "a post-join refresh must stay bounded"
     );
-    match refreshed {
-        Err(MetricsError::SampleFailed(reason)) => {
-            assert!(!reason.is_empty(), "the failure must say why");
-        }
-        Ok(view) => {
-            // Serving a stale view is the documented fallback: the counter of
-            // consecutive failures is what tells the caller it is stale.
-            assert!(
-                view.consecutive_failures > 0,
-                "a pass over terminated shards must not report a fresh view"
-            );
-            assert_eq!(view.runtime.cores.len(), 1);
-        }
-        Err(other) => panic!("unexpected refresh answer after join: {other:?}"),
-    }
+    assert_eq!(stale.sampled_at, successful.sampled_at);
+    assert_eq!(stale.runtime.cores.len(), 1);
+    assert!(
+        stale.consecutive_failures > successful.consecutive_failures,
+        "the returned last-good view must reflect the failed sample"
+    );
 
-    // The read-only path keeps answering from the same retained view.
-    match runtime.metrics_view() {
-        Ok(view) => assert_eq!(view.runtime.cores.len(), 1),
-        Err(MetricsError::NotSampled) => {}
-        Err(other) => panic!("unexpected view answer after join: {other:?}"),
-    }
+    // The read-only path keeps answering with the same updated failure count.
+    let retained = runtime
+        .metrics_view()
+        .unwrap_or_else(|err| panic!("last good view should remain readable: {err}"));
+    assert_eq!(retained.sampled_at, successful.sampled_at);
+    assert_eq!(retained.consecutive_failures, stale.consecutive_failures);
 
     drop(runtime);
 }

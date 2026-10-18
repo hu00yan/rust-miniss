@@ -11,12 +11,18 @@
 
 check:
     cargo fmt --all -- --check
+    just docs-audit
     ./scripts/check_no_ignored_tests.sh
     cargo clippy --all-targets -- -D warnings
     cargo check --all-targets --all-features
     # Include regular library/integration/example tests; long stress cases
     # have their own explicit gate below.
     just test-regular
+
+# ─── Documentation Audit ────────────────────────────────────────
+
+docs-audit:
+    python3 scripts/check_readme_references.py
 
 # ─── Architecture Audit ────────────────────────────────────────
 

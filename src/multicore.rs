@@ -52,6 +52,10 @@ type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
 // state through the cross-core message path.
 type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
 const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
+/// Maximum number of outstanding QUIC tokens per shard that can require
+/// cross-thread retirement. Each token reserves one slot before submission,
+/// so every accepted retirement has guaranteed bounded queue capacity.
+const IO_RETIREMENT_QUEUE_CAPACITY: usize = CORE_MESSAGE_QUEUE_CAPACITY;
 const LOCAL_SPAWN_QUEUE_CAPACITY: usize = 65_536;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -263,32 +267,97 @@ impl CoreWakeup {
     pub(crate) fn notify(&self) {}
 }
 
-/// A shard's inbox handle, valid from any thread.
+/// A shard's reserved I/O retirement lane, valid from any thread.
 ///
-/// Posting to a shard is a `try_send` plus an explicit wake, because a shard
-/// parked in its backend poll is not woken by a queue push on its own. This is
-/// the same pairing `MultiCoreRuntime::notify_core` performs; it lives in its
-/// own type so an owner that is dropped off its shard - `MinissUdpSocket` and
-/// `MinissUdpPoller` are the current ones - can reach the shard without holding
-/// the runtime, which is not globally reachable for every construction path.
+/// QUIC registrations reserve capacity before submitting an operation; a
+/// reserved retirement therefore cannot be lost to ordinary inbox pressure.
+/// The ordinary sender is present only in tests that fill the inbox deliberately.
 #[derive(Clone)]
 pub(crate) struct CoreHandle {
+    #[cfg(test)]
     sender: Sender<CoreMessage>,
+    retirement: Arc<IoRetirementMailbox>,
     wakeup: Arc<CoreWakeup>,
     thread: thread::Thread,
 }
 
+// Architecture audit: one bounded lock-free queue and atomic credit counter
+// per shard; no mutex, runtime creation, or blocking enqueue. Cross-core traffic
+// is limited to reserved token-retirement messages, not task migration.
+struct IoRetirementMailbox {
+    queue: ArrayQueue<IoToken>,
+    reservations: AtomicUsize,
+}
+
+impl IoRetirementMailbox {
+    fn new() -> Self {
+        Self {
+            queue: ArrayQueue::new(IO_RETIREMENT_QUEUE_CAPACITY),
+            reservations: AtomicUsize::new(0),
+        }
+    }
+
+    fn reserve(&self) -> bool {
+        let mut current = self.reservations.load(Ordering::Acquire);
+        loop {
+            if current == IO_RETIREMENT_QUEUE_CAPACITY {
+                return false;
+            }
+            match self.reservations.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release(&self) {
+        let previous = self.reservations.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "retirement reservation underflow");
+    }
+}
+
 impl CoreHandle {
-    /// Queue `message` for the shard and wake it.
-    ///
-    /// Returns `false` when the bounded inbox is full. Callers are `Drop`
-    /// paths, so this never blocks: the dropping thread may be another shard's
-    /// worker, and blocking it would stall that shard (AGENTS.md MUST NOT #3).
-    /// A full inbox means the shard is already saturated, so a dropped
-    /// cancellation is the lesser cost; the alternative - `send_timeout` -
-    /// would trade a leaked operation for a stalled worker.
+    /// Queue an ordinary bounded message for the shard and wake it.
+    #[cfg(test)]
     pub(crate) fn post(&self, message: CoreMessage) -> bool {
         if self.sender.try_send(message).is_err() {
+            return false;
+        }
+        self.thread.unpark();
+        self.wakeup.notify();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn io_retirement_counts(&self) -> (usize, usize) {
+        (
+            self.retirement.queue.len(),
+            self.retirement.reservations.load(Ordering::Acquire),
+        )
+    }
+
+    /// Reserve a guaranteed slot before submitting a token that may need to be
+    /// retired from another thread. Returns false rather than blocking when
+    /// all bounded retirement capacity is in use.
+    pub(crate) fn reserve_io_retirement(&self) -> bool {
+        self.retirement.reserve()
+    }
+
+    /// Release a reservation when its operation completes or is cancelled on
+    /// its owner shard.
+    pub(crate) fn release_io_retirement(&self) {
+        self.retirement.release();
+    }
+
+    /// Post a token using its prior reservation. The queue cannot be full here:
+    /// each queued token owns one of the queue's capacity reservations.
+    pub(crate) fn retire_io_token(&self, token: IoToken) -> bool {
+        if self.retirement.queue.push(token).is_err() {
             return false;
         }
         self.thread.unpark();
@@ -304,8 +373,8 @@ impl std::fmt::Debug for CoreHandle {
 }
 
 thread_local! {
-    /// The inbox handle of the shard this thread runs as, installed by the
-    /// worker before it enters its event loop. `None` on every other thread.
+    /// The owner-side control handle for this shard, installed by its worker
+    /// before the event loop starts. `None` on every other thread.
     static CORE_HANDLE: RefCell<Option<CoreHandle>> = const { RefCell::new(None) };
 }
 
@@ -597,6 +666,9 @@ pub struct CpuCore {
     owner_ready_queue: Vec<OwnerCompletion>,
     /// Message inbox from other cores
     message_inbox: Receiver<CoreMessage>,
+    /// Reserved cross-thread QUIC retirements; independent of ordinary inbox
+    /// pressure and consumed only by this owning shard.
+    retirement: Arc<IoRetirementMailbox>,
     /// Startup acknowledgement held until owner-thread TLS/driver context is
     /// installed by `run`.
     ready_sender: Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
@@ -669,6 +741,7 @@ impl CpuCore {
         ready_hint: Arc<CachePadded<AtomicUsize>>,
         #[cfg(target_os = "linux")] sleep_gate: Arc<WorkerSleepGate>,
         message_inbox: Receiver<CoreMessage>,
+        retirement: Arc<IoRetirementMailbox>,
         ready_sender: std::sync::mpsc::Sender<std::result::Result<(), String>>,
         park_timeout: Duration,
         // Write-once publication: the owning worker sets it during exit, the
@@ -689,6 +762,7 @@ impl CpuCore {
             overflow_hint: Arc::new(AtomicBool::new(false)),
             owner_ready_queue: Vec::with_capacity(256),
             message_inbox,
+            retirement,
             ready_sender: Some(ready_sender),
             timer_wheel: TimerWheel::new(1024, 1),
             park_timeout,
@@ -924,7 +998,12 @@ impl CpuCore {
                 // 1. Process inter-core messages.
                 //    Check immediately when messages are waiting, when the
                 //    ready queue is empty, or every Nth tick under load.
-                if self.draining || self.ready_queue.is_empty() || self.message_poll_ticks == 0 {
+                //    Reserved I/O retirements bypass that cadence below.
+                if self.draining
+                    || self.ready_queue.is_empty()
+                    || self.message_poll_ticks == 0
+                    || !self.retirement.queue.is_empty()
+                {
                     work_done |= self.process_messages();
                     self.message_poll_ticks = if self.ready_queue.len() < 8 {
                         MESSAGE_POLL_TICKS_LIGHT
@@ -994,6 +1073,7 @@ impl CpuCore {
                 && self.local_task_count == 0
                 && self.ready_queue.is_empty()
                 && self.message_inbox.is_empty()
+                && self.retirement.queue.is_empty()
                 && self.io_state.io_backend.pending_operation_count() == 0
             {
                 break;
@@ -1070,6 +1150,7 @@ impl CpuCore {
                 && self.local_task_count == 0
                 && self.ready_queue.is_empty()
                 && self.message_inbox.is_empty()
+                && self.retirement.queue.is_empty()
                 && self.io_state.io_backend.pending_operation_count() == 0
             {
                 break;
@@ -1135,6 +1216,14 @@ impl CpuCore {
 
         // Process more messages when the shard is idle; back off when it is busy.
         while processed < max_messages {
+            if let Some(token) = self.retirement.queue.pop() {
+                // SAFETY: each reservation belongs to a token submitted by
+                // this shard, and only this owner thread mutates backend state.
+                unsafe { self.io_state.cancel_and_discard(token) };
+                self.retirement.release();
+                processed += 1;
+                continue;
+            }
             match self.message_inbox.try_recv() {
                 Ok(CoreMessage::Task { id, future, reply }) => {
                     tracing::debug!(
@@ -1584,6 +1673,24 @@ impl std::fmt::Debug for MultiCoreRuntime {
     }
 }
 
+fn shutdown_and_join_started_workers(
+    shutdowns: &[Arc<AtomicBool>],
+    threads: &[thread::Thread],
+    wakeups: &[Arc<CoreWakeup>],
+    join_handles: Vec<thread::JoinHandle<Result<()>>>,
+) {
+    for shutdown in shutdowns {
+        shutdown.store(true, Ordering::Release);
+    }
+    for (worker, wakeup) in threads.iter().zip(wakeups) {
+        worker.unpark();
+        wakeup.notify();
+    }
+    for handle in join_handles {
+        let _ = handle.join();
+    }
+}
+
 impl MultiCoreRuntime {
     #[cfg(target_os = "linux")]
     fn startup_cpu_plan(requested: Option<usize>) -> Result<Vec<usize>> {
@@ -1667,6 +1774,27 @@ impl MultiCoreRuntime {
 
     /// Create new multi-core runtime
     pub fn new(num_cores: Option<usize>) -> Result<Arc<Self>> {
+        Self::new_with_sampler(num_cores, Self::spawn_metrics_sampler)
+    }
+
+    fn spawn_metrics_sampler(
+        fanout: Arc<MetricsFanout>,
+        interval: Duration,
+        receiver: std::sync::mpsc::Receiver<MetricsCommand>,
+    ) -> std::io::Result<thread::JoinHandle<()>> {
+        thread::Builder::new()
+            .name("miniss-metrics".to_string())
+            .spawn(move || Aggregator::new(interval).run(fanout, receiver))
+    }
+
+    fn new_with_sampler(
+        num_cores: Option<usize>,
+        spawn_sampler: impl FnOnce(
+            Arc<MetricsFanout>,
+            Duration,
+            std::sync::mpsc::Receiver<MetricsCommand>,
+        ) -> std::io::Result<thread::JoinHandle<()>>,
+    ) -> Result<Arc<Self>> {
         let cpu_plan = Self::startup_cpu_plan(num_cores)?;
         let num_cores = cpu_plan.len();
         let runtime_generation = next_runtime_generation();
@@ -1704,12 +1832,10 @@ impl MultiCoreRuntime {
             let ready_hint = Arc::new(CachePadded::new(AtomicUsize::new(0)));
             let termination_report = Arc::new(std::sync::OnceLock::new());
             let wakeup = Arc::new(CoreWakeup::new()?);
+            let retirement = Arc::new(IoRetirementMailbox::new());
             let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
             let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
             core_senders.push(sender.clone());
-            // The worker publishes this clone as its own inbox handle, so code
-            // running on the shard can hand work back to it.
-            let core_sender = sender.clone();
             core_shutdowns.push(core_shutdown.clone());
             core_exited.push(core_exited_flag.clone());
             force_shutdowns.push(force_shutdown.clone());
@@ -1727,7 +1853,9 @@ impl MultiCoreRuntime {
                     // bounded waits in `join`/`Drop` observe it.
                     let _exit = CoreExitGuard(core_exited_flag.clone());
                     install_core_handle(CoreHandle {
-                        sender: core_sender,
+                        #[cfg(test)]
+                        sender: sender.clone(),
+                        retirement: retirement.clone(),
                         wakeup: wakeup.clone(),
                         thread: thread::current(),
                     });
@@ -1753,6 +1881,7 @@ impl MultiCoreRuntime {
                             ready_hint.clone(),
                             sleep_gate,
                             receiver,
+                            retirement,
                             ready_sender,
                             crate::config::park_timeout(),
                             termination_report.clone(),
@@ -1768,6 +1897,7 @@ impl MultiCoreRuntime {
                         force_shutdown.clone(),
                         ready_hint.clone(),
                         receiver,
+                        retirement,
                         ready_sender,
                         crate::config::park_timeout(),
                         termination_report.clone(),
@@ -1836,17 +1966,21 @@ impl MultiCoreRuntime {
             admission: Arc::clone(&admission),
         });
         let (metrics_tx, metrics_rx) = std::sync::mpsc::channel();
-        let metrics_sampler = thread::Builder::new()
-            .name("miniss-metrics".to_string())
-            .spawn({
-                let fanout = Arc::clone(&metrics_fanout);
-                move || {
-                    Aggregator::new(metrics_interval).run(fanout, metrics_rx);
+        let metrics_sampler =
+            match spawn_sampler(Arc::clone(&metrics_fanout), metrics_interval, metrics_rx) {
+                Ok(sampler) => sampler,
+                Err(error) => {
+                    shutdown_and_join_started_workers(
+                        &core_shutdowns,
+                        &core_threads,
+                        &core_wakeups,
+                        join_handles,
+                    );
+                    return Err(RuntimeError::TaskFailed(format!(
+                        "Failed to spawn metrics thread: {error}"
+                    )));
                 }
-            })
-            .map_err(|e| {
-                RuntimeError::TaskFailed(format!("Failed to spawn metrics thread: {e}"))
-            })?;
+            };
 
         let runtime = Arc::new(Self {
             num_cores,
@@ -2927,6 +3061,50 @@ mod tests {
     static_assertions::assert_impl_all!(MultiCoreRuntime: Send, Sync);
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn injected_metrics_sampler_spawn_failure_joins_started_workers() {
+        let error = MultiCoreRuntime::new_with_sampler(Some(1), |_, _, _| {
+            Err(std::io::Error::other("injected sampler spawn failure"))
+        })
+        .expect_err("injected sampler failure should reject runtime startup");
+        assert!(error.to_string().contains("injected sampler spawn failure"));
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::Acquire) {
+                thread::park();
+            }
+            let _ = exited_tx.send(());
+            Ok(())
+        });
+        let worker_thread = worker.thread().clone();
+        shutdown_and_join_started_workers(
+            &[shutdown],
+            &[worker_thread],
+            &[Arc::new(CoreWakeup::new().expect("create test wakeup"))],
+            vec![worker],
+        );
+        exited_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rollback helper must join exited workers");
+    }
+
+    #[test]
+    fn io_retirement_reservations_provide_bounded_backpressure() {
+        let mailbox = IoRetirementMailbox::new();
+        for _ in 0..IO_RETIREMENT_QUEUE_CAPACITY {
+            assert!(mailbox.reserve());
+        }
+        assert!(!mailbox.reserve(), "retirement capacity must stay bounded");
+        for _ in 0..IO_RETIREMENT_QUEUE_CAPACITY {
+            mailbox.release();
+        }
+        assert!(mailbox.reserve(), "released capacity should be reusable");
+        mailbox.release();
+    }
 
     #[test]
     fn least_loaded_core_prefers_the_lowest_published_depth() {
