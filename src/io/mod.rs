@@ -538,8 +538,12 @@ pub enum CompletionKind {
         bytes_read: usize,
         data: Buffer,
     },
+    /// Terminal result of [`Op::WriteFile`]. `data` is the caller's buffer,
+    /// handed back the way [`ReadFile`](Self::ReadFile) hands back the buffer it
+    /// filled; a failed write drops it with the operation.
     WriteFile {
         bytes_written: usize,
+        data: Buffer,
     },
     UdpRecv {
         bytes_read: usize,

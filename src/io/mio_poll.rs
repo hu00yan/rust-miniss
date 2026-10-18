@@ -495,8 +495,10 @@ impl IoProvider for MioBackend {
                         let result = dup_owned_file(fd_copy)
                             .and_then(|mut file| {
                                 file.seek(SeekFrom::Start(offset_copy))?;
-                                file.write(data_clone.as_ref()).map(|bytes_written| {
-                                    CompletionKind::WriteFile { bytes_written }
+                                let bytes_written = file.write(data_clone.as_ref())?;
+                                Ok(CompletionKind::WriteFile {
+                                    bytes_written,
+                                    data: data_clone,
                                 })
                             })
                             .map_err(IoError::Io);
@@ -1134,7 +1136,10 @@ impl IoProvider for MioBackend {
                         let result = file
                             .seek(SeekFrom::Start(offset))
                             .and_then(|_| file.write(data.as_ref()))
-                            .map(|bytes_written| CompletionKind::WriteFile { bytes_written });
+                            .map(|bytes_written| CompletionKind::WriteFile {
+                                bytes_written,
+                                data,
+                            });
                         let _ = file.into_raw_fd();
                         result.map_err(IoError::Io)
                     }

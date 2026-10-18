@@ -87,18 +87,46 @@ impl AsyncFile {
         .await
     }
 
-    /// Writes `buf` at `offset`, returning the bytes actually written.
-    pub async fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
+    /// Writes `data` at `offset`, returning the bytes written and the caller's
+    /// buffer.
+    ///
+    /// The file-side mirror of `AsyncTcpStream::write_rent` and
+    /// `AsyncUdpSocket::send_to_rent`: the caller hands over an owned buffer
+    /// ([`crate::buffer::RentBuffer`] — `Buffer`, `Vec<u8>` or `Box<[u8]>`), the
+    /// runtime owns it until the kernel is done, and the same allocation comes
+    /// back. On the io_uring backend that is the whole story; the readiness
+    /// backend writes from its thread pool, which needs an owned payload of its
+    /// own, so there the returned buffer is a copy rather than the allocation
+    /// the caller passed in.
+    pub async fn write_rent_at<T>(&self, offset: u64, data: T) -> io::Result<(usize, T)>
+    where
+        T: crate::buffer::RentBuffer,
+    {
         let op = Op::WriteFile {
             fd: self.inner.as_raw_fd(),
             offset,
-            data: crate::buffer::Buffer::from_slice(buf),
+            data: data.into(),
         };
         self.run(op, |completion| match completion {
-            CompletionKind::WriteFile { bytes_written } => Some(bytes_written),
+            CompletionKind::WriteFile {
+                bytes_written,
+                data,
+            } => Some((bytes_written, T::from(data))),
             _ => None,
         })
         .await
+    }
+
+    /// Writes `buf` at `offset`, returning the bytes actually written.
+    ///
+    /// The borrowed shape: `buf` is copied into a pooled buffer, which is what
+    /// the queueing needs. Use [`AsyncFile::write_rent_at`] to keep the
+    /// allocation.
+    pub async fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
+        let (bytes_written, _) = self
+            .write_rent_at(offset, crate::buffer::Buffer::from_slice(buf))
+            .await?;
+        Ok(bytes_written)
     }
 
     /// Asynchronous `fsync(2)`: data plus metadata.

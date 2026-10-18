@@ -99,6 +99,91 @@ fn test_sync_data_makes_written_bytes_durable() {
     });
 }
 
+/// `write_rent_at` is the file-side rent shape — the one protocol that was
+/// missing it. The caller hands over an owned buffer and gets that buffer back
+/// with the byte count, the way `read_at` hands back the buffer it filled and
+/// `AsyncTcpStream::write_rent` / `AsyncUdpSocket::send_to_rent` return theirs.
+/// Two things must hold on every backend: the bytes land at the offset asked
+/// for, and the buffer that comes back is immediately reusable rather than
+/// one-shot. `write_at` is now a thin call through this path, so the existing
+/// borrowed-shape tests above are its regression guardrail.
+#[test]
+fn test_write_rent_at_writes_at_the_offset_and_returns_a_reusable_buffer() {
+    use rust_miniss::Buffer;
+
+    let runtime = Runtime::new();
+
+    runtime.block_on(async {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let temp_path = temp_dir.path().join("rent_write.txt");
+        let file = AsyncFile::create(&temp_path).expect("Failed to create file");
+
+        let first = Buffer::from_slice(b"head:");
+        let (written, first) = file
+            .write_rent_at(0, first)
+            .await
+            .expect("rent write at offset 0");
+        assert_eq!(written, b"head:".len());
+        assert_eq!(first.as_ref(), b"head:");
+
+        // The returned buffer is the input of the next rent write. That reuse
+        // is the point of the shape, not a side effect of it.
+        let (written_second, _) = file
+            .write_rent_at(b"head:".len() as u64, first)
+            .await
+            .expect("rent write at offset 5");
+        assert_eq!(written_second, b"head:".len());
+
+        // Read the file back through the owned-buffer read path: both segments
+        // must be where their offsets put them. The read needs its own handle
+        // because `create` is write-only and `open` is read-only, exactly as
+        // `File::create` and `File::open` are; the read on a write-only handle
+        // is the plain EBADF that POSIX specifies, not a backend defect.
+        let reader = AsyncFile::open(&temp_path).expect("Failed to open for read-back");
+        let (bytes_read, contents) = reader.read_at(0, 64).await.expect("read back");
+        assert_eq!(bytes_read, 10);
+        assert_eq!(&contents[..bytes_read], b"head:head:");
+    });
+}
+
+/// On io_uring the operation owns the payload, so the buffer handed back is the
+/// very allocation the caller handed over. The readiness backend cannot promise
+/// that and does not: `src/io/mio_poll.rs` writes from an owned payload of its
+/// own inside the thread-pool handoff, so what comes back there is a copy. The
+/// bytes are asserted equal on both backends above; only the identity is
+/// specific to this one, which is why the assertion is gated.
+#[test]
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+fn test_write_rent_at_returns_the_same_allocation_on_io_uring() {
+    use rust_miniss::Buffer;
+
+    let runtime = Runtime::new();
+
+    runtime.block_on(async {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let temp_path = temp_dir.path().join("rent_identity.txt");
+        let file = AsyncFile::create(&temp_path).expect("Failed to create file");
+
+        let payload: &[u8] = b"same allocation, no copy";
+        let owned = Buffer::from_slice(payload);
+        let original_ptr = owned.as_ref().as_ptr();
+
+        let (written, returned) = file
+            .write_rent_at(0, owned)
+            .await
+            .expect("write rented payload");
+
+        assert_eq!(written, payload.len());
+        assert_eq!(
+            returned.as_ref().as_ptr(),
+            original_ptr,
+            "write_rent_at must return the same allocation on io_uring, not a copy"
+        );
+        assert_eq!(returned.as_ref(), payload);
+        assert_eq!(std::fs::read(&temp_path).expect("read file"), payload);
+    });
+}
+
 /// Many callers on one shard asking for a flush of the same file must all
 /// complete, whichever syscall their group was served by. The syscall *count*
 /// is asserted in `src/io/mio_poll.rs`, where the backend's per-shard counter

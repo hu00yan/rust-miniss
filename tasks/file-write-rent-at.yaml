@@ -1,0 +1,111 @@
+id: file-write-rent-at
+title: AsyncFile::write_rent_at：让文件写也有 rent 形状，给 CompletionKind::WriteFile 带上 data
+branch: fix/io-backend-hygiene-and-macos-correctness
+status: done
+
+## 目标
+
+1. `CompletionKind::WriteFile { bytes_written }` 增加 `data: Buffer`
+   （`src/io/mod.rs:534` 附近），两个后端都在完成时把缓冲 move 回去。
+2. 新增
+   ```rust
+   pub async fn write_rent_at<T: RentBuffer>(&self, offset: u64, data: T) -> io::Result<(usize, T)>
+   ```
+3. `write_at(&self, offset, buf: &[u8])` 改为它的薄包装，与 TCP 的
+   `write_rent`/`read_rent`、UDP 的 `recv_from_rent`/`send_to_rent` 形状一致。
+
+## 证据（为什么）
+
+1. **文件读侧已经带 data，写侧没有**：`ReadFile { bytes_read, data }`
+   （`src/io/mod.rs`）把缓冲还给调用方，`WriteFile { bytes_written }` 不还。
+   这是纯粹的不对称，也是"给 WriteFile 加 data"这件事唯一的技术障碍。
+2. **两次拷贝**：`AsyncFile::write_at`（`src/fs.rs:91-95`）先用
+   `Buffer::from_slice(buf)` 把借用切片拷成 owned Buffer，mio 后端再为线程池
+   交接 `data.clone()` 深拷贝一次（`src/io/mio_poll.rs:504`）。
+3. **协议一致性的要求**：本仓库的 rent 语义是「调用方交出 owned 缓冲，运行时
+   把它交给内核，完成后原样归还」。文件写是唯一缺席的一环——`write_rent`
+   （TCP）与 `recv_from_rent`/`send_to_rent`（UDP）都有，文件写只有借用版。
+
+## 级联
+
+- 两个后端的 `WriteFile` 完成臂都要带上 `data`：
+  - **uring**：`PendingOp` 里保留 `data`，完成时 move 进 `CompletionKind::WriteFile
+    { bytes_written, data }`——与已有的
+    `PendingOp::WriteRent { data }`（`src/io/uring.rs:41-44`）同形。
+  - **mio**：线程池闭包本来就 owned `data`，把 `CompletionKind::WriteFile
+    { bytes_written }` 改成 `{ bytes_written, data }`，`data` 随 completion 回到
+    调用方，而不是写完后被丢掉。
+- `src/fs.rs::write_at` 的完成匹配要取 `data`（`..` 或显式忽略）。
+
+## 平台差异（如实记录，不是缺陷）
+
+mio 的文件写走阻塞线程池，`submit` 路径上 op 是**借用**的
+（`src/io/mio_poll.rs:498` 用 `*fd`/`*offset`），所以交接给线程池时仍需要一次
+payload 拷贝；`write_rent_at` 在 macOS/kqueue 上归还的是**同一个分配**这一步做不到。
+uring 上 op 是 owned 的，零额外拷贝。
+→ 测试断言必须区分：**字节数 + 归还内容**两个后端都断言；**指针不变**只在
+uring 上断言（`cfg(io_backend = "io_uring")`）。
+
+## 非目标
+
+- 不改线程池设计（mio 的阻塞交接拷贝留到「重构文件 I/O 交接」另开卡）
+- 不加 `read_rent_at`：`read_at` 今天也是借用版，但读的借用切片本来就由调用方
+  持有，rent 化的收益与形状收益要在文件读一并评估；本卡只补写侧这一处明确缺口。
+
+## 测试后果
+
+`tests/async_file_tests.rs` 增加：
+
+- `write_rent_at` 写入后 `read_at` 读回内容一致、字节数正确；
+- 归还的缓冲可复用（写第二段）；
+- `cfg(io_backend = "io_uring")`：归还缓冲的 `as_ptr()` 与交出的一致（零拷贝）。
+
+既有 `write_at` 的用例是回归护栏，不改。
+
+## 实施记录
+
+落地形状与「级联」一致，两点更具体：
+
+- `CompletionKind::WriteFile { bytes_written, data }`（`src/io/mod.rs`）。uring 的
+  完成臂原来写着 `let _ = data;`——缓冲已经在 `PendingOp::WriteFile` 里，只是被
+  显式丢掉了；现在 move 进 completion（错误分支照旧丢弃，与 `ReadFile` 一致）。
+  mio 两处都让 payload 随 completion 回去：线程池那处返回的是闭包里那份
+  `data_clone`，正如「平台差异」所预言，调用方拿到的不是自己交出的那个分配；标着
+  「should ideally not be hit」的同步回退那处 op 本身是 owned 的，直接移入。
+- `AsyncFile::write_rent_at<T: RentBuffer>` 复用现成的 `run(op, expect)` 完成映射，
+  `write_at` 成为它的薄包装（`let (bytes_written, _) = ...`），与
+  `AsyncUdpSocket::send_to_rent`/`send_to` 的写法一致。测试里原有的借用版用例一行
+  未改，现在的它同时是这条新路径的回归护栏。
+
+**测试形状的一次纠正（不是后端缺陷）**：`AsyncFile::create` 走 `File::create`，是
+O_WRONLY；`AsyncFile::open` 走 `File::open`，是 O_RDONLY。于是「写完之后在同一个
+handle 上 `read_at`」拿到的是 POSIX 规定的 EBADF，不是分配或注册缺陷：把本卡改动
+stash 掉后在 HEAD 复现同样结果；只读 handle 上写是 EBADF、写只读 handle 后换一个
+`AsyncFile::open` 的 handle 读则成功——四种组合全部自洽。读回断言因此另开一个只读
+handle，既符合 API 语义，也让这条测试顺手固化「create 只写、open 只读」这件事。
+排查过程只用了临时探针（已删除），没有为它改任何生产代码。
+
+**验证**：OrbStack Ubuntu VM 的 io_uring 上 `cargo test --test async_file_tests` 6 passed（含
+io_uring 限定的指针同一性用例），`MINISS_IO_BACKEND=epoll cargo check --all-targets`
+通过；macOS/kqueue 上同一测试 5 passed（该用例按 `cfg(io_backend = "io_uring")`
+编掉，其余全过，覆盖 mio 线程池路径），并且 `cargo check --all-targets` 通过。当前
+D/E 工作树上 Linux `just check` 连续 3/3 通过，macOS `just check` 通过。峰值内存的
+推翻条件没有触发：uring 上没有任何新增分配（原来那个 `Buffer` 换了归属），mio 上
+新增的只是把本来就已经存在的 `data_clone` 多留到 completion 投递，op 自己那份照旧随
+op 释放。
+
+## 推翻条件
+
+若「归还缓冲」使阻塞线程池的峰值内存翻倍（同一时刻池内既持有写入缓冲又持有归还
+缓冲），或使 `PendingOp` 在 uring 上的 slab 占用显著变大，则退回不带 data 的
+`WriteFile`，并把 rent 语义只在 TCP/UDP 上维持。
+
+allowed_files:
+  - src/fs.rs
+  - src/io/mod.rs
+  - src/io/uring.rs
+  - src/io/mio_poll.rs
+  - tests/async_file_tests.rs
+  - tasks/file-write-rent-at.yaml
+  - docs/DECISION_LOG.md
+  - docs/DESIGN.md

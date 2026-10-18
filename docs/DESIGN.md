@@ -365,6 +365,10 @@ poll_read(user_buf):
 `Rent` 模式是 thread-per-core + completion-based I/O 的最佳匹配：
 - `read_rent`: 用户提供 owned buffer → 内核直接写入 → 返还用户（零拷贝）
 - `write_rent`: 用户提供 owned buffer → 内核直接读取 → 返还用户（零拷贝）
+- `write_rent_at`: 文件写侧的同一形状。`AsyncFile::read_at` 一直返还它填的那个
+  buffer，写侧此前只返还字节数，`write_rent_at` 让它对称，`write_at` 则是它的
+  借用薄包装。io_uring 上归还的就是同一个分配；mio 后端从线程池写，需要一个自己
+  的 owned 载荷，因此那里归还的是内容相同、分配不同的拷贝
 - 当前库层接口对 `Buffer` / `Vec<u8>` / `Box<[u8]>` 开放，例子不再需要自己维护专用胶水
 
 写侧因此只有三种形状，且每种都能从签名看出缓冲归谁：

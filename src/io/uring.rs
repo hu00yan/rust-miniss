@@ -1183,12 +1183,12 @@ unsafe fn reconstruct_completion(
             }
         }
         PendingOp::WriteFile { data, .. } => {
-            let _ = data;
             if result < 0 {
                 Err(IoError::Io(io::Error::from_raw_os_error(-result)))
             } else {
                 Ok(CompletionKind::WriteFile {
                     bytes_written: result as usize,
+                    data,
                 })
             }
         }
