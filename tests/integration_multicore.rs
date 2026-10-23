@@ -4,7 +4,7 @@ use std::time::Duration;
 
 #[test]
 fn multicore_task_distribution() {
-    let runtime = rust_miniss::MultiCoreRuntime::new(Some(4)).expect("create multicore runtime");
+    let runtime = rust_miniss::MultiCoreRuntime::new(None).expect("create multicore runtime");
 
     let counters = Arc::new([
         AtomicUsize::new(0),
@@ -43,7 +43,16 @@ fn multicore_task_distribution() {
 
 #[test]
 fn multicore_sustained_cross_core_wake_pressure_drains_cleanly() {
-    let runtime = rust_miniss::MultiCoreRuntime::new(Some(4)).expect("create multicore runtime");
+    let runtime = rust_miniss::MultiCoreRuntime::new(None).expect("create multicore runtime");
+    let shard_count = runtime
+        .metrics_snapshot(Duration::from_secs(1))
+        .expect("read available shard count")
+        .cores
+        .len();
+    assert!(
+        shard_count > 1,
+        "cross-core pressure requires at least two shards"
+    );
     let completed = Arc::new(AtomicUsize::new(0));
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     const TASKS: usize = 1024;
@@ -52,7 +61,7 @@ fn multicore_sustained_cross_core_wake_pressure_drains_cleanly() {
         let completed = completed.clone();
         let completed_tx = completed_tx.clone();
         runtime
-            .spawn_on((index % 3) + 1, async move {
+            .spawn_on((index % (shard_count - 1)) + 1, async move {
                 completed.fetch_add(1, Ordering::Relaxed);
                 completed_tx
                     .send(())

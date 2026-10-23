@@ -5,29 +5,11 @@
 
 use std::time::Duration;
 
-/// Channel capacity for cross-CPU communication
+/// Capacity shared by each shard's bounded cross-CPU inbox and I/O-retirement lane.
 ///
-/// This controls the bounded channel size used for sending messages between CPUs.
-/// A larger value provides more buffering but uses more memory, while a smaller
-/// value provides more back-pressure but may cause blocking under high load.
-///
-/// The default value of 1000 should be sufficient for most workloads while
-/// providing adequate back-pressure when needed.
-pub const CROSS_CPU_CHANNEL_CAPACITY: usize = 1000;
-
-/// Default timeout for CPU thread operations (in milliseconds)
-///
-/// This controls how long CPU threads will wait for new messages when the
-/// ready queue is empty. A smaller value provides more responsive shutdown
-/// but uses more CPU cycles, while a larger value reduces CPU usage but
-/// may delay shutdown.
-pub const CPU_THREAD_TIMEOUT_MS: u64 = 10;
-
-/// Initial capacity for task queue HashMap to reduce allocations
-///
-/// Pre-allocating the task queue reduces allocations during runtime.
-/// This should be set based on expected concurrent task count per CPU.
-pub const INITIAL_TASK_QUEUE_CAPACITY: usize = 128;
+/// This is a compile-time capacity, not a runtime tuning knob. Keep its use in
+/// sync with `MultiCoreRuntime` so the documented value matches actual backpressure.
+pub const CROSS_CPU_CHANNEL_CAPACITY: usize = 4096;
 
 /// Expected number of wakeups per timer expiration cycle
 ///
@@ -35,18 +17,11 @@ pub const INITIAL_TASK_QUEUE_CAPACITY: usize = 128;
 /// Most workloads have few simultaneous timer expirations.
 pub const EXPECTED_WAKEUP_COUNT: usize = 16;
 
-/// Maximum expected tasks per CPU for utilization calculation
+/// Requested default I/O park timeout in microseconds.
 ///
-/// This is used for CPU utilization metrics and represents the
-/// theoretical maximum number of tasks that could be queued per CPU.
-/// Used for normalizing utilization percentages.
-pub const MAX_TASKS: usize = 1024;
-
-/// Default I/O park timeout in microseconds.
-///
-/// This bounds how long worker threads wait in `submit_and_wait` when the
-/// ready queue is empty. Lower values favor p99 latency; higher values favor
-/// throughput.
+/// The selected backend uses this when no work is ready (`submit_and_wait` for
+/// io_uring, `mio::Poll::poll` for the readiness backend). Mio applies a 1 ms
+/// floor, so this value is not a latency guarantee across backends.
 pub const DEFAULT_PARK_TIMEOUT_US: u64 = 100;
 
 /// Default number of local tasks polled during one executor turn.

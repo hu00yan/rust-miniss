@@ -6,6 +6,24 @@ if [ "$(uname -s)" != "Linux" ]; then
     exit 1
 fi
 
+kernel=$(uname -r)
+major=$(printf '%s\n' "$kernel" | cut -d. -f1)
+minor=$(printf '%s\n' "$kernel" | cut -d. -f2)
+case "$major:$minor" in
+    *[!0-9:]*|:|*:)
+        echo "SKIP: cannot parse Linux kernel version for io_uring safety: $kernel"
+        exit 0
+        ;;
+esac
+if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 12 ]; }; then
+    echo "SKIP: Linux $kernel selects the mio/epoll compatibility backend; io_uring safety requires kernel 6.12+"
+    exit 0
+fi
+if [ "${MINISS_IO_BACKEND:-}" = "epoll" ]; then
+    echo "SKIP: MINISS_IO_BACKEND=epoll selects the compatibility backend; io_uring safety is not applicable"
+    exit 0
+fi
+
 echo "PARTIALLY VERIFIED Linux/io_uring obligations:" >&2
 echo "- delayed-submit readv/writev pointer stability: covered below" >&2
 echo "- descriptor lease across numeric fd reuse: covered by runtime regressions" >&2

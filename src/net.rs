@@ -67,8 +67,7 @@ impl AsyncTcpListener {
                 token
             }
         };
-        let future = crate::io::future::IoFuture::accept(token);
-        let result = future.await;
+        let result = await_accept(&mut self.accept_token, token).await;
         let (supports_multishot, streams_nonblocking) = with_io_state(|state| {
             (
                 state.io_backend.supports_multishot_accept(),
@@ -107,6 +106,37 @@ impl AsyncTcpListener {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
+}
+
+/// Keeps the cached accept token only when the wait completes normally.
+/// Architecture audit: the cancellation/connect/write repairs add only
+/// listener-local state, per-socket options, and syscall flags—no shared
+/// mutable state, locks, atomics, runtime creation, blocking calls, or
+/// cross-core traffic.
+struct AcceptTokenGuard<'a> {
+    token: &'a mut Option<IoToken>,
+    keep: bool,
+}
+
+impl Drop for AcceptTokenGuard<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            *self.token = None;
+        }
+    }
+}
+
+async fn await_accept(
+    cached_token: &mut Option<IoToken>,
+    token: IoToken,
+) -> Result<crate::io::CompletionKind, crate::io::IoError> {
+    let mut guard = AcceptTokenGuard {
+        token: cached_token,
+        keep: false,
+    };
+    let result = crate::io::future::IoFuture::accept(token).await;
+    guard.keep = true;
+    result
 }
 
 impl AsRawFd for AsyncTcpListener {
@@ -195,6 +225,24 @@ impl AsyncTcpStream {
     /// Creates a new AsyncTcpStream from a TcpStream that is already non-blocking.
     fn from_nonblocking(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
+        #[cfg(target_os = "macos")]
+        {
+            let enabled: libc::c_int = 1;
+            // SAFETY: `stream` owns a live socket and `enabled` is valid for
+            // the duration of this setsockopt call.
+            let result = unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &enabled as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&enabled) as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let descriptor = RegisteredDescriptor::from_owned(OwnedFd::from(stream));
         Ok(Self {
             descriptor: Some(descriptor),
@@ -378,35 +426,45 @@ impl AsyncTcpStream {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
 
-        let storage = socket_addr_to_storage(&resolved);
-        // SAFETY: `storage` contains a sockaddr matching `resolved`, and the
-        // pointer/length pair stays valid for the duration of connect.
-        let ret = unsafe {
-            libc::connect(
-                fd,
-                &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
-                socket_addr_len(&resolved),
-            )
-        };
+        // Architecture audit: use only the already-installed shard backend;
+        // this adds no shared mutable state, locks, runtime creation, blocking
+        // calls, or cross-core traffic.
+        let completion_io =
+            try_with_io_state(|state| state.io_backend.uses_completion_io()).unwrap_or(false);
+        if !completion_io {
+            let storage = socket_addr_to_storage(&resolved);
+            // SAFETY: `storage` contains a sockaddr matching `resolved`, and the
+            // pointer/length pair stays valid for the duration of connect.
+            let ret = unsafe {
+                libc::connect(
+                    fd,
+                    &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
+                    socket_addr_len(&resolved),
+                )
+            };
 
-        if ret == 0 {
-            // SAFETY: On immediate connect success, ownership of fd moves into
-            // TcpStream exactly once.
-            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-            return Self::new(std_stream);
-        }
-
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINPROGRESS) {
-            // SAFETY: fd has not been wrapped in TcpStream on this error path.
-            unsafe {
-                libc::close(fd);
+            if ret == 0 {
+                // SAFETY: On immediate connect success, ownership of fd moves into
+                // TcpStream exactly once.
+                let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                return Self::new(std_stream);
             }
-            return Err(err);
+
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINPROGRESS) {
+                // SAFETY: fd has not been wrapped in TcpStream on this error path.
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(err);
+            }
         }
 
-        // SAFETY: EINPROGRESS leaves fd open and owned by this function; move
-        // ownership into TcpStream once while io_uring waits for completion.
+        // For completion backends, leave the socket unconnected and let the
+        // backend's Connect operation initiate it. Readiness backends arrive
+        // here only after libc::connect returned EINPROGRESS.
+        // SAFETY: fd remains open and owned by this function; move ownership
+        // into TcpStream exactly once while the backend completes the connect.
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let stream = Self::new(std_stream)?;
 
@@ -1024,11 +1082,23 @@ fn try_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: `buf` points to a valid readable slice for the duration of
         // this synchronous nonblocking syscall.
         let n = unsafe {
-            libc::write(
-                fd,
-                buf.as_ptr() as *const libc::c_void,
-                buf.len() as libc::size_t,
-            )
+            #[cfg(target_os = "linux")]
+            {
+                libc::send(
+                    fd,
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len() as libc::size_t,
+                    libc::MSG_NOSIGNAL,
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                libc::write(
+                    fd,
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len() as libc::size_t,
+                )
+            }
         };
         if n >= 0 {
             return Ok(n as usize);
@@ -1038,6 +1108,25 @@ fn try_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
             continue;
         }
         return Err(err);
+    }
+}
+
+#[inline]
+fn try_writev_once(fd: RawFd, iovecs: &[libc::iovec]) -> isize {
+    // SAFETY: `iovecs` points to caller-owned readable slices that remain valid
+    // for this synchronous syscall, and the message header is initialized below.
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = iovecs.as_ptr() as *mut libc::iovec;
+            message.msg_iovlen = iovecs.len() as _;
+            libc::sendmsg(fd, &message, libc::MSG_NOSIGNAL)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            libc::writev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int)
+        }
     }
 }
 
@@ -1060,9 +1149,7 @@ fn try_write_vectored(fd: RawFd, bufs: &[std::io::IoSlice<'_>]) -> io::Result<us
                         iov_len: bufs[1].len() as libc::size_t,
                     },
                 ];
-                // SAFETY: `iovecs` contains readable buffers derived from the
-                // caller's borrowed slices and remains valid for this syscall.
-                let n = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
+                let n = try_writev_once(fd, &iovecs);
                 if n >= 0 {
                     return Ok(n as usize);
                 }
@@ -1075,9 +1162,7 @@ fn try_write_vectored(fd: RawFd, bufs: &[std::io::IoSlice<'_>]) -> io::Result<us
                         iov_len: buf.len() as libc::size_t,
                     });
                 }
-                // SAFETY: `iovecs` contains readable buffers derived from the
-                // caller's borrowed slices and remains valid for this syscall.
-                let n = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
+                let n = try_writev_once(fd, &iovecs);
                 if n >= 0 {
                     return Ok(n as usize);
                 }
@@ -1102,6 +1187,278 @@ impl IntoRawFd for AsyncUdpSocket {
         let fd = self.inner.as_raw_fd();
         std::mem::forget(self);
         fd
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod completion_connect_tests {
+    use super::{socket_addr_len, socket_addr_to_storage, AsyncTcpStream};
+    use crate::cpu::{test_io_state, RuntimeContextGuard};
+    use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+    use crate::timer::TimerWheel;
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::net::TcpListener;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    struct ConnectBackend {
+        submissions: Rc<Cell<usize>>,
+        syscall_result: Rc<Cell<Option<(i32, Option<i32>)>>>,
+        socket_state_before_submit: Rc<Cell<Option<u8>>>,
+    }
+
+    impl IoProvider for ConnectBackend {
+        type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+        fn submit(&self, op: Op) -> Result<IoToken, IoError> {
+            let Op::Connect { fd, addr } = op else {
+                return Err(IoError::Other("connect expected".into()));
+            };
+            let mut tcp_info = [0_u8; 256];
+            let mut tcp_info_len = tcp_info.len() as libc::socklen_t;
+            // SAFETY: `tcp_info` is a writable output buffer for getsockopt.
+            let info_result = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_INFO,
+                    tcp_info.as_mut_ptr().cast(),
+                    &mut tcp_info_len,
+                )
+            };
+            if info_result < 0 {
+                return Err(IoError::Io(std::io::Error::last_os_error()));
+            }
+            self.socket_state_before_submit.set(Some(tcp_info[0]));
+            let storage = socket_addr_to_storage(&addr);
+            // Simulate the completion backend's Connect SQE by initiating the
+            // connection at submission, and record the result for the test.
+            // SAFETY: `fd` is the live socket owned by the connect future, and
+            // `storage` contains a matching sockaddr valid through this call.
+            let result = unsafe {
+                libc::connect(
+                    fd,
+                    &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
+                    socket_addr_len(&addr),
+                )
+            };
+            let error =
+                (result < 0).then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+            self.submissions.set(self.submissions.get() + 1);
+            self.syscall_result.set(Some((result, error)));
+            Ok(IoToken::new())
+        }
+
+        fn uses_completion_io(&self) -> bool {
+            true
+        }
+
+        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+            Poll::Pending
+        }
+
+        fn cancel(&self, _token: IoToken) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn completion_backend_initiates_connect_exactly_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let submissions = Rc::new(Cell::new(0));
+        let syscall_result = Rc::new(Cell::new(None));
+        let socket_state_before_submit = Rc::new(Cell::new(None));
+        let io_state = test_io_state(ConnectBackend {
+            submissions: submissions.clone(),
+            syscall_result: syscall_result.clone(),
+            socket_state_before_submit: socket_state_before_submit.clone(),
+        });
+        let mut timers = TimerWheel::default();
+        // SAFETY: the test keeps the state and timer on this owner thread
+        // until the guard is dropped.
+        let _guard = unsafe { RuntimeContextGuard::enter(&io_state, &mut timers, Some(0)) };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut connect = Box::pin(AsyncTcpStream::connect(addr));
+        assert!(matches!(connect.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(submissions.get(), 1);
+        assert_eq!(
+            socket_state_before_submit.get(),
+            Some(7), // Linux TCP_CLOSE: completion backends receive an unconnected socket.
+            "libc::connect must not have started the connection before backend submission"
+        );
+        let (result, error) = syscall_result.get().expect("backend connect syscall");
+        assert!(
+            result == 0 || error == Some(libc::EINPROGRESS),
+            "the backend must initiate a fresh connection, not retry an in-flight one: \
+             result={result}, error={error:?}"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_sigpipe_tests {
+    use super::AsyncTcpStream;
+    use std::net::TcpStream;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[test]
+    fn created_tcp_streams_disable_sigpipe() {
+        // SAFETY: the successful socket call transfers ownership of this fd
+        // into the TcpStream immediately below.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        // SAFETY: the successful socket call transferred this fresh descriptor
+        // to the test, and TcpStream takes ownership exactly once here.
+        let client = unsafe { TcpStream::from_raw_fd(fd) };
+        let stream = AsyncTcpStream::new(client).unwrap();
+        let mut enabled: libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&enabled) as libc::socklen_t;
+        // SAFETY: `stream` owns a live socket and the output arguments are
+        // writable for the duration of getsockopt.
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &mut enabled as *mut _ as *mut libc::c_void,
+                    &mut length,
+                )
+            },
+            0
+        );
+        assert_eq!(enabled, 1);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod sigpipe_tests {
+    use super::{try_write, try_write_vectored};
+    use std::io::IoSlice;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::Command;
+
+    const CHILD_MODE: &str = "RUST_MINISS_SIGPIPE_CHILD_MODE";
+
+    #[test]
+    fn borrowed_write_syscalls_do_not_raise_sigpipe() {
+        if let Some(mode) = std::env::var_os(CHILD_MODE) {
+            // SAFETY: this runs only in the isolated child test process.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+            let mut fds = [-1; 2];
+            // SAFETY: `fds` provides two writable slots for socketpair.
+            assert_eq!(
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: successful socketpair transferred ownership of each fd.
+            let writer = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: close the peer before writing to force EPIPE/SIGPIPE.
+            assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+            let result = match mode.to_str().expect("ASCII test mode") {
+                "scalar" => try_write(writer.as_raw_fd(), b"x"),
+                "vectored" => try_write_vectored(
+                    writer.as_raw_fd(),
+                    &[IoSlice::new(b"x"), IoSlice::new(b"y")],
+                ),
+                _ => panic!("unknown child mode"),
+            };
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EPIPE));
+            return;
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        let mut failed_modes = Vec::new();
+        for mode in ["scalar", "vectored"] {
+            let output = Command::new(&executable)
+                .arg("borrowed_write_syscalls_do_not_raise_sigpipe")
+                .env(CHILD_MODE, mode)
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                failed_modes.push(mode);
+            }
+        }
+        assert!(
+            failed_modes.is_empty(),
+            "isolated writes raised SIGPIPE in modes: {failed_modes:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod canceled_accept_tests {
+    use super::AsyncTcpListener;
+    use crate::cpu::{test_io_state, RuntimeContextGuard};
+    use crate::io::{CompletionKind, IoError, IoProvider, IoToken, Op};
+    use crate::timer::TimerWheel;
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    struct AcceptBackend {
+        submissions: Rc<Cell<usize>>,
+        cancellations: Rc<Cell<usize>>,
+    }
+
+    impl IoProvider for AcceptBackend {
+        type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+        fn submit(&self, op: Op) -> Result<IoToken, IoError> {
+            if !matches!(op, Op::Accept { .. }) {
+                return Err(IoError::Other("accept expected".into()));
+            }
+            self.submissions.set(self.submissions.get() + 1);
+            Ok(IoToken::new())
+        }
+
+        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+            Poll::Pending
+        }
+
+        fn cancel(&self, _token: IoToken) -> bool {
+            self.cancellations.set(self.cancellations.get() + 1);
+            true
+        }
+    }
+
+    #[test]
+    fn canceled_accept_submits_a_fresh_operation_next_time() {
+        let submissions = Rc::new(Cell::new(0));
+        let cancellations = Rc::new(Cell::new(0));
+        let io_state = test_io_state(AcceptBackend {
+            submissions: submissions.clone(),
+            cancellations: cancellations.clone(),
+        });
+        let mut timers = TimerWheel::default();
+        // SAFETY: the test keeps the state and timer on this owner thread
+        // until the guard is dropped.
+        let _guard = unsafe { RuntimeContextGuard::enter(&io_state, &mut timers, Some(0)) };
+        let mut listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut first_accept = Box::pin(listener.accept());
+        assert!(matches!(first_accept.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(submissions.get(), 1);
+        drop(first_accept);
+        assert_eq!(cancellations.get(), 1);
+
+        let mut next_accept = Box::pin(listener.accept());
+        assert!(matches!(next_accept.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            submissions.get(),
+            2,
+            "a canceled accept must not reuse its abandoned token"
+        );
     }
 }
 

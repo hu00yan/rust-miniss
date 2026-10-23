@@ -6,17 +6,15 @@
 
 ## 设计哲学
 
-**thread-per-core + io_uring = 不需要锁。**
+**thread-per-core 的核心是任务亲和与分片所有权，不是“完全没有锁或原子操作”。**
 
-每核一个线程，每个线程独享自己的 io_uring 实例、Task 队列、Timer Wheel、Buffer Pool。核间通信用 lock-free 消息队列（仅用于 task spawn 和 shutdown 信号）。
-
-这种模型的关键约束：一个 Task 从创建到完成，永远不会跨线程迁移。
+每个 worker 独占自己的 I/O backend、Task arena、ready queue、Timer Wheel 和活跃连接状态。跨 shard 的任务接收、取消、指标采样、I/O 回收和唤醒通过有界 inbox、ready queue 或明确的通知路径完成；已接收的任务不会被 work-stealing 或透明迁移。
 
 ### Thread-per-core 与 Work-stealing 的取舍
 
-**Work-stealing（Tokio 模式）**：Tokio 的多线程运行时把 Future 提交到全局队列，空闲线程从其他线程窃取任务。这让负载自然均衡——无需知道任务轻重就能充分利用所有 CPU。代价是每个 poll 都需要跨线程同步（`std::sync::Mutex` 或 atomic CAS），以及 CPU cache 频繁失效。
+**Work-stealing**：空闲 worker 可以从其他 worker 窃取可运行任务，有助于吸收负载不均，但任务跨 worker 调度时需要同步，并可能损失 cache locality。任务在本地队列上的每次 poll 并不必然需要跨线程同步。
 
-**Thread-per-core（本运行时的模式）**：任务从创建到完成绑定在一个核心上，永不迁移。这消除了所有跨线程同步开销，CPU cache 局部性极好。代价是负载必须由上层保证均衡。
+**Thread-per-core（本运行时的模式）**：任务被某个 shard 接收后始终由该 shard 执行；控制面可通过 `spawn()`/`spawn_on()` 显式选择目标 shard，worker 内可用 `spawn_local()`。这减少了隐式迁移并让可变状态保持 owner-local，但跨 shard admission/wakeup 仍有有界通信成本，且不提供 work-stealing 的自动负载均衡。
 
 不均衡最典型地出现在：
 
@@ -41,14 +39,14 @@
 |------|--------------------|----------------------|
 | **路径** | 每个请求/连接/I/O | 启动、配置更新、shutdown、指标聚合 |
 | **频率** | 微秒~毫秒级 | 秒~分级，或一次性 |
-| **锁** | 零锁（shard-local） | 允许轻量锁（如控制面 Mutex） |
-| **跨核通信** | 无（线程独享状态） | 允许 bounded channel 或原子 |
-| **分配** | 无堆分配（预分配/池化/arena） | 允许堆分配 |
-| **所有权** | 每个 shard 独占 | 可以共享（只读 config, AggregatedMetrics） |
+| **锁** | 热路径可变状态保持 shard-local；显式跨 shard 通知仍使用队列/原子 | 控制面允许轻量锁（如 Mutex） |
+| **跨核通信** | 允许有界消息、ready queue 和明确的唤醒通知；不允许隐式迁移任务 | 控制面允许 bounded channel 或原子 |
+| **分配** | 按实际 API 在 shard-local 分配或复用池化资源；“零堆分配”不是当前全局保证 | 允许堆分配 |
+| **所有权** | 可变状态由 owner shard 独占 | 可共享只读值和聚合指标；当前没有跨 shard 的 `Arc<Config>` 热更新对象 |
 
 **设计规则**：
 - 控制面代码不能出现在数据面的 include 路径或调用栈中
-- 控制面更新 config 必须通过版本化 broadcast，不能在热路径上检查"配置是否变了"
+- 当前 config 由常量和启动时读取的环境变量组成，没有 live-reload 对象；若未来增加运行时更新，必须通过版本化 broadcast 发布快照，不能让热路径轮询配置是否变化
 - 指标聚合是控制面任务，不能在请求路径上打全局 atomic counter
 - 控制面的简单锁(如 `std::sync::Mutex`)是允许的，但必须在 `ARCHITECTURE_EXCEPTIONS.md` 登记
 
@@ -56,20 +54,20 @@
 
 ```
 每个 CpuCore（一个 shard）独享：
-├── io_uring 实例
+├── I/O backend 实例（io_uring 或 mio）
 ├── Task 队列 (ready_queue)
 ├── Timer Wheel
 ├── Buffer Pool
 ├── 所有活跃连接的状态
 ├── 所有活跃 Task 的状态
 ├── 本 shard 的计数器 (metrics)
-└── config 快照的本地缓存 (Rc<Config>)
+└── 启动时传入的 worker 参数（例如 task poll budget、park timeout）
 
 跨 shard 共享：
-├── 只读 config (Arc<Config>, 控制面广播更新)
-├── 聚合指标 (控制面定期收集)
-├── 跨 shard 消息队列 (bounded channel, 仅 spawn/shutdown)
-└── SO_REUSEPORT socket (内核负责分发)
+├── 聚合指标视图 (控制面定期采样)
+├── 每 shard 的 bounded inbox（任务接收、取消、shutdown、指标请求、I/O token 回收等）
+├── 面向 owner shard 的有界 ready queue / 显式唤醒
+└── 应用按需创建的 SO_REUSEPORT listener（内核在 listener 间分发连接）
 ```
 
 ---
@@ -86,7 +84,8 @@
 构建时按内核版本选择后端：≥ 6.12 选 `io_uring`，< 6.12（或版本探测失败）回退
 `epoll` 后端，**不再编译报错**。需要显式指定时用
 `MINISS_IO_BACKEND={io_uring|epoll|kqueue}` 覆盖探测（值必须对目标 OS 合法）；
-这也是在现代内核上构建并验证 epoll 后端的唯一入口，否则那段代码永远不会被编译。
+这也是在现代内核上构建并验证 epoll 后端的入口。`build.rs` 的 `uname` 探测读取构建机内核，
+默认假设构建机与运行机相同；交叉编译时应显式指定目标可用的 `MINISS_IO_BACKEND`。
 
 ### 内核特性的利用策略
 
@@ -107,33 +106,32 @@
 
 ## 调度模型
 
+以下是 owner shard 的概念结构（不是实际 Rust struct 定义）：
+
 ```
-每一个 CpuCore {
+CpuCore {
     task_queue: TaskArena<Task>             // 固定 65_536 槽的 shard-local 任务表
-                                          // （不是 HashMap；槽索引即 TaskId）
-    ready_queue: ReadyQueue                 // ArrayQueue(65_536) 的 TaskId
-    owner_ready_queue: Vec<OwnerCompletion> // 持有扩容后的生产通道
-    io_backend: UringBackend | MioBackend  // 本核 io_uring / mio
+    ready_queue: ReadyQueue                 // 有界队列，元素是完整 TaskId
+    owner_ready_queue: Vec<OwnerCompletion> // owner-side I/O completion
+    io_backend: Box<dyn IoProvider>         // 本 shard 的 io_uring 或 mio backend
 }
 ```
 
-`task_queue` 曾经写作 `FxHashMap<TaskId, Task>`。实际实现是固定容量槽表
-（`multicore.rs:395`，容量 65_536，`TaskArena::with_capacity`）。这不是
-性能微调：HashMap 需要每个 task 至少一次堆分配，而且泛型键的哈希/探测在
-热路径上；固定槽表让 `TaskId` 直接就是槽索引，没有分配、没有探测，也不需要
-`rustc-hash`（该依赖已删除）。槽位表同时也支撑 `TaskKey` 的 generation 检查，
-这是拒绝 stale wake 的唯一依据。
+`task_queue` 当前使用 `TaskArena`，不是早期草案中的 `FxHashMap<TaskId, Task>`。
+`TaskKey::slot` 索引固定槽；完整 `TaskId` 还包含 runtime、shard 与 generation，不能直接当
+槽索引。固定槽表避免热路径上的哈希查找和动态表扩容；它不代表 task/future admission
+没有任何分配。槽位 generation 用于拒绝 stale wake；generation 用尽后槽位退役而不回绕。
 
-### 事件循环（单次迭代）
+### io_uring 事件循环（backend-specific；mio 使用 readiness poll/drain）
 
 ```
-1. process_messages()    — 接收跨核消息（新 task / shutdown）
+1. process_messages()    — drain 本 shard 的 bounded inbox（task、ping、shutdown、cancel、metrics、I/O retirement）
 2. poll_io()             — 收割所有可用 CQE
     2a. 先 drain completed_ops （错误/不支持操作的快路径）
     2b. 遍历 CQ，对每个 CQE：
         - multi-shot accept → 压入 accept_results，wake accept task
         - 普通 CQE → 如果 pending_task 存在 → inline poll
-                      否则 → completed_io map + waker.wake()
+                      否则 → completion 写入 `CpuIoState::io_slots` + waker.wake()
     2c. flush() — 提交 inline poll 过程中产生的新 SQE
 3. execute_tasks()       — poll 所有 ready task
 4. flush()               — 一次 io_uring_enter 提交批量 SQE
@@ -182,13 +180,9 @@ TCP send/recv buffer 大小在 listener 创建时设置一次，不在 accepted 
 
 ### 跨核协作
 
-只做两件事：
-- `spawn_on_core(core_id, task)` — 跨核扔一个 task 过来
-- `shutdown()` — 所有核广播 shutdown 信号
+跨 shard 路径不是只有任务派发和 shutdown。当前实现用有界 `CoreMessage` inbox 处理 task admission、ping、shutdown、task cancellation、metrics snapshot 和 owner-side I/O token retirement；远端 waker 通过 shard 的有界 ready queue 和 worker notification 唤醒 owner。所有已接收任务仍留在其 owner shard：没有 work-stealing，也没有透明的任务迁移。
 
-不做 work-stealing，不做任务迁移。
-
-新连接的分发：用 `SO_REUSEPORT` 让内核负载均衡。不在运行时层做。
+新连接分发不是运行时自动完成的。应用可在每个 worker 上创建 `SO_REUSEPORT` listener，让内核在这些 listener 间分发连接；`examples/http_echo.rs` 展示了该用法。
 
 ### 任务亲和性与背压
 
@@ -196,7 +190,7 @@ TCP send/recv buffer 大小在 listener 创建时设置一次，不在 accepted 
 
 | API | 用途 | 失败/背压语义 |
 |-----|------|---------------|
-| `spawn()` | 控制面或无亲和性要求的任务，round-robin 选择 shard | bounded inbox 满时立即返回错误 |
+| `spawn()` | 控制面或无亲和性要求的任务，按已发布的 ready/inbox 深度选择 shard，以 round-robin 打破平局 | bounded inbox 满时立即返回错误 |
 | `spawn_on(core)` | 显式指定 shard，适合 dispatcher 或测试 | bounded inbox 满时立即返回错误 |
 | `spawn_local()` | worker 内创建同连接/同 shard 子任务 | 直接进入 thread-local 本地 spawn 队列；必须在 worker 线程调用，否则返回错误 |
 | `spawn_wait()` / `spawn_on_wait()` | 控制面需要等待 bounded inbox 容量时使用 | timer backoff 重试，直到入队或 timeout |
@@ -320,22 +314,28 @@ Task 通过 `CpuIoState::pending_tasks` 的 `IoToken → TaskId` 映射找到。
 多 I/O/请求的真实 workload。但在当前 HTTP keep-alive echo 基准里，主要瓶颈仍是
 event loop/syscall/TCP batch，不能用这个高风险改动替代更直接的 I/O 路径优化。
 
-### 支持的 I/O 操作
+### I/O operation 与 public API 边界
 
-| Op | io_uring opcode | multi-shot | 备注 |
-|----|-----------------|-----------|------|
-| Accept | `ACCEPT_MULTI` | ✓ | 一个 SQE 管所有新连接 |
-| Read | `READ` | — | 普通 buffer，有 memcpy |
-| ReadRent | `READ` | — | zero-copy，buffer 所有权转移 |
-| Write | `WRITE` | — | 用户数据拷贝进内部 buffer |
-| WriteRent | `WRITE` | — | zero-copy |
-| Connect | `CONNECT` | — | 异步 TCP 连接 |
-| Close | `CLOSE` | — | 异步关闭 fd |
-| Fsync | `FSYNC` | — | 落盘 |
-| RecvMsg | `RECVMSG` | — | UDP recv |
-| SendMsg | `SENDMSG` | — | UDP send |
-| Readv | `READV` | — | vectored read |
-| Writev | `WRITEV` | — | vectored write |
+下表对应 `src/io/mod.rs` 当前的 `Op` enum；各 backend 的支持范围不同，unsupported 操作会返回错误。
+
+| `Op` variant | 作用 |
+|---------------|------|
+| `Accept` | 接收 TCP 连接；backend 支持时可用 multi-shot accept |
+| `Read` / `ReadRent` | 普通读，或转移 owned buffer 的读 |
+| `WriteStatic` / `WriteRent` | 写入静态字节，或转移 owned buffer 的写 |
+| `Connect` / `Close` | 建连或关闭描述符 |
+| `ReadFile` / `WriteFile` | 带显式 offset 的文件读写 |
+| `Fsync` / `Fdatasync` | 文件数据与元数据刷盘，或仅刷读回所需数据/元数据 |
+| `UdpRecv` / `UdpSend` | UDP datagram 收发 |
+| `UdpRecvVectored` / `UdpSendVectored` | UDP vectored 收发 |
+| `ReadVectored` | owned buffer 的 vectored read |
+| `PollAdd` | readiness backend 的 interest registration，也用于明确的 readiness 等待 |
+| `Nop` | io_uring no-op benchmark 操作 |
+
+这不是所有 TCP 方法的列表：`poll_read`、`poll_read_vectored`、`poll_write` 和
+`poll_write_vectored` 在 readiness backend 上直接执行借用缓冲区的系统调用，遇到
+`WouldBlock` 后通过 `PollAdd` 等待；当前 `Op` enum 没有旧版的 `Write` 或
+`WriteVectored` 操作。
 
 ### Read Buffer 策略
 
@@ -377,17 +377,19 @@ poll_read(user_buf):
 （直试系统调用，排队 op 永不会比调用方的缓冲活得久）；
 `write_all_static` 借的是 `&'static [u8]`，这正是它可以入队的原因。
 HTTP 响应的「写头再写体」是响应细节而非流能力，由 `src/http.rs` 的
-`send_response` 自己完成（`writev(2)` 一次写完）。
+`send_response` 交给 `write_all_slices`；常见短响应可由一次 `writev(2)` 完成，部分写入时会继续重试。
 
 ---
 
 ## Waker 设计
 
-**方案 B：thread-local queue，无 Arc，无 Mutex。**
+**当前实现：Arc-backed owner-aware waker state + shard 的有界 ready queue。**
 
-当前 waker 使用有界的 owner-aware 状态和 ready queue；不得按旧的裸指针
-或 `Rc` 模型推导生命周期。跨线程 wake 只允许通过显式的 bounded queue 和
-owner shard 通知进入，任务身份必须经过完整 `TaskKey` 校验。
+`WakerState` 用原子状态合并重复唤醒并拒绝已关闭 task 的迟到 wake；ready queue
+容量有界，队列满时 owner shard 通过 sticky overflow 标记重试，不改为无界排队。
+跨线程 wake 只把完整 `TaskId` 放入其 owner shard 的队列并通知 owner；`TaskArena`
+校验 runtime、shard、slot 和 generation，避免陈旧 ID 命中新 task。不要按早期
+thread-local queue、裸指针或 `Rc` 草案推导当前生命周期。
 
 **I/O future 生命周期：**
 
@@ -419,7 +421,7 @@ sequenceDiagram
             Task->>SQ: owner task may submit a new SQE
             poll_io->>poll_io: flush() at event-loop boundary
         else 没有 pending_task
-            poll_io->>poll_io: state.insert_completed(token, result)
+            poll_io->>poll_io: store completion in CpuIoState::io_slots
             poll_io->>poll_io: take stored waker and wake owner task
             Note over poll_io: stale/discarded tokens are ignored safely
             execute_tasks 后续会 poll 这个 task
@@ -443,27 +445,27 @@ event loop polls it; no cross-thread task migration is implied by a wake.
 
 ## Task 系统
 
-### Task 结构体
+### Task 结构体与身份
 
-```rust
-pub struct Task {
-    id: TaskId,
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    waker: Option<Waker>,    // 缓存的 Waker，首次 poll 时创建，后续复用
-}
-```
+`Task` 在 owner shard 的 arena 中保存一个可本地 poll 的 Future；本地 `spawn_local()`
+可以存放 `!Send` Future，跨 shard 的 `spawn()`/`spawn_on()` 则要求 Future 在传递时为
+`Send`。Task 缓存 owner-aware `Waker`，其状态使用有界 ready queue 和显式的跨线程通知。
 
-- Task 持有缓存的 owner-aware Waker。跨线程 wake 只能入 bounded ready queue，
-  由 owner shard 校验完整 TaskKey 后执行。
-- Task 的 re-schedule 通过 `ready_queue.push(task_id)` 触发
-- JoinHandle 的 completion 通过 `Arc<parking_lot::Mutex<JoinState<T>>>` 通信（这是唯一需要轻量锁的地方，因为 JoinHandle 可能被跨 task await）
+`JoinHandle<T>` 与 task 共用 shard-local 的 `Rc<JoinState<T>>`、`Rc<Cell<bool>>` 和任务
+waker，因此它是 `!Send`/`!Sync`；不得用早期草案中的 `Arc<Mutex<JoinState<T>>>` 描述它。
 
-### TaskId 编码
+`TaskKey` 由四个 `u16` 字段组成，`TaskId` 将其打包为 64 位值：
 
 ```
-bit 63..32 = cpu_id
-bit 31..0  = 本核自增序号
+bits 63..48 = runtime_generation
+bits 47..32 = shard
+bits 31..16 = slot
+bits 15..0  = slot generation
 ```
+
+每个 shard 的 `TaskArena` 最多有 65,536 个 slot。slot generation 到达 `u16::MAX` 后永久
+退役而不回绕，以避免迟到的 wake/cancel 重新命中新 occupant；runtime generation 用尽时也
+fail closed。
 
 ---
 
@@ -512,49 +514,16 @@ Rustls/Tokio trait 生态，并在 miniss 的 `AsyncTcpStream` 之上完成客�
 
 ## 代码结构
 
-```
-src/
-├── lib.rs              # 入口，pub re-export
-├── executor.rs         # 单线程 Executor + Runtime（测试用，主力是 multicore）
-├── multicore.rs        # MultiCoreRuntime，CpuCore 事件循环
-├── cpu.rs              # CpuIoState，线程本地上下文（raw pointer 访问）
-├── task.rs             # Task 结构体，JoinHandle，JoinTaskFuture
-├── waker.rs            # MinissWaker，TaskId，VTable
-├── buffer.rs           # Buffer 类型，线程本地回收池
-├── arena.rs            # bumpalo arena（feature-gated）
-├── io/
-│   ├── mod.rs          # IoProvider trait，Op enum，IoToken，CompletionKind
-│   ├── uring.rs        # UringBackend，Slab<PendingOp>，BufRing，process_cqe
-│   ├── future.rs       # IoFuture — 等待 I/O 完成的 Future
-├── net.rs              # AsyncTcpListener/Stream，AsyncUdpSocket
-├── fs.rs               # AsyncFile（io_uring 文件读写）
-├── http.rs             # HTTP Request/Response 解析（简单实现，不依赖 Hyper）
-├── tls.rs              # 基于 tokio-rustls compat 的 TLS 客户端流
-├── timer/              # TimerWheel，sleep，timeout，Interval
-├── signal.rs           # 信号处理
-├── compat.rs           # futures-io ↔ tokio-io compat re-export
-├── config.rs           # 常量配置
-├── cancellation.rs     # 取消令牌
-└── error.rs (在 lib.rs 中) # 错误类型
-```
+当前 crate 的主要边界如下（以 `src/` 为准；`tls` 受 feature 控制）：
 
-### 模块间依赖关系
+- `multicore.rs` 驱动 worker/shard 生命周期；`cpu.rs` 提供 owner-thread 上下文。
+- `task.rs`、`waker.rs` 和 `timer/` 实现 shard-local task、owner-aware wake 与计时器。
+- `io/mod.rs` 定义 `IoProvider`、`Op` 和 completion contract；`io/uring.rs` 是 Linux io_uring backend，`io/mio_poll.rs` 是 Linux epoll/macOS kqueue 共用的 mio backend。
+- `net.rs` 与 `fs.rs` 提供网络和文件 API；mio 文件操作由 backend 的有界线程池执行，不在 runtime worker 上阻塞。
+- `http.rs` 是轻量 HTTP/1.1 实现：请求头按文本解析并验证 method/header token 与控制字符；body 保留任意字节、上限为 8 MiB，且必须与 `Content-Length` 完全一致（未声明时为空）；响应按实际 body 长度生成 `Content-Length`，并过滤不安全的状态行/响应头。`hyper_rt.rs`、`compat.rs`、`quic.rs`、可选 `tls.rs` 提供生态适配。
+- `buffer.rs`、`config.rs`、`metrics.rs`、`signal.rs` 和 `cancellation.rs` 分别承载缓冲区、配置、指标、信号与取消支持；`error` 类型定义在 `lib.rs` 中。
 
-```
-┌────────────────────────────────────────┐
-│  lib.rs  (re-export, public API)        │
-│    ↓                                     │
-│  ┌─────────────────────────────────────┐│
-│  │  multicore.rs  (事件循环,调度器)      ││
-│  │    ↓                     ↑           ││
-│  │  cpu.rs ←→ io/uring.rs  │           ││
-│  │  task.rs ←→ waker.rs    │           ││
-│  │  net.rs → io/future.rs  │           ││
-│  │  fs.rs  → io/future.rs  │           ││
-│  │  timer/  → waker.rs     │           ││
-│  └─────────────────────────────────────┘│
-└────────────────────────────────────────┘
-```
+这份列表描述稳定的职责边界，不把已删除的 `arena.rs` 或已过期的模块依赖图当作当前结构。
 
 ---
 
@@ -662,14 +631,13 @@ neon 是 ntex 框架的内部运行时，它基于 compio 的架构思路但更�
 **第一层：运行时基础能力微 benchmark**
 
 ```
-IORING_OP_NOP 吞吐：每秒处理多少个 no-op 操作
-  → 反映 SQE 填充、批量提交、CQE 收割的纯开销
-  → 正常值：千万级 ops/s
-  → 如果很低，ring 管理本身有问题，不需要往上测
+IORING_OP_NOP 吞吐：记录每秒完成的 no-op 操作
+  → 反映 SQE 填充、批量提交、CQE 收割的综合成本
+  → 与同一主机、内核、CPU 拓扑和 toolchain 下的基线交错比较；不设通用“正常值”
 
-Task spawn + wakeup roundtrip：spawn 一个 task 立刻 wake 另一个
-  → 反映 executor + Waker 实现效率
-  → Monoio/compio 大约几百纳秒
+Task spawn + wakeup roundtrip：spawn 一个 task 后唤醒另一个
+  → 记录多轮分布和尾延迟，隔离 executor/Waker 成本
+  → 不把其他 runtime 或其他机器的单个数字当作本项目性能门槛
 ```
 
 **第二层：I/O 原语 benchmark**
@@ -751,20 +719,19 @@ perf report
 编译矩阵、一次全 feature 普通回归、差分模型、Loom 和 bounded stress；Linux/Miri gate 按主机能力加入，
 不可用时必须显式输出 `SKIP`。
 
-### 关于 fsync 的基准测试
+### 如何基准测试 fsync 与 fdatasync
 
-fsync 越严格越慢，但它测的是运行时能否**有效地批量 fsync**。
-io_uring 的优势在于可以把多个写操作和一个 fsync 用 `IOSQE_IO_LINK` 串成链，
-内核按序执行——"写 → 写 → fsync"链只触发一次磁盘同步。如果运行时没有利用
-链式提交，每个 fsync 都是独立 syscall 和磁盘写屏障，性能就和 `fdatasync()` 一样差。
+分别记录 backend、文件系统、文件大小、主机和 workload；不能把一种 backend 的 group commit
+机制当成另一种 backend 的行为，也不能从 `join!` 推导 I/O 顺序或持久性。
 
-Apache Iggy 的 benchmark 里 fsync 模式显示 thread-per-core + io_uring 相比 Tokio
-有 +18% 的吞吐提升，原因正是这里——Tokio 的 blocking thread pool 处理 fsync 时
-无法做链式批量。
+当前实现的行为边界是：
 
-所以 fsync benchmark 的意义：
-- **不开 fsync**：测吞吐上限（纯带宽/IOPS）
-- **开 fsync**：测运行时是否正确利用 io_uring 的顺序链（链路提交能力）
+- io_uring 为每个 `Op::Fsync` / `Op::Fdatasync` 提交独立 operation；当前代码没有
+  `IOSQE_IO_LINK` 写入—刷盘链，也没有批量刷盘保证。
+- mio backend 在同一 shard 的 event-loop boundary 按 `(st_dev, st_ino)` 合并等待中的
+  flush 请求，并由 bounded file thread pool 执行；这是 readiness backend 的 group-commit
+  行为，不是 io_uring 的行为。
 
-如果 fsync 场景下比 Monoio 还慢，说明链式操作没有做好，
-或 fsync 提交路径退化成了同步阻塞。
+benchmark 应分别测量普通写、`fsync` 和 `fdatasync`，并为每种 backend 记录实际 syscall/完成
+数量与吞吐/延迟。若未来引入 io_uring linked operations，应先增加顺序与取消生命周期测试，再
+用同机基线验证；在此之前不把 `IOSQE_IO_LINK` 或其他 runtime 的性能数字写成当前能力。

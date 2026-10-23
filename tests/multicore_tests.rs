@@ -39,7 +39,7 @@ mod tests {
 fn test_timer_schedule_across_cpus() {
     let _test_lock = runtime_test_lock();
     init_tracing();
-    let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
+    let runtime = MultiCoreRuntime::new(None).unwrap();
     let cpus_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -258,7 +258,7 @@ fn test_runtime_metrics_snapshot_reports_each_core() {
 fn test_multicore_cross_cpu_communication() {
     let _test_lock = runtime_test_lock();
     init_tracing();
-    let runtime = MultiCoreRuntime::new(Some(4)).unwrap();
+    let runtime = MultiCoreRuntime::new(None).unwrap();
 
     let (tx, rx) = mpsc::channel();
     for _ in 0..4 {
@@ -287,7 +287,7 @@ fn test_multicore_cross_cpu_communication() {
 fn test_multicore_round_robin_distribution() {
     let _test_lock = runtime_test_lock();
     init_tracing();
-    let runtime = MultiCoreRuntime::new(Some(3)).unwrap();
+    let runtime = MultiCoreRuntime::new(None).unwrap();
     let task_counter = Arc::new(AtomicU32::new(0));
 
     let (tx, rx) = mpsc::channel();
@@ -364,7 +364,7 @@ fn test_multicore_zero_cpus_error() {
 fn test_multicore_concurrent_spawning() {
     let _test_lock = runtime_test_lock();
     init_tracing();
-    let runtime = Arc::new(MultiCoreRuntime::new(Some(4)).unwrap());
+    let runtime = Arc::new(MultiCoreRuntime::new(None).unwrap());
     let counter = Arc::new(AtomicU32::new(0));
     let mut handles = Vec::new();
 
@@ -476,7 +476,7 @@ fn test_multicore_task_isolation() {
 fn test_multicore_graceful_shutdown() {
     let _test_lock = runtime_test_lock();
     init_tracing();
-    let runtime = MultiCoreRuntime::new(Some(3)).unwrap();
+    let runtime = MultiCoreRuntime::new(None).unwrap();
     let running_tasks = Arc::new(AtomicU32::new(0));
 
     let (tx, rx) = mpsc::channel();
@@ -559,6 +559,10 @@ struct RuntimeGuard(Arc<rust_miniss::multicore::MultiCoreRuntime>);
 impl RuntimeGuard {
     fn new(cores: usize) -> Self {
         Self(rust_miniss::multicore::MultiCoreRuntime::new(Some(cores)).expect("create runtime"))
+    }
+
+    fn new_available() -> Self {
+        Self(rust_miniss::multicore::MultiCoreRuntime::new(None).expect("create available runtime"))
     }
 
     fn runtime(&self) -> &rust_miniss::multicore::MultiCoreRuntime {
@@ -676,8 +680,14 @@ fn spawn_on_ignores_the_ready_hint_and_pins_exactly() {
     let _test_lock = runtime_test_lock();
     init_tracing();
     const PER_SHARD: usize = 16;
-    let guard = RuntimeGuard::new(4);
+    let guard = RuntimeGuard::new_available();
     let runtime = guard.runtime();
+    let shard_count = runtime
+        .metrics_snapshot(Duration::from_secs(1))
+        .expect("read available shard count")
+        .cores
+        .len();
+    assert!(shard_count >= 2, "spawn_on pinning requires two shards");
     let release = Arc::new(AtomicBool::new(false));
 
     // Pin an identical self-re-arming load to shards 0 and 1, so the hint
@@ -691,14 +701,14 @@ fn spawn_on_ignores_the_ready_hint_and_pins_exactly() {
         }
     }
 
-    let mut counts = [0_usize; 4];
-    for core_id in 0..4 {
+    let mut counts = vec![0_usize; shard_count];
+    for core_id in 0..shard_count {
         let task_id = runtime
             .spawn_on(core_id, async {})
             .expect("pinned spawn admitted");
         counts[task_id.cpu_id()] += 1;
     }
-    assert_eq!(counts, [1, 1, 1, 1]);
+    assert_eq!(counts, vec![1; shard_count]);
 
     release.store(true, Ordering::Release);
 }
