@@ -12,19 +12,19 @@
 //!
 //! - **Linux with kernel 6.12+**: Uses `io_uring` for optimal performance
 //! - **Linux (older kernels)**: Uses the `mio` readiness backend (`epoll` underneath)
-//! - **macOS**: Uses the *same* `mio` readiness backend (`kqueue` underneath).
-//!   `mio` normalizes readiness notification but not operation state-machine
-//!   semantics, so macOS shares one code path with no independent kqueue tests.
-//!   Known macOS gaps: `IoProvider::park` is a no-op (workers busy-spin) and
-//!   `Op::ReadRent`/`WriteRent` are unsupported. File flushes (`Op::Fsync`,
-//!   `Op::Fdatasync`) and file reads and writes all run on the backend's bounded
-//!   thread pool, never on the runtime thread; flushes requested by tasks in the
-//!   same shard round are group-committed per inode (see `crate::io::mio_poll`).
-//!   Other Unix targets are not supported or tested by this project.
+//! - **macOS**: Uses the same `mio` readiness backend (`kqueue` underneath).
+//!   `mio` normalizes readiness notification, but each target still needs its
+//!   own correctness validation. `MioBackend::park` blocks through
+//!   `mio::Poll::poll` on both epoll and kqueue. Mio also implements the
+//!   `Op::ReadRent`/`Op::WriteRent` owned-buffer paths. File flushes (`Op::Fsync`,
+//!   `Op::Fdatasync`) and file reads and writes run on the backend's bounded
+//!   thread pool, never on the runtime thread; flushes
+//!   requested by tasks in the same shard round are group-committed per inode
+//!   (see `crate::io::mio_poll`). Other Unix targets are not supported or tested.
 //!
-//! This selection is handled by the build script (`build.rs`) which detects the
-//! target platform and kernel version, and sets the appropriate `io_backend`
-//! configuration flag.
+//! This selection is handled by `build.rs` at compile time. Its Linux `uname`
+//! probe reads the build machine's kernel and assumes build and runtime machines
+//! match; cross-compiling callers should set `MINISS_IO_BACKEND` for the target.
 
 use std::cell::Cell;
 use std::io;

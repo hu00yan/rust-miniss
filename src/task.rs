@@ -471,22 +471,17 @@ impl<T> JoinHandle<T> {
     /// Must be called from the shard that owns the task; `JoinHandle` is
     /// `!Send`, so this is enforced by the type system.
     ///
-    /// Returns `Ok(())` if the cancellation was processed successfully,
-    /// or an error if the task cannot be cancelled (e.g., runtime shutdown).
+    /// Returns `Ok(())` after recording a cancellation request. This does not
+    /// wait for the owner shard to poll the task; await the handle to observe
+    /// its terminal `TaskError::Cancelled` result. An already completed task is
+    /// left unchanged.
     pub fn cancel(&self) -> crate::error::Result<()> {
-        // In the new thread-per-core design, task cancellation is simplified
-        // Since we don't track which CPU the task is on, we just mark it as cancelled
-        tracing::warn!(
-            "Task cancellation not fully implemented in thread-per-core runtime: {:?}",
-            self.task_id
-        );
-
         if !self.state.completed.get() {
             self.cancel_requested.set(true);
             if let Some(waker) = self.task_waker.take() {
                 waker.wake();
             }
-            tracing::info!("Task {:?} cancellation requested", self.task_id);
+            tracing::debug!("Task {:?} cancellation requested", self.task_id);
         }
 
         Ok(())

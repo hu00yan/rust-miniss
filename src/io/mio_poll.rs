@@ -157,6 +157,33 @@ fn write_file_at(file: &std::fs::File, offset: u64, data: Buffer) -> io::Result<
     })
 }
 
+#[cfg(target_os = "macos")]
+const SOCKET_WRITE_FLAGS: libc::c_int = 0;
+#[cfg(not(target_os = "macos"))]
+const SOCKET_WRITE_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+
+/// Write to a socket without letting a disconnected peer terminate the process.
+///
+/// Linux uses `MSG_NOSIGNAL`; macOS uses `SO_NOSIGPIPE` configured on stream
+/// sockets by the net layer. `send` reports `ENOTSOCK` for non-socket fds such
+/// as pipes, which retain their ordinary `write` behavior.
+///
+/// # Safety
+/// `fd` must be a live descriptor, and `buffer` must point to `len` initialized
+/// readable bytes that remain valid until the syscall returns.
+unsafe fn write_no_sigpipe(fd: RawFd, buffer: *const libc::c_void, len: usize) -> libc::ssize_t {
+    // SAFETY: the caller provides a live descriptor and initialized bytes valid
+    // for `len`; `send` does not retain the pointer beyond the call.
+    let written = unsafe { libc::send(fd, buffer, len, SOCKET_WRITE_FLAGS) };
+    if written == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) {
+        // SAFETY: same caller-provided descriptor and byte range; non-socket
+        // descriptors must preserve the existing write semantics.
+        unsafe { libc::write(fd, buffer, len) }
+    } else {
+        written
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct BlockingTestGate {
@@ -233,6 +260,8 @@ pub struct MioBackend {
     fail_udp_send_registration: std::cell::Cell<bool>,
     #[cfg(test)]
     fail_udp_recv_registration: std::cell::Cell<bool>,
+    #[cfg(test)]
+    fail_next_reregister: std::cell::Cell<bool>,
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -281,6 +310,8 @@ impl MioBackend {
             fail_udp_send_registration: std::cell::Cell::new(false),
             #[cfg(test)]
             fail_udp_recv_registration: std::cell::Cell::new(false),
+            #[cfg(test)]
+            fail_next_reregister: std::cell::Cell::new(false),
             _local: std::marker::PhantomData,
         })
     }
@@ -308,6 +339,21 @@ impl MioBackend {
         tables.descriptor_lease_tokens[slot] = None;
         tables.udp_recv_buffers[slot] = None;
         tables.free_slots.push(slot);
+    }
+
+    fn register_after_would_block(
+        &self,
+        poll: &mut Poll,
+        fd: RawFd,
+        token: Token,
+        interest: Interest,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_reregister.replace(false) {
+            return Err(io::Error::other("injected re-registration failure"));
+        }
+        let mut source = SourceFd(&fd);
+        poll.registry().register(&mut source, token, interest)
     }
 
     #[cfg(test)]
@@ -1106,32 +1152,34 @@ impl IoProvider for MioBackend {
                         // Requeue while `buffer` is still owned; only the
                         // non-requeue path is allowed to consume it.
                         if requeue {
-                            let mut source = SourceFd(&effective_fd);
-                            if let Err(reg_err) =
-                                poll.registry()
-                                    .register(&mut source, mio_token, Interest::READABLE)
-                            {
-                                eprintln!(
-                                    "Failed to re-register fd for rent read after WouldBlock: {reg_err}"
-                                );
+                            match self.register_after_would_block(
+                                poll,
+                                effective_fd,
+                                mio_token,
+                                Interest::READABLE,
+                            ) {
+                                Ok(()) => {
+                                    pending_ops[slot] =
+                                        Some((io_token, Op::ReadRent { fd, buffer }));
+                                    continue;
+                                }
+                                Err(error) => Err(IoError::Io(error)),
                             }
-                            pending_ops[slot] = Some((io_token, Op::ReadRent { fd, buffer }));
-                            continue;
-                        }
-
-                        match bytes {
-                            Ok(bytes_read) => match publish_read_len(&mut buffer, bytes_read) {
-                                Ok(()) => Ok(CompletionKind::ReadRent { buffer }),
+                        } else {
+                            match bytes {
+                                Ok(bytes_read) => match publish_read_len(&mut buffer, bytes_read) {
+                                    Ok(()) => Ok(CompletionKind::ReadRent { buffer }),
+                                    Err(error) => Err(error),
+                                },
                                 Err(error) => Err(error),
-                            },
-                            Err(error) => Err(error),
+                            }
                         }
                     }
                     Op::Read { fd, offset, len } => {
                         let effective_fd = leased_fd.unwrap_or(fd);
                         let mut buffer = Buffer::with_capacity(len);
                         let mut requeue = false;
-                        let result = loop {
+                        let mut result = loop {
                             // SAFETY: buffer has at least `len` capacity and
                             // libc::read writes at most that many bytes.
                             let ret = unsafe {
@@ -1165,23 +1213,25 @@ impl IoProvider for MioBackend {
                         };
 
                         if requeue {
-                            let mut source = SourceFd(&effective_fd);
-                            if let Err(reg_err) =
-                                poll.registry()
-                                    .register(&mut source, mio_token, Interest::READABLE)
-                            {
-                                eprintln!(
-                                    "Failed to re-register fd for read after WouldBlock: {reg_err}"
-                                );
+                            match self.register_after_would_block(
+                                poll,
+                                effective_fd,
+                                mio_token,
+                                Interest::READABLE,
+                            ) {
+                                Ok(()) => {
+                                    // Reconstruct from the arm's own fields. The old
+                                    // `op.clone()` deep-copied `Buffer` (payload copy)
+                                    // to re-arm a read that had not produced a byte yet.
+                                    // `Op::Read` carries only a length, so re-arming it
+                                    // is free. The old `op.clone()` still walked the
+                                    // `Buffer` clone path for the other variants.
+                                    pending_ops[slot] =
+                                        Some((io_token, Op::Read { fd, offset, len }));
+                                    continue;
+                                }
+                                Err(error) => result = Err(IoError::Io(error)),
                             }
-                            // Reconstruct from the arm's own fields. The old
-                            // `op.clone()` deep-copied `Buffer` (payload copy)
-                            // to re-arm a read that had not produced a byte yet.
-                            // `Op::Read` carries only a length, so re-arming it
-                            // is free. The old `op.clone()` still walked the
-                            // `Buffer` clone path for the other variants.
-                            pending_ops[slot] = Some((io_token, Op::Read { fd, offset, len }));
-                            continue;
                         }
 
                         result
@@ -1193,6 +1243,7 @@ impl IoProvider for MioBackend {
                         let effective_fd = leased_fd.unwrap_or(fd);
                         let mut written = 0usize;
                         let mut requeue = false;
+                        let mut write_error = None;
                         // The loop reports progress instead of building the
                         // completion, so `data` stays owned until after the
                         // requeue decision.
@@ -1201,10 +1252,11 @@ impl IoProvider for MioBackend {
                             if remaining.is_empty() {
                                 break;
                             }
-                            // SAFETY: remaining points to initialized bytes owned
-                            // by `data`; write reads at most len bytes.
+                            // SAFETY: `remaining` is initialized and live for the
+                            // call; the accepted descriptor lease keeps `effective_fd`
+                            // valid. Socket writes suppress SIGPIPE in the syscall.
                             let ret = unsafe {
-                                libc::write(
+                                write_no_sigpipe(
                                     effective_fd,
                                     remaining.as_ptr() as *const libc::c_void,
                                     remaining.len(),
@@ -1219,6 +1271,9 @@ impl IoProvider for MioBackend {
                                     requeue = true;
                                     break;
                                 }
+                                if written == 0 {
+                                    write_error = Some(err);
+                                }
                                 // A partial write followed by an error is a
                                 // successful partial write, not a failure of the
                                 // whole operation.
@@ -1231,39 +1286,44 @@ impl IoProvider for MioBackend {
                         }
 
                         if requeue {
-                            let mut source = SourceFd(&effective_fd);
-                            if let Err(reg_err) =
-                                poll.registry()
-                                    .register(&mut source, mio_token, Interest::WRITABLE)
-                            {
-                                eprintln!(
-                                    "Failed to re-register fd for rent write after WouldBlock: {reg_err}"
-                                );
+                            match self.register_after_would_block(
+                                poll,
+                                effective_fd,
+                                mio_token,
+                                Interest::WRITABLE,
+                            ) {
+                                Ok(()) => {
+                                    pending_ops[slot] =
+                                        Some((io_token, Op::WriteRent { fd, data }));
+                                    continue;
+                                }
+                                Err(error) => Err(IoError::Io(error)),
                             }
-                            pending_ops[slot] = Some((io_token, Op::WriteRent { fd, data }));
-                            continue;
+                        } else if let Some(error) = write_error {
+                            Err(IoError::Io(error))
+                        } else {
+                            Ok(CompletionKind::WriteRent {
+                                bytes_written: written,
+                                data,
+                            })
                         }
-
-                        Ok(CompletionKind::WriteRent {
-                            bytes_written: written,
-                            data,
-                        })
                     }
                     Op::WriteStatic { fd, data } => {
                         let effective_fd = leased_fd.unwrap_or(fd);
                         let mut written = 0usize;
                         let mut requeue = false;
-                        let result = loop {
+                        let mut result = loop {
                             let remaining = &data[written..];
                             if remaining.is_empty() {
                                 break Ok(CompletionKind::Write {
                                     bytes_written: written,
                                 });
                             }
-                            // SAFETY: remaining points to static initialized
-                            // bytes; write reads at most len bytes.
+                            // SAFETY: `remaining` is initialized and live for the
+                            // call; the accepted descriptor lease keeps `effective_fd`
+                            // valid. Socket writes suppress SIGPIPE in the syscall.
                             let ret = unsafe {
-                                libc::write(
+                                write_no_sigpipe(
                                     effective_fd,
                                     remaining.as_ptr() as *const libc::c_void,
                                     remaining.len(),
@@ -1302,17 +1362,19 @@ impl IoProvider for MioBackend {
                         };
 
                         if requeue {
-                            let mut source = SourceFd(&effective_fd);
-                            if let Err(reg_err) =
-                                poll.registry()
-                                    .register(&mut source, mio_token, Interest::WRITABLE)
-                            {
-                                eprintln!(
-                                    "Failed to re-register fd for static write after WouldBlock: {reg_err}"
-                                );
+                            match self.register_after_would_block(
+                                poll,
+                                effective_fd,
+                                mio_token,
+                                Interest::WRITABLE,
+                            ) {
+                                Ok(()) => {
+                                    pending_ops[slot] =
+                                        Some((io_token, Op::WriteStatic { fd, data }));
+                                    continue;
+                                }
+                                Err(error) => result = Err(IoError::Io(error)),
                             }
-                            pending_ops[slot] = Some((io_token, Op::WriteStatic { fd, data }));
-                            continue;
                         }
 
                         result
@@ -1361,26 +1423,26 @@ impl IoProvider for MioBackend {
                                     }
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    let mut mio_source = SourceFd(&effective_fd);
-                                    if let Err(reg_err) = poll.registry().register(
-                                        &mut mio_source,
+                                    match self.register_after_would_block(
+                                        poll,
+                                        effective_fd,
                                         mio_token,
                                         mio::Interest::READABLE,
                                     ) {
-                                        eprintln!(
-                                            "Failed to re-register UDP socket with mio: {reg_err}"
-                                        );
+                                        Ok(()) => {
+                                            udp_recv_buffers[slot] = Some(buffer);
+                                            pending_ops[slot] = Some((
+                                                io_token,
+                                                Op::UdpRecv {
+                                                    fd,
+                                                    buffer: Buffer::empty(),
+                                                },
+                                            ));
+                                            retry = true;
+                                            Err(IoError::Io(e))
+                                        }
+                                        Err(reg_error) => Err(IoError::Io(reg_error)),
                                     }
-                                    udp_recv_buffers[slot] = Some(buffer);
-                                    pending_ops[slot] = Some((
-                                        io_token,
-                                        Op::UdpRecv {
-                                            fd,
-                                            buffer: Buffer::empty(),
-                                        },
-                                    ));
-                                    retry = true;
-                                    Err(IoError::Io(e))
                                 }
                                 Err(e) => Err(IoError::Io(e)),
                             };
@@ -1447,7 +1509,7 @@ impl IoProvider for MioBackend {
                             })
                             .collect();
                         let mut requeue = false;
-                        let result = loop {
+                        let mut result = loop {
                             // SAFETY: iovecs point to writable capacity in
                             // dest_buffers and remain valid for this call.
                             let ret = unsafe {
@@ -1495,20 +1557,22 @@ impl IoProvider for MioBackend {
                         };
 
                         if requeue {
-                            let mut source = SourceFd(&effective_fd);
-                            if let Err(reg_err) =
-                                poll.registry()
-                                    .register(&mut source, mio_token, Interest::READABLE)
-                            {
-                                eprintln!(
-                                    "Failed to re-register fd for readv after WouldBlock: {reg_err}"
-                                );
+                            match self.register_after_would_block(
+                                poll,
+                                effective_fd,
+                                mio_token,
+                                Interest::READABLE,
+                            ) {
+                                Ok(()) => {
+                                    // Reconstruct from the op's own fields. `Buffer::clone`
+                                    // copies bytes, so cloning to re-arm a read that had
+                                    // produced nothing duplicated the payload for nothing.
+                                    pending_ops[slot] =
+                                        Some((io_token, Op::ReadVectored { fd, buffers }));
+                                    continue;
+                                }
+                                Err(error) => result = Err(IoError::Io(error)),
                             }
-                            // Reconstruct from the op's own fields. `Buffer::clone`
-                            // copies bytes, so cloning to re-arm a read that had
-                            // produced nothing duplicated the payload for nothing.
-                            pending_ops[slot] = Some((io_token, Op::ReadVectored { fd, buffers }));
-                            continue;
                         }
 
                         result
@@ -2241,6 +2305,8 @@ mod mio_regression_tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::fs::FileExt;
     use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
     use std::sync::{Arc, Barrier};
     use std::task::Poll;
     use std::time::{Duration, Instant};
@@ -2576,6 +2642,150 @@ mod mio_regression_tests {
         assert_eq!(slot_snapshot(&backend).pending_len, 1);
         // SAFETY: only the write descriptor remains owned by this test.
         unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn reregister_failure_completes_with_error_and_recycles_state() {
+        let backend = MioBackend::new().expect("mio backend");
+        let mut fds = [0; 2];
+        // SAFETY: fds is a valid pair of slots for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors are live; fcntl only updates the read-end flags.
+        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        // SAFETY: `fds[0]` is still the live pipe read end and `flags` came from
+        // its successful F_GETFL query above.
+        assert_eq!(
+            unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        let token = backend
+            .submit(Op::Read {
+                fd: fds[0],
+                offset: 0,
+                len: 1,
+            })
+            .expect("submit nonblocking read");
+        // Make the registered descriptor readable, and harvest its event.
+        // SAFETY: fds[1] is writable and the source byte is valid for this call.
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+        assert!(backend.park(Duration::from_millis(100)) > 0);
+        // Consume the byte after harvesting readiness so the backend's read
+        // deterministically returns WouldBlock when drain processes the event.
+        let mut byte = 0u8;
+        // SAFETY: byte is writable and fds[0] names the pipe read end.
+        assert_eq!(
+            unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) },
+            1
+        );
+        // SAFETY: this test is the sole backend owner and sets this one-shot
+        // fault before drain.
+        backend.fail_next_reregister.set(true);
+
+        let completions = match backend.drain_completions() {
+            Poll::Ready(completions) => completions,
+            Poll::Pending => panic!("failed re-registration stranded the pending read"),
+        };
+        assert_eq!(completions.len(), 1);
+        let (completed_token, result) = completions.into_iter().next().unwrap();
+        assert_eq!(completed_token, token);
+        assert!(matches!(
+            result,
+            Err(crate::io::IoError::Io(error))
+                if error.kind() == std::io::ErrorKind::Other
+                    && error.to_string() == "injected re-registration failure"
+        ));
+        assert_eq!(backend.pending_operation_count(), 0);
+        let failed = slot_snapshot(&backend);
+        assert!(failed.pending_empty);
+        assert!(failed.descriptor_leases_empty);
+        assert!(failed.descriptor_lease_tokens_empty);
+        assert!(failed.udp_recv_buffers_empty);
+        assert_eq!(failed.free_slots.as_slice(), &[0]);
+
+        // SAFETY: both descriptors belong to this test.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn disconnected_socket_write_returns_error_without_sigpipe() {
+        const CHILD: &str = "MINISS_MIO_SIGPIPE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Rust normally ignores SIGPIPE; restore the OS default in this
+            // isolated process so the regression detects an unprotected write.
+            // SAFETY: signal disposition is process-global and this branch only
+            // runs in the dedicated child process spawned by the test below.
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            let (writer, peer) = UnixStream::pair().expect("create socket pair");
+            drop(peer);
+            #[cfg(target_os = "macos")]
+            {
+                let enabled: libc::c_int = 1;
+                // SAFETY: `writer` is a live stream socket and `enabled` is a
+                // valid SO_NOSIGPIPE option value for this call.
+                let result = unsafe {
+                    libc::setsockopt(
+                        writer.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_NOSIGPIPE,
+                        (&enabled as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&enabled) as libc::socklen_t,
+                    )
+                };
+                assert_eq!(result, 0, "set SO_NOSIGPIPE");
+            }
+            let backend = MioBackend::new().expect("mio backend");
+            let token = backend
+                .submit(Op::WriteStatic {
+                    fd: writer.as_raw_fd(),
+                    data: b"payload",
+                })
+                .expect("submit write to disconnected socket");
+            let completions = drain_one(&backend);
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].0, token);
+            assert!(matches!(
+                &completions[0].1,
+                Err(crate::io::IoError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+            ));
+
+            let rent_token = backend
+                .submit(Op::WriteRent {
+                    fd: writer.as_raw_fd(),
+                    data: Buffer::from_slice(b"payload"),
+                })
+                .expect("submit rent write to disconnected socket");
+            let rent_completions = drain_one(&backend);
+            assert_eq!(rent_completions.len(), 1);
+            assert_eq!(rent_completions[0].0, rent_token);
+            assert!(matches!(
+                &rent_completions[0].1,
+                Err(crate::io::IoError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+            ));
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("resolve test executable"))
+            .arg("--exact")
+            .arg(concat!(
+                "io::mio_poll::mio_regression_tests::",
+                "disconnected_socket_write_returns_error_without_sigpipe"
+            ))
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("run SIGPIPE isolation child");
+        assert!(
+            output.status.success(),
+            "child should return I/O error instead of SIGPIPE; status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

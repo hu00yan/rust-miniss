@@ -11,8 +11,7 @@ are not silently mixed into the implementation batch.
    owner markers in this batch.
 3. `ReadyQueue` names a cross-thread bounded notifier, not the shard-local ready
    owner. Rename/split this API in a later compatibility-aware change.
-4. Task generations are `u16` and wrap. Define exhaustion/retirement semantics
-   before claiming stale keys are harmless for an unbounded runtime lifetime.
+4. Resolved: task-slot generations remain `u16`, but `TaskArena::reserve()` now permanently retires a slot at `u16::MAX`, and external admissions reject wrapped/lower generations. `waker::tests::task_arena_retires_slots_after_generation_exhaustion_without_wrapping` exercises the exhaustion boundary; the runtime-generation allocator already fails closed when its own key space is exhausted.
 5. io_uring terminal cleanup is duplicated across completion paths. Consolidate
    it later; recent follow-up fixes show that single-close handling can drift.
 6. Resolved in this batch: the old `bench-smoke` ran twice, parsed arbitrary
@@ -20,9 +19,7 @@ are not silently mixed into the implementation batch.
    requires matching host/workload metadata, and compares throughput plus p99.
    A fresh same-host Linux baseline still has to be measured before the gate can
    make a performance claim.
-7. Runtime termination does not expose one mechanically asserted resource-zero
-   snapshot. Add owner-local counters/reporting before treating shutdown drain
-   as fully verified.
+7. Resolved: `RuntimeTerminationSnapshot` reports owner-local task, ready, timer, message, completion, submission, operation, and descriptor counts after worker exit. `multicore::tests::termination_snapshot_is_zero_after_join` and loaded-shutdown regressions assert the snapshot is all-zero; this is post-join evidence, not a live quiescence oracle.
 8. Two legacy cancellation integration files raced immediately completing
    tasks and expected fire-and-forget success for nonexistent ids. They were
    removed: owner acknowledgement is already covered deterministically by

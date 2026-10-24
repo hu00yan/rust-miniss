@@ -7,8 +7,8 @@
 rust-miniss 是一个最小化的异步运行时，展示了高性能服务器设计原理：
 
 - **线程每核架构**：每个 CPU 核心独立运行自己的事件循环
-- **无锁通信**：通过 SPSC 队列进行跨 CPU 消息传递
-- **I/O 后端**：Linux 需要 6.12+ 内核并使用 io-uring；macOS 使用 kqueue 正确性路径。
+- **有界跨核心通信**：新任务、取消、指标采样和 I/O 资源回收通过显式有界消息或唤醒路径处理；已接收任务不会被偷取或迁移。
+- **I/O 后端**：Linux 6.12+ 默认使用 io_uring；较旧内核或探测失败时回退到 mio/epoll；macOS 通过 mio 使用 kqueue。
 - **futures::io 兼容性**：实现 `AsyncRead`/`AsyncWrite` traits 以支持生态系统集成
 - **Panic 隔离**：任务 panic 不会影响其他任务
 
@@ -104,30 +104,31 @@ fn main() {
 │ │kqueue)  │ │ │kqueue)  │ │ │kqueue)  │ │                     │
 │ └─────────┘ │ └─────────┘ │ └─────────┘ │                     │
 └─────────────┴─────────────┴─────────────┴─────────────────────┘
-     SPSC 队列          SPSC 队列
+     有界跨核心消息      有界跨核心消息
 ```
 
 ## 构建
 
 ```bash
-# 在 Linux 上使用 io-uring 支持（推荐性能最佳）
+# Linux 6.12+ 默认选择 io_uring；旧内核或探测失败时使用 epoll 回退
 cargo build --all-features
 
-# 在 macOS 上（通过 mio 使用 kqueue）
-cargo build
+# 在现代 Linux 上显式检查 epoll 兼容路径（正确性验证，不是性能目标）
+MINISS_IO_BACKEND=epoll cargo check --all-targets --all-features
 
-# Linux 需要 6.12+ 内核；当前不会在 Linux 上自动回退到 epoll
+# 在 macOS 上通过 mio 使用 kqueue
 cargo build --all-features
 ```
 
 ## I/O 后端选择
 
-运行时根据平台和内核版本自动选择最佳 I/O 后端：
+`build.rs` 在编译时依据目标平台和可探测的内核版本选择后端，不是运行时探测。Linux 也可用 `MINISS_IO_BACKEND` 显式覆盖；选择结果必须适用于目标操作系统。`uname` 读取的是构建机内核，交叉编译时请显式指定目标可用的后端。
 
-| 平台 | 后端 | 备注 |
+| 平台 / 条件 | 后端 | 用途 |
 |------|------|------|
-| Linux（内核 6.12+） | io-uring | 性能路径 |
-| macOS | kqueue | 通过 mio |
+| Linux（内核 6.12+ 且探测成功） | io_uring | 性能路径 |
+| Linux（低于 6.12 或探测失败） | mio / epoll | 兼容与正确性路径 |
+| macOS | mio / kqueue | 正确性与开发路径 |
 
 ## 示例
 
@@ -162,7 +163,7 @@ UDP、多核生命周期和 Loom 取消模型均有自动化回归。TLS 根证�
 QUIC/UDP 压力和长期性能矩阵仍未完成；这些状态以 `TODO.md` 为准。
 
 完整正确性套件入口是 `just test-full`。它会串行运行格式/静态检查、feature 编译
-矩阵、一次全 feature 普通回归、差分模型、Loom 和压力测试；Linux 会额外运行 io_uring safety，检测到 nightly
+矩阵、一次全 feature 普通回归、差分模型、Loom 和压力测试；Linux 内核 6.12+ 且选择 io_uring 时会运行 io_uring safety，旧内核使用 epoll 时该 gate 会明确打印 `SKIP`。检测到 nightly
 和 Miri 时运行 Miri。被当前主机跳过的 gate 会明确打印 `SKIP`。
 
 ## 与 monoio/compio 的当前差距
@@ -175,7 +176,7 @@ QUIC/UDP 压力和长期性能矩阵仍未完成；这些状态以 `TODO.md` 为
 - 公开 API、生态适配、文档、发布版本和生产案例都比成熟运行时少；
 - TLS 当前主要是客户端流，HTTP/2 和 HTTP/3 分别通过 Hyper、Quinn/H3 集成，
   不是完整的协议框架；
-- 明确支持 Linux 和 macOS，Linux 路径要求较新的 io_uring 内核。
+- 明确支持 Linux 和 macOS；较新的 Linux 内核可使用 io_uring 性能路径，旧内核通过 mio/epoll 提供兼容正确性路径。
 
 这些是项目当前的产品边界。`IOSQE_IO_LINK`、provided buffer、multishot receive、
 registered buffer、SQPOLL 等是 runtime 内部的实现手段，不是必须暴露给用户的功能。
