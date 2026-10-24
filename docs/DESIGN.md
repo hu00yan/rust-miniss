@@ -520,7 +520,7 @@ Rustls/Tokio trait 生态，并在 miniss 的 `AsyncTcpStream` 之上完成客�
 - `task.rs`、`waker.rs` 和 `timer/` 实现 shard-local task、owner-aware wake 与计时器。
 - `io/mod.rs` 定义 `IoProvider`、`Op` 和 completion contract；`io/uring.rs` 是 Linux io_uring backend，`io/mio_poll.rs` 是 Linux epoll/macOS kqueue 共用的 mio backend。
 - `net.rs` 与 `fs.rs` 提供网络和文件 API；mio 文件操作由 backend 的有界线程池执行，不在 runtime worker 上阻塞。
-- `http.rs` 是轻量 HTTP/1.1 实现：请求头按文本解析并验证 method/header token 与控制字符；body 保留任意字节、上限为 8 MiB，且必须与 `Content-Length` 完全一致（未声明时为空）；响应按实际 body 长度生成 `Content-Length`，并过滤不安全的状态行/响应头。`hyper_rt.rs`、`compat.rs`、`quic.rs`、可选 `tls.rs` 提供生态适配。
+- `http.rs` 是轻量 HTTP/1.1 实现：请求必须有完整的 `\r\n\r\n` header delimiter，且 header 行只接受 CRLF；按文本解析并验证 method/header token 与控制字符；body 保留任意字节、上限为 8 MiB，且必须与 `Content-Length` 完全一致（未声明时为空）。响应按实际 body 长度生成 `Content-Length`；由于不做 chunk encoding，`Transfer-Encoding` 响应头不予序列化，并过滤不安全的状态行/响应头。`hyper_rt.rs`、`compat.rs`、`quic.rs`、可选 `tls.rs` 提供生态适配。
 - `buffer.rs`、`config.rs`、`metrics.rs`、`signal.rs` 和 `cancellation.rs` 分别承载缓冲区、配置、指标、信号与取消支持；`error` 类型定义在 `lib.rs` 中。
 
 这份列表描述稳定的职责边界，不把已删除的 `arena.rs` 或已过期的模块依赖图当作当前结构。

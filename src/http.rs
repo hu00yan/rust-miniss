@@ -133,7 +133,12 @@ impl Request {
 
     /// Parse HTTP request from bytes. Bodies are limited to 8 MiB.
     pub fn parse(data: &[u8]) -> io::Result<Self> {
-        let header_end = find_header_end(data).unwrap_or(data.len());
+        let header_end = find_header_end(data).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete HTTP headers: missing CRLF delimiter",
+            )
+        })?;
         if header_end > MAX_HTTP_HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -495,6 +500,7 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 }
 
 fn content_length(headers: &[u8]) -> io::Result<usize> {
+    validate_crlf_line_endings(headers)?;
     let text = str::from_utf8(headers)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP headers"))?;
     let mut parsed = None;
@@ -548,8 +554,25 @@ fn is_valid_header_value(value: &str) -> bool {
 
 fn is_valid_response_header(name: &str, value: &str) -> bool {
     !name.eq_ignore_ascii_case("content-length")
+        // This serializer does not apply chunk framing, so never emit a
+        // Transfer-Encoding header that conflicts with its generated length.
+        && !name.eq_ignore_ascii_case("transfer-encoding")
         && is_valid_header_name(name)
         && is_valid_header_value(value)
+}
+
+fn validate_crlf_line_endings(headers: &[u8]) -> io::Result<()> {
+    for (index, byte) in headers.iter().copied().enumerate() {
+        let valid_lf = byte != b'\n' || index > 0 && headers[index - 1] == b'\r';
+        let valid_cr = byte != b'\r' || headers.get(index + 1) == Some(&b'\n');
+        if !valid_lf || !valid_cr {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP headers must use CRLF line endings",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_valid_header_name(name: &str) -> bool {
@@ -650,6 +673,18 @@ mod tests {
         assert_eq!(request.headers.get("host"), Some(&"localhost".to_string()));
         assert_eq!(request.headers.get("x-trace"), Some(&"42".to_string()));
         assert_eq!(request.body, b"body");
+    }
+
+    #[test]
+    fn request_parser_rejects_missing_header_delimiter() {
+        let error = Request::parse(b"GET / HTTP/1.1").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn request_parser_rejects_bare_lf_header_lines() {
+        let error = Request::parse(b"GET / HTTP/1.1\nHost: localhost\r\n\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -845,6 +880,31 @@ mod tests {
             1
         );
         assert!(bytes.ends_with(b"\r\n\r\nabc"));
+    }
+
+    #[test]
+    fn response_serializer_rejects_transfer_encoding_without_chunking() {
+        let mut direct_header = Response::new(StatusCode::OK).with_body("abc");
+        direct_header
+            .headers
+            .insert("transfer-encoding".to_owned(), "chunked".to_owned());
+        let responses = [
+            Response::new(StatusCode::OK)
+                .with_header("Transfer-Encoding", "chunked")
+                .with_body("abc"),
+            direct_header,
+        ];
+
+        for response in responses {
+            let bytes = response.to_bytes();
+            assert!(!bytes
+                .windows(b"transfer-encoding".len())
+                .any(|part| part.eq_ignore_ascii_case(b"transfer-encoding")));
+            assert!(bytes
+                .windows(b"content-length: 3\r\n".len())
+                .any(|line| line == b"content-length: 3\r\n"));
+            assert!(bytes.ends_with(b"\r\n\r\nabc"));
+        }
     }
 
     #[test]

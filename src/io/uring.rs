@@ -77,6 +77,7 @@ enum PendingOp {
 struct SlotMeta {
     generation: u32,
     token_id: u64,
+    discard_accept_results: bool,
 }
 
 /// The completion type for the io_uring backend.
@@ -100,6 +101,35 @@ fn queue_accept_result(
     } else {
         queue.push_back(result);
     }
+}
+
+// Return false only when cancellation makes this result unobservable; callers
+// then avoid waking a waiter whose successful completion was discarded.
+fn queue_accept_completion(
+    accept_results: &mut AcceptResults,
+    token: IoToken,
+    meta: SlotMeta,
+    result: Result<CompletionKind, IoError>,
+) -> bool {
+    if meta.discard_accept_results {
+        // A late successful CQE owns its descriptor in `result`; dropping it
+        // closes the descriptor without retaining it in the accept queue.
+        drop(result);
+        return false;
+    }
+
+    let queue = accept_results[token.slot_index()]
+        .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
+    queue_accept_result(queue, result);
+    true
+}
+
+const SOCKET_SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+
+fn socket_send_entry(fd: RawFd, data: *const u8, len: usize) -> io_uring::squeue::Entry {
+    opcode::Send::new(types::Fd(fd), data, len as u32)
+        .flags(SOCKET_SEND_FLAGS)
+        .build()
 }
 
 /// Multishot accept was added in Linux 5.19. The opcode probe alone cannot
@@ -425,6 +455,7 @@ impl UringBackend {
                 pending_ops.try_remove(idx);
                 self.release_descriptor_lease(idx);
                 slot_meta[idx].token_id = 0;
+                slot_meta[idx].discard_accept_results = false;
                 continue;
             }
 
@@ -496,13 +527,16 @@ impl UringBackend {
                             addr: None,
                         })
                     };
-                    let token_idx = token.slot_index();
-                    let queue = accept_results[token_idx]
-                        .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
-                    queue_accept_result(queue, completion_result);
-                    if let Some(waker) = io_state.take_waker(token) {
-                        wakeups += 1;
-                        waker.wake();
+                    if queue_accept_completion(
+                        accept_results,
+                        token,
+                        slot_meta[idx],
+                        completion_result,
+                    ) {
+                        if let Some(waker) = io_state.take_waker(token) {
+                            wakeups += 1;
+                            waker.wake();
+                        }
                     }
                     continue;
                 }
@@ -513,6 +547,7 @@ impl UringBackend {
                 self.release_descriptor_lease(idx);
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
+                    meta.discard_accept_results = false;
                 }
                 // Reconstruct the terminal completion from the slot's pending
                 // operation and this CQE's result.
@@ -657,13 +692,10 @@ impl UringBackend {
                     (entry, PendingOp::WriteFile { data })
                 }
                 Op::WriteStatic { fd, data } => {
-                    let entry = opcode::Write::new(
-                        types::Fd(leased_fd(fd)),
-                        data.as_ptr(),
-                        data.len() as u32,
-                    )
-                    .offset(0)
-                    .build();
+                    // `Send` carries MSG_NOSIGNAL, matching the mio socket
+                    // write path and preventing a disconnected peer from
+                    // delivering SIGPIPE to the process.
+                    let entry = socket_send_entry(leased_fd(fd), data.as_ptr(), data.len());
                     (entry, PendingOp::WriteStatic)
                 }
                 Op::Fsync { fd } => {
@@ -922,13 +954,7 @@ impl UringBackend {
                     )
                 }
                 Op::WriteRent { fd, data } => {
-                    let entry = opcode::Write::new(
-                        types::Fd(leased_fd(fd)),
-                        data.as_ptr(),
-                        data.len() as u32,
-                    )
-                    .offset(0)
-                    .build();
+                    let entry = socket_send_entry(leased_fd(fd), data.as_ptr(), data.len());
                     (entry, PendingOp::WriteRent { data })
                 }
                 Op::PollAdd {
@@ -978,6 +1004,7 @@ impl UringBackend {
         }
         let generation = slot_meta[idx].generation.wrapping_add(1).max(1);
         slot_meta[idx].generation = generation;
+        slot_meta[idx].discard_accept_results = false;
         let token = IoToken::next_from(&self.next_token_id);
         slot_meta[idx].token_id = token.id();
         if is_accept {
@@ -1413,7 +1440,17 @@ impl IoProvider for UringBackend {
         else {
             return false;
         };
-        self.discard_accept_results(token);
+        let is_accept = matches!(pending_ops.get(idx), Some(PendingOp::Accept { .. }));
+        if is_accept {
+            // Cancellation means queued and future accept results no longer
+            // have a consumer, even if adding the cancel SQE needs a retry.
+            // SAFETY: slot_meta is shard-local and cancel() runs on its owner.
+            let slot_meta = unsafe { &mut *self.slot_meta.get() };
+            if let Some(meta) = slot_meta.get_mut(idx).filter(|meta| meta.token_id == token.id()) {
+                meta.discard_accept_results = true;
+            }
+            self.discard_accept_results(token);
+        }
         // CQE user_data is the packed slot/generation identity, not the
         // public monotonic IoToken value.
         let target = Self::pack_slot(idx, meta.generation);
@@ -1581,7 +1618,6 @@ impl IoProvider for UringBackend {
                 else {
                     continue;
                 };
-
                 let completion_result = {
                     let res = if result < 0 {
                         Err(IoError::Io(io::Error::from_raw_os_error(-result)))
@@ -1648,17 +1684,20 @@ impl IoProvider for UringBackend {
                     };
                     res
                 };
-                let token_idx = token.slot_index();
-                let queue = accept_results[token_idx]
-                    .get_or_insert_with(|| VecDeque::with_capacity(ACCEPT_QUEUE_CAPACITY));
-                queue_accept_result(queue, completion_result);
-                // SAFETY: token belongs to this shard and the waker slot is
-                // owned by the current io_state.
-                crate::cpu::with_io_state(|io_state| unsafe {
-                    if let Some(waker) = io_state.take_waker(token) {
-                        waker.wake();
-                    }
-                });
+                if queue_accept_completion(
+                    accept_results,
+                    token,
+                    slot_meta[idx],
+                    completion_result,
+                ) {
+                    // SAFETY: token belongs to this shard and the waker slot is
+                    // owned by the current io_state.
+                    crate::cpu::with_io_state(|io_state| unsafe {
+                        if let Some(waker) = io_state.take_waker(token) {
+                            waker.wake();
+                        }
+                    });
+                }
                 continue;
             }
 
@@ -1668,6 +1707,7 @@ impl IoProvider for UringBackend {
                 self.release_descriptor_lease(idx);
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
+                    meta.discard_accept_results = false;
                 }
                 // Reconstruct the terminal completion from the slot's pending
                 // operation and this CQE's result.
@@ -2063,6 +2103,140 @@ mod tests {
             }
         }
         assert_eq!(backend.pending_operation_count(), 0);
+    }
+
+    #[test]
+    fn multishot_accept_cancel_discards_late_success_cqe() {
+        let backend = UringBackend::new(8).expect("io_uring backend must be available");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let token = backend
+            .submit(Op::Accept {
+                fd: listener.as_raw_fd(),
+            })
+            .expect("accept admission");
+        assert!(backend.cancel(token));
+
+        // Simulate the successful CQE's descriptor after cancel() has
+        // discarded any earlier queue but before the target's terminal CQE.
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` is a live two-element array; `pipe` writes both descriptors into it.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let accepted_raw = fds[0];
+        // SAFETY: `fds[0]` is moved into `OwnedFd` exactly once below.
+        let accepted_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: `fds[1]` is unused and owned by this test.
+        unsafe { libc::close(fds[1]) };
+        // SAFETY: slot_meta is shard-local; this test exclusively owns backend.
+        let slot_meta = unsafe { &*backend.slot_meta.get() };
+        let accept_slot = slot_meta
+            .iter()
+            .position(|meta| meta.token_id == token.id())
+            .expect("accept slot");
+        // SAFETY: accept_results is shard-local; this test exclusively owns backend.
+        let accept_results = unsafe { &mut *backend.accept_results.get() };
+        assert!(!queue_accept_completion(
+            accept_results,
+            token,
+            slot_meta[accept_slot],
+            Ok(CompletionKind::Accept {
+                fd: accepted_fd,
+                addr: None,
+            }),
+        ));
+        // SAFETY: read-only check of the queue after the production helper discarded the result.
+        assert!(unsafe { &*backend.accept_results.get() }[token.slot_index()].is_none());
+
+        backend.flush_logged();
+        for _ in 0..8 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+
+        // The late accepted fd must have been dropped and the queued result
+        // must not keep shutdown's pending-operation count nonzero.
+        // SAFETY: F_GETFD only inspects `accepted_raw`; the test owns no other alias.
+        assert_eq!(unsafe { libc::fcntl(accepted_raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(backend.pending_operation_count(), 0);
+    }
+
+    #[test]
+    fn disconnected_socket_writes_return_epipe_without_sigpipe() {
+        const CHILD_MODE: &str = "MINISS_URING_SIGPIPE_CHILD";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            // Rust normally ignores SIGPIPE; restore the OS default in this
+            // child so a missing MSG_NOSIGNAL terminates this process.
+            // SAFETY: this branch executes only in the isolated child test.
+            let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            assert_ne!(previous, libc::SIG_ERR, "restore default SIGPIPE action");
+
+            let mut fds = [-1; 2];
+            // SAFETY: `fds` is a live two-element array for socketpair output.
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
+                },
+                0
+            );
+            // SAFETY: socketpair transferred ownership of the writer fd here.
+            let writer = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: close the peer to make both writes return EPIPE.
+            assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+
+            let backend = UringBackend::new(8).expect("io_uring backend must be available");
+            let static_token = backend
+                .submit(Op::WriteStatic {
+                    fd: writer.as_raw_fd(),
+                    data: b"static payload",
+                })
+                .expect("static write admission");
+            let rent_token = backend
+                .submit(Op::WriteRent {
+                    fd: writer.as_raw_fd(),
+                    data: Buffer::from_slice(b"rented payload"),
+                })
+                .expect("rented write admission");
+            backend.flush_logged();
+
+            let mut completions = Vec::new();
+            for _ in 0..16 {
+                let _ = backend.park(Duration::from_millis(20));
+                if let Poll::Ready(mut ready) = backend.drain_completions() {
+                    completions.append(&mut ready);
+                }
+                if backend.pending_operation_count() == 0 {
+                    break;
+                }
+            }
+            assert_eq!(completions.len(), 2, "both writes must terminate");
+            for (token, result) in completions {
+                assert!(token == static_token || token == rent_token);
+                match result.expect_err("disconnected socket write should fail") {
+                    IoError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::EPIPE)),
+                    other => panic!("unexpected write error: {other:?}"),
+                }
+            }
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("io::uring::tests::disconnected_socket_writes_return_epipe_without_sigpipe")
+            .env(CHILD_MODE, "1")
+            .output()
+            .expect("run SIGPIPE isolation child");
+        assert!(
+            output.status.success(),
+            "io_uring socket writes raised SIGPIPE or failed: status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
