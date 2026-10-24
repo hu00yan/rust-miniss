@@ -74,8 +74,9 @@ impl TaskKey {
 /// Bounded shard-local arena with generational slot allocation.
 ///
 /// A slot is returned to the free list only through `remove`; `reserve` then
-/// advances its generation before handing it out again.  Keys from a prior
-/// occupant therefore fail `get`/`remove` instead of touching the replacement.
+/// advances its generation before handing it out again. Once a slot reaches
+/// `u16::MAX`, it is permanently retired rather than wrapping to a prior key.
+/// Keys from a prior occupant therefore cannot alias a later task.
 pub struct TaskArena<T> {
     runtime_generation: u16,
     shard: u16,
@@ -105,17 +106,24 @@ impl<T> TaskArena<T> {
         }
     }
 
-    /// Reserve a vacant slot. `None` means bounded capacity is exhausted.
+    /// Reserve a vacant slot. `None` means bounded capacity is exhausted or
+    /// every remaining slot has exhausted its generation space.
     pub fn reserve(&mut self) -> Option<TaskKey> {
-        let slot = self.free.pop_front()?;
-        let generation = self.generations[slot as usize].wrapping_add(1).max(1);
-        self.generations[slot as usize] = generation;
-        Some(TaskKey::new(
-            self.runtime_generation,
-            self.shard,
-            slot,
-            generation,
-        ))
+        while let Some(slot) = self.free.pop_front() {
+            let Some(generation) = self.generations[slot as usize].checked_add(1) else {
+                // Reusing this slot would eventually recreate a stale TaskKey.
+                // Keep it out of the free list permanently instead.
+                continue;
+            };
+            self.generations[slot as usize] = generation;
+            return Some(TaskKey::new(
+                self.runtime_generation,
+                self.shard,
+                slot,
+                generation,
+            ));
+        }
+        None
     }
 
     pub fn insert(&mut self, key: TaskKey, value: T) -> bool {
@@ -136,8 +144,8 @@ impl<T> TaskArena<T> {
 
     /// Admit an externally allocated key (for example, a bounded cross-shard
     /// message). The first key initializes a vacant slot; every reuse must
-    /// advance the arena generation, so a delayed old message cannot recreate
-    /// a terminal occupant.
+    /// advance the arena generation without wrapping, so a delayed old message
+    /// cannot recreate a terminal occupant.
     pub fn insert_external(&mut self, key: TaskKey, value: T) -> bool {
         if !self.can_insert_external(key) {
             return false;
@@ -164,8 +172,7 @@ impl<T> TaskArena<T> {
             return false;
         }
         let current_generation = self.generations[slot_index];
-        let generation_delta = key.generation.wrapping_sub(current_generation);
-        current_generation == 0 || (generation_delta != 0 && generation_delta < 0x8000)
+        current_generation == 0 || key.generation > current_generation
     }
 
     pub fn get(&self, key: TaskKey) -> Option<&T> {
@@ -544,6 +551,27 @@ mod tests {
         assert!(arena.insert_external(replacement, 9));
         assert!(!arena.insert_external(skipped, 8));
         assert_eq!(arena.get(replacement), Some(&9));
+    }
+
+    #[test]
+    fn task_arena_retires_slots_after_generation_exhaustion_without_wrapping() {
+        let mut arena = TaskArena::<u8>::with_capacity(4, 3, 2);
+        let exhausted = TaskKey::new(4, 3, 0, u16::MAX);
+        assert!(arena.insert_external(exhausted, 7));
+        assert_eq!(arena.remove(exhausted), Some(7));
+
+        let remaining = arena.reserve().expect("the other slot remains available");
+        assert_eq!(remaining.slot, 1);
+        assert_eq!(
+            arena.reserve(),
+            None,
+            "the exhausted slot must stay retired"
+        );
+
+        let wrapped = TaskKey::new(4, 3, 0, 1);
+        assert!(!arena.can_insert_external(wrapped));
+        assert!(!arena.insert_external(wrapped, 8));
+        assert_eq!(arena.get(exhausted), None);
     }
 
     #[test]

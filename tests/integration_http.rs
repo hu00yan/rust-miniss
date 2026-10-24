@@ -91,6 +91,47 @@ fn test_http_partial_request_eof_is_reported_and_connection_finishes() {
 }
 
 #[test]
+fn test_http_bare_lf_header_is_rejected_while_connection_stays_open() {
+    let runtime = Runtime::new();
+    runtime.block_on(async {
+        let mut listener =
+            AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server_released_tx, server_released_rx) = futures::channel::oneshot::channel();
+
+        let server = async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = HttpConnection::new(stream);
+            let result = rust_miniss::timer::timeout(
+                std::time::Duration::from_secs(1),
+                connection.read_request(),
+            )
+            .await;
+            match result {
+                Ok(Err(error)) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+                Ok(Ok(_)) => panic!("bare-LF request was accepted"),
+                Err(_) => panic!("bare-LF request was not rejected while the socket stayed open"),
+            }
+            server_released_tx
+                .send(())
+                .expect("client is waiting for the server result");
+        };
+        let client = async move {
+            let mut stream = AsyncTcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\nHost: localhost\n")
+                .await
+                .unwrap();
+            // Keep the connection open until read_request returns so this
+            // detects implementations that only reject the malformed head at EOF.
+            let _ = server_released_rx.await;
+        };
+
+        future::join(server, client).await;
+    });
+}
+
+#[test]
 fn test_http_oversized_headers_are_rejected_and_connection_finishes() {
     let runtime = Runtime::new();
     runtime.block_on(async {

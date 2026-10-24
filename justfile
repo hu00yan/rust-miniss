@@ -261,8 +261,9 @@ test-full:
 test-differential:
     cargo test --test runtime_safety_models
 
-# Fast local safety loop. Deliberately excludes Loom, Miri, kernel I/O tests,
-# examples, and benchmarks.
+# Fast local safety loop. It excludes Loom, Miri, the separate long Linux
+# lifetime/stress gates, examples, and benchmarks. `runtime_regressions` still
+# includes bounded I/O tests against the backend selected for this host.
 test-fast:
     cargo fmt --all -- --check
     ./scripts/check_no_ignored_tests.sh

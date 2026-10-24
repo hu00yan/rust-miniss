@@ -443,7 +443,9 @@ fn multicore_spawned_async_file_future_completes() {
 #[test]
 fn multicore_loaded_timer_shutdown_publishes_zero_termination_snapshot() {
     const TASKS: usize = 256;
-    let guard = RuntimeGuard::new(MultiCoreRuntime::new(Some(4)).expect("runtime"));
+    // Use the cpuset-aware default so the same loaded-shutdown invariant runs
+    // on small CI/dev containers without reducing task or cleanup assertions.
+    let guard = RuntimeGuard::new(MultiCoreRuntime::new(None).expect("runtime"));
     let (tx, rx) = std::sync::mpsc::channel();
 
     for task_number in 0..TASKS {

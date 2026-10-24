@@ -1,0 +1,65 @@
+id: architecture-lifecycle-audit
+title: Source-verified runtime lifecycle and protocol contract audit
+status: done
+
+objective: >-
+  Review the current runtime and public protocol APIs against the checked-in
+  architecture contract, tests, history, and design records. Fix reproduced
+  lifecycle/protocol correctness defects and remove factual drift in docs and
+  comments without broad redesign or unrelated cleanup.
+
+baseline:
+  commit: 2d3e6ce
+  branch: reason/rust-miniss-5a59f2a6
+
+architecture_contract:
+  - Keep task execution shard-affine; do not add work-stealing or migration.
+  - Keep mutable data-plane state owner-local; cross-shard communication is bounded and explicit.
+  - Preserve io_uring as the Linux performance path and mio/epoll as correctness compatibility; do not add GitHub CI or performance claims.
+  - Preserve provider-neutral runtime metrics; Prometheus remains an optional adapter/format.
+  - Keep the configured bounded cross-shard inbox capacity identical to the runtime's actual capacity; remove obsolete no-op settings only after confirming there are no call sites.
+  - Do not raise timeouts, skip tests, or weaken assertions to obtain green checks.
+  - Read every edited SAFETY comment in context; no bulk rewriting.
+
+verified_findings:
+  - TaskArena generations wrap from u16::MAX to 1, allowing stale identities to alias after slot reuse.
+  - Current docs/comments contain stale backend, task identity, JoinHandle, I/O-operation, and cross-shard messaging descriptions.
+  - `src/config.rs` exposes unused or inaccurate capacity/timeout constants; the live channel uses a different hard-coded capacity and the task queue is no longer a HashMap.
+  - General multi-core tests now use the cpuset-aware default where the test does not require a fixed shard count. The fixed 4-worker stress matrices remain intact and passed on the 4-physical-core validation machine.
+  - Reproduced and fixed HTTP binary-body/framing/header/version/method-token defects, canceled-accept stale-token reuse, duplicate io_uring connect initiation, SIGPIPE on stream writes, and mio re-registration failure cleanup.
+  - The stress UDP test sent all datagrams before draining and had no completion deadline; it stalled in the stress run. It now drains concurrently with bounded deadlines while retaining packet-count and payload assertions.
+
+acceptance:
+  - Add a deterministic regression for generation exhaustion and fix by retiring exhausted slots without identity reuse.
+  - Reproduce and fix confirmed TCP accept-cancellation and HTTP framing/parsing/security issues; retain public API compatibility where practical, including strict request framing and safe response serialization.
+  - Update only source-verified design and platform descriptions; retain dated benchmark/review evidence.
+  - Keep the exposed bounded-inbox capacity wired to the actual runtime value; remove unreferenced timeout/task-map/utilization constants whose documented behavior no longer exists.
+  - Keep general multi-core correctness tests runnable on small cpusets without skipping them, reducing task counts, or weakening cleanup assertions; retain fixed-worker stress matrices and report when host capacity cannot exercise them.
+  - Keep UDP stress completion bounded and verify all original datagram count/content assertions.
+  - Run focused tests and the complete available local checks; report environment-blocked checks explicitly.
+  - Run architecture/unsafe/docs checks available in this checkout and review the final diff.
+
+validation_limits:
+  - The exact `cargo fmt --all -- --check` and Clippy gates remain unverified because the stable toolchain lacks rustfmt/clippy; changed Rust files were checked with the available older Debian rustfmt.
+  - Runtime io_uring/Linux safety and macOS/kqueue execution were not available on this kernel/OS; the io_uring all-target compile passed and Linux safety explicitly skipped kernel 6.1.189.
+
+allowed_files:
+  - tasks/architecture-lifecycle-audit.yaml
+  - src/waker.rs
+  - src/task.rs
+  - src/io/mod.rs
+  - src/io/mio_poll.rs
+  - src/multicore.rs
+  - src/config.rs
+  - src/net.rs
+  - tests/runtime_regressions.rs
+  - tests/integration_multicore.rs
+  - tests/multicore_tests.rs
+  - tests/stress_test.rs
+  - src/http.rs
+  - README_CN.md
+  - docs/DESIGN.md
+  - docs/DECISION_LOG.md
+  - docs/review/runtime-safety-findings.md
+  - justfile
+  - scripts/linux_safety.sh

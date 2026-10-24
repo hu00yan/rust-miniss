@@ -1,13 +1,16 @@
-//! Pure Thread-Per-Core Runtime - Seastar/Glommio Inspired
+//! Thread-per-core runtime inspired by Seastar and Glommio.
 //!
-//! Implements shared-nothing architecture where each CPU core runs completely
-//! independently with its own io_uring instance, task queue, and timer wheel.
+//! Each worker owns its task arena, timer wheel, and I/O backend. Tasks remain
+//! on their owner shard after admission; new work can be explicitly dispatched
+//! to a shard, but the runtime does not steal or migrate tasks. Cross-shard
+//! admission, cancellation, metrics requests, I/O retirement, and wakeups use
+//! bounded queues or explicit notifications rather than shared task state.
 //!
 //! ## Core Principles
-//! 1. **Shared Nothing**: Zero shared mutable state between cores
-//! 2. **Message Passing**: All inter-core communication via lock-free queues
-//! 3. **CPU Affinity**: Each core bound to physical CPU for optimal cache locality
-//! 4. **Independent IO**: Each core has its own io_uring/epoll instance
+//! 1. **Shard ownership**: Mutable task, timer, connection, and backend state is owner-local.
+//! 2. **Bounded messaging**: Cross-shard operations have explicit capacity and backpressure.
+//! 3. **CPU affinity**: Worker affinity is applied where the target supports it.
+//! 4. **Per-shard I/O**: Each worker owns an io_uring or mio backend instance.
 
 use crossbeam::utils::CachePadded;
 use crossbeam_queue::ArrayQueue;
@@ -51,11 +54,10 @@ type IoCompletion = (IoToken, std::result::Result<CompletionKind, IoError>);
 // explicitly `!Send` so the API cannot accidentally migrate shard-local
 // state through the cross-core message path.
 type LocalSpawn = (TaskId, Pin<Box<dyn Future<Output = ()>>>);
-const CORE_MESSAGE_QUEUE_CAPACITY: usize = 4096;
 /// Maximum number of outstanding QUIC tokens per shard that can require
 /// cross-thread retirement. Each token reserves one slot before submission,
 /// so every accepted retirement has guaranteed bounded queue capacity.
-const IO_RETIREMENT_QUEUE_CAPACITY: usize = CORE_MESSAGE_QUEUE_CAPACITY;
+const IO_RETIREMENT_QUEUE_CAPACITY: usize = crate::config::CROSS_CPU_CHANNEL_CAPACITY;
 const LOCAL_SPAWN_QUEUE_CAPACITY: usize = 65_536;
 const SPAWN_BACKPRESSURE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -1833,7 +1835,7 @@ impl MultiCoreRuntime {
             let termination_report = Arc::new(std::sync::OnceLock::new());
             let wakeup = Arc::new(CoreWakeup::new()?);
             let retirement = Arc::new(IoRetirementMailbox::new());
-            let (sender, receiver) = bounded(CORE_MESSAGE_QUEUE_CAPACITY);
+            let (sender, receiver) = bounded(crate::config::CROSS_CPU_CHANNEL_CAPACITY);
             let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
             core_senders.push(sender.clone());
             core_shutdowns.push(core_shutdown.clone());
