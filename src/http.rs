@@ -377,7 +377,8 @@ impl HttpConnection {
     /// Read and parse HTTP request from the connection
     pub async fn read_request(&mut self) -> io::Result<Request> {
         loop {
-            if let Some(header_end) = find_header_end(&self.read_buf) {
+            let header_end = find_header_end(&self.read_buf);
+            if let Some(header_end) = header_end {
                 if header_end > MAX_HTTP_HEADER_SIZE {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -396,6 +397,10 @@ impl HttpConnection {
                     self.read_buf.drain(..request_len);
                     return request;
                 }
+            } else {
+                // No complete delimiter yet, but malformed LF/CR line endings
+                // can still be rejected without waiting for more bytes or EOF.
+                validate_crlf_prefix(&self.read_buf)?;
             }
 
             if self.read_buf.len() > MAX_HTTP_HEADER_SIZE {
@@ -562,9 +567,24 @@ fn is_valid_response_header(name: &str, value: &str) -> bool {
 }
 
 fn validate_crlf_line_endings(headers: &[u8]) -> io::Result<()> {
+    validate_crlf_prefix(headers)?;
+    if headers.last() == Some(&b'\r') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP headers must use CRLF line endings",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_crlf_prefix(headers: &[u8]) -> io::Result<()> {
     for (index, byte) in headers.iter().copied().enumerate() {
         let valid_lf = byte != b'\n' || index > 0 && headers[index - 1] == b'\r';
-        let valid_cr = byte != b'\r' || headers.get(index + 1) == Some(&b'\n');
+        // A trailing CR may be the first byte of a CRLF split across reads.
+        let valid_cr = byte != b'\r'
+            || headers
+                .get(index + 1)
+                .map_or(true, |next| *next == b'\n');
         if !valid_lf || !valid_cr {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -684,6 +704,13 @@ mod tests {
     #[test]
     fn request_parser_rejects_bare_lf_header_lines() {
         let error = Request::parse(b"GET / HTTP/1.1\nHost: localhost\r\n\r\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn crlf_prefix_validator_allows_a_split_terminator_but_rejects_bare_cr() {
+        assert!(validate_crlf_prefix(b"GET / HTTP/1.1\r").is_ok());
+        let error = validate_crlf_prefix(b"GET /\rX").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 

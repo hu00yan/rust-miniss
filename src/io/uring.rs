@@ -1429,21 +1429,26 @@ impl IoProvider for UringBackend {
         // SAFETY: `ring` is shard-local; `cancel` runs on the owning runtime thread
         // (see `UringBackend`'s thread-affinity note), so no other borrow is live.
         let ring = unsafe { &mut *self.ring.get() };
-        // SAFETY: `slot_meta` is shard-local and only read here.
-        let slot_meta = unsafe { &*self.slot_meta.get() };
-        // SAFETY: as above — `pending_ops` is shard-local and only read here.
-        let pending_ops = unsafe { &*self.pending_ops.get() };
-        let Some((idx, meta)) = slot_meta
-            .iter()
-            .enumerate()
-            .find(|(idx, meta)| meta.token_id == token.id() && pending_ops.get(*idx).is_some())
-        else {
-            return false;
+        let (idx, generation, is_accept) = {
+            // SAFETY: `slot_meta` is shard-local and only read in this scope.
+            let slot_meta = unsafe { &*self.slot_meta.get() };
+            // SAFETY: as above — `pending_ops` is shard-local and only read here.
+            let pending_ops = unsafe { &*self.pending_ops.get() };
+            let Some((idx, meta)) = slot_meta.iter().enumerate().find(|(idx, meta)| {
+                meta.token_id == token.id() && pending_ops.get(*idx).is_some()
+            }) else {
+                return false;
+            };
+            (
+                idx,
+                meta.generation,
+                matches!(pending_ops.get(idx), Some(PendingOp::Accept { .. })),
+            )
         };
-        let is_accept = matches!(pending_ops.get(idx), Some(PendingOp::Accept { .. }));
         if is_accept {
             // Cancellation means queued and future accept results no longer
             // have a consumer, even if adding the cancel SQE needs a retry.
+            // The shared metadata borrow ended above before this mutable borrow.
             // SAFETY: slot_meta is shard-local and cancel() runs on its owner.
             let slot_meta = unsafe { &mut *self.slot_meta.get() };
             if let Some(meta) = slot_meta.get_mut(idx).filter(|meta| meta.token_id == token.id()) {
@@ -1453,7 +1458,7 @@ impl IoProvider for UringBackend {
         }
         // CQE user_data is the packed slot/generation identity, not the
         // public monotonic IoToken value.
-        let target = Self::pack_slot(idx, meta.generation);
+        let target = Self::pack_slot(idx, generation);
         let entry = opcode::AsyncCancel::new(target)
             .build()
             .user_data(INTERNAL_CANCEL_USER_DATA);
