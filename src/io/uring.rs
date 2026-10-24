@@ -132,6 +132,33 @@ fn socket_send_entry(fd: RawFd, data: *const u8, len: usize) -> io_uring::squeue
         .build()
 }
 
+fn write_entry_no_sigpipe(fd: RawFd, data: *const u8, len: usize) -> io_uring::squeue::Entry {
+    let mut socket_type = 0;
+    let mut option_len = std::mem::size_of_val(&socket_type) as socklen_t;
+    // SAFETY: `fd` is held by the operation's descriptor lease, and both output
+    // pointers refer to live stack values for this immediate metadata query.
+    let socket_query = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut socket_type as *mut libc::c_int).cast(),
+            &mut option_len,
+        )
+    };
+    if socket_query == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK)
+    {
+        // Preserve the public write operations' support for pipes and files.
+        opcode::Write::new(types::Fd(fd), data, len as u32).build()
+    } else {
+        // For sockets, MSG_NOSIGNAL prevents a disconnected peer from raising
+        // SIGPIPE. Other query errors stay on this path so invalid descriptors
+        // are reported asynchronously by the operation itself.
+        socket_send_entry(fd, data, len)
+    }
+}
+
 /// Multishot accept was added in Linux 5.19. The opcode probe alone cannot
 /// report SQE flag support, so gate the flag on the running kernel release and
 /// retain the single-shot fallback for unknown/malformed releases.
@@ -692,10 +719,7 @@ impl UringBackend {
                     (entry, PendingOp::WriteFile { data })
                 }
                 Op::WriteStatic { fd, data } => {
-                    // `Send` carries MSG_NOSIGNAL, matching the mio socket
-                    // write path and preventing a disconnected peer from
-                    // delivering SIGPIPE to the process.
-                    let entry = socket_send_entry(leased_fd(fd), data.as_ptr(), data.len());
+                    let entry = write_entry_no_sigpipe(leased_fd(fd), data.as_ptr(), data.len());
                     (entry, PendingOp::WriteStatic)
                 }
                 Op::Fsync { fd } => {
@@ -954,7 +978,7 @@ impl UringBackend {
                     )
                 }
                 Op::WriteRent { fd, data } => {
-                    let entry = socket_send_entry(leased_fd(fd), data.as_ptr(), data.len());
+                    let entry = write_entry_no_sigpipe(leased_fd(fd), data.as_ptr(), data.len());
                     (entry, PendingOp::WriteRent { data })
                 }
                 Op::PollAdd {
@@ -2169,6 +2193,86 @@ mod tests {
             Some(libc::EBADF)
         );
         assert_eq!(backend.pending_operation_count(), 0);
+    }
+
+    #[test]
+    fn non_socket_static_and_rent_writes_keep_write_semantics() {
+        fn pipe_pair() -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1; 2];
+            // SAFETY: `fds` is a live two-element array for `pipe` output.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: `pipe` transferred ownership of both descriptors to this test.
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        }
+
+        let backend = UringBackend::new(8).expect("io_uring backend must be available");
+        let (static_reader, static_writer) = pipe_pair();
+        let (rent_reader, rent_writer) = pipe_pair();
+        let static_payload = b"static pipe payload";
+        let rent_payload = b"rented pipe payload";
+
+        let static_token = backend
+            .submit(Op::WriteStatic {
+                fd: static_writer.as_raw_fd(),
+                data: static_payload,
+            })
+            .expect("static pipe write admission");
+        let rent_token = backend
+            .submit(Op::WriteRent {
+                fd: rent_writer.as_raw_fd(),
+                data: Buffer::from_slice(rent_payload),
+            })
+            .expect("rented pipe write admission");
+        backend.flush_logged();
+
+        let mut completions = Vec::new();
+        for _ in 0..16 {
+            let _ = backend.park(Duration::from_millis(20));
+            if let Poll::Ready(mut ready) = backend.drain_completions() {
+                completions.append(&mut ready);
+            }
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(completions.len(), 2, "both pipe writes must terminate");
+        for (token, result) in completions {
+            let completion = result.expect("pipe write should succeed");
+            match (token, completion) {
+                (token, CompletionKind::Write { bytes_written }) if token == static_token => {
+                    assert_eq!(bytes_written, static_payload.len());
+                }
+                (
+                    token,
+                    CompletionKind::WriteRent {
+                        bytes_written,
+                        data,
+                    },
+                ) if token == rent_token => {
+                    assert_eq!(bytes_written, rent_payload.len());
+                    assert_eq!(&data[..], rent_payload);
+                }
+                (token, other) => panic!("unexpected write completion for {token:?}: {other:?}"),
+            }
+        }
+
+        for (reader, expected) in [
+            (&static_reader, static_payload.as_slice()),
+            (&rent_reader, rent_payload.as_slice()),
+        ] {
+            let mut actual = vec![0; expected.len()];
+            // SAFETY: `actual` is writable for its full length and the reader
+            // remains open; each corresponding completed write filled this pipe.
+            let read = unsafe {
+                libc::read(
+                    reader.as_raw_fd(),
+                    actual.as_mut_ptr().cast(),
+                    actual.len(),
+                )
+            };
+            assert_eq!(read, expected.len() as libc::ssize_t);
+            assert_eq!(&actual, expected);
+        }
     }
 
     #[test]
