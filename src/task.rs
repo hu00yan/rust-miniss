@@ -265,26 +265,6 @@ impl Task {
         self.id
     }
 
-    /// Poll the task's future
-    #[inline(always)]
-    pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.completed {
-            return Poll::Ready(());
-        }
-        match self.future.as_mut().poll(cx) {
-            Poll::Ready(()) => {
-                self.completed = true;
-                if let Some(state) = &self.wake_state {
-                    state.deactivate();
-                }
-                self.waker = None;
-                self.wake_state = None;
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
     /// Poll the task using its cached waker for the given ready queue.
     #[inline(always)]
     pub fn poll_with_cached_waker(&mut self) -> Poll<()> {
@@ -675,29 +655,6 @@ mod tests {
         executor.run();
 
         assert!(handle.is_finished());
-        assert!(completed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn test_task_polling() {
-        let completed = Arc::new(AtomicBool::new(false));
-        let completed_clone = completed.clone();
-
-        let task_id = TaskId(1);
-        let future = async move {
-            completed_clone.store(true, Ordering::Release);
-        };
-
-        let mut task = Task::new(task_id, future);
-
-        // Poll the task
-        let waker = dummy_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let result = task.poll(&mut cx);
-
-        // Task should complete immediately
-        assert!(matches!(result, Poll::Ready(())));
         assert!(completed.load(Ordering::Acquire));
     }
 

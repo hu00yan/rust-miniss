@@ -395,23 +395,6 @@ impl CpuIoState {
             .is_some()
     }
 
-    /// Stores the task waiting on a pending I/O token.
-    ///
-    /// # Safety
-    ///
-    /// `token` must refer to a live operation owned by this `CpuIoState`, and
-    /// the task id must remain valid until the operation completes or is
-    /// cancelled.
-    #[inline(always)]
-    pub unsafe fn store_pending_task(&self, token: IoToken, task_id: crate::waker::TaskId) {
-        let slots = &mut *self.io_slots.get();
-        // SAFETY: as in `insert_completed` — owning thread, exclusive `slots`, live token.
-        let slot = unsafe { Self::prepare_slot(slots, token) };
-        if slot.pending_task != Some(task_id) {
-            slot.pending_task = Some(task_id);
-        }
-    }
-
     /// Removes and returns the task waiting on a pending I/O token.
     ///
     /// # Safety
@@ -425,43 +408,6 @@ impl CpuIoState {
         unsafe { Self::live_slot(slots, token) }?
             .pending_task
             .take()
-    }
-
-    /// Take the pending task and store the completion result with one slot lookup.
-    ///
-    /// # Safety
-    ///
-    /// Must be called from the owning CPU thread. The token must refer to a
-    /// live slot owned by this `CpuIoState`.
-    #[inline(always)]
-    pub unsafe fn take_pending_task_and_store_completed(
-        &self,
-        token: IoToken,
-        result: Result<CompletionKind, IoError>,
-    ) -> Option<crate::waker::TaskId> {
-        let slots = &mut *self.io_slots.get();
-        // SAFETY: This method is only called by the owning CPU thread.
-        let slot = unsafe { Self::live_slot(slots, token) }?;
-        let task_id = slot.pending_task.take()?;
-        slot.completed = Some(result);
-        Some(task_id)
-    }
-
-    /// Take both the pending task and its waker with one slot lookup.
-    ///
-    /// # Safety
-    ///
-    /// Must be called from the owning CPU thread. The token must refer to a
-    /// live slot owned by this `CpuIoState`.
-    #[inline(always)]
-    pub unsafe fn take_pending_task_and_waker(
-        &self,
-        token: IoToken,
-    ) -> Option<(crate::waker::TaskId, Waker)> {
-        let slots = &mut *self.io_slots.get();
-        // SAFETY: This method is only called by the owning CPU thread.
-        let slot = unsafe { Self::live_slot(slots, token) }?;
-        Some((slot.pending_task.take()?, slot.waker.take()?))
     }
 
     /// Store a completion result and take the current waker in one slot lookup.
