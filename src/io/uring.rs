@@ -132,7 +132,10 @@ fn socket_send_entry(fd: RawFd, data: *const u8, len: usize) -> io_uring::squeue
         .build()
 }
 
-fn write_entry_no_sigpipe(fd: RawFd, data: *const u8, len: usize) -> io_uring::squeue::Entry {
+/// `Some(true)` = socket, `Some(false)` = confirmed non-socket (ENOTSOCK),
+/// `None` = probe failed for another reason and the descriptor error should be
+/// reported asynchronously by the operation itself.
+fn probe_socket_class(fd: RawFd) -> Option<bool> {
     let mut socket_type = 0;
     let mut option_len = std::mem::size_of_val(&socket_type) as socklen_t;
     // SAFETY: `fd` is held by the operation's descriptor lease, and both output
@@ -146,14 +149,45 @@ fn write_entry_no_sigpipe(fd: RawFd, data: *const u8, len: usize) -> io_uring::s
             &mut option_len,
         )
     };
-    if socket_query == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) {
-        // Preserve the public write operations' support for pipes and files.
-        opcode::Write::new(types::Fd(fd), data, len as u32).build()
+    if socket_query >= 0 {
+        Some(true)
+    } else if io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) {
+        Some(false)
     } else {
-        // For sockets, MSG_NOSIGNAL prevents a disconnected peer from raising
-        // SIGPIPE. Other query errors stay on this path so invalid descriptors
-        // are reported asynchronously by the operation itself.
+        None
+    }
+}
+
+/// Build the write SQE for a descriptor, suppressing SIGPIPE for sockets while
+/// preserving `Write` semantics for pipes and files.
+///
+/// Leased descriptors cache the classification on their shared class cell, so
+/// the `getsockopt` probe runs once per registered descriptor instead of once
+/// per queued operation. Unleased submissions probe every time: a raw fd has
+/// no identity that outlives the operation.
+fn write_entry_for_descriptor(
+    lease: Option<&DescriptorLease>,
+    fd: RawFd,
+    data: *const u8,
+    len: usize,
+) -> io_uring::squeue::Entry {
+    let is_socket = match lease {
+        Some(lease) => match lease.socket_class() {
+            Some(class) => class,
+            None => match probe_socket_class(fd) {
+                Some(class) => {
+                    lease.store_socket_class(class);
+                    class
+                }
+                None => true,
+            },
+        },
+        None => probe_socket_class(fd).unwrap_or(true),
+    };
+    if is_socket {
         socket_send_entry(fd, data, len)
+    } else {
+        opcode::Write::new(types::Fd(fd), data, len as u32).build()
     }
 }
 
@@ -717,7 +751,12 @@ impl UringBackend {
                     (entry, PendingOp::WriteFile { data })
                 }
                 Op::WriteStatic { fd, data } => {
-                    let entry = write_entry_no_sigpipe(leased_fd(fd), data.as_ptr(), data.len());
+                    let entry = write_entry_for_descriptor(
+                        descriptor_lease.as_ref(),
+                        leased_fd(fd),
+                        data.as_ptr(),
+                        data.len(),
+                    );
                     (entry, PendingOp::WriteStatic)
                 }
                 Op::Fsync { fd } => {
@@ -976,7 +1015,12 @@ impl UringBackend {
                     )
                 }
                 Op::WriteRent { fd, data } => {
-                    let entry = write_entry_no_sigpipe(leased_fd(fd), data.as_ptr(), data.len());
+                    let entry = write_entry_for_descriptor(
+                        descriptor_lease.as_ref(),
+                        leased_fd(fd),
+                        data.as_ptr(),
+                        data.len(),
+                    );
                     (entry, PendingOp::WriteRent { data })
                 }
                 Op::PollAdd {

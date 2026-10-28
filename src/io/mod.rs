@@ -55,20 +55,46 @@ pub trait AsRawFd {
 /// prevents that reuse from redirecting the in-flight operation.  Lease drop
 /// is the terminal reclamation point; dropping `IoFuture` only abandons result
 /// delivery.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) struct RegisteredDescriptor(Arc<OwnedFd>);
+/// Shared socket-classification cell for one registered descriptor.
+///
+/// `0` = unprobed, `1` = socket, `2` = not a socket. Every lease of a
+/// registered descriptor shares one cell, so the kernel only has to be asked
+/// once per descriptor lifetime. The cell dies with the descriptor's `Arc`,
+/// so a cached class can never outlive the fd it was probed on and cannot
+/// alias a reused descriptor number.
+pub(crate) const DESCRIPTOR_CLASS_UNKNOWN: u8 = 0;
+pub(crate) const DESCRIPTOR_CLASS_SOCKET: u8 = 1;
+pub(crate) const DESCRIPTOR_CLASS_NOT_SOCKET: u8 = 2;
+
+pub(crate) struct RegisteredDescriptor {
+    fd: Arc<OwnedFd>,
+    class: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl std::fmt::Debug for RegisteredDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredDescriptor")
+            .field("fd", &self.fd.as_raw_fd())
+            .finish_non_exhaustive()
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
 #[doc(hidden)]
-pub struct DescriptorLease(Arc<OwnedFd>);
+pub struct DescriptorLease {
+    fd: Arc<OwnedFd>,
+    class: Arc<std::sync::atomic::AtomicU8>,
+}
 
 #[allow(dead_code)]
 impl RegisteredDescriptor {
     /// Transfer an already-owned descriptor into operation-safe ownership.
     pub(crate) fn from_owned(owned: OwnedFd) -> Self {
-        Self(Arc::new(owned))
+        Self {
+            fd: Arc::new(owned),
+            class: Arc::new(std::sync::atomic::AtomicU8::new(DESCRIPTOR_CLASS_UNKNOWN)),
+        }
     }
 
     /// Import one descriptor identity into shard-local ownership.
@@ -81,25 +107,28 @@ impl RegisteredDescriptor {
         }
         // SAFETY: duplicate is newly created and exclusively owned here.
         let owned = unsafe { OwnedFd::from_raw_fd(duplicate) };
-        Ok(Self(Arc::new(owned)))
+        Ok(Self::from_owned(owned))
     }
 
     /// Create one operation-local lease without another descriptor syscall.
     #[inline]
     pub(crate) fn lease(&self) -> DescriptorLease {
-        DescriptorLease(Arc::clone(&self.0))
+        DescriptorLease {
+            fd: Arc::clone(&self.fd),
+            class: Arc::clone(&self.class),
+        }
     }
 
     #[inline]
     pub(crate) fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.fd.as_raw_fd()
     }
 
     /// Transfer the descriptor to a raw-fd caller. If a kernel operation still
     /// owns a lease, return a duplicate and let the original live to terminal
     /// completion; otherwise transfer the original identity without a syscall.
     pub(crate) fn into_raw_fd(self) -> io::Result<RawFd> {
-        match Arc::try_unwrap(self.0) {
+        match Arc::try_unwrap(self.fd) {
             Ok(owned) => Ok(owned.into_raw_fd()),
             Err(shared) => {
                 // SAFETY: dup creates a new descriptor owned by the caller.
@@ -124,12 +153,37 @@ impl DescriptorLease {
     /// Create another operation-local lease without duplicating the descriptor.
     #[inline]
     pub(crate) fn lease(&self) -> Self {
-        Self(Arc::clone(&self.0))
+        Self {
+            fd: Arc::clone(&self.fd),
+            class: Arc::clone(&self.class),
+        }
     }
 
     #[inline]
     pub(crate) fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.fd.as_raw_fd()
+    }
+
+    /// Cached socket classification for this descriptor identity, if probed.
+    /// Only the owner thread probes and stores; relaxed ordering is enough
+    /// because a stale "unprobed" answer merely repeats the probe.
+    pub(crate) fn socket_class(&self) -> Option<bool> {
+        match self.class.load(std::sync::atomic::Ordering::Relaxed) {
+            DESCRIPTOR_CLASS_SOCKET => Some(true),
+            DESCRIPTOR_CLASS_NOT_SOCKET => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Publish a probe result to every lease of this descriptor.
+    pub(crate) fn store_socket_class(&self, is_socket: bool) {
+        let class = if is_socket {
+            DESCRIPTOR_CLASS_SOCKET
+        } else {
+            DESCRIPTOR_CLASS_NOT_SOCKET
+        };
+        self.class
+            .store(class, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -157,6 +211,42 @@ mod descriptor_lease_tests {
         // SAFETY: the lease holds a live duplicated descriptor; `F_GETFD` only queries it.
         assert_ne!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, -1);
         drop(lease);
+        // SAFETY: write_fd is still owned by this test and closed exactly once.
+        unsafe { libc::close(write_fd) };
+    }
+
+    #[test]
+    fn leases_of_one_descriptor_share_the_socket_classification() {
+        let (read_fd, write_fd) = {
+            let mut fds = [0; 2];
+            // SAFETY: fds points to two writable RawFd slots.
+            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            assert_eq!(rc, 0);
+            (fds[0], fds[1])
+        };
+        let registered = RegisteredDescriptor::acquire(read_fd).expect("register read end");
+        // A freshly duplicated descriptor starts unclassified: a raw-fd lease
+        // must not inherit the class recorded for a different descriptor that
+        // once held the same number.
+        let fresh = DescriptorLease::acquire(read_fd).expect("dup read end");
+        // SAFETY: read_fd is still owned by this test and closed exactly once.
+        unsafe { libc::close(read_fd) };
+
+        let first = registered.lease();
+        let second = registered.lease();
+        assert_eq!(first.socket_class(), None);
+        first.store_socket_class(true);
+        assert_eq!(second.socket_class(), Some(true));
+
+        assert_eq!(fresh.socket_class(), None);
+        fresh.store_socket_class(false);
+        assert_eq!(fresh.socket_class(), Some(false));
+        assert_eq!(first.socket_class(), Some(true));
+
+        drop(registered);
+        drop(first);
+        drop(second);
+        drop(fresh);
         // SAFETY: write_fd is still owned by this test and closed exactly once.
         unsafe { libc::close(write_fd) };
     }
