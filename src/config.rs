@@ -11,6 +11,23 @@ use std::time::Duration;
 /// sync with `MultiCoreRuntime` so the documented value matches actual backpressure.
 pub const CROSS_CPU_CHANNEL_CAPACITY: usize = 4096;
 
+/// Default io_uring SQ/CQ ring entry count per shard.
+pub const DEFAULT_URING_ENTRIES: u32 = 4096;
+
+/// io_uring ring size for new backends.
+///
+/// Reads `MINISS_URING_ENTRIES`, clamped to `[64, 32768]`. This exists so
+/// ring-size sweeps can be benchmarked without recompiling — a same-shape
+/// comparison against another runtime must hold ring size equal, and it is
+/// part of the documented confounders of the 2026-07 matrix.
+pub fn uring_entries() -> u32 {
+    std::env::var("MINISS_URING_ENTRIES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.clamp(64, 32768))
+        .unwrap_or(DEFAULT_URING_ENTRIES)
+}
+
 /// Expected number of wakeups per timer expiration cycle
 ///
 /// This optimizes the Vec allocation for expired timer wakers.
@@ -83,4 +100,37 @@ pub fn task_poll_budget() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_TASK_POLL_BUDGET)
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::uring_entries;
+
+    #[test]
+    fn uring_entries_clamps_and_falls_back() {
+        // SAFETY: tests run single-threaded per process env; set_var is safe
+        // here because no other thread reads this variable concurrently.
+        unsafe {
+            std::env::remove_var("MINISS_URING_ENTRIES");
+        }
+        assert_eq!(uring_entries(), super::DEFAULT_URING_ENTRIES);
+
+        for (raw, expected) in [
+            ("1024", 1024),
+            ("63", 64),
+            ("999999", 32768),
+            ("not-a-number", super::DEFAULT_URING_ENTRIES),
+            ("0", 64),
+        ] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var("MINISS_URING_ENTRIES", raw);
+            }
+            assert_eq!(uring_entries(), expected, "raw={raw}");
+        }
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("MINISS_URING_ENTRIES");
+        }
+    }
 }

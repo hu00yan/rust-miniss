@@ -153,6 +153,14 @@ bench-matrix rounds="1" scenarios="":
 bench-topology rounds="1":
     BENCH_MATRIX_ROUNDS="{{rounds}}" ./bench/scripts/bench_http_topology.sh
 
+# Interleaved io_uring flag matrix on Linux (OrbStack VM): pairs each runtime
+# flag against the default with order-swapped rounds plus mechanism counters
+# (io_uring_enter, task-clock, context switches, max RSS). Pairwise verdicts
+# go through bench-verdict with BENCH_BASELINE pointing at the default's
+# summary. Not part of any gate.
+bench-uring-flags rounds="3" flagsets="":
+    BENCH_FLAG_ROUNDS="{{rounds}}" BENCH_FLAGSETS="{{flagsets}}" ./bench/scripts/bench_uring_flags.sh
+
 # Evaluate one or more completed bench_http summaries mechanically. Set
 # BENCH_BASELINE to a same-shape summary.csv to enforce the 5% throughput
 # regression threshold. The command emits adjacent JSON and CSV verdicts and

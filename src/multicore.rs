@@ -2027,7 +2027,7 @@ impl MultiCoreRuntime {
     fn create_io_backend(core_id: usize) -> Result<Box<dyn IoProvider<Completion = IoCompletion>>> {
         #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
         {
-            match crate::io::uring::UringBackend::new(4096) {
+            match crate::io::uring::UringBackend::new(crate::config::uring_entries()) {
                 Ok(uring) => {
                     tracing::debug!("Core {} using io_uring backend", core_id);
                     return Ok(Box::new(uring));

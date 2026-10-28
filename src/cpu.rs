@@ -35,7 +35,7 @@ pub(crate) fn create_default_io_backend() -> Box<IoBackend> {
     #[cfg(all(not(miri), target_os = "linux", io_backend = "io_uring"))]
     {
         Box::new(
-            crate::io::uring::UringBackend::new(4096)
+            crate::io::uring::UringBackend::new(crate::config::uring_entries())
                 .unwrap_or_else(|e| panic!("Failed to create io_uring backend: {e}")),
         )
     }
