@@ -376,8 +376,15 @@ impl HttpConnection {
 
     /// Read and parse HTTP request from the connection
     pub async fn read_request(&mut self) -> io::Result<Request> {
+        // Bytes of `read_buf` already scanned without finding the terminator.
+        // The watermark advances right after each scan that comes up empty: a
+        // terminator can then only start within the last three bytes of what
+        // is currently buffered, so the next scan resumes there instead of
+        // rescanning the whole accumulated buffer (quadratic in body size).
+        let mut scanned = 0usize;
         loop {
-            let header_end = find_header_end(&self.read_buf);
+            let header_end = find_header_end_from(&self.read_buf, scanned);
+            scanned = scanned.max(self.read_buf.len().saturating_sub(3));
             if let Some(header_end) = header_end {
                 if header_end > MAX_HTTP_HEADER_SIZE {
                     return Err(io::Error::new(
@@ -501,7 +508,20 @@ async fn write_all_slices(
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    find_header_end_from(buffer, 0)
+}
+
+/// Search for the `\r\n\r\n` terminator starting at `start`.
+///
+/// `start` may be up to three bytes before the previous scan's end so a
+/// terminator split across two reads is still found; callers pass
+/// `len.saturating_sub(3)` as the resume point.
+fn find_header_end_from(buffer: &[u8], start: usize) -> Option<usize> {
+    let start = start.min(buffer.len());
+    buffer[start..]
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|offset| offset + start)
 }
 
 fn content_length(headers: &[u8]) -> io::Result<usize> {
@@ -581,10 +601,7 @@ fn validate_crlf_prefix(headers: &[u8]) -> io::Result<()> {
     for (index, byte) in headers.iter().copied().enumerate() {
         let valid_lf = byte != b'\n' || index > 0 && headers[index - 1] == b'\r';
         // A trailing CR may be the first byte of a CRLF split across reads.
-        let valid_cr = byte != b'\r'
-            || headers
-                .get(index + 1)
-                .map_or(true, |next| *next == b'\n');
+        let valid_cr = byte != b'\r' || headers.get(index + 1).is_none_or(|next| *next == b'\n');
         if !valid_lf || !valid_cr {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -862,6 +879,62 @@ mod tests {
     fn content_length_parser_rejects_invalid_header_names_before_framing() {
         let error = content_length(b"POST / HTTP/1.1\r\nbad name: 1\r\n\r\n").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn header_end_search_resumes_without_missing_split_terminators() {
+        let head = b"GET / HTTP/1.1\r\nHost: localhost\r";
+        let tail = b"\nX: y\r\n\r\n";
+        let mut buffer = head.to_vec();
+        assert_eq!(find_header_end_from(&buffer, 0), None);
+
+        buffer.extend_from_slice(tail);
+        // The terminator begins inside the three-byte overlap region before
+        // the previous scan's end, so resuming there must still find it.
+        let resume = buffer.len() - tail.len() - 3;
+        let found = find_header_end_from(&buffer, resume).expect("split terminator found");
+        assert_eq!(Some(found), find_header_end(&buffer));
+    }
+
+    #[test]
+    fn header_end_search_ignores_terminators_before_resume() {
+        let buffer = b"GET / HTTP/1.1\r\n\r\nlater stuff";
+        assert_eq!(find_header_end(buffer), Some(14));
+        assert_eq!(find_header_end_from(buffer, 14), Some(14));
+        assert_eq!(find_header_end_from(buffer, 18), None);
+    }
+
+    #[test]
+    fn header_end_search_start_at_or_beyond_length_yields_none() {
+        let buffer = b"GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(find_header_end_from(buffer, buffer.len()), None);
+        assert_eq!(find_header_end_from(buffer, usize::MAX), None);
+    }
+
+    #[test]
+    fn watermark_scan_matches_full_scan_when_chunks_arrive_between_scans() {
+        // Mirrors read_request's order: scan, advance the watermark, then
+        // receive more bytes, with one final rescan after the last read. A
+        // terminator split across receives must still be found exactly once
+        // at its absolute offset.
+        let request = b"POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut scanned = 0usize;
+        let mut found = None;
+        for chunk in request.chunks(7) {
+            found = find_header_end_from(&buffer, scanned);
+            scanned = scanned.max(buffer.len().saturating_sub(3));
+            assert_eq!(found, find_header_end(&buffer));
+            if found.is_some() {
+                break;
+            }
+            buffer.extend_from_slice(chunk);
+        }
+        if found.is_none() {
+            found = find_header_end_from(&buffer, scanned);
+            assert_eq!(found, find_header_end(&buffer));
+        }
+        assert_eq!(found, Some(40));
     }
 
     #[test]

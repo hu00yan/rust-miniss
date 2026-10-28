@@ -146,9 +146,7 @@ fn write_entry_no_sigpipe(fd: RawFd, data: *const u8, len: usize) -> io_uring::s
             &mut option_len,
         )
     };
-    if socket_query == -1
-        && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK)
-    {
+    if socket_query == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) {
         // Preserve the public write operations' support for pipes and files.
         opcode::Write::new(types::Fd(fd), data, len as u32).build()
     } else {
@@ -1453,29 +1451,33 @@ impl IoProvider for UringBackend {
         // SAFETY: `ring` is shard-local; `cancel` runs on the owning runtime thread
         // (see `UringBackend`'s thread-affinity note), so no other borrow is live.
         let ring = unsafe { &mut *self.ring.get() };
-        let (idx, generation, is_accept) = {
-            // SAFETY: `slot_meta` is shard-local and only read in this scope.
-            let slot_meta = unsafe { &*self.slot_meta.get() };
-            // SAFETY: as above — `pending_ops` is shard-local and only read here.
-            let pending_ops = unsafe { &*self.pending_ops.get() };
-            let Some((idx, meta)) = slot_meta.iter().enumerate().find(|(idx, meta)| {
-                meta.token_id == token.id() && pending_ops.get(*idx).is_some()
-            }) else {
-                return false;
+        let (idx, generation, is_accept) =
+            {
+                // SAFETY: `slot_meta` is shard-local and only read in this scope.
+                let slot_meta = unsafe { &*self.slot_meta.get() };
+                // SAFETY: as above — `pending_ops` is shard-local and only read here.
+                let pending_ops = unsafe { &*self.pending_ops.get() };
+                let Some((idx, meta)) = slot_meta.iter().enumerate().find(|(idx, meta)| {
+                    meta.token_id == token.id() && pending_ops.get(*idx).is_some()
+                }) else {
+                    return false;
+                };
+                (
+                    idx,
+                    meta.generation,
+                    matches!(pending_ops.get(idx), Some(PendingOp::Accept { .. })),
+                )
             };
-            (
-                idx,
-                meta.generation,
-                matches!(pending_ops.get(idx), Some(PendingOp::Accept { .. })),
-            )
-        };
         if is_accept {
             // Cancellation means queued and future accept results no longer
             // have a consumer, even if adding the cancel SQE needs a retry.
             // The shared metadata borrow ended above before this mutable borrow.
             // SAFETY: slot_meta is shard-local and cancel() runs on its owner.
             let slot_meta = unsafe { &mut *self.slot_meta.get() };
-            if let Some(meta) = slot_meta.get_mut(idx).filter(|meta| meta.token_id == token.id()) {
+            if let Some(meta) = slot_meta
+                .get_mut(idx)
+                .filter(|meta| meta.token_id == token.id())
+            {
                 meta.discard_accept_results = true;
             }
             self.discard_accept_results(token);
@@ -1713,12 +1715,8 @@ impl IoProvider for UringBackend {
                     };
                     res
                 };
-                if queue_accept_completion(
-                    accept_results,
-                    token,
-                    slot_meta[idx],
-                    completion_result,
-                ) {
+                if queue_accept_completion(accept_results, token, slot_meta[idx], completion_result)
+                {
                     // SAFETY: token belongs to this shard and the waker slot is
                     // owned by the current io_state.
                     crate::cpu::with_io_state(|io_state| unsafe {
@@ -2263,13 +2261,8 @@ mod tests {
             let mut actual = vec![0; expected.len()];
             // SAFETY: `actual` is writable for its full length and the reader
             // remains open; each corresponding completed write filled this pipe.
-            let read = unsafe {
-                libc::read(
-                    reader.as_raw_fd(),
-                    actual.as_mut_ptr().cast(),
-                    actual.len(),
-                )
-            };
+            let read =
+                unsafe { libc::read(reader.as_raw_fd(), actual.as_mut_ptr().cast(), actual.len()) };
             assert_eq!(read, expected.len() as libc::ssize_t);
             assert_eq!(&actual, expected);
         }
@@ -2288,9 +2281,7 @@ mod tests {
             let mut fds = [-1; 2];
             // SAFETY: `fds` is a live two-element array for socketpair output.
             assert_eq!(
-                unsafe {
-                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
-                },
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
                 0
             );
             // SAFETY: socketpair transferred ownership of the writer fd here.
