@@ -42,6 +42,23 @@ use smallvec::SmallVec;
 /// because user-space delivery is smaller than the advertised backlog.
 pub(crate) const ACCEPT_BACKLOG_CAPACITY: usize = 1024;
 
+/// Synthetic termination marker for a multishot receive arm.
+///
+/// The kernel terminates a multishot arm either with a zero result (peer
+/// close — surfaced as an empty `CompletionKind::RecvMultishot` payload) or
+/// with an errno (ring exhausted `-ENOBUFS`, cancellation `-ECANCELED`, or a
+/// socket error — surfaced as `IoError::Io`). The one kernel shape that fits
+/// neither is a final data CQE (positive result, no `IORING_CQE_F_MORE`);
+/// after its data is delivered, the backend queues this marker so the net
+/// layer knows the arm is dead and re-arms on the next read. It never
+/// escapes `AsyncTcpStream::read_rent`.
+pub(crate) const MULTISHOT_ARM_TERMINATED: &str = "miniss multishot recv arm terminated";
+
+/// Provided-buffer-ring group id shared by the io_uring backend and the net
+/// layer (`Op::RecvMultishot`). Declared here — not in the Linux-only
+/// `buf_ring` module — so the net layer can name it on every platform.
+pub(crate) const MULTISHOT_BUF_GROUP: u16 = 1;
+
 /// A trait for I/O resources that can be represented by a raw file descriptor.
 pub trait AsRawFd {
     /// Returns the raw file descriptor of this I/O resource.
@@ -607,6 +624,24 @@ pub trait IoProvider: 'static {
         None
     }
 
+    /// Whether `Op::RecvMultishot` is admitted and long-lived multishot
+    /// receive completions are delivered for this backend. Readiness
+    /// backends never enable it; io_uring enables it only when a provided
+    /// buffer ring was successfully registered at backend creation.
+    fn supports_multishot_recv(&self) -> bool {
+        false
+    }
+
+    /// Pop one queued multishot-receive result for the given arm token,
+    /// releasing the ring buffer that the result held (if any) back to the
+    /// kernel. FIFO order: data CQEs first, the terminal result last.
+    fn pop_multishot_recv_result(
+        &self,
+        _token: IoToken,
+    ) -> Option<Result<CompletionKind, IoError>> {
+        None
+    }
+
     /// Whether Accept operations stay armed after a completion.
     fn supports_multishot_accept(&self) -> bool {
         false
@@ -713,6 +748,23 @@ pub enum Op {
     WriteRent {
         fd: i32,
         data: Buffer,
+    },
+    /// Arm one long-lived multishot receive on `fd`.
+    ///
+    /// Requires the io_uring backend with a provided buffer ring
+    /// (`MINISS_URING_BUF_RING`): the kernel rejects
+    /// `IORING_RECV_MULTISHOT` at prep time unless the SQE carries
+    /// `IOSQE_BUFFER_SELECT`, which is only satisfiable against a registered
+    /// `IORING_REGISTER_PBUF_RING` group (kernel 5.19+). The arm posts one
+    /// data CQE per receive (each carrying a buffer id from the group) and a
+    /// final CQE without `IORING_CQE_F_MORE` on termination (peer close,
+    /// ring exhausted, or error); re-arming is the caller's job.
+    ///
+    /// Readiness backends reject this variant with a clear error instead of
+    /// silently degrading the semantics.
+    RecvMultishot {
+        fd: i32,
+        buf_group: u16,
     },
 }
 
@@ -844,6 +896,22 @@ pub enum CompletionKind {
     },
     /// No-op completion — used for io_uring NOP benchmarking.
     Nop,
+    /// One delivered multishot-receive chunk.
+    ///
+    /// `buffer_id` is the provided-buffer-ring id the kernel picked (upper 16
+    /// bits of the CQE flags). `data` is an owned copy of the delivered bytes:
+    /// the backend copies out of the ring buffer at drain time and recycles
+    /// the ring slot when the completion is consumed, so net-layer code never
+    /// touches ring memory.
+    ///
+    /// An **empty** `data` payload is the terminal end-of-stream marker: the
+    /// kernel posted the final CQE (`IORING_CQE_F_MORE` unset) with a zero
+    /// receive result, i.e. the peer closed. Non-empty payloads are always
+    /// data CQEs; termination for other reasons surfaces as `Err`.
+    RecvMultishot {
+        buffer_id: u16,
+        data: Buffer,
+    },
 }
 
 #[cfg(all(test, unix))]
@@ -907,6 +975,9 @@ pub mod mio_poll;
 
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 pub mod uring;
+
+#[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+pub(crate) mod buf_ring;
 
 pub mod future;
 

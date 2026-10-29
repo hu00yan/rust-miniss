@@ -850,6 +850,28 @@ impl IoProvider for MioBackend {
                         pending_ops[slot] = Some((io_token, op));
                     }
                 }
+                // Multishot receive is a completion-model operation that
+                // needs a provided buffer ring; it cannot be expressed as a
+                // readiness registration. Reject it explicitly so a
+                // mis-routed op fails loudly instead of panicking or
+                // silently degrading semantics.
+                Op::RecvMultishot { .. } => {
+                    self.recycle_slot(
+                        slot,
+                        &mut SlotTables {
+                            pending_ops: &mut *pending_ops,
+                            descriptor_leases: &mut *descriptor_leases,
+                            descriptor_lease_tokens: &mut *descriptor_lease_tokens,
+                            udp_recv_buffers: &mut *udp_recv_buffers,
+                            mio_tokens: &mut *mio_tokens,
+                            active_mio_slots: &mut *active_mio_slots,
+                            free_slots: &mut *free_slots,
+                        },
+                    );
+                    return Err(IoError::Other(
+                        "RecvMultishot requires the io_uring backend".into(),
+                    ));
+                }
                 _ => {
                     registration_error = Some(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -1831,6 +1853,7 @@ impl AsRawFd for Op {
             Op::ReadRent { fd, .. } => fd,
             Op::WriteRent { fd, .. } => fd,
             Op::PollAdd { fd, .. } => fd,
+            Op::RecvMultishot { fd, .. } => fd,
             Op::Nop => panic!("Nop has no file descriptor"),
         }
     }

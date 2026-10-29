@@ -3,7 +3,11 @@
 //! A `io-uring` backend for the I/O subsystem.
 
 use crate::buffer::Buffer;
-use crate::io::{CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op};
+use crate::io::buf_ring::BufRing;
+use crate::io::{
+    CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op, MULTISHOT_ARM_TERMINATED,
+    MULTISHOT_BUF_GROUP,
+};
 use io_uring::{cqueue, opcode, types, IoUring};
 use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
 use slab::Slab;
@@ -71,18 +75,26 @@ enum PendingOp {
     },
     PollAdd,
     Nop,
+    /// A long-lived multishot receive arm (`Op::RecvMultishot`). Carries no
+    /// kernel-visible storage: every CQE selects a provided-ring buffer and
+    /// the shared decoder copies the payload out at drain time. The slot
+    /// stays occupied from arming until the terminal CQE.
+    RecvMultishot,
 }
 
 #[derive(Clone, Copy, Default)]
 struct SlotMeta {
     generation: u32,
     token_id: u64,
-    discard_accept_results: bool,
+    discard_queued_results: bool,
 }
 
 /// The completion type for the io_uring backend.
 pub(super) type Completion = (IoToken, Result<CompletionKind, IoError>);
 type AcceptResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
+/// Per-token FIFO of multishot-receive results (data chunks, then the
+/// terminal marker). Indexed by `IoToken::slot_index` like `AcceptResults`.
+type MultishotResults = Vec<Option<VecDeque<Result<CompletionKind, IoError>>>>;
 const ACCEPT_QUEUE_CAPACITY: usize = crate::io::ACCEPT_BACKLOG_CAPACITY;
 const INTERNAL_CANCEL_USER_DATA: u64 = u64::MAX;
 
@@ -111,7 +123,7 @@ fn queue_accept_completion(
     meta: SlotMeta,
     result: Result<CompletionKind, IoError>,
 ) -> bool {
-    if meta.discard_accept_results {
+    if meta.discard_queued_results {
         // A late successful CQE owns its descriptor in `result`; dropping it
         // closes the descriptor without retaining it in the accept queue.
         drop(result);
@@ -232,9 +244,107 @@ fn kernel_supports_multishot_accept() -> bool {
     major > 5 || (major == 5 && minor >= 19)
 }
 
+/// Multishot receive (`IORING_RECV_MULTISHOT` on `IORING_OP_RECV`) landed in
+/// Linux 6.0, one release after the provided buffer ring it depends on. Same
+/// release-file gate as [`kernel_supports_multishot_accept`].
+fn kernel_supports_multishot_recv() -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .or_else(|_| std::fs::read_to_string("/proc/version"))
+        .ok();
+    let Some(release) = release else {
+        return false;
+    };
+    let mut numbers = release
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok());
+    let Some(major) = numbers.next() else {
+        return false;
+    };
+    let _minor = numbers.next().unwrap_or(0);
+    major >= 6
+}
+
+/// Default number of buffers in the provided buffer ring.
+const DEFAULT_BUF_RING_COUNT: u16 = 256;
+/// Default per-buffer size in the provided buffer ring.
+const DEFAULT_BUF_RING_SIZE: usize = 4096;
+
+/// Explicit feature switches for the io_uring backend.
+///
+/// Both feature flags default to off. `new()` derives them from the
+/// environment (`MINISS_URING_BUF_RING`, `MINISS_URING_BUF_RING_COUNT`,
+/// `MINISS_URING_BUF_RING_SIZE`, `MINISS_URING_MULTISHOT_RECV`); tests and
+/// embedders construct backends directly via
+/// [`UringBackend::new_with_options`] so feature state never leaks through
+/// process-global environment reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UringOptions {
+    /// Register one provided buffer ring (group id 1) per backend at
+    /// creation. Registration failure (e.g. kernel < 5.19) degrades to the
+    /// feature being off with a warning.
+    pub buf_ring: bool,
+    /// Buffers in the provided buffer ring. Must be a non-zero power of two.
+    pub buf_ring_count: u16,
+    /// Bytes per buffer in the provided buffer ring.
+    pub buf_ring_size: usize,
+    /// Serve `AsyncTcpStream::read_rent` from long-lived multishot receive
+    /// arms. Requires `buf_ring`; without it this flag has no effect.
+    pub multishot_recv: bool,
+}
+
+impl Default for UringOptions {
+    fn default() -> Self {
+        Self {
+            buf_ring: false,
+            buf_ring_count: DEFAULT_BUF_RING_COUNT,
+            buf_ring_size: DEFAULT_BUF_RING_SIZE,
+            multishot_recv: false,
+        }
+    }
+}
+
+impl UringOptions {
+    /// Read the opt-in environment switches. The feature flags require the
+    /// literal value `1`; the geometry knobs accept any positive number.
+    fn from_env() -> Self {
+        let mut options = Self {
+            buf_ring: std::env::var("MINISS_URING_BUF_RING")
+                .map(|value| value == "1")
+                .unwrap_or(false),
+            multishot_recv: std::env::var("MINISS_URING_MULTISHOT_RECV")
+                .map(|value| value == "1")
+                .unwrap_or(false),
+            ..Self::default()
+        };
+        if let Ok(count) = std::env::var("MINISS_URING_BUF_RING_COUNT") {
+            if let Ok(count) = count.parse::<u16>() {
+                if count > 0 {
+                    options.buf_ring_count = count;
+                }
+            }
+        }
+        if let Ok(size) = std::env::var("MINISS_URING_BUF_RING_SIZE") {
+            if let Ok(size) = size.parse::<usize>() {
+                if size > 0 {
+                    options.buf_ring_size = size;
+                }
+            }
+        }
+        options
+    }
+}
+
 /// A `io-uring` based `IoProvider`.
 /// Thread-local to ensure single-threaded access.
 pub struct UringBackend {
+    /// Provided buffer ring for multishot receive (group id 1). Declared
+    /// before `ring` so teardown unregisters against a live ring fd.
+    buf_ring: Option<BufRing>,
+    /// Whether long-lived multishot receive arms are admitted and served.
+    /// True only when an option requested it AND a buffer ring registered
+    /// AND the kernel release supports `IORING_RECV_MULTISHOT`.
+    multishot_recv_enabled: bool,
     ring: UnsafeCell<IoUring>,
     pending_ops: UnsafeCell<Slab<PendingOp>>,
     /// Descriptor lease kept alive from acceptance through terminal CQE.
@@ -257,6 +367,10 @@ pub struct UringBackend {
     completed_ops: UnsafeCell<Vec<Completion>>,
     /// Multi-shot accept completions indexed by slab slot.
     accept_results: UnsafeCell<AcceptResults>,
+    /// Multi-shot receive results indexed by token slot. Bounded per arm by
+    /// the buffer-ring count: the kernel cannot post another data CQE for an
+    /// arm until a consumed buffer is republished at the tail.
+    multishot_results: UnsafeCell<MultishotResults>,
     /// Count of SQEs not yet flushed. Zero means flush() can skip the syscall.
     pending_sqes: Cell<usize>,
     /// True when the kernel SQPOLL thread owns submission. In that mode flush()
@@ -314,7 +428,8 @@ impl UringBackend {
             | Op::Connect { fd, .. }
             | Op::PollAdd { fd, .. }
             | Op::ReadRent { fd, .. }
-            | Op::WriteRent { fd, .. } => Some(*fd),
+            | Op::WriteRent { fd, .. }
+            | Op::RecvMultishot { fd, .. } => Some(*fd),
             Op::Nop => None,
         }
     }
@@ -351,7 +466,239 @@ impl UringBackend {
         }
     }
 
+    /// Copy one multishot payload out of the provided buffer ring.
+    ///
+    /// The ring buffer itself is *not* republished here: it stays held by the
+    /// queued completion until the consumer pops it, which is the
+    /// backpressure mechanism that bounds the per-arm queue by the ring
+    /// count (the kernel terminates the arm with `-ENOBUFS` once every
+    /// buffer is held by an undelivered result).
+    fn copy_multishot_payload(&self, buffer_id: u16, len: i32) -> Result<Buffer, IoError> {
+        let Some(buf_ring) = self.buf_ring.as_ref() else {
+            return Err(IoError::Other(
+                "multishot CQE without a registered provided buffer ring".into(),
+            ));
+        };
+        let Some((ptr, capacity)) = buf_ring.buffer_region(buffer_id) else {
+            return Err(IoError::Other(format!(
+                "multishot CQE buffer id {buffer_id} is outside the registered ring"
+            )));
+        };
+        let len = len as usize;
+        if len > capacity {
+            // Trust the CQE result as an upper bound only
+            // (runtime-safety-contracts.md C8): a length past the registered
+            // buffer is a corrupted completion, not a smaller read.
+            return Err(IoError::Other(
+                "multishot CQE length exceeds the registered buffer size".into(),
+            ));
+        }
+        let mut data = Buffer::new_uninitialized(len);
+        // SAFETY: `ptr` is the registered ring region for `buffer_id`, valid
+        // for `capacity` bytes, and `len <= capacity` was checked above; the
+        // kernel reported initializing exactly `len` bytes for this CQE.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), len);
+            data.set_len(len);
+        }
+        Ok(data)
+    }
+
+    /// Return one consumed buffer to the kernel's selection pool.
+    fn republish_multishot_buffer(&self, buffer_id: u16) {
+        if let Some(buf_ring) = self.buf_ring.as_ref() {
+            buf_ring.publish(buffer_id);
+        }
+    }
+
+    /// Queue one multishot result for `token`'s arm.
+    ///
+    /// Bounded by construction: every queued data result holds one ring
+    /// buffer that is only republished at pop, so the kernel cannot push the
+    /// queue past `ring count` data entries plus the terminal marker.
+    fn push_multishot_result(&self, token: IoToken, result: Result<CompletionKind, IoError>) {
+        // SAFETY: `multishot_results` is shard-local; the owning thread is
+        // the only writer (submit reservation + drain + cancel + pop).
+        let results = unsafe { &mut *self.multishot_results.get() };
+        let idx = token.slot_index();
+        if idx >= results.len() {
+            results.resize_with(idx + 1, || None);
+        }
+        results[idx]
+            .get_or_insert_with(VecDeque::new)
+            .push_back(result);
+    }
+
+    /// Drain `token`'s multishot queue, republishing every held ring buffer.
+    ///
+    /// Used when an arm is abandoned (cancellation, stream drop, backend
+    /// teardown): queued data results can no longer reach a reader, so their
+    /// buffers must rejoin the pool instead of shrinking it.
+    fn discard_multishot_queue(&self, token: IoToken) {
+        // SAFETY: shard-local; owner thread only (see `push_multishot_result`).
+        let results = unsafe { &mut *self.multishot_results.get() };
+        let idx = token.slot_index();
+        if idx >= results.len() {
+            return;
+        }
+        if let Some(queue) = results[idx].take() {
+            for result in queue {
+                if let Ok(CompletionKind::RecvMultishot { buffer_id, data }) = result {
+                    if !data.is_empty() {
+                        self.republish_multishot_buffer(buffer_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shared decoder for `Op::RecvMultishot` CQEs.
+    ///
+    /// Called from EVERY completion drain path (`drain_completions_fused_inline`
+    /// and `drain_completions_into`) so long-lived arms take the same terminal
+    /// cleanup everywhere — the consolidation point for ledger #5
+    /// ("io_uring terminal cleanup is duplicated across completion paths;
+    /// single-close handling can drift").
+    ///
+    /// Semantics (consumer side: `AsyncTcpStream::read_rent`):
+    ///
+    /// - Data CQE (`IORING_CQE_F_BUFFER` set, result > 0): copy the ring
+    ///   buffer payload into an owned [`Buffer`] and queue
+    ///   `CompletionKind::RecvMultishot { buffer_id, data }`. The arm stays
+    ///   armed; the slot is NOT released.
+    /// - Terminal CQE (no `IORING_CQE_F_MORE`, result <= 0, or an
+    ///   undecodable payload): run the exact cleanup the generic terminal
+    ///   path runs (pending slot removal, descriptor lease release, metadata
+    ///   reset) and queue the final result. A final CQE may still carry data
+    ///   (kernel CQ-ring overflow shape, `io_recv_finish`'s `finish:` label);
+    ///   that data is delivered first, then a synthetic
+    ///   `MULTISHOT_ARM_TERMINATED` marker tells the consumer to re-arm.
+    ///
+    /// `wake` is the drain path's waker hook; each path owns its io-state
+    /// lookup shape (fused inline vs. `with_io_state`).
+    ///
+    /// Returns `true` when the CQE belonged to a multishot arm and is fully
+    /// consumed; `false` lets the caller fall through to generic handling.
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the owning thread, `idx` must be a live slab slot whose
+    /// generation matches the CQE, and the CQE must not have been consumed
+    /// elsewhere. `result` is trusted as an upper bound on kernel writes
+    /// (runtime-safety-contracts.md C8).
+    // The arguments are the drain context the two callers already hold as
+    // disjoint locals; a params struct would obscure that borrow splitting.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn handle_multishot_cqe(
+        &self,
+        pending_ops: &mut Slab<PendingOp>,
+        slot_meta: &mut [SlotMeta],
+        idx: usize,
+        token: IoToken,
+        result: i32,
+        flags: u32,
+        wake: &mut dyn FnMut(IoToken),
+    ) -> bool {
+        if !matches!(pending_ops.get(idx), Some(PendingOp::RecvMultishot)) {
+            return false;
+        }
+        let discarded = slot_meta[idx].discard_queued_results;
+        let has_more = cqueue::more(flags);
+        let buffer_id = cqueue::buffer_select(flags);
+
+        // Decode failure is terminal: an undecodable payload would have to be
+        // dropped byte-wise, so kill the arm loudly instead.
+        let mut decode_error: Option<IoError> = None;
+
+        if result > 0 {
+            match buffer_id {
+                Some(buffer_id) => match self.copy_multishot_payload(buffer_id, result) {
+                    Ok(data) => {
+                        if discarded {
+                            // No consumer will pop the queued result (the arm
+                            // is being cancelled): hand the ring buffer
+                            // straight back so the pool is not depleted.
+                            self.republish_multishot_buffer(buffer_id);
+                        } else {
+                            self.push_multishot_result(
+                                token,
+                                Ok(CompletionKind::RecvMultishot { buffer_id, data }),
+                            );
+                            wake(token);
+                        }
+                    }
+                    Err(error) => {
+                        // The ring slot cannot be delivered either way;
+                        // recycle it and terminate the arm.
+                        self.republish_multishot_buffer(buffer_id);
+                        decode_error = Some(error);
+                    }
+                },
+                None => {
+                    decode_error = Some(IoError::Other(
+                        "multishot CQE without a provided buffer id".into(),
+                    ));
+                }
+            }
+        }
+
+        // Terminal conditions: the kernel stops a multishot arm with a final
+        // CQE without IORING_CQE_F_MORE (peer close ret==0, ring exhausted
+        // -ENOBUFS, error), and a canceled op may post a negative CQE even
+        // with the MORE flag still set. Both must release the slot.
+        if decode_error.is_some() || !has_more || result <= 0 {
+            let pending = pending_ops.try_remove(idx);
+            debug_assert!(matches!(pending, Some(PendingOp::RecvMultishot)));
+            self.release_descriptor_lease(idx);
+            if let Some(meta) = slot_meta.get_mut(idx) {
+                meta.token_id = 0;
+                meta.discard_queued_results = false;
+            }
+            let terminal = if let Some(error) = decode_error {
+                Err(error)
+            } else if result < 0 {
+                Err(IoError::Io(io::Error::from_raw_os_error(-result)))
+            } else if result == 0 {
+                // Peer closed: the empty payload is the EOF marker (see
+                // `CompletionKind::RecvMultishot`).
+                Ok(CompletionKind::RecvMultishot {
+                    buffer_id: 0,
+                    data: Buffer::empty(),
+                })
+            } else {
+                // Final CQE still carried data (delivered above). Queue the
+                // synthetic arm-dead marker so the consumer re-arms instead
+                // of waiting forever on a dead token.
+                Err(IoError::Other(MULTISHOT_ARM_TERMINATED.to_string()))
+            };
+            if !discarded {
+                // A discarded arm keeps only the marker `cancel` queued (the
+                // consumer-side signal); terminal results of a discarded arm
+                // must not resurrect delivery. The marker is cleared by the
+                // next pop or by the stream-drop cancel.
+                self.push_multishot_result(token, terminal);
+                wake(token);
+            }
+        }
+        true
+    }
+
     pub fn new(entries: u32) -> io::Result<Self> {
+        // Environment switches are read exactly here, as the default source
+        // for the explicit `UringOptions` constructor below.
+        Self::new_with_options(entries, UringOptions::from_env())
+    }
+
+    /// Construct a backend with explicit feature switches.
+    ///
+    /// `options.buf_ring` mmaps + registers one provided buffer ring
+    /// (group id 1, `options.buf_ring_count` buffers of
+    /// `options.buf_ring_size` bytes). Registration failure — the typical
+    /// cause is a kernel older than 5.19 — logs a warning and leaves the
+    /// feature off instead of failing backend creation, mirroring the
+    /// COOP_TASKRUN fallback. `options.multishot_recv` additionally requires
+    /// the buffer ring and kernel 6.0+.
+    pub fn new_with_options(entries: u32, options: UringOptions) -> io::Result<Self> {
         let flush_batch_size = std::env::var("MINISS_URING_FLUSH_BATCH_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -428,11 +775,51 @@ impl UringBackend {
         let supports_multishot_accept = ring.submitter().register_probe(&mut probe).is_ok()
             && probe.is_supported(opcode::Accept::CODE)
             && kernel_supports_multishot_accept();
+
+        // Provided buffer ring: opt-in, degrades to off when the kernel
+        // cannot register it (registration is the kernel-version probe).
+        let buf_ring = if options.buf_ring {
+            match BufRing::create(&ring, options.buf_ring_count, options.buf_ring_size) {
+                Ok(buf_ring) => Some(buf_ring),
+                Err(error) => {
+                    tracing::warn!(
+                        "MINISS_URING_BUF_RING requested but the provided buffer ring \
+                         could not be registered ({error}); continuing without it"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let multishot_recv_enabled = if options.multishot_recv {
+            if buf_ring.is_none() {
+                tracing::warn!(
+                    "MINISS_URING_MULTISHOT_RECV requires a provided buffer ring; \
+                     continuing with single-shot reads"
+                );
+                false
+            } else if !kernel_supports_multishot_recv() {
+                tracing::warn!(
+                    "MINISS_URING_MULTISHOT_RECV requires Linux 6.0+; \
+                     continuing with single-shot reads"
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
         let flush_high_watermark = std::cmp::max(1, ring_entries.saturating_mul(3) / 4);
         let capacity = std::cmp::max(entries, 64) as usize;
         let mut accept_results = Vec::with_capacity(capacity);
         accept_results.resize_with(capacity, || None);
+        let mut multishot_results = Vec::with_capacity(capacity);
+        multishot_results.resize_with(capacity, || None);
         Ok(Self {
+            buf_ring,
+            multishot_recv_enabled,
             ring: UnsafeCell::new(ring),
             // Use at least 64 entries for slab capacity
             pending_ops: UnsafeCell::new(Slab::with_capacity(capacity)),
@@ -442,6 +829,7 @@ impl UringBackend {
             next_slot_index: Cell::new(0),
             completed_ops: UnsafeCell::new(Vec::with_capacity(capacity)),
             accept_results: UnsafeCell::new(accept_results),
+            multishot_results: UnsafeCell::new(multishot_results),
             pending_sqes: Cell::new(0),
             sqpoll_enabled,
             supports_multishot_accept,
@@ -640,7 +1028,7 @@ impl UringBackend {
                 }
                 self.release_descriptor_lease(idx);
                 slot_meta[idx].token_id = 0;
-                slot_meta[idx].discard_accept_results = false;
+                slot_meta[idx].discard_queued_results = false;
                 // The parking poll never prepared a cpu-side slot (no waker,
                 // completion, or pending task is ever stored for it), so its
                 // identity is returned without a slot clear. Without this,
@@ -649,6 +1037,39 @@ impl UringBackend {
                 // poll's slot was never prepared on this io_state.
                 unsafe { io_state.recycle_unprepared_slot(token) };
                 continue;
+            }
+
+            // Multishot receive: data CQEs stay armed and queue results; the
+            // terminal CQE takes the shared cleanup. One helper for every
+            // drain path — ledger #5 (io_uring terminal cleanup duplication)
+            // consolidation point.
+            if matches!(pending_ops.get(idx), Some(PendingOp::RecvMultishot)) {
+                let mut wake = |woken: IoToken| {
+                    if let Some(waker) = io_state.take_waker(woken) {
+                        wakeups += 1;
+                        waker.wake();
+                    }
+                };
+                // SAFETY: this is the fused drain's own contract (owner thread,
+                // live slot with verified generation, CQE not consumed
+                // elsewhere); `handle_multishot_cqe` documents the rest.
+                if unsafe {
+                    self.handle_multishot_cqe(
+                        pending_ops,
+                        slot_meta,
+                        idx,
+                        token,
+                        result,
+                        flags,
+                        &mut wake,
+                    )
+                } {
+                    processed += 1;
+                    if processed >= self.drain_batch_size.min(batch_limit) {
+                        break;
+                    }
+                    continue;
+                }
             }
 
             // Multishot accept: stays armed, result goes into accept_results VecDeque.
@@ -740,7 +1161,7 @@ impl UringBackend {
                 self.release_descriptor_lease(idx);
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
-                    meta.discard_accept_results = false;
+                    meta.discard_queued_results = false;
                 }
                 if matches!(pending_op, PendingOp::Accept { .. }) {
                     // A terminal CQE orphans any still-queued accept results:
@@ -1168,6 +1589,27 @@ impl UringBackend {
                     );
                     (entry, PendingOp::WriteRent { data })
                 }
+                Op::RecvMultishot { fd, buf_group } => {
+                    // Multishot receive is only meaningful against a provided
+                    // buffer ring: the kernel rejects IORING_RECV_MULTISHOT
+                    // without IOSQE_BUFFER_SELECT at prep time, and buffer
+                    // selection needs a registered group. Refuse clearly
+                    // instead of queueing an arm destined to fail.
+                    if self.buf_ring.is_none() {
+                        return Err(IoError::Io(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "Op::RecvMultishot requires a registered provided buffer ring \
+                             (MINISS_URING_BUF_RING)",
+                        )));
+                    }
+                    debug_assert_eq!(buf_group, MULTISHOT_BUF_GROUP);
+                    // `opcode::RecvMulti` encodes exactly the kernel contract:
+                    // IORING_OP_RECV + ioprio IORING_RECV_MULTISHOT +
+                    // IOSQE_BUFFER_SELECT + buf_group. Long-lived: the slot is
+                    // released only by the terminal CQE (no IORING_CQE_F_MORE).
+                    let entry = opcode::RecvMulti::new(types::Fd(leased_fd(fd)), buf_group).build();
+                    (entry, PendingOp::RecvMultishot)
+                }
                 Op::PollAdd {
                     fd,
                     events,
@@ -1193,6 +1635,7 @@ impl UringBackend {
             }
         };
         let is_accept = matches!(&pending_op, PendingOp::Accept { .. });
+        let is_multishot_recv = matches!(&pending_op, PendingOp::RecvMultishot);
 
         // Allocate the public token identity before taking a slab slot so an
         // exhausted identity space fails without post-insert cleanup.
@@ -1228,7 +1671,7 @@ impl UringBackend {
         }
         let generation = slot_meta[idx].generation.wrapping_add(1).max(1);
         slot_meta[idx].generation = generation;
-        slot_meta[idx].discard_accept_results = false;
+        slot_meta[idx].discard_queued_results = false;
         slot_meta[idx].token_id = token.id();
         if is_accept {
             // SAFETY: accept_results is shard-local and only mutated by this
@@ -1237,6 +1680,15 @@ impl UringBackend {
             let token_idx = token.slot_index();
             if token_idx >= accept_results.len() {
                 accept_results.resize_with(token_idx + 1, || None);
+            }
+        }
+        if is_multishot_recv {
+            // SAFETY: multishot_results is shard-local and only mutated by
+            // this backend owner thread while submitting/draining operations.
+            let multishot_results = unsafe { &mut *self.multishot_results.get() };
+            let token_idx = token.slot_index();
+            if token_idx >= multishot_results.len() {
+                multishot_results.resize_with(token_idx + 1, || None);
             }
         }
         let entry = entry.user_data(Self::pack_slot(idx, generation));
@@ -1573,6 +2025,15 @@ unsafe fn reconstruct_completion(
                 })
             }
         }
+        PendingOp::RecvMultishot => {
+            // Multishot CQEs are decoded by `handle_multishot_cqe` in every
+            // drain path; the generic terminal decoder never sees this
+            // variant. Reaching here would mean a drain path skipped the
+            // shared helper.
+            Err(IoError::Other(
+                "multishot recv CQE reached the generic completion decoder".into(),
+            ))
+        }
         PendingOp::Nop => {
             if result < 0 {
                 Err(IoError::Io(io::Error::from_raw_os_error(-result)))
@@ -1580,6 +2041,22 @@ unsafe fn reconstruct_completion(
                 Ok(CompletionKind::Nop)
             }
         }
+    }
+}
+
+impl Drop for UringBackend {
+    fn drop(&mut self) {
+        // Unregister the provided buffer ring while the ring fd is open and
+        // the mappings are still mapped: unregister -> munmap, in that order,
+        // instead of relying on field drop-glue order. The kernel also frees
+        // registrations when the ring closes, so a failure here (e.g. the
+        // group was never registered) must not panic.
+        if self.buf_ring.is_some() {
+            // SAFETY: exclusive owner during drop; the ring is still alive.
+            let ring = unsafe { &mut *self.ring.get() };
+            let _ = ring.submitter().unregister_buf_ring(MULTISHOT_BUF_GROUP);
+        }
+        // `self.buf_ring` drops right after this body (munmap), then `ring`.
     }
 }
 
@@ -1631,9 +2108,21 @@ impl IoProvider for UringBackend {
             .filter_map(Option::as_ref)
             .map(VecDeque::len)
             .sum::<usize>();
+        // Multishot receive results are accepted work the consumer still
+        // owes a read for; count them so graceful shutdown cannot exit early.
+        // SAFETY: same shard-local storage, read only by this owner thread.
+        let queued_multishot = unsafe { &*self.multishot_results.get() }
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(VecDeque::len)
+            .sum::<usize>();
         // SAFETY: same shard-local storage, read only by this owner thread.
         let completed = unsafe { &*self.completed_ops.get() }.len();
-        pending + queued_accepts + completed + usize::from(self.pending_sqes.get() != 0)
+        pending
+            + queued_accepts
+            + queued_multishot
+            + completed
+            + usize::from(self.pending_sqes.get() != 0)
     }
 
     fn retained_descriptor_count(&self) -> usize {
@@ -1686,7 +2175,7 @@ impl IoProvider for UringBackend {
         // SAFETY: `ring` is shard-local; `cancel` runs on the owning runtime thread
         // (see `UringBackend`'s thread-affinity note), so no other borrow is live.
         let ring = unsafe { &mut *self.ring.get() };
-        let (idx, generation, is_accept) =
+        let (idx, generation, is_accept, is_multishot_recv) =
             {
                 // SAFETY: `slot_meta` is shard-local and only read in this scope.
                 let slot_meta = unsafe { &*self.slot_meta.get() };
@@ -1695,12 +2184,18 @@ impl IoProvider for UringBackend {
                 let Some((idx, meta)) = slot_meta.iter().enumerate().find(|(idx, meta)| {
                     meta.token_id == token.id() && pending_ops.get(*idx).is_some()
                 }) else {
+                    // The arm may already be terminal with undelivered queued
+                    // results (e.g. a stream dropped after the final CQE was
+                    // processed but before the consumer popped the marker).
+                    // Release their ring buffers so the pool is not depleted.
+                    self.discard_multishot_queue(token);
                     return false;
                 };
                 (
                     idx,
                     meta.generation,
                     matches!(pending_ops.get(idx), Some(PendingOp::Accept { .. })),
+                    matches!(pending_ops.get(idx), Some(PendingOp::RecvMultishot)),
                 )
             };
         if is_accept {
@@ -1713,9 +2208,36 @@ impl IoProvider for UringBackend {
                 .get_mut(idx)
                 .filter(|meta| meta.token_id == token.id())
             {
-                meta.discard_accept_results = true;
+                meta.discard_queued_results = true;
             }
             self.discard_accept_results(token);
+        }
+        if is_multishot_recv {
+            // Same consumer-gone logic for a multishot receive arm: drain the
+            // queue (republishing held buffers), suppress future result
+            // delivery, and leave a termination marker so the next read
+            // re-arms instead of waiting on a cancelled token.
+            // SAFETY: slot_meta is shard-local and cancel() runs on its owner.
+            let slot_meta = unsafe { &mut *self.slot_meta.get() };
+            if let Some(meta) = slot_meta
+                .get_mut(idx)
+                .filter(|meta| meta.token_id == token.id())
+            {
+                meta.discard_queued_results = true;
+            }
+            self.discard_multishot_queue(token);
+            self.push_multishot_result(
+                token,
+                Err(IoError::Other(MULTISHOT_ARM_TERMINATED.to_string())),
+            );
+            // Deliver the wake only when a shard's io state is installed:
+            // cancellation can also run without one (direct backend tests,
+            // teardown sweeps), and there is then no waiter to wake anyway.
+            crate::cpu::try_with_io_state(|io_state| unsafe {
+                if let Some(waker) = io_state.take_waker(token) {
+                    waker.wake();
+                }
+            });
         }
         // CQE user_data is the packed slot/generation identity, not the
         // public monotonic IoToken value.
@@ -1864,6 +2386,45 @@ impl IoProvider for UringBackend {
 
             let token = IoToken::from_id(slot_meta[idx].token_id);
 
+            // Multishot receive: data CQEs stay armed and queue results; the
+            // terminal CQE takes the shared cleanup. One helper for every
+            // drain path — ledger #5 (io_uring terminal cleanup duplication)
+            // consolidation point.
+            if matches!(pending_ops.get(idx), Some(PendingOp::RecvMultishot)) {
+                let mut wake = |woken: IoToken| {
+                    // This drain can also run without a runtime context
+                    // (direct backend tests and teardown sweeps): deliver the
+                    // wake only when a shard's io state is installed. When it
+                    // is, the state belongs to this owner thread — the same
+                    // contract the accept path below relies on.
+                    crate::cpu::try_with_io_state(|io_state| unsafe {
+                        if let Some(waker) = io_state.take_waker(woken) {
+                            waker.wake();
+                        }
+                    });
+                };
+                // SAFETY: this drain runs on the owning thread with a live
+                // slot whose generation was verified above and a CQE no other
+                // path consumed; `handle_multishot_cqe` documents the rest.
+                if unsafe {
+                    self.handle_multishot_cqe(
+                        pending_ops,
+                        slot_meta,
+                        idx,
+                        token,
+                        result,
+                        flags,
+                        &mut wake,
+                    )
+                } {
+                    processed += 1;
+                    if processed >= self.drain_batch_size {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
             // A negative CQE is terminal even if a canceled multishot op
             // carries the MORE flag; route it through terminal cleanup.
             if has_more && result >= 0 {
@@ -1974,7 +2535,7 @@ impl IoProvider for UringBackend {
                 self.release_descriptor_lease(idx);
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
-                    meta.discard_accept_results = false;
+                    meta.discard_queued_results = false;
                 }
                 if matches!(pending_op, PendingOp::Accept { .. }) {
                     // A terminal CQE orphans any still-queued accept results:
@@ -2021,6 +2582,34 @@ impl IoProvider for UringBackend {
             accept_results[idx] = None;
         }
         Some(result)
+    }
+
+    fn supports_multishot_recv(&self) -> bool {
+        self.multishot_recv_enabled
+    }
+
+    fn pop_multishot_recv_result(&self, token: IoToken) -> Option<Result<CompletionKind, IoError>> {
+        let popped = {
+            // SAFETY: multishot_results is shard-local and only accessed by
+            // this UringBackend owner thread.
+            let results = unsafe { &mut *self.multishot_results.get() };
+            let idx = token.slot_index();
+            let queue = results.get_mut(idx)?.as_mut()?;
+            let result = queue.pop_front()?;
+            if queue.is_empty() {
+                results[idx] = None;
+            }
+            result
+        };
+        if let Ok(CompletionKind::RecvMultishot { buffer_id, data }) = &popped {
+            // A data result held one ring buffer from drain until now; hand
+            // it back to the kernel's selection pool. An empty payload is
+            // the EOF marker and holds nothing.
+            if !data.is_empty() {
+                self.republish_multishot_buffer(*buffer_id);
+            }
+        }
+        Some(popped)
     }
 
     fn supports_multishot_accept(&self) -> bool {
@@ -2859,5 +3448,568 @@ mod slot_recycling_tests {
         // targeting a reissued slot.
         assert_ne!(stale.id(), reissued.id());
         assert_eq!(stale.slot_index(), reissued.slot_index());
+    }
+}
+
+#[cfg(test)]
+mod multishot_recv_tests {
+    //! Opt-in multishot receive + provided buffer ring (`MINISS_URING_BUF_RING`
+    //! / `MINISS_URING_MULTISHOT_RECV`).
+    //!
+    //! Backend-level tests construct `UringBackend::new_with_options`
+    //! directly so the feature flags never leak through process-global env.
+    //! Net-level tests need the ambient runtime (whose backend is built from
+    //! the environment), so they re-exec the test binary as an isolation
+    //! child with the flags set — the same pattern as
+    //! `disconnected_socket_writes_return_epipe_without_sigpipe`.
+
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    const CHILD_MODE: &str = "MINISS_URING_MULTISHOT_CHILD";
+    const NET_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn multishot_options(count: u16, buf_size: usize) -> UringOptions {
+        UringOptions {
+            buf_ring: true,
+            buf_ring_count: count,
+            buf_ring_size: buf_size,
+            multishot_recv: true,
+        }
+    }
+
+    fn socketpair() -> [std::os::fd::OwnedFd; 2] {
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` is a live two-element array for socketpair output;
+        // both descriptors are owned by the caller on success.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: socketpair transferred ownership of both descriptors here.
+        unsafe { [OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])] }
+    }
+
+    fn peer_write(peer: &std::os::fd::OwnedFd, payload: &[u8]) {
+        let mut written = 0;
+        while written < payload.len() {
+            // SAFETY: `peer` owns a live socket; the slice is valid for read.
+            let n = unsafe {
+                libc::write(
+                    peer.as_raw_fd(),
+                    payload[written..].as_ptr().cast(),
+                    payload.len() - written,
+                )
+            };
+            assert!(n > 0, "peer write failed: {}", io::Error::last_os_error());
+            written += n as usize;
+        }
+    }
+
+    fn queued_results(
+        backend: &UringBackend,
+        token: IoToken,
+    ) -> Vec<Result<CompletionKind, IoError>> {
+        let mut results = Vec::new();
+        while let Some(result) = backend.pop_multishot_recv_result(token) {
+            results.push(result);
+        }
+        results
+    }
+
+    // --- Backend-level (no env, constructor-parameter flags) ---
+
+    #[test]
+    fn buf_ring_registration_maps_and_publishes_every_buffer() {
+        let backend = UringBackend::new_with_options(
+            8,
+            UringOptions {
+                buf_ring: true,
+                ..Default::default()
+            },
+        )
+        .expect("io_uring backend must be available");
+        // multishot_recv flag is off: the ring exists but the capability
+        // stays off and RecvMultishot ops are refused.
+        assert!(!backend.supports_multishot_recv());
+        let buf_ring = backend.buf_ring.as_ref().expect("buffer ring registered");
+        assert_eq!(buf_ring.count(), DEFAULT_BUF_RING_COUNT);
+        assert_eq!(buf_ring.buf_size(), DEFAULT_BUF_RING_SIZE);
+        // Every registered id resolves inside the data region.
+        for bid in 0..buf_ring.count() {
+            assert!(buf_ring.buffer_region(bid).is_some());
+        }
+        assert!(buf_ring.buffer_region(buf_ring.count()).is_none());
+    }
+
+    #[test]
+    fn multishot_capability_requires_buffer_ring_and_kernel_support() {
+        let without_ring = UringBackend::new_with_options(
+            8,
+            UringOptions {
+                multishot_recv: true,
+                buf_ring: false,
+                ..Default::default()
+            },
+        )
+        .expect("io_uring backend must be available");
+        assert!(!without_ring.supports_multishot_recv());
+        // A RecvMultishot without a registered ring is refused, not queued
+        // as an arm that would die on the kernel's -EINVAL.
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` is a live two-element array for pipe output.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let error = without_ring
+            .submit(Op::RecvMultishot {
+                fd: fds[0],
+                buf_group: MULTISHOT_BUF_GROUP,
+            })
+            .expect_err("multishot without a buffer ring must be refused");
+        assert!(matches!(error, IoError::Io(e) if e.kind() == io::ErrorKind::Unsupported));
+        // SAFETY: both pipe descriptors are owned by this test.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        let with_ring = UringBackend::new_with_options(8, multishot_options(8, 4096))
+            .expect("io_uring backend must be available");
+        assert_eq!(
+            with_ring.supports_multishot_recv(),
+            kernel_supports_multishot_recv()
+        );
+    }
+
+    #[test]
+    fn multishot_arm_serves_repeated_data_completions_from_one_slot() {
+        let backend =
+            UringBackend::new_with_options(8, multishot_options(8, 4096)).expect("backend");
+        let [reader, writer] = socketpair();
+        let token = backend
+            .submit(Op::RecvMultishot {
+                fd: reader.as_raw_fd(),
+                buf_group: MULTISHOT_BUF_GROUP,
+            })
+            .expect("multishot arm admission");
+        backend.flush_logged();
+
+        for round in 0..3 {
+            let payload = format!("multishot-{round}");
+            peer_write(&writer, payload.as_bytes());
+            let results = loop {
+                let _ = backend.park(Duration::from_millis(20));
+                let _ = backend.drain_completions();
+                let results = queued_results(&backend, token);
+                if !results.is_empty() {
+                    break results;
+                }
+            };
+            assert_eq!(results.len(), 1, "one write must produce one data CQE");
+            match &results[0] {
+                Ok(CompletionKind::RecvMultishot { buffer_id, data }) => {
+                    assert_eq!(data.as_ref(), payload.as_bytes());
+                    assert!(*buffer_id < 8);
+                }
+                other => panic!("expected data completion, got {other:?}"),
+            }
+        }
+        // The arm survived all three rounds: one live slot, one lease.
+        assert_eq!(backend.pending_operation_count(), 1);
+        assert_eq!(backend.retained_descriptor_count(), 1);
+
+        // Popping released each buffer back to the pool; a fourth write must
+        // still find buffers to select.
+        peer_write(&writer, b"after-rounds");
+        let results = loop {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            let results = queued_results(&backend, token);
+            if !results.is_empty() {
+                break results;
+            }
+        };
+        assert!(matches!(
+            results.first(),
+            Some(Ok(CompletionKind::RecvMultishot { data, .. })) if data.as_ref() == b"after-rounds"
+        ));
+        // Dropping both ends closes the socketpair exactly once each.
+        drop(writer);
+        drop(reader);
+    }
+
+    #[test]
+    fn multishot_peer_close_posts_eof_marker_and_releases_the_slot() {
+        let backend =
+            UringBackend::new_with_options(8, multishot_options(8, 4096)).expect("backend");
+        let [reader, writer] = socketpair();
+        let token = backend
+            .submit(Op::RecvMultishot {
+                fd: reader.as_raw_fd(),
+                buf_group: MULTISHOT_BUF_GROUP,
+            })
+            .expect("multishot arm admission");
+        peer_write(&writer, b"final-bytes");
+        // SAFETY: `writer` is owned by this test; closing is the peer close.
+        drop(writer);
+        backend.flush_logged();
+
+        let results = loop {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            let results = queued_results(&backend, token);
+            if results.len() >= 2 {
+                break results;
+            }
+        };
+        assert_eq!(
+            results.len(),
+            2,
+            "the final data CQE and the EOF marker must both be queued, in order"
+        );
+        assert!(
+            matches!(&results[0], Ok(CompletionKind::RecvMultishot { data, .. }) if data.as_ref() == b"final-bytes")
+        );
+        assert!(
+            matches!(&results[1], Ok(CompletionKind::RecvMultishot { data, .. }) if data.is_empty()),
+            "the terminal CQE (ret 0, no MORE) is the empty-payload EOF marker"
+        );
+        // Terminal cleanup ran: no pending op, no descriptor lease.
+        assert_eq!(backend.pending_operation_count(), 0);
+        assert_eq!(backend.retained_descriptor_count(), 0);
+    }
+
+    #[test]
+    fn multishot_ring_exhaustion_terminates_arm_and_republishes_on_pop() {
+        // A four-buffer ring: write five chunks without consuming anything.
+        let backend = UringBackend::new_with_options(8, multishot_options(4, 64)).expect("backend");
+        let [reader, writer] = socketpair();
+        let token = backend
+            .submit(Op::RecvMultishot {
+                fd: reader.as_raw_fd(),
+                buf_group: MULTISHOT_BUF_GROUP,
+            })
+            .expect("multishot arm admission");
+        backend.flush_logged();
+        for chunk in ["aaaa", "bbbb", "cccc", "dddd", "eeee"] {
+            peer_write(&writer, chunk.as_bytes());
+        }
+        // SAFETY: `writer` is owned by this test.
+        drop(writer);
+
+        let results = loop {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            let results = queued_results(&backend, token);
+            if results.len() >= 5 {
+                break results;
+            }
+        };
+        // Four data CQEs (every buffer was selected once), then the
+        // -ENOBUFS termination the kernel posts once the ring is empty
+        // (io_uring/kbuf.c buffer selection fails with REQ_F_BL_EMPTY).
+        assert_eq!(results.len(), 5, "results: {results:?}");
+        for (index, expected) in ["aaaa", "bbbb", "cccc", "dddd"].iter().enumerate() {
+            match &results[index] {
+                Ok(CompletionKind::RecvMultishot { data, .. }) => {
+                    assert_eq!(data.as_ref(), expected.as_bytes());
+                }
+                other => panic!("expected data completion {index}, got {other:?}"),
+            }
+        }
+        match &results[4] {
+            Err(IoError::Io(error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
+            }
+            other => panic!("expected ENOBUFS termination, got {other:?}"),
+        }
+        // Every popped data result republished its buffer; the terminal
+        // cleanup released the arm. The ring pool is fully restocked, which
+        // is what makes the net layer's transparent re-arm safe.
+        assert_eq!(backend.pending_operation_count(), 0);
+        assert_eq!(backend.retained_descriptor_count(), 0);
+    }
+
+    #[test]
+    fn multishot_cancel_republishes_held_buffers_and_signals_termination() {
+        let backend = UringBackend::new_with_options(8, multishot_options(4, 64)).expect("backend");
+        let [reader, writer] = socketpair();
+        let token = backend
+            .submit(Op::RecvMultishot {
+                fd: reader.as_raw_fd(),
+                buf_group: MULTISHOT_BUF_GROUP,
+            })
+            .expect("multishot arm admission");
+        backend.flush_logged();
+        peer_write(&writer, b"held");
+        // Give the data CQE time to land while nothing pops it: depending on
+        // timing it is either queued-with-held-buffer (cancel drains and
+        // republishes it) or a discarded post-cancel CQE (the decoder
+        // republishes it directly). Both paths must restock the pool.
+        for _ in 0..8 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+        }
+        assert!(backend.pending_operation_count() >= 1, "arm still live");
+
+        // Cancellation must drain the queue (republishing any held buffer),
+        // suppress further delivery, and queue the termination marker so a
+        // future read re-arms instead of waiting on a cancelled token.
+        assert!(backend.cancel(token));
+        backend.flush_logged();
+        let marker = queued_results(&backend, token);
+        assert_eq!(
+            marker.len(),
+            1,
+            "exactly the termination marker: {marker:?}"
+        );
+        assert!(matches!(
+            &marker[0],
+            Err(IoError::Other(message)) if message == MULTISHOT_ARM_TERMINATED
+        ));
+        // The cancel SQE and the target's terminal CQE both drain.
+        for _ in 0..32 {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            if backend.pending_operation_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(backend.pending_operation_count(), 0);
+        assert_eq!(backend.retained_descriptor_count(), 0);
+
+        // The pool was not depleted by the abandoned arm: a fresh arm still
+        // receives on the (re-published) ring.
+        let token = backend
+            .submit(Op::RecvMultishot {
+                fd: reader.as_raw_fd(),
+                buf_group: MULTISHOT_BUF_GROUP,
+            })
+            .expect("fresh arm after cancel");
+        backend.flush_logged();
+        peer_write(&writer, b"again");
+        let results = loop {
+            let _ = backend.park(Duration::from_millis(20));
+            let _ = backend.drain_completions();
+            let results = queued_results(&backend, token);
+            if !results.is_empty() {
+                break results;
+            }
+        };
+        assert!(matches!(
+            results.first(),
+            Some(Ok(CompletionKind::RecvMultishot { data, .. })) if data.as_ref() == b"again"
+        ));
+    }
+
+    #[test]
+    fn single_shot_read_rent_path_is_unchanged_without_flags() {
+        let backend = UringBackend::new_with_options(8, UringOptions::default()).expect("backend");
+        assert!(!backend.supports_multishot_recv());
+        assert!(backend.buf_ring.is_none());
+
+        // `Op::ReadRent` lowers to recv(2) (the socket-facing rented API), so
+        // the probe must use a socketpair, not a pipe.
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` is a live two-element array for socketpair output.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let token = backend
+            .submit(Op::ReadRent {
+                fd: fds[0],
+                buffer: Buffer::with_capacity(64),
+            })
+            .expect("read_rent admission");
+        // SAFETY: `fds[1]` is owned by this test.
+        assert_eq!(unsafe { libc::write(fds[1], b"xyz".as_ptr().cast(), 3) }, 3);
+        backend.flush_logged();
+        let _ = backend.park(Duration::from_secs(1));
+        let completions = match backend.drain_completions() {
+            Poll::Ready(completions) => completions,
+            Poll::Pending => panic!("single-shot read did not complete"),
+        };
+        let result = completions
+            .into_iter()
+            .find(|(completed, _)| *completed == token)
+            .expect("read_rent completion");
+        match result.1.expect("read completion") {
+            CompletionKind::ReadRent { buffer } => assert_eq!(buffer.as_ref(), b"xyz"),
+            other => panic!("unexpected completion: {other:?}"),
+        }
+        // SAFETY: both pipe descriptors are owned by this test.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    // --- Net-level (isolation child with the env flags on) ---
+
+    fn run_in_multishot_child(test_name: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(test_name)
+            .env(CHILD_MODE, "1")
+            .env("MINISS_URING_BUF_RING", "1")
+            .env("MINISS_URING_MULTISHOT_RECV", "1")
+            .env("MINISS_URING_BUF_RING_COUNT", "8")
+            .output()
+            .expect("run multishot isolation child");
+        assert!(
+            output.status.success(),
+            "multishot net test failed in the isolation child: status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn in_multishot_child() -> bool {
+        std::env::var_os(CHILD_MODE).is_some()
+    }
+
+    #[test]
+    fn net_multishot_read_rent_round_trip_on_one_arm() {
+        if !in_multishot_child() {
+            run_in_multishot_child(
+                "io::uring::tests::net_multishot_read_rent_round_trip_on_one_arm",
+            );
+            return;
+        }
+        use crate::net::{AsyncTcpListener, AsyncTcpStream};
+        use std::net::SocketAddr;
+
+        let runtime = crate::Runtime::new();
+        runtime
+            .block_on(crate::timer::timeout(NET_TEST_TIMEOUT, async move {
+                // The ambient backend must have both features on, otherwise this
+                // test would silently prove nothing (the single-shot path also
+                // delivers the bytes).
+                assert!(crate::cpu::with_io_state(|state| state
+                    .io_backend
+                    .supports_multishot_recv()));
+
+                let mut listener =
+                    AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+
+                let server = async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    // Three reads off ONE armed connection: arm longevity.
+                    for round in 0..3 {
+                        let payload = format!("arm-longevity-{round}");
+                        let (n, buf) = stream.read_rent(Vec::with_capacity(64)).await.unwrap();
+                        assert_eq!(n, payload.len(), "round {round}");
+                        assert_eq!(&buf[..], payload.as_bytes(), "round {round}");
+                    }
+                };
+                let client = async move {
+                    let stream = AsyncTcpStream::connect(addr).await.unwrap();
+                    for round in 0..3 {
+                        let payload = format!("arm-longevity-{round}");
+                        let (_, buf) = stream
+                            .write_rent(Vec::from(payload.as_bytes()))
+                            .await
+                            .unwrap();
+                        assert_eq!(buf.len(), payload.len());
+                    }
+                };
+                futures::future::join(server, client).await;
+            }))
+            .expect("multishot round trip within the bounded wait");
+    }
+
+    #[test]
+    fn net_multishot_eof_then_rearm_keeps_returning_eof() {
+        if !in_multishot_child() {
+            run_in_multishot_child(
+                "io::uring::tests::net_multishot_eof_then_rearm_keeps_returning_eof",
+            );
+            return;
+        }
+        use crate::net::{AsyncTcpListener, AsyncTcpStream};
+        use std::net::SocketAddr;
+
+        let runtime = crate::Runtime::new();
+        runtime
+            .block_on(crate::timer::timeout(NET_TEST_TIMEOUT, async move {
+                let mut listener =
+                    AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+
+                let server = async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    // 1. Data written before the peer close arrives first.
+                    let (n, buf) = stream.read_rent(Vec::with_capacity(64)).await.unwrap();
+                    assert_eq!(n, 5);
+                    assert_eq!(&buf[..], b"bye!!", "expected b\"bye!!\", got {buf:?}");
+                    // 2. The final CQE (ret 0, no MORE) is EOF: Ok((0, buf)).
+                    let (n, _) = stream.read_rent(Vec::with_capacity(64)).await.unwrap();
+                    assert_eq!(n, 0, "peer close must surface as EOF");
+                    // 3. The next read re-arms on the half-closed socket; the
+                    //    kernel replies with an immediate zero-length terminal,
+                    //    so this returns EOF again instead of hanging — that is
+                    //    the documented re-arm behavior.
+                    let (n, _) = stream.read_rent(Vec::with_capacity(64)).await.unwrap();
+                    assert_eq!(n, 0, "re-armed read on a closed socket returns EOF again");
+                };
+                let client = async move {
+                    let stream = AsyncTcpStream::connect(addr).await.unwrap();
+                    let (_, _) = stream
+                        .write_rent(Vec::from(b"bye!!".as_slice()))
+                        .await
+                        .unwrap();
+                    // Drop closes the socket: peer close for the server arm.
+                };
+                futures::future::join(server, client).await;
+            }))
+            .expect("multishot EOF test within the bounded wait");
+    }
+
+    #[test]
+    fn net_multishot_ring_exhaustion_preserves_stream_data() {
+        if !in_multishot_child() {
+            run_in_multishot_child(
+                "io::uring::tests::net_multishot_ring_exhaustion_preserves_stream_data",
+            );
+            return;
+        }
+        use crate::net::{AsyncTcpListener, AsyncTcpStream};
+        use std::net::SocketAddr;
+
+        // The child was started with MINISS_URING_BUF_RING_COUNT=8; a burst
+        // of 24 chunks therefore exhausts the ring at least once and forces
+        // the -ENOBUFS termination + transparent re-arm path.
+        let chunk = [b'x'; 64];
+        let chunks = 24;
+
+        let runtime = crate::Runtime::new();
+        runtime
+            .block_on(crate::timer::timeout(NET_TEST_TIMEOUT, async move {
+                let mut listener =
+                    AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+
+                let server = async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    for index in 0..chunks {
+                        let (n, buf) = stream.read_rent(Vec::with_capacity(128)).await.unwrap();
+                        assert_eq!(n, chunk.len(), "chunk {index}");
+                        assert_eq!(&buf[..], &chunk, "chunk {index} must be byte-exact");
+                    }
+                };
+                let client = async move {
+                    let stream = AsyncTcpStream::connect(addr).await.unwrap();
+                    for _ in 0..chunks {
+                        let (_, buf) = stream
+                            .write_rent(Vec::from(chunk.as_slice()))
+                            .await
+                            .unwrap();
+                        assert_eq!(buf.len(), chunk.len());
+                    }
+                };
+                futures::future::join(server, client).await;
+            }))
+            .expect("multishot exhaustion test within the bounded wait");
     }
 }

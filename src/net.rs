@@ -208,6 +208,11 @@ pub struct AsyncTcpStream {
     /// Borrowed-write adaptation: an armed rent write holding a pooled copy of
     /// the caller's bytes while the socket was not writable.
     write: BorrowedWrite,
+    /// Long-lived multishot receive arm (io_uring with
+    /// `MINISS_URING_BUF_RING` + `MINISS_URING_MULTISHOT_RECV`). `Cell`
+    /// because `read_rent` takes `&self`; the token is shard-local state
+    /// exactly like the backend's pending-op slab.
+    multishot_arm: std::cell::Cell<Option<IoToken>>,
     /// Stream I/O tokens and TLS state belong to the creating shard. The
     /// marker prevents accidental migration through an `Arc<OwnedFd>` lease.
     _owner_local: PhantomData<Rc<()>>,
@@ -254,6 +259,7 @@ impl AsyncTcpStream {
             descriptor: Some(descriptor),
             read: BorrowedRead::new(),
             write: BorrowedWrite::new(),
+            multishot_arm: std::cell::Cell::new(None),
             _owner_local: PhantomData,
         })
     }
@@ -263,12 +269,29 @@ impl AsyncTcpStream {
     /// The buffer is converted into the runtime's internal owned-buffer form,
     /// filled by the kernel, then returned to the caller's type without an
     /// extra copy.
+    ///
+    /// # Multishot receive mode (io_uring, opt-in)
+    ///
+    /// With `MINISS_URING_BUF_RING=1` and `MINISS_URING_MULTISHOT_RECV=1` on a
+    /// Linux io_uring backend, this method switches from a one-shot
+    /// `Op::ReadRent` to a long-lived multishot receive arm (see
+    /// [`Self::read_rent_multishot`]). One deviation from the single-shot
+    /// contract: the returned buffer is the kernel-delivered ring chunk (the
+    /// backend's copy of the provided-ring buffer), not the caller's original
+    /// allocation — the caller's buffer is consumed and dropped unused, and
+    /// the returned allocation carries exactly the bytes the kernel received.
     pub async fn read_rent<T>(&self, buffer: T) -> io::Result<(usize, T)>
     where
         T: RentBuffer,
     {
         let fd = self.as_raw_fd();
         let mut buffer = buffer.into();
+        let multishot = with_io_state(|state| {
+            state.io_backend.uses_completion_io() && state.io_backend.supports_multishot_recv()
+        });
+        if multishot {
+            return self.read_rent_multishot(buffer).await;
+        }
         let direct = with_io_state(|state| state.io_backend.uses_completion_io());
         match if direct {
             Err(io::Error::from_raw_os_error(libc::EAGAIN))
@@ -304,6 +327,129 @@ impl AsyncTcpStream {
                 }
             }
             Err(err) => Err(err),
+        }
+    }
+
+    /// Multishot receive model for [`Self::read_rent`] (io_uring only,
+    /// opt-in via `MINISS_URING_BUF_RING=1` + `MINISS_URING_MULTISHOT_RECV=1`).
+    ///
+    /// The chosen state machine, deliberately the simplest correct v1:
+    ///
+    /// - **Arm once per connection.** The first read submits one
+    ///   `Op::RecvMultishot` and caches its token in `multishot_arm`. The arm
+    ///   is long-lived: the kernel loops internally and posts a CQE per
+    ///   receive with `IORING_CQE_F_MORE` until it terminates.
+    /// - **One CQE per `read_rent` call.** Each delivered data CQE is one
+    ///   result; the backend copied the ring buffer into an owned `Buffer` at
+    ///   drain time and recycles the ring slot when this result is consumed
+    ///   (popped) here.
+    /// - **Re-arming is the next read's job.** A terminal CQE (no
+    ///   `IORING_CQE_F_MORE`) clears the cached arm and this call returns:
+    ///   peer close surfaces as `Ok(0)` EOF; ring exhaustion (`-ENOBUFS`) and
+    ///   transient `-EAGAIN` re-arm transparently on the next loop pass
+    ///   because the queued data has already been consumed by the time the
+    ///   marker is reached; any other error returns to the caller. A dead arm
+    ///   never spins: re-arming submits one SQE and the kernel replies with
+    ///   real work or a real termination.
+    /// - **Not concurrent-safe per stream.** Concurrent `read_rent` calls
+    ///   share one arm token; like `poll_read` re-entrancy this is a caller
+    ///   error. HTTP and every in-repo protocol handler read a connection
+    ///   sequentially.
+    ///
+    /// Architecture audit: per-stream shard-local `Cell` token plus the
+    /// backend's shard-local queue/ring — no shared state, locks, atomics,
+    /// runtime creation, blocking calls, or cross-core traffic.
+    /// Retire a dead multishot arm: drop the cached token and release the
+    /// arm's cpu-side slot back to the backend's recycle pool.
+    ///
+    /// The backend slab-side cleanup (pending op, descriptor lease, slot
+    /// metadata) already ran in the terminal CQE handler
+    /// (`UringBackend::handle_multishot_cqe`). The matching cpu-side identity
+    /// must be released here, when the consumer observes the terminal
+    /// marker — otherwise every arm death (EOF, backpressure re-arm, cancel
+    /// marker) would permanently consume one `CpuIoState::io_slots` index
+    /// and defeat the slot-recycling bound (ledger #45). `clear_slot` no-ops
+    /// when the slot was never prepared (no waker or completion was ever
+    /// stored for the arm token), so arms that died before any poll parked
+    /// on them are equally safe here.
+    fn retire_multishot_arm(&self, arm: IoToken) {
+        self.multishot_arm.set(None);
+        try_with_io_state(|state| unsafe { state.clear_slot(arm) });
+    }
+
+    async fn read_rent_multishot<T>(&self, buffer: Buffer) -> io::Result<(usize, T)>
+    where
+        T: RentBuffer,
+    {
+        loop {
+            let arm = match self.multishot_arm.get() {
+                Some(token) => token,
+                None => {
+                    let op = crate::io::Op::RecvMultishot {
+                        fd: self.as_raw_fd(),
+                        buf_group: crate::io::MULTISHOT_BUF_GROUP,
+                    };
+                    let descriptor = self.descriptor_lease();
+                    let token = with_io_state(|state| {
+                        state
+                            .io_backend
+                            .submit_with_descriptor(op, descriptor)
+                            .map_err(io::Error::from)
+                    })?;
+                    self.multishot_arm.set(Some(token));
+                    token
+                }
+            };
+            // Fast path: a previous drain already queued a result for this
+            // arm. `IoFuture::multishot_recv` re-checks the same queue before
+            // parking, so the arm-could-have-died-while-polling race is
+            // closed inside the future.
+            let queued = with_io_state(|state| state.io_backend.pop_multishot_recv_result(arm));
+            let result = match queued {
+                Some(result) => result,
+                None => crate::io::future::IoFuture::multishot_recv(arm).await,
+            };
+            match result {
+                Ok(crate::io::CompletionKind::RecvMultishot { data, .. }) if !data.is_empty() => {
+                    return Ok((data.len(), T::from(data)));
+                }
+                Ok(crate::io::CompletionKind::RecvMultishot { .. }) => {
+                    // Empty payload = final CQE with a zero receive result:
+                    // the peer closed. Surface EOF; the next read re-arms
+                    // (and keeps returning EOF while the socket stays
+                    // half-closed).
+                    self.retire_multishot_arm(arm);
+                    return Ok((0, T::from(buffer)));
+                }
+                Err(crate::io::IoError::Other(message))
+                    if message == crate::io::MULTISHOT_ARM_TERMINATED =>
+                {
+                    // The arm died after delivering its final data CQE
+                    // (kernel CQ-ring overflow shape). Re-arm.
+                    self.retire_multishot_arm(arm);
+                }
+                Err(err) if is_multishot_starvation(&err) => {
+                    // Ring exhausted (-ENOBUFS) or a transient -EAGAIN: the
+                    // arm was terminated by backpressure after all its queued
+                    // data was consumed above, so the ring is full again.
+                    // Re-arm silently instead of failing the read.
+                    self.retire_multishot_arm(arm);
+                }
+                Err(err) => {
+                    self.retire_multishot_arm(arm);
+                    return Err(err.into());
+                }
+                // Unreachable: the multishot queue only holds RecvMultishot
+                // results and termination markers. Mirror the other read
+                // paths' defensive handling instead of assuming it.
+                other => {
+                    self.retire_multishot_arm(arm);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unexpected completion for multishot read_rent: {other:?}"),
+                    ));
+                }
+            }
         }
     }
 
@@ -511,6 +657,16 @@ impl IntoRawFd for AsyncTcpStream {
         // the descriptor alive until terminal completion either way.
         self.read.clear();
         self.write.clear();
+        // Cancel the multishot receive arm, if armed: cancelling republishes
+        // any ring buffers still held by undelivered results (see
+        // `UringBackend::cancel`).
+        // SAFETY: `state` is this thread's own shard, and the arm token belongs
+        // to this stream — `cancel_and_discard`'s contract is met.
+        with_io_state(|state| unsafe {
+            if let Some(token) = self.multishot_arm.get() {
+                state.cancel_and_discard(token);
+            }
+        });
         self.descriptor
             .take()
             .expect("live stream must own its descriptor")
@@ -528,6 +684,17 @@ impl Drop for AsyncTcpStream {
         // terminal completion either way.
         self.read.clear();
         self.write.clear();
+        // Cancel the multishot receive arm, if armed: cancelling republishes
+        // any ring buffers still held by undelivered results (see
+        // `UringBackend::cancel`), so an abandoned connection cannot shrink
+        // the shared ring pool.
+        // SAFETY: as in `into_raw_fd` — own shard, own token. `try_with_io_state`
+        // just skips the body when the dropping thread has no runtime state.
+        try_with_io_state(|state| unsafe {
+            if let Some(token) = self.multishot_arm.get() {
+                state.cancel_and_discard(token);
+            }
+        });
     }
 }
 
@@ -1361,6 +1528,21 @@ fn is_wouldblock(err: &io::Error) -> bool {
         || err.raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
+/// Termination results a multishot arm may post that must NOT fail
+/// `read_rent`: the kernel stops the arm with `-ENOBUFS` when the provided
+/// buffer ring is exhausted (`REQ_F_BL_EMPTY`, io_uring/kbuf.c buffer
+/// selection) and a retried receive can resurface as `-EAGAIN` (same errno
+/// value as `EWOULDBLOCK`). Both are backpressure, not stream errors: every
+/// queued chunk was already consumed by the time the marker is reached, so
+/// the ring is full again and the next loop pass simply re-arms.
+#[inline]
+fn is_multishot_starvation(err: &crate::io::IoError) -> bool {
+    matches!(err, crate::io::IoError::Io(io_err) if matches!(
+        io_err.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ENOBUFS)
+    ))
+}
+
 #[inline]
 fn try_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     loop {
@@ -1560,9 +1742,13 @@ mod completion_connect_tests {
     use std::rc::Rc;
     use std::task::{Context, Poll};
 
+    /// Shared syscall-result cell: `(connect rc, Option<errno>)`.
+    /// (Alias keeps clippy's type_complexity happy on newer toolchains.)
+    type SyscallResultCell = Rc<Cell<Option<(i32, Option<i32>)>>>;
+
     struct ConnectBackend {
         submissions: Rc<Cell<usize>>,
-        syscall_result: Rc<Cell<Option<(i32, Option<i32>)>>>,
+        syscall_result: SyscallResultCell,
         socket_state_before_submit: Rc<Cell<Option<u8>>>,
     }
 

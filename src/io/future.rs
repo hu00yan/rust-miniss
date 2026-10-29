@@ -15,6 +15,7 @@ use std::task::{Context, Poll};
 pub struct IoFuture {
     token: IoToken,
     is_accept: bool,
+    is_multishot_recv: bool,
     completed: bool,
     task_id: Option<TaskId>,
     immediate: Option<Result<CompletionKind, IoError>>,
@@ -48,6 +49,7 @@ impl IoFuture {
             IoFutureInput::Token(token) => Self {
                 token,
                 is_accept: false,
+                is_multishot_recv: false,
                 completed: false,
                 task_id: crate::cpu::current_task_id(),
                 immediate: None,
@@ -63,6 +65,7 @@ impl IoFuture {
             IoFutureInput::Token(token) => Self {
                 token,
                 is_accept: true,
+                is_multishot_recv: false,
                 completed: false,
                 task_id: crate::cpu::current_task_id(),
                 immediate: None,
@@ -78,9 +81,29 @@ impl IoFuture {
         Self {
             token: IoToken::from_id(0),
             is_accept: false,
+            is_multishot_recv: false,
             completed: true,
             task_id: None,
             immediate: Some(Err(error)),
+        }
+    }
+
+    /// Creates an `IoFuture` for a long-lived multishot receive arm.
+    ///
+    /// The arm token stays valid across many completions; each poll pops the
+    /// next queued result (data chunk or terminal marker) from the backend.
+    #[inline(always)]
+    pub fn multishot_recv<T: Into<IoFutureInput>>(input: T) -> Self {
+        match input.into() {
+            IoFutureInput::Token(token) => Self {
+                token,
+                is_accept: false,
+                is_multishot_recv: true,
+                completed: false,
+                task_id: crate::cpu::current_task_id(),
+                immediate: None,
+            },
+            IoFutureInput::Error(error) => Self::error(error),
         }
     }
 }
@@ -114,6 +137,17 @@ impl Future for IoFuture {
             if this.is_accept {
                 // Check the multi-shot accept result queue.
                 if let Some(result) = state.io_backend.pop_accept_result(this.token) {
+                    this.completed = true;
+                    return Poll::Ready(result);
+                }
+            }
+
+            if this.is_multishot_recv {
+                // Check the multi-shot receive result queue. The backend
+                // queues one entry per data CQE plus the terminal marker, so
+                // this both serves already-arrived data and closes the race
+                // between the caller's own pop attempt and waker storage.
+                if let Some(result) = state.io_backend.pop_multishot_recv_result(this.token) {
                     this.completed = true;
                     return Poll::Ready(result);
                 }
