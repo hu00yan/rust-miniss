@@ -1,0 +1,1 @@
+{"threads":"2","cores":"1","host":"cs-819488018017-default","affinity_mode":"unbound","duration":"10","runtime":"miniss,monoio,compio,tokio,glommio","client_cpus":"unbound","server_cpus":"unbound","kernel":"6.18.55+","cpu_model":"AMD EPYC 7B12","connections":"32","os":"Linux"}

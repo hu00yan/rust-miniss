@@ -1,0 +1,4 @@
+9611.97,msec,task-clock,9611965893,100.00,0.961,CPUs utilized
+6334,,context-switches,9611957033,100.00,658.970,/sec
+0,,cpu-migrations,9611949293,100.00,0.000,/sec
+31928,,page-faults,9611941582,100.00,3.322,K/sec

@@ -1,0 +1,10 @@
+scenario,miniss_rps,monoio_rps,best_runtime,best_rps,miniss_vs_monoio,miniss_vs_best,summary
+"round1/ka8:0:8:1:10","65486.41","67076.01","tokio","78295.19","0.9763","0.8364","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-1/ka8:0:8:1:10/summary.csv"
+"round1/ka32:0:32:2:10","77848.37","71845.16","tokio","79788.62","1.0836","0.9757","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-1/ka32:0:32:2:10/summary.csv"
+"round1/close32:1:32:2:10","77908.23","70824.23","tokio","79120.57","1.1000","0.9847","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-1/close32:1:32:2:10/summary.csv"
+"round2/ka8:0:8:1:10","68668.72","66758.69","tokio","77720.60","1.0286","0.8835","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-2/ka8:0:8:1:10/summary.csv"
+"round2/ka32:0:32:2:10","77626.46","70953.96","tokio","79391.09","1.0940","0.9778","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-2/ka32:0:32:2:10/summary.csv"
+"round2/close32:1:32:2:10","77022.37","71200.87","tokio","80875.25","1.0818","0.9524","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-2/close32:1:32:2:10/summary.csv"
+"round3/ka8:0:8:1:10","68075.44","66764.30","tokio","77878.84","1.0196","0.8741","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-3/ka8:0:8:1:10/summary.csv"
+"round3/ka32:0:32:2:10","78016.00","70986.19","tokio","79123.06","1.0990","0.9860","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-3/ka32:0:32:2:10/summary.csv"
+"round3/close32:1:32:2:10","78001.00","70179.26","miniss","78001.00","1.1115","1.0000","/home/wuyan19981/rust-miniss/bench/results/http-matrix-20261029-163437/round-3/close32:1:32:2:10/summary.csv"
