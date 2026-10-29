@@ -38,9 +38,14 @@ CONNECTIONS=${BENCH_FLAG_CONNECTIONS:-200}
 THREADS=${BENCH_FLAG_THREADS:-2}
 
 # Each entry is NAME=VAR=value,VAR=value. The first entry is the baseline.
+# Flagsets must be kernel-legal: src/io/uring.rs resolve_taskrun_flags()
+# encodes the constraints (DEFER promotes SINGLE_ISSUER and excludes COOP;
+# SQPOLL drops DEFER with a warning), so "turn everything on" degrades to the
+# nearest legal subset instead of a dead ring.
 DEFAULT_FLAGSETS=(
     "default"
     "no_coop=MINISS_URING_NO_COOP_TASKRUN=1"
+    "defer_pair=MINISS_URING_SINGLE_ISSUER=1,MINISS_URING_DEFER_TASKRUN=1"
     "sqpoll=MINISS_URING_SQPOLL=1"
     "flush16=MINISS_URING_FLUSH_BATCH_SIZE=16"
     "entries1024=MINISS_URING_ENTRIES=1024"

@@ -47,6 +47,23 @@
 纯收益。解决路径(未实现):`IORING_SETUP_ATTACH_WQ`(内核 5.6+)可让多个
 ring 共享一个 SQPOLL 线程池,大核数机器上若启用 SQPOLL 应连它一起评估。
 
+## setup flag 的内核级冲突矩阵(2026-10-29 起由代码强制)
+
+"全打开"在 io_uring 是不可能的——部分 flag 互斥,内核直接拒绝整个 ring。
+`src/io/uring.rs` 的 `resolve_taskrun_flags()` 现在持有这张表,非法组合自动
+落到最近合法子集并 warn,而不是起不来或静默错配:
+
+| 组合 | 内核语义 | 运行时处理 |
+|---|---|---|
+| COOP_TASKRUN + DEFER_TASKRUN | 互斥(两种 taskrun 模式) | DEFER 胜出,自动去 COOP |
+| DEFER_TASKRUN 无 SINGLE_ISSUER | EINVAL(硬性前置) | 自动补 SINGLE_ISSUER |
+| SQPOLL + DEFER_TASKRUN | 内核拒绝 | 忽略 DEFER,warn,SQPOLL 照跑 |
+| 其余组合 | 自由组合 | 一开关一实验 |
+
+`just bench-uring-flags` 的默认 flagset 已包含 `defer_pair`(SINGLE_ISSUER+
+DEFER_TASKRUN)这一合法组合;gcloud 干净内核上的重测结果将决定 DEFER 是否
+进默认(OrbStack 数据不作数,见下节)。
+
 ## 硬件前提
 
 任何性能决策的测试环境必须是干净内核:

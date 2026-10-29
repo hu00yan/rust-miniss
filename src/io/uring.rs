@@ -191,6 +191,26 @@ fn write_entry_for_descriptor(
     }
 }
 
+/// Resolve the mutually-constrained taskrun setup flags into what the kernel
+/// will actually accept.
+///
+/// Kernel rules (io_uring_setup(2)): DEFER_TASKRUN requires SINGLE_ISSUER and
+/// is an *alternative* to COOP_TASKRUN — the two taskrun modes cannot be
+/// combined, so requesting DEFER promotes SINGLE_ISSUER and drops COOP.
+/// SQPOLL cannot combine with DEFER_TASKRUN at all; the SQPOLL caller passes
+/// `defer_requested = false` and warns instead of failing setup.
+fn resolve_taskrun_flags(
+    coop_requested: bool,
+    defer_requested: bool,
+    single_issuer_requested: bool,
+) -> (bool, bool, bool) {
+    if defer_requested {
+        (true, false, true)
+    } else {
+        (single_issuer_requested, coop_requested, false)
+    }
+}
+
 /// Multishot accept was added in Linux 5.19. The opcode probe alone cannot
 /// report SQE flag support, so gate the flag on the running kernel release and
 /// retain the single-shot fallback for unknown/malformed releases.
@@ -306,17 +326,28 @@ impl UringBackend {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(MAX_COMPLETIONS_PER_DRAIN);
-        fn base_builder(enable_coop_taskrun: bool) -> io_uring::Builder {
+        fn base_builder(
+            enable_coop_taskrun: bool,
+            enable_defer_taskrun: bool,
+        ) -> io_uring::Builder {
             let mut builder = IoUring::builder();
             // Keep optional flags explicit so each one has an isolated
-            // benchmark and an unsupported-kernel fallback.
-            if std::env::var_os("MINISS_URING_SINGLE_ISSUER").is_some() {
+            // benchmark and an unsupported-kernel fallback. The flags are NOT
+            // freely combinable at the kernel level; resolve_taskrun_flags
+            // below owns that policy so an invalid combination cannot reach
+            // the kernel.
+            let (single_issuer, coop, defer) = resolve_taskrun_flags(
+                enable_coop_taskrun,
+                enable_defer_taskrun,
+                std::env::var_os("MINISS_URING_SINGLE_ISSUER").is_some(),
+            );
+            if single_issuer {
                 builder.setup_single_issuer();
             }
-            if enable_coop_taskrun {
+            if coop {
                 builder.setup_coop_taskrun();
             }
-            if std::env::var_os("MINISS_URING_DEFER_TASKRUN").is_some() {
+            if defer {
                 builder.setup_defer_taskrun();
             }
             builder
@@ -327,23 +358,31 @@ impl UringBackend {
         // is safe to request on modern kernels and falls back cleanly when the
         // running kernel rejects the setup flag.
         let enable_coop_taskrun = std::env::var_os("MINISS_URING_NO_COOP_TASKRUN").is_none();
+        let enable_defer_taskrun = std::env::var_os("MINISS_URING_DEFER_TASKRUN").is_some();
 
         let (ring, sqpoll_enabled) = if std::env::var_os("MINISS_URING_SQPOLL").is_some() {
-            let mut builder = base_builder(enable_coop_taskrun);
+            // The kernel disallows DEFER_TASKRUN alongside SQPOLL (the SQPOLL
+            // thread is the issuer); drop DEFER for this ring instead of
+            // failing setup. The standalone DEFER experiment is run without
+            // SQPOLL.
+            if enable_defer_taskrun {
+                tracing::warn!("MINISS_URING_SQPOLL with DEFER_TASKRUN: kernel rejects the pair, running SQPOLL without DEFER");
+            }
+            let mut builder = base_builder(enable_coop_taskrun, false);
             builder.setup_sqpoll(1000);
             match builder.build(entries) {
                 Ok(ring) => (ring, true),
                 Err(err) => {
                     tracing::warn!("io_uring SQPOLL unavailable, falling back: {err}");
-                    (base_builder(false).build(entries)?, false)
+                    (base_builder(false, false).build(entries)?, false)
                 }
             }
         } else {
-            match base_builder(enable_coop_taskrun).build(entries) {
+            match base_builder(enable_coop_taskrun, enable_defer_taskrun).build(entries) {
                 Ok(ring) => (ring, false),
-                Err(error) if enable_coop_taskrun => {
-                    tracing::warn!("io_uring COOP_TASKRUN unavailable, using plain ring: {error}");
-                    (base_builder(false).build(entries)?, false)
+                Err(error) if enable_coop_taskrun || enable_defer_taskrun => {
+                    tracing::warn!("io_uring taskrun flags unavailable, using plain ring: {error}");
+                    (base_builder(false, false).build(entries)?, false)
                 }
                 Err(error) => return Err(error),
             }
@@ -1851,6 +1890,33 @@ mod tests {
     static_assertions::assert_not_impl_any!(UringBackend: Send, Sync);
     static_assertions::assert_not_impl_any!(PendingOp: Clone);
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn taskrun_flag_resolution_encodes_kernel_constraints() {
+        // DEFER_TASKRUN promotes SINGLE_ISSUER and excludes COOP_TASKRUN —
+        // the two taskrun modes are alternatives at the kernel level.
+        assert_eq!(
+            resolve_taskrun_flags(true, true, false),
+            (true, false, true)
+        );
+        assert_eq!(
+            resolve_taskrun_flags(false, true, false),
+            (true, false, true)
+        );
+        // Without DEFER, COOP and SINGLE_ISSUER keep whatever was requested.
+        assert_eq!(
+            resolve_taskrun_flags(true, false, false),
+            (false, true, false)
+        );
+        assert_eq!(
+            resolve_taskrun_flags(false, false, true),
+            (true, false, false)
+        );
+        assert_eq!(
+            resolve_taskrun_flags(false, false, false),
+            (false, false, false)
+        );
+    }
 
     #[test]
     fn failed_submission_is_reported_without_allocating_a_token() {
