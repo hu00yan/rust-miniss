@@ -57,6 +57,20 @@ bpftrace 与全部 `syscalls:sys_enter_*` perf 轨点不可用;perf 软件计数
 完整 VM 或裸金属**(GCE 常规实例、或未来 OrbStack 修复后)。本次 syscall
 归因由 strace -cf 完成(计数可信、吞吐不可比)。
 
+## OrbStack 污染环境对照(形状,2026-10-30;不入 bench/results)
+
+同矩阵在 OrbStack 7.2.12(7 vCPU,已知跨核唤醒 7-300ms)重跑,全部 45 格
+零错误零泄漏。**污染签名被完整隔离验证**:干净内核上 miniss 是 uring 家族
+第一(c32 对 monoio +8.3~10.0%),同一份代码在污染 VM 上对 monoio 跌到
+0.53-0.61x(ka8 0.53x)——7 worker 的跨核 spawn 路径正是被 7-300ms 虚拟
+中断击中的路径(1 worker 的 cloud shell 从未触发)。glommio 同样下坠
+(0.45-0.69x monoio)。monoio≈compio 的相对关系两环境一致;tokio 两环境
+都是 c32 第一或并列。另一个形状发现:c32 p99 的 uring 家族尾巴
+(3.7-5.6ms)在 7 真核上不复现(monoio/compio 179-258µs)——干净跑的
+发现 A(park 超时空转)更像 1 核争抢下的产物,不是 uring 家族的内在缺陷;
+这直接支持"自适应 park 超时"方向的收益预期。两环境差异 = 拓扑(1 vs 7
+worker)+ 污染,双变量不可分离,故 orb 数据仍只作形状参考。
+
 ## 结论
 
 1. 2026-07 矩阵的"高并发与 monoio 同量级"在干净内核、对齐 ring 后
