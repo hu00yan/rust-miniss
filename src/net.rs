@@ -182,26 +182,31 @@ fn bind_tcp_listener(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListen
 ///
 /// # Buffer ownership
 ///
-/// The three shapes are kept apart on purpose, so a caller can tell from the
-/// signature alone whether it keeps its buffer or hands it over:
+/// There are exactly two API families, so a caller can tell from the signature
+/// alone whether it keeps its buffer or hands it over. The driver level knows
+/// only the rent family: every queued data-movement operation is a rent op
+/// (`Op::ReadRent`/`Op::WriteRent`) carrying a pooled owned `Buffer`, on both
+/// backends. The borrowed family ([`borrowed`]) is a thin adaptation over it.
 ///
-/// | method | buffer | copy | who holds the bytes while a call blocks |
+/// | method | buffer | fast path (socket ready) | slow path (EAGAIN) |
 /// |---|---|---|---|
-/// | `read_rent`, `write_rent` | **rented**: the caller hands over an owned `T: RentBuffer` and gets the same allocation back | none beyond the `T`/`Buffer` conversion | the backend op, on the owning shard |
-/// | `poll_read`, `poll_read_vectored`, `poll_write`, `poll_write_vectored` | **borrowed**: the caller's slices | none — a direct `read(2)`/`write(2)`/`readv(2)`/`writev(2)`, retried on the readiness wakeup | nobody: the syscall only runs inside `poll`, so a queued op can never outlive the caller's buffer |
-/// | `write_all_static` | borrowed `&'static [u8]` | none — tries `write(2)`, then queues `Op::WriteStatic`, which points the backend straight at those bytes | the backend op; `'static` is exactly why queueing it is sound |
+/// | `read_rent`, `write_rent` | **rented**: the caller hands over an owned `T: RentBuffer` and gets the same allocation back | direct syscall against the caller's allocation (`read_rent` skips it on completion backends: the queued Recv doubles as readiness) | rent op, zero copies |
+/// | `poll_read`, `poll_read_vectored`, `poll_write`, `poll_write_vectored`, `HyperRead::poll_read` | **borrowed**: the caller's slices | direct `read(2)`/`write(2)`/`readv(2)`/`writev(2)` straight from/into the slices — zero copies | rent op armed with a pooled `Buffer`; completion is copied into (or out of) the caller's slice — one copy, on the waiting path only |
+/// | `write_all_static` | borrowed `&'static [u8]` | direct `write(2)` | `Op::WriteStatic` points the backend straight at the `'static` bytes — the `'static` lifetime is exactly why queueing without a copy is sound |
 ///
 /// Writing a head followed by a body is an HTTP response detail, not a stream
 /// capability, so `HttpConnection::send_response` does that itself.
+///
+/// [`borrowed`]: self::borrowed
 #[derive(Debug)]
 pub struct AsyncTcpStream {
     descriptor: Option<RegisteredDescriptor>,
-    readiness_token: Option<IoToken>,
-    /// Token for the POLLOUT registration submitted when `poll_write` or
-    /// `poll_write_vectored` finds the send buffer full. The task is woken when
-    /// the socket may be writable and retries the syscall directly; no write is
-    /// queued and no byte is copied.
-    pollout_token: Option<IoToken>,
+    /// Borrowed-read adaptation: an armed rent read plus leftover bytes from a
+    /// completed rent read that the completing poll's buffer could not take.
+    read: BorrowedRead,
+    /// Borrowed-write adaptation: an armed rent write holding a pooled copy of
+    /// the caller's bytes while the socket was not writable.
+    write: BorrowedWrite,
     /// Stream I/O tokens and TLS state belong to the creating shard. The
     /// marker prevents accidental migration through an `Arc<OwnedFd>` lease.
     _owner_local: PhantomData<Rc<()>>,
@@ -246,8 +251,8 @@ impl AsyncTcpStream {
         let descriptor = RegisteredDescriptor::from_owned(OwnedFd::from(stream));
         Ok(Self {
             descriptor: Some(descriptor),
-            readiness_token: None,
-            pollout_token: None,
+            read: BorrowedRead::new(),
+            write: BorrowedWrite::new(),
             _owner_local: PhantomData,
         })
     }
@@ -499,16 +504,12 @@ impl AsRawFd for AsyncTcpStream {
 
 impl IntoRawFd for AsyncTcpStream {
     fn into_raw_fd(mut self) -> RawFd {
-        // SAFETY: `state` is this thread's own shard, and the readiness tokens
-        // belong to this stream — `cancel_and_discard`'s contract is met.
-        with_io_state(|state| unsafe {
-            if let Some(token) = self.readiness_token {
-                state.cancel_and_discard(token);
-            }
-            if let Some(token) = self.pollout_token {
-                state.cancel_and_discard(token);
-            }
-        });
+        // Cancel armed rent ops before the descriptor identity leaves this
+        // wrapper. Dropping the armed futures cancels and discards their
+        // operations on the owning shard; the backend's operation lease keeps
+        // the descriptor alive until terminal completion either way.
+        self.read.clear();
+        self.write.clear();
         self.descriptor
             .take()
             .expect("live stream must own its descriptor")
@@ -519,92 +520,497 @@ impl IntoRawFd for AsyncTcpStream {
 
 impl Drop for AsyncTcpStream {
     fn drop(&mut self) {
-        // SAFETY: as in `into_raw_fd` — own shard, own tokens. `try_with_io_state`
-        // just skips the body when the dropping thread has no runtime state.
-        try_with_io_state(|state| unsafe {
-            if let Some(token) = self.readiness_token {
-                state.cancel_and_discard(token);
-            }
-            if let Some(token) = self.pollout_token {
-                state.cancel_and_discard(token);
-            }
-        });
+        // Cancel armed rent ops first so cancellation is ordered before the
+        // registered descriptor is released. Dropping an armed `IoFuture`
+        // cancels and discards its operation on the owning shard; the
+        // backend's operation lease keeps the fd identity alive until the
+        // terminal completion either way.
+        self.read.clear();
+        self.write.clear();
     }
 }
 
-/// One readiness attempt, shared by every borrowed (non-rent) poll path.
+/// Borrowed-over-rent adaptation for the stream poll family.
 ///
-/// All five call sites — scalar and vectored, read and write, plus
-/// `HyperRead::poll_read` — do the same four things in the same order, so the
-/// order only has to be correct here:
+/// This is monoio-compat's shape with a syscall-first fast path: the driver
+/// level only ever sees rent operations (`Op::ReadRent`/`Op::WriteRent`
+/// carrying pooled owned [`Buffer`]s), and the borrowed poll family arms one
+/// of them whenever a call cannot complete inside its own `poll` invocation,
+/// copying between the pooled buffer and the caller's slice at completion.
+/// While the socket is ready the borrowed path stays a plain nonblocking
+/// syscall straight from/into the caller's slice — zero copies, zero queued
+/// operations, on both backends — which is what keeps the ready case from
+/// gaining anything.
 ///
-/// 1. consume the readiness completion that woke us. It carries no payload; it
-///    means "run the syscall again", nothing more;
-/// 2. run that syscall directly. A queued op could outlive the caller's buffer,
-///    so the syscall only ever runs inside `poll`;
-/// 3. on `WouldBlock`, arm `events` on `fd` and register this task's waker, so
-///    the runtime re-enters `poll` when the descriptor is ready;
-/// 4. otherwise return the result.
+/// Each direction holds at most one armed operation. A re-poll before that
+/// operation completes never re-arms and never cancels: it only refreshes the
+/// waker through `IoFuture::poll`. An unrelated wake-up therefore cannot
+/// submit a duplicate operation for the descriptor (the kernel would answer a
+/// duplicate with `EEXIST`, so the mock-backend tests below stand in for it).
 ///
-/// `slot` is the caller's own registration handle for *its* direction
-/// (`readiness_token` for reads, `pollout_token` for writes), so the two
-/// directions can never consume each other's registration.
-fn poll_readiness(
-    state: &CpuIoState,
-    fd: RawFd,
-    descriptor: DescriptorLease,
-    cx: &Context<'_>,
-    events: u32,
-    slot: &mut Option<IoToken>,
-    attempt: impl FnOnce() -> io::Result<usize>,
-) -> Poll<io::Result<usize>> {
-    if let Some(token) = slot.take() {
-        // Consume a completion already delivered to the task before attempting
-        // to cancel; completion-based backends retain discarded slots until
-        // terminal completion, which has already happened in this case.
-        // SAFETY: `token` belongs to this shard and the poll owns its slot.
-        let completed = unsafe { state.has_completed(token) }
-            || unsafe { state.take_owner_completion(token) }.is_some();
-        if completed {
-            // SAFETY: same live shard-local token; its completion is consumed.
-            unsafe { state.clear_slot(token) };
-        } else if state.io_backend.uses_completion_io() {
-            // SAFETY: `token` was submitted on this shard; async cancellation
-            // must retain its slot until the backend reports terminal completion.
-            unsafe { state.cancel_and_discard(token) };
-        } else {
-            // Readiness backends cancel synchronously, releasing the registration
-            // and descriptor lease before a replacement PollAdd is submitted.
-            let _ = state.io_backend.cancel(token);
-            // SAFETY: this token was submitted on this shard and synchronous
-            // cancellation (or prior backend retirement) makes its slot reusable.
-            unsafe { state.clear_slot(token) };
+/// Architecture audit: the adaptation adds only stream-local state (one
+/// armed `IoFuture` and one leftover `Buffer` per direction, both owned by the
+/// creating shard). It adds no shared state, locks, atomics, runtime
+/// creation, blocking calls, or cross-core traffic; the intermediate buffers
+/// come from the existing thread-local pooled `Buffer`.
+mod borrowed {
+    use super::{is_wouldblock, try_read, try_read_vectored, try_write, try_write_vectored};
+    use crate::cpu::CpuIoState;
+    use crate::io::future::IoFuture;
+    use crate::io::{CompletionKind, DescriptorLease, Op};
+    use crate::Buffer;
+    use std::io;
+    use std::io::IoSliceMut;
+    use std::os::unix::io::RawFd;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    fn unexpected_completion(other: CompletionKind, context: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unexpected completion for {context}: {other:?}"),
+        )
+    }
+
+    /// Copy a completed rent read into the caller's slice, stashing whatever
+    /// the slice could not take for the next poll (the completing poll may
+    /// pass a smaller buffer than the one that armed the read).
+    fn deliver_rent_read(
+        buffer: Buffer,
+        dst: &mut [u8],
+        leftover: &mut Option<Buffer>,
+        consumed: &mut usize,
+    ) -> usize {
+        let filled = buffer.len();
+        if filled == 0 {
+            return 0; // EOF: never stash an empty leftover.
+        }
+        let copy_len = filled.min(dst.len());
+        dst[..copy_len].copy_from_slice(&buffer[..copy_len]);
+        if copy_len < filled {
+            *leftover = Some(buffer);
+            *consumed = copy_len;
+        }
+        copy_len
+    }
+
+    /// [`deliver_rent_read`] across the caller's slices, in order.
+    fn deliver_rent_read_vectored(
+        buffer: Buffer,
+        dsts: &mut [IoSliceMut<'_>],
+        leftover: &mut Option<Buffer>,
+        consumed: &mut usize,
+    ) -> usize {
+        let filled = buffer.len();
+        if filled == 0 {
+            return 0;
+        }
+        let mut remaining = &buffer[..filled];
+        let mut copied = 0;
+        for dst in dsts.iter_mut() {
+            if remaining.is_empty() {
+                break;
+            }
+            let n = remaining.len().min(dst.len());
+            dst[..n].copy_from_slice(&remaining[..n]);
+            remaining = &remaining[n..];
+            copied += n;
+        }
+        if copied < filled {
+            *leftover = Some(buffer);
+            *consumed = copied;
+        }
+        copied
+    }
+
+    /// Borrowed read side: armed rent read + leftover completed bytes.
+    #[derive(Debug)]
+    pub(super) struct BorrowedRead {
+        /// Rent read armed by a previous `EAGAIN`, waiting for completion. The
+        /// pooled buffer it reads into lives in the backend's operation slot
+        /// and returns inside the completion.
+        wait: Option<IoFuture>,
+        /// Completed rent read bytes the caller has not consumed yet.
+        leftover: Option<Buffer>,
+        /// Consumed prefix of `leftover`.
+        consumed: usize,
+    }
+
+    impl BorrowedRead {
+        pub(super) fn new() -> Self {
+            Self {
+                wait: None,
+                leftover: None,
+                consumed: 0,
+            }
+        }
+
+        /// Cancel an armed read and drop leftover bytes. Dropping the armed
+        /// `IoFuture` cancels and discards the operation on the owning shard.
+        pub(super) fn clear(&mut self) {
+            self.wait = None;
+            self.leftover = None;
+            self.consumed = 0;
+        }
+
+        /// Poll the armed rent read, taking it out when it completed.
+        fn poll_armed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Buffer>> {
+            let mut future = self
+                .wait
+                .take()
+                .expect("armed read polled without an operation");
+            match Pin::new(&mut future).poll(cx) {
+                Poll::Pending => {
+                    self.wait = Some(future);
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(CompletionKind::ReadRent { buffer })) => Poll::Ready(Ok(buffer)),
+                Poll::Ready(Ok(other)) => {
+                    Poll::Ready(Err(unexpected_completion(other, "borrowed read")))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            }
+        }
+
+        /// Hand out leftover bytes from a completed rent read. Returns `None`
+        /// when there is nothing (or an empty amount) to serve so the caller
+        /// falls through to the socket; `Ok(0)` must remain EOF-only.
+        fn serve_leftover(&mut self, dst: &mut [u8]) -> Option<usize> {
+            let (served, exhausted) = {
+                let leftover = self.leftover.as_ref()?;
+                let available = &leftover[self.consumed..];
+                let n = available.len().min(dst.len());
+                dst[..n].copy_from_slice(&available[..n]);
+                (n, self.consumed + n == leftover.len())
+            };
+            if exhausted {
+                self.leftover = None;
+                self.consumed = 0;
+            } else {
+                self.consumed += served;
+            }
+            (served > 0).then_some(served)
+        }
+
+        /// Arm one `Op::ReadRent` of `capacity` bytes and poll it once. The
+        /// common result is `Pending` (stored as the armed read); a backend
+        /// that completed the operation synchronously returns its buffer.
+        fn arm_read(
+            &mut self,
+            state: &CpuIoState,
+            fd: RawFd,
+            lease: DescriptorLease,
+            cx: &mut Context<'_>,
+            capacity: usize,
+        ) -> Poll<io::Result<Buffer>> {
+            let op = Op::ReadRent {
+                fd,
+                buffer: Buffer::new_uninitialized(capacity),
+            };
+            let token = match state.io_backend.submit_with_descriptor(op, lease) {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            let mut future = IoFuture::new(token);
+            match Pin::new(&mut future).poll(cx) {
+                Poll::Pending => {
+                    self.wait = Some(future);
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(CompletionKind::ReadRent { buffer })) => Poll::Ready(Ok(buffer)),
+                Poll::Ready(Ok(other)) => {
+                    Poll::Ready(Err(unexpected_completion(other, "borrowed read")))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            }
+        }
+
+        /// Borrowed `poll_read`: leftover, armed op, direct syscall, then a
+        /// rented read armed with a pooled buffer. The syscall fast path writes
+        /// into the caller's slice with zero copies; the rented slow path pays
+        /// one copy out of the pooled buffer at completion.
+        pub(super) fn poll_read_slice(
+            &mut self,
+            state: &CpuIoState,
+            fd: RawFd,
+            lease: DescriptorLease,
+            cx: &mut Context<'_>,
+            dst: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if dst.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            if let Some(n) = self.serve_leftover(dst) {
+                return Poll::Ready(Ok(n));
+            }
+            if self.wait.is_some() {
+                match self.poll_armed(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(buffer)) => {
+                        return Poll::Ready(Ok(deliver_rent_read(
+                            buffer,
+                            dst,
+                            &mut self.leftover,
+                            &mut self.consumed,
+                        )));
+                    }
+                    // A completion-backend read op can only report EAGAIN for a
+                    // non-socket descriptor; treat it like the fast path's
+                    // EAGAIN and fall through to re-arm below.
+                    Poll::Ready(Err(err)) if is_wouldblock(&err) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            match try_read(fd, dst) {
+                Ok(bytes) => return Poll::Ready(Ok(bytes)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            match self.arm_read(state, fd, lease, cx, dst.len()) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(buffer)) => Poll::Ready(Ok(deliver_rent_read(
+                    buffer,
+                    dst,
+                    &mut self.leftover,
+                    &mut self.consumed,
+                ))),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            }
+        }
+
+        /// Borrowed `poll_read_vectored` with more than one destination slice.
+        /// The slow path arms a scalar rented read sized to the destinations'
+        /// total and distributes the completion across them in order.
+        pub(super) fn poll_read_vectored(
+            &mut self,
+            state: &CpuIoState,
+            fd: RawFd,
+            lease: DescriptorLease,
+            cx: &mut Context<'_>,
+            dsts: &mut [IoSliceMut<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let total: usize = dsts.iter().map(|dst| dst.len()).sum();
+            if total == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            if let Some(n) = self.serve_leftover_vectored(dsts) {
+                return Poll::Ready(Ok(n));
+            }
+            if self.wait.is_some() {
+                match self.poll_armed(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(buffer)) => {
+                        return Poll::Ready(Ok(deliver_rent_read_vectored(
+                            buffer,
+                            dsts,
+                            &mut self.leftover,
+                            &mut self.consumed,
+                        )));
+                    }
+                    Poll::Ready(Err(err)) if is_wouldblock(&err) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            match try_read_vectored(fd, dsts) {
+                Ok(bytes) => return Poll::Ready(Ok(bytes)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            match self.arm_read(state, fd, lease, cx, total) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(buffer)) => Poll::Ready(Ok(deliver_rent_read_vectored(
+                    buffer,
+                    dsts,
+                    &mut self.leftover,
+                    &mut self.consumed,
+                ))),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            }
+        }
+
+        /// [`serve_leftover`] across the caller's slices, in order.
+        fn serve_leftover_vectored(&mut self, dsts: &mut [IoSliceMut<'_>]) -> Option<usize> {
+            let (served, exhausted) = {
+                let leftover = self.leftover.as_ref()?;
+                let mut available = &leftover[self.consumed..];
+                let mut served = 0;
+                for dst in dsts.iter_mut() {
+                    if available.is_empty() {
+                        break;
+                    }
+                    let n = available.len().min(dst.len());
+                    dst[..n].copy_from_slice(&available[..n]);
+                    available = &available[n..];
+                    served += n;
+                }
+                (served, self.consumed + served == leftover.len())
+            };
+            if exhausted {
+                self.leftover = None;
+                self.consumed = 0;
+            } else {
+                self.consumed += served;
+            }
+            (served > 0).then_some(served)
         }
     }
 
-    match attempt() {
-        Ok(bytes) => return Poll::Ready(Ok(bytes)),
-        Err(err) if is_wouldblock(&err) => {}
-        Err(err) => return Poll::Ready(Err(err)),
+    /// Borrowed write side: armed rent write holding the caller's bytes.
+    #[derive(Debug)]
+    pub(super) struct BorrowedWrite {
+        /// Rent write armed by a previous `EAGAIN`. Its pooled `Buffer` holds
+        /// a copy of the caller's bytes while the socket is not writable.
+        wait: Option<IoFuture>,
     }
 
-    let op = crate::io::Op::PollAdd {
-        fd,
-        events,
-        multishot: false,
-    };
-    let token = match state.io_backend.submit_with_descriptor(op, descriptor) {
-        Ok(token) => token,
-        Err(error) => return Poll::Ready(Err(error.into())),
-    };
-    *slot = Some(token);
-    // Register waker AND pending_task for inline completion.
-    // SAFETY: `token` was just submitted on this shard; the waker/task
-    // association is shard-local.
-    unsafe {
-        state.store_waker_and_pending_task(token, cx.waker(), current_task_id());
+    impl BorrowedWrite {
+        pub(super) fn new() -> Self {
+            Self { wait: None }
+        }
+
+        /// Cancel an armed write. Dropping the armed `IoFuture` cancels and
+        /// discards the operation on the owning shard.
+        pub(super) fn clear(&mut self) {
+            self.wait = None;
+        }
+
+        /// Poll the armed rent write. On completion returns the byte count the
+        /// operation wrote; the caller returns it as this poll's progress.
+        fn poll_armed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+            let mut future = self
+                .wait
+                .take()
+                .expect("armed write polled without an operation");
+            match Pin::new(&mut future).poll(cx) {
+                Poll::Pending => {
+                    self.wait = Some(future);
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(CompletionKind::WriteRent { bytes_written, .. })) => {
+                    if bytes_written == 0 {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "borrowed write completed with zero bytes",
+                        )))
+                    } else {
+                        Poll::Ready(Ok(bytes_written))
+                    }
+                }
+                Poll::Ready(Ok(other)) => {
+                    Poll::Ready(Err(unexpected_completion(other, "borrowed write")))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            }
+        }
+
+        /// Shared tail of the borrowed write paths: arm one `Op::WriteRent`
+        /// carrying `data` and poll it once. `Pending` stores the armed write.
+        fn arm_write(
+            &mut self,
+            state: &CpuIoState,
+            fd: RawFd,
+            lease: DescriptorLease,
+            cx: &mut Context<'_>,
+            data: Buffer,
+        ) -> Poll<io::Result<usize>> {
+            let op = Op::WriteRent { fd, data };
+            let token = match state.io_backend.submit_with_descriptor(op, lease) {
+                Ok(token) => token,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            let mut future = IoFuture::new(token);
+            match Pin::new(&mut future).poll(cx) {
+                Poll::Pending => {
+                    self.wait = Some(future);
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(CompletionKind::WriteRent { bytes_written, .. })) => {
+                    if bytes_written == 0 {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "borrowed write completed with zero bytes",
+                        )))
+                    } else {
+                        Poll::Ready(Ok(bytes_written))
+                    }
+                }
+                Poll::Ready(Ok(other)) => {
+                    Poll::Ready(Err(unexpected_completion(other, "borrowed write")))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            }
+        }
+
+        /// Borrowed `poll_write`: armed op, direct `write(2)` from the
+        /// caller's slice, then a rented write of a pooled copy. The fast path
+        /// is byte-for-byte today's zero-copy write; only the EAGAIN path
+        /// copies, into the pooled `Buffer` the rent op owns.
+        pub(super) fn poll_write_slice(
+            &mut self,
+            state: &CpuIoState,
+            fd: RawFd,
+            lease: DescriptorLease,
+            cx: &mut Context<'_>,
+            src: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.wait.is_some() {
+                match self.poll_armed(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => return Poll::Ready(result),
+                    // An armed write cannot legitimately complete EAGAIN on a
+                    // socket; fall through to the fast path and re-arm.
+                    Poll::Ready(Err(err)) if is_wouldblock(&err) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            match try_write(fd, src) {
+                Ok(bytes) => return Poll::Ready(Ok(bytes)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            self.arm_write(state, fd, lease, cx, Buffer::from_slice(src))
+        }
+
+        /// Borrowed `poll_write_vectored` with more than one source slice. The
+        /// slow path concatenates the slices into one pooled buffer so the
+        /// rented write carries a single contiguous payload.
+        pub(super) fn poll_write_vectored(
+            &mut self,
+            state: &CpuIoState,
+            fd: RawFd,
+            lease: DescriptorLease,
+            cx: &mut Context<'_>,
+            srcs: &[std::io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            if self.wait.is_some() {
+                match self.poll_armed(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => return Poll::Ready(result),
+                    Poll::Ready(Err(err)) if is_wouldblock(&err) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            match try_write_vectored(fd, srcs) {
+                Ok(bytes) => return Poll::Ready(Ok(bytes)),
+                Err(err) if is_wouldblock(&err) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            let total: usize = srcs.iter().map(|src| src.len()).sum();
+            let mut contiguous = Vec::with_capacity(total);
+            for src in srcs {
+                contiguous.extend_from_slice(src);
+            }
+            self.arm_write(state, fd, lease, cx, Buffer::from(contiguous))
+        }
     }
-    Poll::Pending
 }
 
 impl AsyncRead for AsyncTcpStream {
