@@ -441,3 +441,13 @@ are not silently mixed into the implementation batch.
     `tasks/vectored-writev-armed-registration-fd-leak.yaml`. Review follow-up #5
     ("io_uring terminal cleanup is duplicated across completion paths") is the
     same hazard seen from the other side.
+
+44. PR #3's macOS SIGPIPE regression
+    (`io::mio_poll::mio_regression_tests::disconnected_socket_write_returns_error_without_sigpipe`)
+    could not pass on any macOS host: the child asserted `setsockopt(SO_NOSIGPIPE)`
+    after dropping the socketpair peer, and a disconnected AF_UNIX socket rejects
+    the option with `EINVAL`. The PR's own verification notes say macOS/kqueue
+    checks were not run. Fix: set the option before the peer is dropped (the
+    production path in `net.rs` was always correct — it sets the option on a live
+    stream at construction). Verified with a standalone socketpair reproduction:
+    option set succeeds before the peer close and fails with `EINVAL` after it.

@@ -2721,9 +2721,10 @@ mod mio_regression_tests {
             // runs in the dedicated child process spawned by the test below.
             unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
             let (writer, peer) = UnixStream::pair().expect("create socket pair");
-            drop(peer);
             #[cfg(target_os = "macos")]
             {
+                // SO_NOSIGPIPE must be set while the peer is still open: a
+                // disconnected AF_UNIX socket rejects setsockopt with EINVAL.
                 let enabled: libc::c_int = 1;
                 // SAFETY: `writer` is a live stream socket and `enabled` is a
                 // valid SO_NOSIGPIPE option value for this call.
@@ -2738,6 +2739,7 @@ mod mio_regression_tests {
                 };
                 assert_eq!(result, 0, "set SO_NOSIGPIPE");
             }
+            drop(peer);
             let backend = MioBackend::new().expect("mio backend");
             let token = backend
                 .submit(Op::WriteStatic {
