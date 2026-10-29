@@ -273,7 +273,7 @@ multishot recv 优先，其次 provided buffer ring；SQPOLL/SEND_ZC 应后排�
 | 开关 | 当前策略 | 观测结论 |
 |------|----------|----------|
 | `MINISS_URING_SINGLE_ISSUER` | 仅在实验时开启 | 多轮 800 keep-alive 交错样本中收益不稳定；不适合作为默认值。 |
-| `MINISS_URING_SQPOLL` | 仅在实验时开启 | 在 OrbStack VM 的 800 keep-alive 样本里 p99 优于 baseline，但尾延迟仍不及 monoio / compio；对 VM / 内核配置敏感。 |
+| `MINISS_URING_SQPOLL` | 布尔开关，默认关（不是拒绝：未在多核大内存目标机上验证） | 每个开启的 ring 占一个专属内核收割线程——10 核开 10 个 ring 即腰斩可用核；大机器上若启用应连 `IORING_SETUP_ATTACH_WQ`（共享收割线程池，内核 5.6+，未实现）一起评估。资料先验：单线程存储 +32%，但 ~30µs 唤醒延迟伤尾延迟（arXiv 2512.04859）。决策框架见 `docs/review/io-uring-feature-policy.md`。 |
 | `MINISS_URING_DEFER_TASKRUN` | 默认关闭 | 在当前 OrbStack 内核上启用时，runtime 直接报 `No suitable IO backend available`，说明这类 taskrun 语义不是所有环境都可用。 |
 | `MINISS_URING_COOP_TASKRUN` | 默认开启（失败时回退） | `MINISS_URING_NO_COOP_TASKRUN=1` 可禁用；当前内核可用，关闭会降低吞吐，不能仅凭较低单轮 p99 默认关闭。 |
 | `MINISS_URING_FLUSH_BATCH_SIZE` | 默认 61 | 已验证过把它调高并不总是更好；对 p99 的影响比吞吐更敏感。 |
