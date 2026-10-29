@@ -161,9 +161,15 @@ Loom、Miri 和性能矩阵必须使用各自的显式命令，不得偷偷并�
 
 | 项目 | 内核需求 | 目标 |
 |------|---------|------|
-| IOSQE_IO_LINK 链式操作 | 6.0+ | 评估 WAL/fsync 场景的提交开销 |
-| Provided Buffer Ring | 6.12+ | 降低 buffer 分配与回收开销 |
-| SQPOLL 模式 | 5.11+ | 评估减少提交 syscall；需要权限和独立证据 |
-| Registered Buffers | 5.7+ | 评估大 I/O 的页固定开销 |
 | Multi-shot recv | 6.10+ | 评估减少 recv SQE 数量 |
+| Provided Buffer Ring | 6.12+ | 降低 buffer 分配与回收开销 |
+| IOSQE_IO_LINK 链式操作 | 6.0+ | 评估 WAL/fsync 场景的提交开销 |
+| Registered Buffers | 5.7+ | 评估大 I/O 的页固定开销 |
 | DMA-BUF zero-copy recv | 6.16+ | 评估真正的网络接收零拷贝 |
+| SQPOLL 模式 | 5.11+ | 评估减少提交 syscall；需要权限和独立证据 |
+
+行序即建议评估顺序。对小消息 HTTP 这类负载，外部测量（arXiv 2512.04859，内核
+6.15/6.17）显示 multishot recv 收益最大，其次 provided buffer ring；
+registered buffer/fixed file 主要惠及存储型大 I/O；SQPOLL 单线程吞吐提升明显
+但约 30µs 唤醒延迟损害尾延迟，SEND_ZC 在 ~1KiB 以下消息反而劣于普通
+io_uring，两者均应后排。

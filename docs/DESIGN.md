@@ -254,8 +254,17 @@ draining
 | sendzc / `IOSQE_FIXED_FILE` | ≥ 6.0 | ❌ 未使用 |
 
 这张表的意义在 `docs/review/performance-baseline-2026-07-11.md`：42.4 req/enter
-与 monoio 持平，而 monoio 用了 fixed file + registered buffer。差距不在实现质量，
+与 monoio 持平。注意：**不能**把缺注册 buffer / buf_ring 当作与 monoio 差距
+的解释——经源码核对，monoio 0.2.4 同样只用普通单次 op，没有 provided buffer ring、
+registered buffer、fixed file，也没有 multishot recv（高级特性仅有 opt-in 的
+sendzc 与大 buffer MSG_ZEROCOPY），双方在这张表上一样保守，42.4 vs 42.0 的持平
+正是同等保守的直接结果。当前 io_uring 特性最全的参照是 compio（provided buffer
+ring 池、fixed file 注册、multishot accept 带内核版本回退、SQPOLL/DEFER_TASKRUN
+等构建开关）；若做 buf-ring 相关工作，应以 compio 的实现为参照。差距不在实现质量，
 在**未启用的机制**。上面每一项都是独立可做的工作，不要当成一个整体的"io_uring 优化"。
+对小消息 HTTP 负载，外部测量（arXiv 2512.04859，内核 6.15/6.17）给出的启用顺序是：
+multishot recv 优先，其次 provided buffer ring；SQPOLL/SEND_ZC 应后排（SQPOLL 约
+30µs 唤醒延迟损害尾延迟，SEND_ZC 在 ~1KiB 以下消息反而劣于普通 io_uring）。
 
 ### io_uring 性能敏感开关
 
