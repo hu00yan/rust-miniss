@@ -47,6 +47,34 @@
 纯收益。解决路径(未实现):`IORING_SETUP_ATTACH_WQ`(内核 5.6+)可让多个
 ring 共享一个 SQPOLL 线程池,大核数机器上若启用 SQPOLL 应连它一起评估。
 
+## B 类特性的内核源码定论(2026-10-29,torvalds/master io_uring/net.c + kbuf.c)
+
+不依赖跑分,内核实现直接给出三个确定结论:
+
+1. **multishot recv 与 provided buffer ring 是一个原子特性,不可拆分。**
+   `io_recvmsg_prep()` 对 `IORING_RECV_MULTISHOT` 强制要求
+   `REQ_F_BUFFER_SELECT`,否则 prep 阶段直接 `-EINVAL`——没有 buf ring,
+   multishot recv 无法存在。实现顺序从"先 recv 后 buf_ring"改为
+   **单分支原子交付**(`feat/multishot-recv-buf-ring`)。
+2. **机制收益确定:每请求对 op 数 2 → ~1。** 单发 recv 每次完整走
+   submit → io_recv → CQE;multishot 在 `io_recv()` 内 `retry_multishot`
+   循环:每轮从 buffer group 重新选 buffer、`io_req_post_cqe()` 直接
+   post CQE,不重走 SQE 提交(arm 一次收 N 次)。echo 场景每请求对
+   原本 1 recv + 1 send 两个 op,recv 并入长驻 arm 后 ≈1.x 个。
+   端到端 RPS/p99 增益取决于 op 开销占比,这一层必须真机 A/B——但
+   eBPF 计数(io_uring_submit_sqe tracepoint 按 opcode 计数)可以先于
+   任何性能数字验证"op 减半"确实发生。
+3. **buf ring 选择成本 O(1) 零分配**:`io_ring_buffer_select()` 是掩码
+   索引弹出 + acquire 读生产者尾,无内核分配(legacy ProvideBuffers 是
+   链表 + 每 buffer kmalloc);`IOU_PBUF_RING_INC`(6.14+)支持部分消费,
+   小请求不再整块占用 4KiB buffer——正对 22 字节 echo 负载的内存放大问题。
+4. **术语修正**:此前文档把两类注册混称"registered buffer"。我们的 recv
+   路径需要的是 **PBUF_RING(provided buffer ring,5.19+)**;而
+   `IORING_REGISTER_BUFFERS`(REGISTERED 固定数据 buffer,READ_FIXED/
+   WRITE_FIXED,5.1+)是另一个东西,arXiv 的"+11% 存储"是后者的数据,
+   与 recv 路径无关,引用时要分开。recvzc 存在但强制 multishot 且依赖
+   网卡 zcrx 基础设施(`io_zcrx_ifq`),不适用,维持搁置。
+
 ## setup flag 的内核级冲突矩阵(2026-10-29 起由代码强制)
 
 "全打开"在 io_uring 是不可能的——部分 flag 互斥,内核直接拒绝整个 ring。
