@@ -323,15 +323,19 @@ fn linux_uring_delayed_submit_readv_survives_relocation_pressure() {
 
 /// Fill a nonblocking socket without involving the runtime, so the next public
 /// `poll_write` / `poll_write_vectored` cannot complete on its optimistic
-/// `write(2)` / `writev(2)` fast path and must arm POLLOUT instead.
+/// `write(2)` / `writev(2)` fast path and must arm a rented write instead.
+/// Returns the number of filler bytes the kernel accepted, so the peer can
+/// account for them against its read total.
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
-fn fill_send_buffer_until_would_block(fd: std::os::fd::RawFd) {
+fn fill_send_buffer_until_would_block(fd: std::os::fd::RawFd) -> usize {
     let bytes = [0x3Cu8; 8192];
+    let mut total = 0usize;
     loop {
         // SAFETY: `fd` belongs to the live AsyncTcpStream and `bytes` remains
         // valid for this synchronous syscall.
         let written = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), 0) };
         if written >= 0 {
+            total += written as usize;
             continue;
         }
         let error = std::io::Error::last_os_error();
@@ -339,7 +343,7 @@ fn fill_send_buffer_until_would_block(fd: std::os::fd::RawFd) {
             matches!(error.raw_os_error(), Some(libc::EAGAIN)),
             "unexpected send-buffer fill error: {error}"
         );
-        return;
+        return total;
     }
 }
 
@@ -452,14 +456,17 @@ fn linux_uring_delayed_submit_writev_survives_relocation_pressure() {
 
 /// Bounded backpressure regression for the borrowed scalar write path.
 ///
-/// A full send buffer must make `poll_write` return `Pending` after arming
-/// POLLOUT — and it must stay `Pending` while the buffer is still full, so a
-/// task cannot spin. Once the peer drains, the same outstanding poll must
+/// A full send buffer must make `poll_write` return `Pending` after arming a
+/// rented write — and it must stay `Pending` while the buffer is still full, so
+/// a task cannot spin. Once the peer drains, the same outstanding poll must
 /// deliver the whole payload across as many retries as the 4 KiB send buffer
-/// needs.
+/// needs. The peer counts the pre-fill bytes explicitly and drains to the
+/// exact send total: every byte the filler and the payload put on the wire
+/// must arrive exactly once, in order, regardless of how the runtime chunks
+/// the kernel-executed write.
 #[test]
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
-fn linux_uring_poll_write_blocks_on_readiness_until_the_peer_drains() {
+fn linux_uring_poll_write_blocks_until_the_peer_drains() {
     use futures::future::poll_fn;
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
@@ -497,19 +504,26 @@ fn linux_uring_poll_write_blocks_on_readiness_until_the_peer_drains() {
         };
         assert_eq!(set_rcvbuf, 0, "set peer receive buffer");
         accepted_tx.send(()).expect("notify peer acceptance");
-        drain_rx
+        let filler_total = drain_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("release peer drain");
         let mut scratch = [0u8; 8192];
         let mut received = 0usize;
-        while received < PAYLOAD_LEN {
+        while received < filler_total + PAYLOAD_LEN {
             match socket.read(&mut scratch) {
                 Ok(0) => break,
                 Ok(n) => received += n,
                 Err(error) => panic!("peer drain failed after {received} bytes: {error}"),
             }
         }
-        assert_eq!(received, PAYLOAD_LEN, "peer must receive the whole payload");
+        // Every byte the filler and the payload put on the wire must arrive
+        // exactly once and in order; the read total is bounded by the send
+        // total, so the final read lands on it exactly.
+        assert_eq!(
+            received,
+            filler_total + PAYLOAD_LEN,
+            "peer must receive the filler and the whole payload"
+        );
     });
 
     let client = TcpStream::connect(addr).expect("connect client");
@@ -534,7 +548,7 @@ fn linux_uring_poll_write_blocks_on_readiness_until_the_peer_drains() {
             )
         };
         assert_eq!(set_sndbuf, 0, "set client send buffer");
-        fill_send_buffer_until_would_block(writer.as_raw_fd());
+        let filler_total = fill_send_buffer_until_would_block(writer.as_raw_fd());
 
         let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
         let mut written = 0usize;
@@ -563,7 +577,7 @@ fn linux_uring_poll_write_blocks_on_readiness_until_the_peer_drains() {
                             again.is_pending(),
                             "poll_write must not report writable while the send buffer is full"
                         );
-                        drain_tx.send(()).expect("release peer drain");
+                        drain_tx.send(filler_total).expect("release peer drain");
                     }
                     return Poll::Pending;
                 }

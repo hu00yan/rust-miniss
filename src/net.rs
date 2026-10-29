@@ -1,6 +1,7 @@
-use crate::cpu::{current_task_id, try_with_io_state, with_io_state, CpuIoState};
+use crate::cpu::{try_with_io_state, with_io_state};
 use crate::io::{DescriptorLease, IoToken, RegisteredDescriptor};
 use crate::{Buffer, RentBuffer};
+use borrowed::{BorrowedRead, BorrowedWrite};
 use futures::io::{AsyncRead, AsyncWrite};
 use hyper::rt::{Read as HyperRead, ReadBufCursor, Write as HyperWrite};
 use libc;
@@ -559,6 +560,7 @@ mod borrowed {
     use crate::io::future::IoFuture;
     use crate::io::{CompletionKind, DescriptorLease, Op};
     use crate::Buffer;
+    use std::future::Future;
     use std::io;
     use std::io::IoSliceMut;
     use std::os::unix::io::RawFd;
@@ -668,7 +670,7 @@ mod borrowed {
                 Poll::Ready(Ok(other)) => {
                     Poll::Ready(Err(unexpected_completion(other, "borrowed read")))
                 }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
             }
         }
 
@@ -721,7 +723,7 @@ mod borrowed {
                 Poll::Ready(Ok(other)) => {
                     Poll::Ready(Err(unexpected_completion(other, "borrowed read")))
                 }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
             }
         }
 
@@ -903,7 +905,7 @@ mod borrowed {
                 Poll::Ready(Ok(other)) => {
                     Poll::Ready(Err(unexpected_completion(other, "borrowed write")))
                 }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
             }
         }
 
@@ -941,7 +943,7 @@ mod borrowed {
                 Poll::Ready(Ok(other)) => {
                     Poll::Ready(Err(unexpected_completion(other, "borrowed write")))
                 }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
             }
         }
 
@@ -960,11 +962,10 @@ mod borrowed {
             if self.wait.is_some() {
                 match self.poll_armed(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => return Poll::Ready(result),
                     // An armed write cannot legitimately complete EAGAIN on a
                     // socket; fall through to the fast path and re-arm.
                     Poll::Ready(Err(err)) if is_wouldblock(&err) => {}
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(result) => return Poll::Ready(result),
                 }
             }
 
@@ -991,9 +992,8 @@ mod borrowed {
             if self.wait.is_some() {
                 match self.poll_armed(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => return Poll::Ready(result),
                     Poll::Ready(Err(err)) if is_wouldblock(&err) => {}
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(result) => return Poll::Ready(result),
                 }
             }
 
@@ -1026,15 +1026,7 @@ impl AsyncRead for AsyncTcpStream {
             let this = self.as_mut().get_mut();
             let fd = this.as_raw_fd();
             let descriptor = this.descriptor_lease();
-            poll_readiness(
-                state,
-                fd,
-                descriptor,
-                cx,
-                libc::POLLIN as u32,
-                &mut this.readiness_token,
-                || try_read(fd, buf),
-            )
+            this.read.poll_read_slice(state, fd, descriptor, cx, buf)
         })
     }
 
@@ -1054,19 +1046,8 @@ impl AsyncRead for AsyncTcpStream {
             let this = self.as_mut().get_mut();
             let fd = this.as_raw_fd();
             let descriptor = this.descriptor_lease();
-            // readv straight into the caller's slices: one syscall, one copy.
-            // Submitting `Op::ReadVectored` would have the backend allocate its
-            // own `Buffer`s, read into them, and then be copied a second time
-            // into `bufs` on completion.
-            poll_readiness(
-                state,
-                fd,
-                descriptor,
-                cx,
-                libc::POLLIN as u32,
-                &mut this.readiness_token,
-                || try_read_vectored(fd, bufs),
-            )
+            this.read
+                .poll_read_vectored(state, fd, descriptor, cx, bufs)
         })
     }
 }
@@ -1084,20 +1065,7 @@ impl AsyncWrite for AsyncTcpStream {
             let this = self.as_mut().get_mut();
             let fd = this.as_raw_fd();
             let descriptor = this.descriptor_lease();
-            // write(2) straight from the caller's slice: one syscall, no copy.
-            // Submitting `Op::Write` would make the backend copy `buf` into an
-            // owned `Buffer` and queue that, and `buf` is borrowed, so it could
-            // not be handed to the kernel as a queued operation anyway.
-            // `poll_read` reasons the same way about the borrowed read buffer.
-            poll_readiness(
-                state,
-                fd,
-                descriptor,
-                cx,
-                libc::POLLOUT as u32,
-                &mut this.pollout_token,
-                || try_write(fd, buf),
-            )
+            this.write.poll_write_slice(state, fd, descriptor, cx, buf)
         })
     }
 
@@ -1120,20 +1088,8 @@ impl AsyncWrite for AsyncTcpStream {
             let this = self.as_mut().get_mut();
             let fd = this.as_raw_fd();
             let descriptor = this.descriptor_lease();
-            // writev(2) straight from the caller's slices: one syscall, no copy —
-            // the mirror of `poll_read_vectored`. The queued-vectored shape this
-            // replaced had the backend copy every slice into its own `Buffer`s and
-            // then write those, which is the same double copy the readv path
-            // avoids; it was retired with `Op::WriteVectored`.
-            poll_readiness(
-                state,
-                fd,
-                descriptor,
-                cx,
-                libc::POLLOUT as u32,
-                &mut this.pollout_token,
-                || try_write_vectored(fd, bufs),
-            )
+            this.write
+                .poll_write_vectored(state, fd, descriptor, cx, bufs)
         })
     }
 
@@ -1174,17 +1130,13 @@ impl HyperRead for AsyncTcpStream {
             let fd = this.as_raw_fd();
             let descriptor = this.descriptor_lease();
 
-            match poll_readiness(
-                state,
-                fd,
-                descriptor,
-                cx,
-                libc::POLLIN as u32,
-                &mut this.readiness_token,
-                || try_read(fd, read_buf),
-            ) {
+            match this
+                .read
+                .poll_read_slice(state, fd, descriptor, cx, read_buf)
+            {
                 Poll::Ready(Ok(bytes_read)) => {
-                    // SAFETY: `try_read` initialized exactly `bytes_read` bytes.
+                    // SAFETY: the borrowed read initialized exactly `bytes_read`
+                    // bytes of the cursor's tail.
                     unsafe {
                         buf.advance(bytes_read);
                     }
@@ -1876,12 +1828,13 @@ mod locality_contract_tests {
 }
 
 #[cfg(test)]
-mod readiness_repoll_tests {
-    use super::poll_readiness;
-    use crate::cpu::test_io_state;
+mod borrowed_repoll_tests {
+    use super::borrowed::BorrowedRead;
+    use crate::cpu::{test_io_state, RuntimeContextGuard};
     use crate::io::{
         CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op, RegisteredDescriptor,
     };
+    use crate::timer::TimerWheel;
     use std::cell::RefCell;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::rc::Rc;
@@ -1889,26 +1842,31 @@ mod readiness_repoll_tests {
 
     #[derive(Default)]
     struct BackendState {
-        pending: Vec<PendingPoll>,
+        pending: Vec<PendingRent>,
         cancellations: usize,
+        submissions: usize,
     }
 
-    struct PendingPoll {
+    struct PendingRent {
         token: IoToken,
         fd: i32,
         _descriptor: DescriptorLease,
     }
 
-    struct DuplicatePollBackend(Rc<RefCell<BackendState>>);
+    /// Rent-op stand-in for the kernel's EEXIST answer: a second armed
+    /// operation on the same descriptor is rejected outright, so a duplicate
+    /// submission can never hide inside this test.
+    struct DuplicateRentBackend(Rc<RefCell<BackendState>>);
 
-    impl DuplicatePollBackend {
-        fn register(&self, fd: i32, descriptor: DescriptorLease) -> Result<IoToken, IoError> {
+    impl DuplicateRentBackend {
+        fn admit(&self, fd: i32, descriptor: DescriptorLease) -> Result<IoToken, IoError> {
             let mut state = self.0.borrow_mut();
             if state.pending.iter().any(|pending| pending.fd == fd) {
                 return Err(IoError::Io(std::io::Error::from_raw_os_error(libc::EEXIST)));
             }
             let token = IoToken::new();
-            state.pending.push(PendingPoll {
+            state.submissions += 1;
+            state.pending.push(PendingRent {
                 token,
                 fd,
                 _descriptor: descriptor,
@@ -1917,14 +1875,18 @@ mod readiness_repoll_tests {
         }
     }
 
-    impl IoProvider for DuplicatePollBackend {
+    impl IoProvider for DuplicateRentBackend {
         type Completion = (IoToken, Result<CompletionKind, IoError>);
 
         fn submit(&self, op: Op) -> Result<IoToken, IoError> {
-            let Op::PollAdd { fd, .. } = op else {
-                return Err(IoError::Other("readiness poll expected".into()));
+            let Op::ReadRent { fd, buffer } = op else {
+                return Err(IoError::Other("rent read expected".into()));
             };
-            self.register(fd, DescriptorLease::acquire(fd).map_err(IoError::Io)?)
+            drop(buffer);
+            // SAFETY: the test submitted this descriptor on its own shard; the
+            // duplicate-lease acquisition models the backend's operation lease.
+            let lease = DescriptorLease::acquire(fd).map_err(IoError::Io)?;
+            self.admit(fd, lease)
         }
 
         fn submit_with_descriptor(
@@ -1932,10 +1894,10 @@ mod readiness_repoll_tests {
             op: Op,
             descriptor: DescriptorLease,
         ) -> Result<IoToken, IoError> {
-            let Op::PollAdd { fd, .. } = op else {
-                return Err(IoError::Other("readiness poll expected".into()));
+            let Op::ReadRent { fd, .. } = op else {
+                return Err(IoError::Other("rent read expected".into()));
             };
-            self.register(fd, descriptor)
+            self.admit(fd, descriptor)
         }
 
         fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
@@ -1965,10 +1927,15 @@ mod readiness_repoll_tests {
         }
     }
 
+    /// The borrowed-read contract that replaced readiness registration: a
+    /// re-poll woken by something unrelated must neither submit a duplicate
+    /// rent op for the descriptor (the kernel would answer `EEXIST`) nor
+    /// cancel the armed one — it only refreshes the waker. The armed op then
+    /// delivers its completion to whichever poll comes next.
     #[test]
-    fn repoll_after_unrelated_wake_cancels_the_previous_readiness_registration() {
+    fn repoll_after_unrelated_wake_never_rearms_the_rent_read() {
         let state = Rc::new(RefCell::new(BackendState::default()));
-        let io_state = test_io_state(DuplicatePollBackend(state.clone()));
+        let io_state = test_io_state(DuplicateRentBackend(state.clone()));
         let mut fds = [0; 2];
         // SAFETY: `fds` contains two writable slots for `pipe` to fill.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -1976,51 +1943,70 @@ mod readiness_repoll_tests {
         let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         // SAFETY: same as above for the other endpoint.
         let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        // The syscall fast path needs a nonblocking descriptor; a blocking
+        // pipe would stall the test thread instead of returning EAGAIN.
+        // SAFETY: `read_end` is a live pipe endpoint owned by this test.
+        unsafe {
+            let flags = libc::fcntl(read_end.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(
+                read_end.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            );
+        }
         let descriptor = RegisteredDescriptor::acquire(read_end.as_raw_fd()).expect("lease fd");
         let waker = futures::task::noop_waker();
-        let cx = Context::from_waker(&waker);
-        let mut slot = None;
-        let would_block = || Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        let mut cx = Context::from_waker(&waker);
+        let mut timers = TimerWheel::default();
+        // SAFETY: the test keeps the state and timer on this owner thread
+        // until the guard is dropped.
+        let _guard = unsafe { RuntimeContextGuard::enter(&io_state, &mut timers, Some(0)) };
+        let mut borrowed = BorrowedRead::new();
+        let mut slot = [0_u8; 64];
+        let lease = || descriptor.lease();
 
-        assert!(matches!(
-            poll_readiness(
-                &io_state,
-                read_end.as_raw_fd(),
-                descriptor.lease(),
-                &cx,
-                libc::POLLIN as u32,
-                &mut slot,
-                would_block,
-            ),
-            Poll::Pending
-        ));
-        let first_token = slot.expect("first readiness registration");
-
-        // Model the task being polled again by an unrelated wake before this
-        // readiness token has completed.
-        let repoll = poll_readiness(
-            &io_state,
-            read_end.as_raw_fd(),
-            descriptor.lease(),
-            &cx,
-            libc::POLLIN as u32,
-            &mut slot,
-            would_block,
-        );
-        assert!(
-            matches!(repoll, Poll::Pending),
-            "re-poll should replace the old registration, not return EEXIST: {repoll:?}"
-        );
-        let second_token = slot.expect("replacement readiness registration");
-
-        assert_ne!(first_token, second_token);
+        // First poll: syscall hits EAGAIN on the empty pipe, so the read arms
+        // exactly one rent op and goes Pending.
+        let poll =
+            borrowed.poll_read_slice(&io_state, read_end.as_raw_fd(), lease(), &mut cx, &mut slot);
+        assert!(matches!(poll, Poll::Pending));
+        assert_eq!(state.borrow().submissions, 1);
         assert_eq!(io_state.io_backend.pending_operation_count(), 1);
         assert_eq!(io_state.io_backend.retained_descriptor_count(), 1);
-        assert_eq!(state.borrow().cancellations, 1);
 
-        assert!(io_state.io_backend.cancel(second_token));
-        // SAFETY: the test owns this token on the same shard; the mock backend
-        // synchronously removed its registration above.
-        unsafe { io_state.clear_slot(second_token) };
+        // Model the task being polled again by an unrelated wake before the
+        // armed read completes: no re-arm, no cancel, same single pending op.
+        let repoll =
+            borrowed.poll_read_slice(&io_state, read_end.as_raw_fd(), lease(), &mut cx, &mut slot);
+        assert!(
+            matches!(repoll, Poll::Pending),
+            "re-poll should keep waiting on the armed read, not re-arm: {repoll:?}"
+        );
+        assert_eq!(state.borrow().submissions, 1, "duplicate rent submission");
+        assert_eq!(state.borrow().cancellations, 0);
+        assert_eq!(io_state.io_backend.pending_operation_count(), 1);
+
+        // Complete the armed op with data, then deliver it to the next poll.
+        // Consuming the completion retires the backend-side operation slot, as
+        // the CQE drain does on a real backend.
+        let token = state.borrow_mut().pending.remove(0).token;
+        // SAFETY: the test owns the shard-local state and this token.
+        unsafe {
+            if let Some(waker) = io_state.insert_completed_and_take_waker(
+                token,
+                Ok(CompletionKind::ReadRent {
+                    buffer: crate::Buffer::from_slice(b"data"),
+                }),
+            ) {
+                drop(waker);
+            }
+        }
+        let delivered =
+            borrowed.poll_read_slice(&io_state, read_end.as_raw_fd(), lease(), &mut cx, &mut slot);
+        assert!(matches!(delivered, Poll::Ready(Ok(4))), "{delivered:?}");
+        assert_eq!(&slot[..4], b"data");
+        assert_eq!(state.borrow().cancellations, 0);
+        assert_eq!(io_state.io_backend.pending_operation_count(), 0);
+        assert_eq!(io_state.io_backend.retained_descriptor_count(), 0);
     }
 }
