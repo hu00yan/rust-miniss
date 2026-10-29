@@ -268,6 +268,11 @@ pub struct UringBackend {
     park_flushes: Cell<u64>,
     park_flush_total_us: Cell<u64>,
     max_park_flush_us: Cell<u64>,
+    /// Acquire/release ledger for descriptor leases and pending ops. Plain
+    /// `Cell` counters mutated only by this owner thread; see
+    /// [`crate::io::ResourceLedger`] for the balance equations asserted at
+    /// every drain/park boundary in debug builds.
+    ledger: crate::io::ResourceLedger,
     thread_id: std::thread::ThreadId,
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -311,7 +316,30 @@ impl UringBackend {
         // SAFETY: backend is thread-affine; only owner drains/removes leases.
         let leases = unsafe { &mut *self.descriptor_leases.get() };
         if let Some(lease) = leases.get_mut(idx) {
-            let _ = lease.take();
+            // Release side of the lease ledger: counted exactly when the
+            // table entry is removed.
+            if lease.take().is_some() {
+                self.ledger.lease_released();
+            }
+        }
+    }
+
+    /// Debug-build balance assertion over the shard's lease table and pending
+    /// slab. Runs at every drain/park boundary; in release builds the whole
+    /// body (including the table scans) is compiled out.
+    #[inline]
+    fn assert_ledger_balanced(&self, context: &'static str) {
+        if cfg!(debug_assertions) {
+            // SAFETY: owner-thread-only tables; this runs on the backend's
+            // owning runtime thread at a drain/park boundary.
+            let live_leases = unsafe { &*self.descriptor_leases.get() }
+                .iter()
+                .filter(|lease| lease.is_some())
+                .count();
+            // SAFETY: same owner-thread-only slab. `Slab::len` counts occupied
+            // entries, i.e. the live in-flight operation set.
+            let live_ops = unsafe { &*self.pending_ops.get() }.len();
+            self.ledger.assert_balanced(live_leases, live_ops, context);
         }
     }
 
@@ -414,6 +442,7 @@ impl UringBackend {
             park_flushes: Cell::new(0),
             park_flush_total_us: Cell::new(0),
             max_park_flush_us: Cell::new(0),
+            ledger: crate::io::ResourceLedger::default(),
             thread_id: std::thread::current().id(),
             _local: std::marker::PhantomData,
         })
@@ -550,7 +579,9 @@ impl UringBackend {
             // Skip the wakeup poll token — caller handles it separately.
             if wakeup_poll_token == Some(token) {
                 saw_wakeup_poll_completion = true;
-                pending_ops.try_remove(idx);
+                if pending_ops.try_remove(idx).is_some() {
+                    self.ledger.op_released();
+                }
                 self.release_descriptor_lease(idx);
                 slot_meta[idx].token_id = 0;
                 slot_meta[idx].discard_accept_results = false;
@@ -642,6 +673,7 @@ impl UringBackend {
 
             // Normal completion: remove PendingOp, reconstruct result, store + wake.
             if let Some(pending_op) = pending_ops.try_remove(idx) {
+                self.ledger.op_released();
                 self.release_descriptor_lease(idx);
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
@@ -682,6 +714,9 @@ impl UringBackend {
                 break;
             }
         }
+        // Fused-drain tail: both ledger equations must hold against the slab
+        // and lease table this drain just mutated.
+        self.assert_ledger_balanced("io_uring fused drain tail");
         (processed, saw_wakeup_poll_completion, wakeups)
     }
 }
@@ -1090,6 +1125,10 @@ impl UringBackend {
 
         // Insert into slab to get efficient O(1) storage.
         let idx = pending_ops.insert(pending_op);
+        // Acquire side of the pending-op ledger: released again exactly once
+        // at a terminal `try_remove` below (kernel CQE, cancel-reap CQE, or
+        // submission failure).
+        self.ledger.op_acquired();
 
         // Keep descriptor ownership parallel to PendingOp.  Slab movement and
         // user-future drop cannot reclaim this lease before terminal CQE.
@@ -1098,6 +1137,11 @@ impl UringBackend {
         let leases = unsafe { &mut *self.descriptor_leases.get() };
         if idx >= leases.len() {
             leases.resize_with(idx + 1, || None);
+        }
+        // Acquire side of the lease ledger: this submit installs the slot's
+        // lease, released again exactly once in `release_descriptor_lease`.
+        if descriptor_lease.is_some() {
+            self.ledger.lease_acquired();
         }
         leases[idx] = descriptor_lease;
 
@@ -1133,7 +1177,9 @@ impl UringBackend {
             // SAFETY: Same as above; retry after flushing free SQ slots.
             if unsafe { ring.submission().push(&entry) }.is_err() {
                 // Still full after flush — ring is too small, drop the op.
-                pending_ops.try_remove(idx);
+                if pending_ops.try_remove(idx).is_some() {
+                    self.ledger.op_released();
+                }
                 self.release_descriptor_lease(idx);
                 slot_meta[idx].token_id = 0;
                 tracing::error!("SQ still full after emergency flush (ring too small?)");
@@ -1530,6 +1576,19 @@ impl IoProvider for UringBackend {
         leases + accepted
     }
 
+    fn resource_balance(&self) -> crate::io::ResourceBalanceSnapshot {
+        // SAFETY: termination-time query on the owning thread, after the
+        // event loop stopped mutating the shard-local tables.
+        let live_leases = unsafe { &*self.descriptor_leases.get() }
+            .iter()
+            .filter(|lease| lease.is_some())
+            .count();
+        // SAFETY: same owner-thread-only slab; occupied entries are the live
+        // in-flight operation set.
+        let live_ops = unsafe { &*self.pending_ops.get() }.len();
+        self.ledger.snapshot(live_leases, live_ops)
+    }
+
     fn cancel(&self, token: IoToken) -> bool {
         // SAFETY: `ring` is shard-local; `cancel` runs on the owning runtime thread
         // (see `UringBackend`'s thread-affinity note), so no other borrow is live.
@@ -1610,6 +1669,7 @@ impl IoProvider for UringBackend {
         // No need to wait if results are ready.
         let ready = ring.completion().len();
         if ready != 0 {
+            self.assert_ledger_balanced("io_uring park entry (completions ready)");
             return ready;
         }
 
@@ -1634,6 +1694,7 @@ impl IoProvider for UringBackend {
 
         let ready = ring.completion().len();
         if ready != 0 {
+            self.assert_ledger_balanced("io_uring park tail (flush produced CQEs)");
             return ready;
         }
 
@@ -1654,7 +1715,9 @@ impl IoProvider for UringBackend {
                 tracing::error!("io_uring park submit failed: {error}");
             }
         }
-        ring.completion().len()
+        let ready = ring.completion().len();
+        self.assert_ledger_balanced("io_uring park tail");
+        ready
     }
 
     fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
@@ -1814,6 +1877,7 @@ impl IoProvider for UringBackend {
             let pending_op = { pending_ops.try_remove(idx) };
 
             if let Some(pending_op) = pending_op {
+                self.ledger.op_released();
                 self.release_descriptor_lease(idx);
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
@@ -1835,6 +1899,9 @@ impl IoProvider for UringBackend {
             }
         }
 
+        // Plain-drain tail: both ledger equations must hold against the slab
+        // and lease table this drain just mutated.
+        self.assert_ledger_balanced("io_uring drain tail");
         if completions.is_empty() {
             Poll::Pending
         } else {

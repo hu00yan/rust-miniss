@@ -587,6 +587,10 @@ pub struct CoreTerminationSnapshot {
     pub queued_submissions: usize,
     pub pending_operations: usize,
     pub retained_descriptors: usize,
+    /// Acquire/release balance for descriptor leases and pending operations
+    /// (see [`crate::io::ResourceLedger`] for the equations). Quiescence
+    /// requires [`ResourceBalanceSnapshot::is_balanced_and_empty`].
+    pub resources: crate::io::ResourceBalanceSnapshot,
 }
 
 impl CoreTerminationSnapshot {
@@ -601,6 +605,7 @@ impl CoreTerminationSnapshot {
             && self.queued_submissions == 0
             && self.pending_operations == 0
             && self.retained_descriptors == 0
+            && self.resources.is_balanced_and_empty()
     }
 }
 
@@ -844,6 +849,7 @@ impl CpuCore {
             queued_submissions: self.io_state.io_backend.pending_submission_count(),
             pending_operations: self.io_state.io_backend.pending_operation_count(),
             retained_descriptors: self.io_state.io_backend.retained_descriptor_count(),
+            resources: self.io_state.io_backend.resource_balance(),
         }
     }
 
@@ -3096,6 +3102,104 @@ mod tests {
     static_assertions::assert_impl_all!(MultiCoreRuntime: Send, Sync);
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Unit-test shutdown-quiescence oracle (assert_quiescent helper).
+    ///
+    /// Mirror of `tests/common/quiescent.rs` — integration tests cannot see
+    /// lib test-gated (cfg test) items, so the small helper is duplicated
+    /// there. Keep both copies under 60 code lines and cross-referenced.
+    /// (The word "cfg(test)" is spelled without its attribute punctuation so
+    /// the arch-audit cfg-test span tracker is not reset by this comment.)
+    ///
+    /// fd tolerance: +2 for the fd reader itself and one-time lazy machinery
+    /// (tracing/metrics control plane) first touched inside the measured
+    /// window; far below any real leak signal, since guarded tests hold
+    /// several sockets/leases, so a per-operation leak exceeds the bar.
+    struct QuiescenceGuard {
+        runtime: Option<Arc<MultiCoreRuntime>>,
+        baseline_fds: usize,
+    }
+
+    const FD_TOLERANCE: usize = 2;
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+    const SETTLE_WINDOW: Duration = Duration::from_secs(2);
+
+    impl QuiescenceGuard {
+        fn start(workers: Option<usize>) -> Self {
+            Self {
+                runtime: Some(MultiCoreRuntime::new(workers).expect("quiescence runtime")),
+                baseline_fds: open_fd_count(),
+            }
+        }
+
+        fn runtime(&self) -> &Arc<MultiCoreRuntime> {
+            self.runtime.as_ref().expect("quiescence guard is active")
+        }
+
+        fn finish_quiescent(mut self, context: &'static str) {
+            let runtime = self.runtime.take().expect("quiescence guard is active");
+            runtime
+                .shutdown_with_timeout(SHUTDOWN_TIMEOUT)
+                .expect("shutdown request");
+            runtime.join().expect("quiescence workers joined");
+            let snapshot = runtime
+                .termination_snapshot()
+                .expect("termination snapshot");
+            assert!(
+                snapshot.all_zero(),
+                "{context}: non-zero termination snapshot: {snapshot:?}"
+            );
+            drop(runtime);
+            // Settle window: sibling tests may transiently hold fds; this
+            // runtime is fully dropped, so persistent growth is a leak and
+            // transient growth falls back under the bar.
+            let deadline = Instant::now() + SETTLE_WINDOW;
+            let mut after = open_fd_count();
+            while after > self.baseline_fds + FD_TOLERANCE && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
+                after = open_fd_count();
+            }
+            assert!(
+                after <= self.baseline_fds + FD_TOLERANCE,
+                "{context}: open fd count grew {} -> {}",
+                self.baseline_fds,
+                after
+            );
+        }
+    }
+
+    impl Drop for QuiescenceGuard {
+        fn drop(&mut self) {
+            // Panic path: bound cleanup so an assertion failure cannot hang.
+            if let Some(runtime) = self.runtime.take() {
+                let _ = runtime.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
+                let _ = runtime.join();
+            }
+        }
+    }
+
+    fn open_fd_count() -> usize {
+        #[cfg(target_os = "linux")]
+        let dir = "/proc/self/fd";
+        #[cfg(not(target_os = "linux"))]
+        let dir = "/dev/fd";
+        // Unreadable fd dir degrades the guard to snapshot-only evidence.
+        std::fs::read_dir(dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn loaded_shutdown_helper_asserts_snapshot_and_fd_quiescence() {
+        let guard = QuiescenceGuard::start(Some(2));
+        guard
+            .runtime()
+            .spawn(async {
+                crate::timer::sleep(Duration::from_millis(5)).await;
+            })
+            .expect("helper probe task admitted");
+        guard.finish_quiescent("lib quiescence helper");
+    }
 
     #[test]
     fn injected_metrics_sampler_spawn_failure_joins_started_workers() {

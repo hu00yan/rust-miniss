@@ -254,6 +254,11 @@ pub struct MioBackend {
     /// zero-timeout poll would report zero new events and drop the ones park
     /// just harvested.
     park_left_events: std::cell::Cell<bool>,
+    /// Acquire/release ledger for descriptor leases and pending ops. Plain
+    /// `Cell` counters mutated only by this owner thread; see
+    /// [`crate::io::ResourceLedger`] for the balance equations asserted at
+    /// every drain/park boundary in debug builds.
+    ledger: crate::io::ResourceLedger,
     #[cfg(test)]
     blocking_test_gate: UnsafeCell<Option<Arc<BlockingTestGate>>>,
     #[cfg(test)]
@@ -304,6 +309,7 @@ impl MioBackend {
             completed_tx,
             completed_rx: UnsafeCell::new(completed_rx),
             park_left_events: std::cell::Cell::new(false),
+            ledger: crate::io::ResourceLedger::default(),
             #[cfg(test)]
             blocking_test_gate: UnsafeCell::new(None),
             #[cfg(test)]
@@ -330,15 +336,46 @@ impl MioBackend {
         }
     }
 
-    fn recycle_slot(slot: usize, tables: &mut SlotTables<'_>) {
+    /// Return one slot to the reusable pool.
+    ///
+    /// This is the terminal reclaim point for the slot's pending operation and
+    /// descriptor lease, so it is the release side of both ledger equations:
+    /// an entry present here is counted released exactly when it is removed.
+    fn recycle_slot(&self, slot: usize, tables: &mut SlotTables<'_>) {
         if let Some(token) = tables.mio_tokens[slot].take() {
             tables.active_mio_slots.remove(&token);
         }
-        tables.pending_ops[slot] = None;
-        tables.descriptor_leases[slot] = None;
+        if tables.pending_ops[slot].take().is_some() {
+            self.ledger.op_released();
+        }
+        if tables.descriptor_leases[slot].take().is_some() {
+            self.ledger.lease_released();
+        }
         tables.descriptor_lease_tokens[slot] = None;
         tables.udp_recv_buffers[slot] = None;
         tables.free_slots.push(slot);
+    }
+
+    /// Debug-build balance assertion over the shard's lease and pending-op
+    /// tables. Runs at every drain/park boundary; in release builds the whole
+    /// body (including the table scans) is compiled out.
+    #[inline]
+    fn assert_ledger_balanced(&self, context: &'static str) {
+        if cfg!(debug_assertions) {
+            // SAFETY: owner-thread-only tables; this runs on the backend's
+            // owning event-loop thread at a drain/park boundary.
+            let live_leases = unsafe { &*self.descriptor_leases.get() }
+                .iter()
+                .filter(|lease| lease.is_some())
+                .count();
+            let live_ops =
+                // SAFETY: owner-thread-only table; same owner event-loop thread.
+                unsafe { &*self.pending_ops.get() }
+                    .iter()
+                    .filter(|entry| entry.is_some())
+                    .count();
+            self.ledger.assert_balanced(live_leases, live_ops, context);
+        }
     }
 
     fn register_after_would_block(
@@ -527,6 +564,11 @@ impl IoProvider for MioBackend {
         let udp_recv_buffers = unsafe { &mut *self.udp_recv_buffers.get() };
         Self::ensure_slot_capacity(udp_recv_buffers, slot);
 
+        // Acquire side of the lease ledger: this submit installs the slot's
+        // lease, released again exactly once at recycle_slot.
+        if descriptor_lease.is_some() {
+            self.ledger.lease_acquired();
+        }
         descriptor_leases[slot] = descriptor_lease;
         descriptor_lease_tokens[slot] = Some(io_token);
         mio_tokens[slot] = Some(mio_token);
@@ -773,7 +815,7 @@ impl IoProvider for MioBackend {
                         }
                     };
                     self.complete_local((io_token, result));
-                    Self::recycle_slot(
+                    self.recycle_slot(
                         slot,
                         &mut SlotTables {
                             pending_ops: &mut *pending_ops,
@@ -817,10 +859,19 @@ impl IoProvider for MioBackend {
             },
         };
 
+        // Acquire side of the pending-op ledger: exactly the arms above that
+        // admitted the operation leave `pending_ops[slot]` occupied (recycled
+        // slots are always empty on entry). Failed-registration and
+        // unsupported arms never install; `Op::Close` completes inline without
+        // ever going pending.
+        if pending_ops[slot].is_some() {
+            self.ledger.op_acquired();
+        }
+
         // Registration failures and unsupported operations do not leave a
         // pending slot. File/flush jobs retain theirs until owner drain.
         if let Some(error) = registration_error {
-            Self::recycle_slot(
+            self.recycle_slot(
                 slot,
                 &mut SlotTables {
                     pending_ops: &mut *pending_ops,
@@ -879,6 +930,23 @@ impl IoProvider for MioBackend {
         leases + accepted
     }
 
+    fn resource_balance(&self) -> crate::io::ResourceBalanceSnapshot {
+        // SAFETY: termination-time query on the owning thread, after the
+        // event loop stopped mutating the shard-local tables.
+        let live_leases = unsafe { &*self.descriptor_leases.get() }
+            .iter()
+            .filter(|lease| lease.is_some())
+            .count();
+        let live_ops =
+            // SAFETY: termination-time query on the owning thread, after the
+            // event loop stopped mutating the shard-local pending-op table.
+            unsafe { &*self.pending_ops.get() }
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count();
+        self.ledger.snapshot(live_leases, live_ops)
+    }
+
     fn cancel(&self, token: IoToken) -> bool {
         // SAFETY: `cancel` runs on the owning event-loop thread, so `poll` is ours alone.
         let poll = unsafe { &mut *self.poll.get() };
@@ -916,7 +984,7 @@ impl IoProvider for MioBackend {
         let active_mio_slots = unsafe { &mut *self.active_mio_slots.get() };
         // SAFETY: `cancel` runs on the owning event-loop thread, the sole accessor to free slots.
         let free_slots = unsafe { &mut *self.free_slots.get() };
-        Self::recycle_slot(
+        self.recycle_slot(
             slot,
             &mut SlotTables {
                 pending_ops: &mut *pending_ops,
@@ -963,6 +1031,7 @@ impl IoProvider for MioBackend {
         // Nothing to wait for if the pool already produced work.
         if completed != 0 {
             self.park_left_events.set(false);
+            self.assert_ledger_balanced("mio park (pool completions ready)");
             return completed;
         }
 
@@ -972,7 +1041,7 @@ impl IoProvider for MioBackend {
         let wait = timeout.max(Duration::from_millis(1));
         // `Poll::poll` in mio 1.0 returns `io::Result<()>`, so the event count
         // is read back from the shared buffer instead of from the return value.
-        match poll.poll(events, Some(wait)) {
+        let parked = match poll.poll(events, Some(wait)) {
             Ok(()) => {
                 // A count of 1, not the true event count: the caller only asks
                 // "is there work", and a fabricated count would corrupt
@@ -986,7 +1055,9 @@ impl IoProvider for MioBackend {
                 self.park_left_events.set(false);
                 0
             }
-        }
+        };
+        self.assert_ledger_balanced("mio park tail");
+        parked
     }
 
     fn cancel_all(&self) {
@@ -1039,7 +1110,7 @@ impl IoProvider for MioBackend {
                         .iter()
                         .position(|token| *token == Some(completion.0))
                     {
-                        Self::recycle_slot(
+                        self.recycle_slot(
                             slot,
                             &mut SlotTables {
                                 pending_ops: &mut *pending_ops,
@@ -1072,6 +1143,7 @@ impl IoProvider for MioBackend {
                 Err(e) => {
                     // An error from poll is serious, but we'll just log it for now.
                     eprintln!("mio poll error: {e}");
+                    self.assert_ledger_balanced("mio drain tail (poll error)");
                     return if completions.is_empty() {
                         TaskPoll::Ready(Vec::new())
                     } else {
@@ -1089,6 +1161,11 @@ impl IoProvider for MioBackend {
                 continue;
             };
             if let Some((io_token, op)) = pending_ops.get_mut(slot).and_then(Option::take) {
+                // The take is this operation's exit from the pending set:
+                // count it released here. A WouldBlock requeue reinstalls the
+                // slot below and counts the acquire again, so the balance
+                // holds at every boundary either way.
+                self.ledger.op_released();
                 let leased_fd = descriptor_leases
                     .get(slot)
                     .and_then(Option::as_ref)
@@ -1161,6 +1238,7 @@ impl IoProvider for MioBackend {
                                 Ok(()) => {
                                     pending_ops[slot] =
                                         Some((io_token, Op::ReadRent { fd, buffer }));
+                                    self.ledger.op_acquired();
                                     continue;
                                 }
                                 Err(error) => Err(IoError::Io(error)),
@@ -1228,6 +1306,7 @@ impl IoProvider for MioBackend {
                                     // `Buffer` clone path for the other variants.
                                     pending_ops[slot] =
                                         Some((io_token, Op::Read { fd, offset, len }));
+                                    self.ledger.op_acquired();
                                     continue;
                                 }
                                 Err(error) => result = Err(IoError::Io(error)),
@@ -1295,6 +1374,7 @@ impl IoProvider for MioBackend {
                                 Ok(()) => {
                                     pending_ops[slot] =
                                         Some((io_token, Op::WriteRent { fd, data }));
+                                    self.ledger.op_acquired();
                                     continue;
                                 }
                                 Err(error) => Err(IoError::Io(error)),
@@ -1371,6 +1451,7 @@ impl IoProvider for MioBackend {
                                 Ok(()) => {
                                     pending_ops[slot] =
                                         Some((io_token, Op::WriteStatic { fd, data }));
+                                    self.ledger.op_acquired();
                                     continue;
                                 }
                                 Err(error) => result = Err(IoError::Io(error)),
@@ -1438,6 +1519,7 @@ impl IoProvider for MioBackend {
                                                     buffer: Buffer::empty(),
                                                 },
                                             ));
+                                            self.ledger.op_acquired();
                                             retry = true;
                                             Err(IoError::Io(e))
                                         }
@@ -1569,6 +1651,7 @@ impl IoProvider for MioBackend {
                                     // produced nothing duplicated the payload for nothing.
                                     pending_ops[slot] =
                                         Some((io_token, Op::ReadVectored { fd, buffers }));
+                                    self.ledger.op_acquired();
                                     continue;
                                 }
                                 Err(error) => result = Err(IoError::Io(error)),
@@ -1594,7 +1677,7 @@ impl IoProvider for MioBackend {
 
                 // The terminal result no longer references its operation slot.
                 // Readiness requeues `continue` above and retain the slot.
-                Self::recycle_slot(
+                self.recycle_slot(
                     slot,
                     &mut SlotTables {
                         pending_ops: &mut *pending_ops,
@@ -1610,6 +1693,10 @@ impl IoProvider for MioBackend {
             }
         }
 
+        // Plain-drain tail: both ledger equations must hold against the tables
+        // this drain just mutated (pool-completion recycles and event-driven
+        // terminal recycles).
+        self.assert_ledger_balanced("mio drain tail");
         if completions.is_empty() {
             TaskPoll::Pending
         } else {

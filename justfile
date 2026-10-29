@@ -197,6 +197,10 @@ test:
 
 # Regular correctness tests. Stress and long-running lifecycle tests are run
 # once by `just stress`, rather than once per feature combination.
+# tests/shutdown_quiescence.rs carries the bounded shutdown-reclaim regressions
+# promoted from `just stress` (defect-forensics Tier-1 items 3+4): they run the
+# live quiescence oracle (all-zero termination snapshot incl. the resource
+# balance ledger + fd-count guard) on every run of this recipe.
 test-regular:
     cargo test --lib --tests --examples -- --test-threads=1 \
         --skip test_long_running \

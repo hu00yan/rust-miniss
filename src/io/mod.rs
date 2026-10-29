@@ -329,6 +329,156 @@ mod descriptor_lease_tests {
     }
 }
 
+/// Owner-published acquire/release balance for one shard's I/O resources.
+///
+/// Published into [`crate::multicore::CoreTerminationSnapshot`] so shutdown
+/// accounting is evidence-bearing: at quiescence every acquire must have a
+/// matching release (`*_acquired == *_released`) and nothing may remain
+/// in flight (`*_held == *_live == 0`). Mid-stream, `acquired − released`
+/// is the legitimate in-flight set; it is asserted, not zeroed, at every
+/// drain/park boundary in debug builds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceBalanceSnapshot {
+    /// Lease installs counted on this shard.
+    pub descriptor_leases_acquired: u64,
+    /// Terminal lease reclaims counted on this shard.
+    pub descriptor_leases_released: u64,
+    /// Leases still held in the backend lease table at publication time.
+    pub descriptor_leases_held: u64,
+    /// Operations admitted into the backend pending set.
+    pub pending_ops_acquired: u64,
+    /// Operations removed from the pending set (terminal CQE, cancel,
+    /// submission failure).
+    pub pending_ops_released: u64,
+    /// Operations still pending in the backend at publication time.
+    pub pending_ops_live: u64,
+}
+
+impl ResourceBalanceSnapshot {
+    /// Quiescence form of the balance equation: every acquire is paired with
+    /// exactly one release and nothing is in flight.
+    pub fn is_balanced_and_empty(&self) -> bool {
+        self.descriptor_leases_acquired == self.descriptor_leases_released
+            && self.pending_ops_acquired == self.pending_ops_released
+            && self.descriptor_leases_held == 0
+            && self.pending_ops_live == 0
+    }
+}
+
+/// Owner-thread acquire/release counters for the resources whose pairing the
+/// forensics review (docs/review/defect-forensics-2026-10.md, P3) identified
+/// as structurally error-prone: descriptor leases and pending operations.
+///
+/// These are plain `Cell<u64>` fields mutated only by the backend's owning
+/// thread — the same discipline as `CoreMetrics` and MioBackend's flush
+/// counters (AGENTS.md MUST #3/#6). No atomics, no locks, no cross-core
+/// traffic: the only reader outside the owner thread is the termination
+/// snapshot, which is collected after the owner exits.
+///
+/// # The balance equations
+///
+/// For each resource, with `A` = acquired, `R` = released, `L` = live
+/// (counted by scanning the backend's own table — the ground truth, not a
+/// third counter):
+///
+/// ```text
+/// R == A − L        asserted at every drain/park boundary (debug builds)
+/// R == A ∧ L == 0   asserted at quiescence via ResourceBalanceSnapshot
+/// ```
+///
+/// The equation is *not* "always zero": in-flight operations are legitimate.
+/// Counting mutations only at table transitions means the equation detects
+/// *pairing* drift — a release path that clears the table without counting,
+/// a counting path that clears nothing, or a slot taken from the pending set
+/// and neither reinstated nor recycled (the op is lost; `L` drops below
+/// `A − R` and the assert fires). It deliberately does *not* detect a
+/// resource that is never released at all: an abandoned entry stays in the
+/// table, so the equation still balances while `L > 0`. That class is caught
+/// by the quiescence half at shutdown, where every legitimate in-flight set
+/// is empty and the snapshot must be `is_balanced_and_empty()`.
+///
+/// Backend in-flight models:
+/// - descriptor leases: an entry in the backend's lease table (installed at
+///   submit/registration, removed at terminal reclaim).
+/// - pending ops: an entry in the backend's pending-operation set (slab for
+///   io_uring, slot table for mio). Multishot accepts stay one pending op
+///   while armed; their queued-but-unconsumed results are accounted by the
+///   existing `pending_operation_count`, not by this ledger.
+#[derive(Debug, Default)]
+pub(crate) struct ResourceLedger {
+    leases_acquired: Cell<u64>,
+    leases_released: Cell<u64>,
+    ops_acquired: Cell<u64>,
+    ops_released: Cell<u64>,
+}
+
+impl ResourceLedger {
+    /// Count one lease installed into the backend lease table.
+    #[inline]
+    pub(crate) fn lease_acquired(&self) {
+        self.leases_acquired.set(self.leases_acquired.get() + 1);
+    }
+
+    /// Count one lease removed from the backend lease table.
+    #[inline]
+    pub(crate) fn lease_released(&self) {
+        self.leases_released.set(self.leases_released.get() + 1);
+    }
+
+    /// Count one operation admitted into the backend pending set.
+    #[inline]
+    pub(crate) fn op_acquired(&self) {
+        self.ops_acquired.set(self.ops_acquired.get() + 1);
+    }
+
+    /// Count one operation removed from the backend pending set.
+    #[inline]
+    pub(crate) fn op_released(&self) {
+        self.ops_released.set(self.ops_released.get() + 1);
+    }
+
+    /// Assert both balance equations against the backend's live table counts.
+    ///
+    /// Debug-build only and free in release: `cfg!(debug_assertions)` is a
+    /// compile-time constant, so callers pass live counts produced by
+    /// table scans inside the same gated block and the scans are eliminated
+    /// entirely from release builds.
+    #[inline]
+    pub(crate) fn assert_balanced(
+        &self,
+        live_leases: usize,
+        live_ops: usize,
+        context: &'static str,
+    ) {
+        if cfg!(debug_assertions) {
+            let (acquired, released) = (self.leases_acquired.get(), self.leases_released.get());
+            debug_assert!(
+                acquired as i128 - released as i128 == live_leases as i128,
+                "descriptor lease ledger imbalance at {context}: acquired={acquired} released={released} in_flight={live_leases} (expected released == acquired - in_flight)"
+            );
+            let (acquired, released) = (self.ops_acquired.get(), self.ops_released.get());
+            debug_assert!(
+                acquired as i128 - released as i128 == live_ops as i128,
+                "pending op ledger imbalance at {context}: acquired={acquired} released={released} in_flight={live_ops} (expected released == acquired - in_flight)"
+            );
+        }
+    }
+
+    /// Owner-published balance snapshot for termination reporting.
+    /// `live_*` come from the same owner-thread table scans as the asserts.
+    #[inline]
+    pub(crate) fn snapshot(&self, live_leases: usize, live_ops: usize) -> ResourceBalanceSnapshot {
+        ResourceBalanceSnapshot {
+            descriptor_leases_acquired: self.leases_acquired.get(),
+            descriptor_leases_released: self.leases_released.get(),
+            descriptor_leases_held: live_leases as u64,
+            pending_ops_acquired: self.ops_acquired.get(),
+            pending_ops_released: self.ops_released.get(),
+            pending_ops_live: live_ops as u64,
+        }
+    }
+}
+
 /// The core asynchronous I/O backend trait.
 ///
 /// Each CPU thread will own an instance of a type that implements this trait.
@@ -401,6 +551,15 @@ pub trait IoProvider: 'static {
     /// queues. Queried only during owner-thread termination reporting.
     fn retained_descriptor_count(&self) -> usize {
         0
+    }
+
+    /// Owner-thread acquire/release balance for descriptor leases and pending
+    /// operations, published once at worker exit into
+    /// [`crate::multicore::CoreTerminationSnapshot`]. See [`ResourceLedger`]
+    /// for the equations. Queried only after the owner stopped mutating its
+    /// tables; the default is a trivially balanced, empty ledger.
+    fn resource_balance(&self) -> ResourceBalanceSnapshot {
+        ResourceBalanceSnapshot::default()
     }
 
     /// Request owner-thread cancellation while retaining operation resources
