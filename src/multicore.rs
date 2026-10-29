@@ -1693,6 +1693,30 @@ fn shutdown_and_join_started_workers(
     }
 }
 
+/// Generation component of a task key derived from a core's monotonic spawn
+/// sequence (the high 16 bits above the slot index).
+///
+/// A slot's generation must strictly increase on every reuse:
+/// `TaskArena::can_insert_external` (src/waker.rs) admits an external key only
+/// when its generation is greater than the stored one, and a slot whose
+/// generation reaches `u16::MAX` is permanently retired instead of wrapping.
+/// The legacy formula cycled modulo `u16::MAX`, so once a core passed
+/// 65,535 cycles (`sequence >= 65,535 * 65,536`, about 4.3e9 spawns) it
+/// reproduced generations the arena must reject: every such key would be
+/// declined forever, turning cross-shard spawns into errors and local spawns
+/// into silent deferral. Fail closed at exactly that boundary instead,
+/// mirroring the arena's own retire-on-exhaustion behaviour.
+#[inline]
+fn task_id_generation(sequence: u64) -> Option<u16> {
+    let cycle = sequence >> 16;
+    if cycle >= u16::MAX as u64 {
+        return None;
+    }
+    // The modulo is an identity on this guarded domain; it is kept to mirror
+    // the legacy formula.
+    Some(((cycle % u16::MAX as u64) + 1) as u16)
+}
+
 impl MultiCoreRuntime {
     #[cfg(target_os = "linux")]
     fn startup_cpu_plan(requested: Option<usize>) -> Result<Vec<usize>> {
@@ -2118,7 +2142,7 @@ impl MultiCoreRuntime {
         let mut disconnected = 0usize;
         for offset in 0..self.num_cores {
             let core_id = (start_core + offset) % self.num_cores;
-            let task_id = self.next_task_id_for_core(core_id);
+            let task_id = self.next_task_id_for_core(core_id)?;
             let message = CoreMessage::Task {
                 id: task_id,
                 future,
@@ -2177,7 +2201,7 @@ impl MultiCoreRuntime {
             )));
         }
 
-        let task_id = self.next_task_id_for_core(core_id);
+        let task_id = self.next_task_id_for_core(core_id)?;
         self.spawn_on_core(core_id, task_id, future)
     }
 
@@ -2228,7 +2252,7 @@ impl MultiCoreRuntime {
             )));
         }
 
-        let task_id = self.next_task_id_for_core(core_id);
+        let task_id = self.next_task_id_for_core(core_id)?;
         self.send_task_with_backpressure_on_core(core_id, task_id, Box::pin(future), timeout)
             .await
     }
@@ -2253,7 +2277,7 @@ impl MultiCoreRuntime {
         let core_id = current_core_id().ok_or_else(|| {
             RuntimeError::TaskFailed("spawn_local called outside a worker core".to_string())
         })?;
-        let task_id = self.next_task_id_for_core(core_id);
+        let task_id = self.next_task_id_for_core(core_id)?;
         if !push_local_spawn(task_id, Box::pin(DetachedTaskFuture::new(future))) {
             return Err(RuntimeError::TaskFailed(
                 "local task admission queue capacity exhausted".to_string(),
@@ -2263,18 +2287,27 @@ impl MultiCoreRuntime {
     }
 
     #[inline]
-    fn next_task_id_for_core(&self, core_id: usize) -> TaskId {
+    fn next_task_id_for_core(&self, core_id: usize) -> Result<TaskId> {
+        // The sequence is consumed unconditionally before the check, exactly
+        // as before: the fetched value is the checked value, so there is no
+        // check/consume race, and consumption stays monotonic. A failed spawn
+        // burns one sequence, which is harmless below the exhaustion boundary
+        // (no key is minted) and irrelevant at it (every later spawn fails
+        // too).
         let sequence = self.task_counters[core_id].fetch_add(1, Ordering::Relaxed);
+        let generation = task_id_generation(sequence).ok_or_else(|| {
+            RuntimeError::TaskFailed(format!(
+                "task id generation space exhausted for core {core_id}"
+            ))
+        })?;
         let slot = sequence as u16;
-        // Zero is reserved as invalid. Cycle through all 65,535 live
-        // generations without the saturating tail of the legacy u32 helper.
-        let generation = ((sequence >> 16) % u16::MAX as u64 + 1) as u16;
-        TaskId::from_key(crate::waker::TaskKey::new(
+        // Zero is reserved as invalid; the helper above yields 1..=u16::MAX.
+        Ok(TaskId::from_key(crate::waker::TaskKey::new(
             self.runtime_generation,
             core_id as u16,
             slot,
             generation,
-        ))
+        )))
     }
 
     /// Scan shards from `start` and return the one with the lowest `score`.
@@ -2395,7 +2428,7 @@ impl MultiCoreRuntime {
 
         for offset in 0..self.num_cores {
             let core_id = (start_core + offset) % self.num_cores;
-            let task_id = self.next_task_id_for_core(core_id);
+            let task_id = self.next_task_id_for_core(core_id)?;
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let message = CoreMessage::Task {
                 id: task_id,
@@ -2450,7 +2483,7 @@ impl MultiCoreRuntime {
         loop {
             for offset in 0..self.num_cores {
                 let core_id = (start_core + offset) % self.num_cores;
-                let task_id = self.next_task_id_for_core(core_id);
+                let task_id = self.next_task_id_for_core(core_id)?;
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 let message = CoreMessage::Task {
                     id: task_id,
@@ -3168,6 +3201,22 @@ mod tests {
                 "single-shard selection must stay on shard 0"
             );
         }
+    }
+
+    #[test]
+    fn task_id_generation_fails_closed_where_task_arena_retires() {
+        // Sequence 0 never occurs at runtime (the counters start at 1), but the
+        // pure helper must still map it to the first live generation.
+        assert_eq!(task_id_generation(0), Some(1));
+        assert_eq!(task_id_generation(65_536), Some(2));
+        // First and last sequences that produce the saturating generation: the
+        // arena still accepts u16::MAX, so these stay Some.
+        assert_eq!(task_id_generation(65_534 * 65_536), Some(u16::MAX));
+        assert_eq!(task_id_generation(65_535 * 65_536 - 1), Some(u16::MAX));
+        // First sequence of the wrapped cycle: fail closed instead of wrapping
+        // back to a generation the arena must reject.
+        assert_eq!(task_id_generation(65_535 * 65_536), None);
+        assert_eq!(task_id_generation(u64::MAX), None);
     }
 
     #[test]
