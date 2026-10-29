@@ -18,6 +18,26 @@ check:
     # have their own explicit gate below.
     just test-regular
 
+# Backend compile matrix (defect-forensics Tier-1 item 1). Every cfg
+# (io_backend) combination must compile on its native OS — the Linux-epoll
+# path once went uncompiled for 14 months and produced the 18-CPU-hour
+# D22 incident. Linux compiles both backend cfgs; macOS compiles its
+# kqueue default. Zero-risk: compile only, no tests, no behavior.
+check-backends:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Backend compile matrix ==="
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        for backend in io_uring epoll; do
+            echo "--- MINISS_IO_BACKEND=$backend cargo check --all-targets --all-features"
+            MINISS_IO_BACKEND=$backend cargo check --all-targets --all-features
+        done
+    else
+        echo "--- macOS default (kqueue) cargo check --all-targets --all-features"
+        cargo check --all-targets --all-features
+    fi
+    echo "=== backend compile matrix OK ==="
+
 # ─── Documentation Audit ────────────────────────────────────────
 
 docs-audit:
