@@ -470,3 +470,27 @@ are not silently mixed into the implementation batch.
     cleared IoSlot indices through a free list (mirroring the PendingOp slab)
     or adopt generation-packed slot reuse. A production server at 100k rps
     would hit ~2 GiB in under 3 hours.
+
+46. **Multi-worker executor-loop spin pathology** (found 2026-10-31, healthy-regime
+    OrbStack rerun after the VM-hang fix — see #45 context). With the environment
+    proven healthy (probe µs-class; monoio/compio/tokio all 388-403k rps), miniss
+    still collapses cross-worker: 0.58x monoio / 0.57x tokio at 32 connections
+    (226-230k vs 388-403k), p50 2x, p99 4-5x vs monoio/compio. Mechanism, measured
+    on one instrumented ka32 probe: **the executor turn loop spins instead of
+    blocking** — busy_rounds/polled ≈ 17-18:1 (17 loop iterations of flush/CQ-ring
+    checks per polled task), parks collapse to ~8k/s with only ~91 ms/s parked per
+    worker. SO_REUSEPORT distribution is even (5/7 workers at 9.5-9.7 s CPU per
+    10 s), so the cost is per-worker loop overhead: the spin floor burns ~1 core
+    per worker (~6 cores total at 230k rps) and oversubscribes the box against the
+    co-located client. CPU per 10k requests: miniss 256.8 ms vs monoio 56.6 ms
+    (4.5x). At 1 worker the same loop amortizes well (cloud shell: miniss 117.0 vs
+    monoio 124.3 ms/10k — the MORE efficient runtime), so the pathology is specific
+    to the multi-worker low-per-worker-event-rate topology. glommio degrades on the
+    same box too (0.47x monoio). Fix direction: adaptive blocking — when the CQ
+    peek is empty AND the ready queue is empty, wait in `io_uring_enter` (or shrink
+    the busy-round budget by per-worker event rate) instead of re-checking; the
+    existing metrics counters (busy_rounds, parks, park_time) already carry the
+    signal. Classification: design trade (MAX_BUSY_ROUNDS=96 spin floor tuned for
+    1-worker saturation) that becomes a defect at multi-worker low-rate topologies.
+    First-class: it means every published multi-worker number from this runtime
+    predates a real scaling bug.

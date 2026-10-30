@@ -59,6 +59,18 @@ bpftrace 与全部 `syscalls:sys_enter_*` perf 轨点不可用;perf 软件计数
 完整 VM 或裸金属**(GCE 常规实例、或未来 OrbStack 修复后)。本次 syscall
 归因由 strace -cf 完成(计数可信、吞吐不可比)。
 
+## OrbStack 健康复跑(2026-10-31):多 worker 塌陷是真实缺陷(台账 #46)
+
+VM-hang 修复(macOS 27.2)后同矩阵重跑:环境确认健康(探针 µs 级,
+monoio/compio/tokio 388-403k),但 **miniss 跨 worker 塌陷仍在**——c32
+0.58x monoio,p50 2x、p99 4-5x;CPU/万请求 256.8ms vs monoio 56.6ms(4.5x)。
+机制实测:busy_rounds/polled ≈17:1,每秒 park 仅 ~8k 次、每 worker 每秒
+仅 91ms 在 park——**执行循环在自旋而非阻塞**,自旋地板烧掉每 worker ~1 核。
+1 worker 时同循环摊销良好(发现 A 的空转正是其另一面)。结论:污染对照中
+"miniss 塌陷"不是(或不只是)VM-hang,而是**多 worker 低单 worker 事件率
+拓扑下的真实调度缺陷**(台账 #46),修复方向为自适应阻塞。下面污染-era 的
+对照记录保留作为历史,但其"环境伪影"归因已被 #46 修正。
+
 ## OrbStack 污染环境对照(形状,2026-10-30;不入 bench/results)
 
 同矩阵在 OrbStack 7.2.12(7 vCPU,已知跨核唤醒 7-300ms)重跑,全部 45 格
