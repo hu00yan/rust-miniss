@@ -451,3 +451,22 @@ are not silently mixed into the implementation batch.
     production path in `net.rs` was always correct — it sets the option on a live
     stream at construction). Verified with a standalone socketpair reproduction:
     option set succeeds before the peer close and fails with `EINVAL` after it.
+
+45. **io_uring `io_slots` grows unboundedly with cumulative op count** (found
+    2026-10-30 while chasing the gcloud benchmark's 191 MiB RSS). Idle server
+    RSS is 8.8 MiB — the eager pre-allocation arithmetic (TaskArena 65,536
+    slots + queues + ring + slab) is fully accounted for and innocent. Under
+    load, RSS grows LINEARLY with cumulative requests: 8.8 → 153 → 301 → 594
+    MiB at 0 → 0.7M → 1.5M → 3.0M cumulative requests (~200 B/request ≈ 2
+    ops/request × ~100-150 B per IoSlot). Root cause: `IoToken::next_from`
+    issues monotonically increasing ids, `CpuIoState::ensure_capacity`
+    (src/cpu.rs:247-260) grows `io_slots` to the highest index ever issued,
+    and completed slots are cleared but their indices are never reused. This
+    is the io_uring sibling of the mio token/slot unbounded-growth defect
+    fixed in `2d3e6ce` (reusable slots + monotonically unique mio tokens);
+    the uring side was never covered by that fix — pattern P3 (accounting/
+    ownership asymmetry) again, per docs/review/defect-forensics-2026-10.md.
+    At production rates this OOMs in hours-to-days. Fix direction: recycle
+    cleared IoSlot indices through a free list (mirroring the PendingOp slab)
+    or adopt generation-packed slot reuse. A production server at 100k rps
+    would hit ~2 GiB in under 3 hours.
