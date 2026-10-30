@@ -228,7 +228,14 @@ impl CpuIoState {
             .as_ref()
             .is_some_and(|(current, _)| *current == token)
         {
-            Some(completion.take().expect("owner completion was present").1)
+            let result = completion.take().expect("owner completion was present").1;
+            // The result left this state; the token's cpu-side slot holds
+            // nothing pending (delivery took the waker and the pending task),
+            // so its index is releasable. The live-slot guard inside makes
+            // this a no-op when a later path already released the slot.
+            // SAFETY: owning thread per this method's contract.
+            unsafe { self.release_consumed_slot(token) };
+            Some(result)
         } else {
             None
         }
@@ -241,7 +248,14 @@ impl CpuIoState {
     pub(crate) unsafe fn clear_owner_completion(&self) {
         // SAFETY: clears the shard's own `owner_completion` slot; exclusive access
         // is the caller contract above.
-        unsafe { &mut *self.owner_completion.get() }.take();
+        if let Some((token, _)) = unsafe { &mut *self.owner_completion.get() }.take() {
+            // A stale wake drops the result unconsumed; the token's slot
+            // is dead either way, so its index stays reusable. Without
+            // this release a cancelled task racing its completion would
+            // pin one slot forever.
+            // SAFETY: owning thread per this method's contract.
+            unsafe { self.release_consumed_slot(token) };
+        }
     }
 
     /// Ensure vec is large enough for the given index (grows by 64-slot chunks).
@@ -369,6 +383,11 @@ impl CpuIoState {
 
     /// Removes and returns the completion result for a token.
     ///
+    /// Consuming a completion also releases the slot: the result has left the
+    /// table and no future poll of this token can observe slot state again.
+    /// The release keeps `CpuIoState::io_slots` bounded by peak in-flight
+    /// operations instead of cumulative operations (ledger #45).
+    ///
     /// # Safety
     ///
     /// `token` must refer to a live operation owned by this `CpuIoState`, and
@@ -377,7 +396,17 @@ impl CpuIoState {
     pub unsafe fn take_completed(&self, token: IoToken) -> Option<Result<CompletionKind, IoError>> {
         let slots = &mut *self.io_slots.get();
         // SAFETY: as in `take_waker` — owning thread, exclusive `slots`, live token.
-        unsafe { Self::live_slot(slots, token) }?.completed.take()
+        let slot = unsafe { Self::live_slot(slots, token) }?;
+        let completed = slot.completed.take()?;
+        // The completion left the slot; the remaining fields are dead state
+        // (the waker was taken at delivery, so this cannot drop a live wake).
+        slot.token_id = 0;
+        slot.waker = None;
+        slot.pending_task = None;
+        slot.discarded = false;
+        // The backend may now reissue the index under a new generation.
+        self.io_backend.recycle_io_slot(token);
+        Some(completed)
     }
 
     /// Returns whether a token has a stored completion.
@@ -454,6 +483,10 @@ impl CpuIoState {
 
     /// Consume a terminal completion for an abandoned operation.
     ///
+    /// Consuming the terminal completion is also the release point: the
+    /// backend published the last event for this token, so its slot index may
+    /// be recycled (ledger #45).
+    ///
     /// # Safety
     ///
     /// The caller must own the shard and call this only after terminal
@@ -469,11 +502,20 @@ impl CpuIoState {
             return false;
         }
         slot.token_id = 0;
+        slot.waker = None;
+        slot.completed = None;
+        slot.pending_task = None;
         slot.discarded = false;
+        // SAFETY: owning thread per this method's contract.
+        self.io_backend.recycle_io_slot(token);
         true
     }
 
     /// Clear the per-token slot in one lookup.
+    ///
+    /// Clearing is the release point for callers that have just consumed the
+    /// slot's completion (`poll_readiness`'s readiness-consumed path): the
+    /// cleared index is handed back to the backend's recycle pool.
     ///
     /// # Safety
     ///
@@ -491,6 +533,68 @@ impl CpuIoState {
         slot.completed = None;
         slot.pending_task = None;
         slot.discarded = false;
+        // SAFETY: owning thread per this method's contract.
+        self.io_backend.recycle_io_slot(token);
+    }
+
+    /// Release a fully consumed slot back to the backend's recycle pool.
+    ///
+    /// A slot enters the pool only after its completion has been consumed or
+    /// dropped and its waker/pending-task state is gone, so a reissued index
+    /// can never carry data for the token that released it. The zeroed
+    /// `token_id` doubles as the double-release guard: a second release for
+    /// the same token fails the `live_slot` match and no-ops.
+    ///
+    /// # Safety
+    ///
+    /// The caller must run on the owning CPU thread with exclusive shard-local
+    /// access to `slots`.
+    #[inline(always)]
+    unsafe fn release_consumed_slot(&self, token: IoToken) {
+        if token.id() == 0 {
+            // The degenerate all-zero identity (stale CQE reconstruction for
+            // an already-retired backend slot) never owned a cpu-side slot.
+            return;
+        }
+        let slots = &mut *self.io_slots.get();
+        // SAFETY: the caller owns the shard, so `slots` is exclusively held.
+        let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
+            return;
+        };
+        slot.token_id = 0;
+        slot.waker = None;
+        slot.completed = None;
+        slot.pending_task = None;
+        slot.discarded = false;
+        // SAFETY: owning thread per this method's contract.
+        self.io_backend.recycle_io_slot(token);
+    }
+
+    /// Release a token whose cpu-side slot was never prepared.
+    ///
+    /// Backend-internal tokens (the shard parking poll) never store a waker,
+    /// completion, or pending task, so their cpu-side entry is untouched state
+    /// with `token_id == 0`. There is nothing to clear; only the index is
+    /// returned to the backend's recycle pool.
+    ///
+    /// # Safety
+    ///
+    /// The caller must run on the owning CPU thread, and `token` must name an
+    /// operation whose slot was never prepared on this `CpuIoState`.
+    // The only caller is the io_uring fused drain's parking-poll branch, so
+    // this is dead code on other backends.
+    #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
+    pub(crate) unsafe fn recycle_unprepared_slot(&self, token: IoToken) {
+        debug_assert_ne!(token.id(), 0);
+        let idx = token.slot_index();
+        let slots = &mut *self.io_slots.get();
+        if idx < slots.len() {
+            debug_assert_eq!(
+                slots[idx].token_id, 0,
+                "recycle_unprepared_slot on a prepared slot"
+            );
+        }
+        self.io_backend.recycle_io_slot(token);
     }
 }
 
@@ -784,5 +888,168 @@ mod tests {
         assert!(try_with_io_state(|_| ()).is_none());
         assert_eq!(current_core_id(), None);
         assert_eq!(current_task_id(), None);
+    }
+
+    /// Records `recycle_io_slot` notifications so tests can assert the exact
+    /// release discipline behind ledger #45.
+    struct RecordingProvider {
+        recycled: std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
+    }
+
+    impl IoProvider for RecordingProvider {
+        type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+        fn submit(&self, _op: Op) -> Result<IoToken, IoError> {
+            Ok(IoToken::from_id(1))
+        }
+
+        fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+            Poll::Pending
+        }
+
+        fn recycle_io_slot(&self, token: IoToken) {
+            self.recycled.borrow_mut().push(token.id());
+        }
+    }
+
+    fn recording_state() -> (CpuIoState, std::rc::Rc<std::cell::RefCell<Vec<u64>>>) {
+        let recycled = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let state = test_io_state(RecordingProvider {
+            recycled: std::rc::Rc::clone(&recycled),
+        });
+        (state, recycled)
+    }
+
+    fn packed(generation: u32, slot: usize) -> IoToken {
+        IoToken::from_id(((generation as u64) << 32) | slot as u64)
+    }
+
+    #[test]
+    fn consumed_completion_releases_slot_exactly_once() {
+        let (state, recycled) = recording_state();
+        let token = packed(1, 5);
+        let waker = futures::task::noop_waker();
+        // SAFETY: the test owns this shard-local state on one thread.
+        unsafe {
+            state.store_waker(token, &waker);
+            assert!(recycled.borrow().is_empty(), "store must not release");
+
+            state.insert_completed(token, Ok(CompletionKind::Nop));
+            assert!(recycled.borrow().is_empty(), "delivery must not release");
+
+            assert!(state.take_completed(token).is_some());
+            assert_eq!(*recycled.borrow(), vec![token.id()], "consumption releases");
+
+            assert!(state.take_completed(token).is_none());
+            assert_eq!(
+                *recycled.borrow(),
+                vec![token.id()],
+                "a released slot must not release again"
+            );
+            state.clear_slot(token);
+            assert_eq!(
+                *recycled.borrow(),
+                vec![token.id()],
+                "clear after release must be a no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_slot_releases_only_when_the_slot_is_live() {
+        let (state, recycled) = recording_state();
+        let token = packed(3, 9);
+        let waker = futures::task::noop_waker();
+        // SAFETY: the test owns this shard-local state on one thread.
+        unsafe {
+            state.store_waker(token, &waker);
+            state.clear_slot(token);
+            assert_eq!(*recycled.borrow(), vec![token.id()]);
+            state.clear_slot(token);
+            assert_eq!(*recycled.borrow(), vec![token.id()], "no double release");
+        }
+    }
+
+    #[test]
+    fn owner_completion_consumption_releases_the_slot() {
+        let (state, recycled) = recording_state();
+        let token = packed(1, 2);
+        // SAFETY: the test owns this shard-local state on one thread.
+        unsafe {
+            // Production delivery requires `take_pending_task`, whose live-slot
+            // check guarantees the future polled first; mirror that here.
+            let waker = futures::task::noop_waker();
+            state.store_waker_and_pending_task(token, &waker, Some(crate::waker::TaskId(3)));
+            // `set_owner_completion` is the delivery step the owner drain
+            // performs after swapping the owner completion batch.
+            state.set_owner_completion(token, Ok(CompletionKind::Nop));
+            assert!(state.take_owner_completion(token).is_some());
+            assert_eq!(*recycled.borrow(), vec![token.id()]);
+            assert!(state.take_owner_completion(token).is_none());
+            assert_eq!(*recycled.borrow(), vec![token.id()]);
+
+            // The stale-wake drop path (delivery raced task cancellation) also
+            // releases: the result is dropped unconsumed against a live slot.
+            let stale = packed(1, 3);
+            let waker = futures::task::noop_waker();
+            state.store_waker_and_pending_task(stale, &waker, Some(crate::waker::TaskId(4)));
+            state.set_owner_completion(stale, Ok(CompletionKind::Nop));
+            state.clear_owner_completion();
+            assert_eq!(*recycled.borrow(), vec![token.id(), stale.id()]);
+            state.clear_owner_completion();
+            assert_eq!(recycled.borrow().len(), 2, "no double release");
+        }
+    }
+
+    #[test]
+    fn abandoned_slot_releases_at_terminal_completion() {
+        let (state, recycled) = recording_state();
+        let token = packed(2, 4);
+        let waker = futures::task::noop_waker();
+        // SAFETY: the test owns this shard-local state on one thread.
+        unsafe {
+            state.store_waker(token, &waker);
+            state.cancel_and_discard(token);
+            assert!(
+                recycled.borrow().is_empty(),
+                "abandonment must retain the slot until the terminal CQE"
+            );
+            assert!(state.take_discarded(token));
+            assert_eq!(*recycled.borrow(), vec![token.id()]);
+            assert!(!state.take_discarded(token));
+            assert_eq!(*recycled.borrow(), vec![token.id()]);
+        }
+    }
+
+    #[test]
+    fn released_slot_rejects_stale_tokens_and_serves_the_new_generation() {
+        let (state, recycled) = recording_state();
+        let old = packed(1, 7);
+        let waker = futures::task::noop_waker();
+        // SAFETY: the test owns this shard-local state on one thread.
+        unsafe {
+            state.store_waker(old, &waker);
+            state.insert_completed(old, Ok(CompletionKind::Nop));
+            assert!(state.take_completed(old).is_some());
+            assert_eq!(*recycled.borrow(), vec![old.id()]);
+
+            // The backend reissues the index under a bumped generation.
+            let new = packed(2, 7);
+            state.store_waker(new, &waker);
+
+            // Stale-token consumers observe nothing and cannot reset the slot.
+            assert!(!state.has_completed(old));
+            assert!(state.take_completed(old).is_none());
+            assert!(state.take_waker(old).is_none());
+            assert!(state.take_pending_task(old).is_none());
+            assert_eq!(
+                recycled.borrow().len(),
+                1,
+                "stale touches must not release the reissued slot"
+            );
+
+            // The live generation is intact after the stale touches.
+            assert!(state.take_waker(new).is_some());
+        }
     }
 }

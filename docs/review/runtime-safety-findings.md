@@ -471,6 +471,40 @@ are not silently mixed into the implementation batch.
     or adopt generation-packed slot reuse. A production server at 100k rps
     would hit ~2 GiB in under 3 hours.
 
+    **Resolved** (branch `fix/uring-io-slot-recycling`). The uring backend now
+    packs the public `IoToken` id as `(generation << 32) | cpu_slot_index`
+    and keeps a shard-local recycle pool of cleared identities
+    (`UringBackend::free_io_slots`, fed by the new
+    `IoProvider::recycle_io_slot` hook that `CpuIoState`'s consumption paths
+    call). A slot index is reissued only after its completion was consumed
+    and its cpu-side slot cleared, under a bumped per-slot generation, so
+    stale-token rejection (`live_slot`, backend cancel matching) keeps
+    working; kernel CQEs are unaffected (their user_data remains the slab
+    identity `pack_slot(slab_idx, slab_generation)`). Fresh indices
+    (generation 1) are consumed only when the pool is empty, so
+    `CpuIoState::io_slots` tracks peak in-flight operations instead of
+    cumulative operations. The same discipline applies to the shard parking
+    poll (never prepared, released directly) and to orphaned multishot-accept
+    queues (dropped at terminal CQE so a recycled index cannot inherit
+    queued descriptors). The mio/kqueue backend is deliberately untouched: it
+    already received its own fix in `2d3e6ce`, and its tokens stay monotonic.
+    Evidence (OrbStack Ubuntu, kernel 7.2.12-orbstack, 7 vCPU,
+    `MINISS_URING_ENTRIES=1024 http_echo --cores 1`, `wrk -t1 -c8`):
+    pre-fix `main` (`ade84c1`) grew 8,800 → 167,712 → 333,192 → 660,348 KiB
+    at 0 / 0.82M / 1.66M / 3.34M cumulative requests (~196 B/request), while
+    the fixed branch measured 8,824 → 8,892 → 8,896 → 8,896 KiB at the same
+    stages and stayed flat through 6.71M cumulative requests (8,912 KiB),
+    including a post-load idle re-check. `cargo test --lib` passes on macOS
+    (163) and io_uring Linux (168), the four new uring
+    `slot_recycling_tests` plus five new cpu-state release-discipline tests
+    cover the double-release and stale-generation guards,
+    `MINISS_IO_BACKEND=epoll cargo check --lib` compiles, and the serial
+    stress gate passes with no leftover processes. Residual: an index whose
+    op was abandoned while its terminal CQE never arrives (cancel SQE
+    rejected after the op already completed) still waits in the discarded
+    state; that is the pre-existing terminal-cleanup asymmetry of ledger
+    follow-up #5, now bounded by abandoned-op count instead of cumulative
+    operations.
 46. **Multi-worker executor-loop spin pathology** (found 2026-10-31, healthy-regime
     OrbStack rerun after the VM-hang fix — see #45 context). With the environment
     proven healthy (probe µs-class; monoio/compio/tokio all 388-403k rps), miniss

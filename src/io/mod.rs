@@ -568,6 +568,20 @@ pub trait IoProvider: 'static {
         false
     }
 
+    /// Notify the backend that the cpu-side completion slot for `token` was
+    /// fully consumed and cleared, so the token's slot index may be reissued
+    /// inside a future `IoToken`.
+    ///
+    /// Called only from the owning shard thread, and only after the slot's
+    /// waker, completion, and pending-task state has been consumed or dropped
+    /// and its `token_id` zeroed — a released index can therefore never carry
+    /// data for the token that released it. Backends with monotonic tokens
+    /// (mio/kqueue) keep the default no-op: their slot indices are never
+    /// reused. The io_uring backend overrides this to recycle cpu-side slot
+    /// indices, keeping `CpuIoState::io_slots` bounded by peak in-flight
+    /// operations instead of cumulative operations (ledger #45).
+    fn recycle_io_slot(&self, _token: IoToken) {}
+
     /// Request cancellation for every accepted operation during owner-local
     /// escalation. Resources remain backend-owned until terminal drain or
     /// backend destruction after the bounded escalation window.

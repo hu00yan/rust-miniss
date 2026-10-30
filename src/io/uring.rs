@@ -242,8 +242,16 @@ pub struct UringBackend {
     /// Generation per slab slot. Packed with the slot index into CQE user_data
     /// so stale completions can be dropped without a hash table lookup.
     slot_meta: UnsafeCell<Vec<SlotMeta>>,
-    /// Monotonic token counter for unique shard-local IoToken values.
-    next_token_id: Cell<u64>,
+    /// Recycled cpu-side slot identities, packed as the next `IoToken` id to
+    /// reissue: `(generation << 32) | slot_index`. An index enters this pool
+    /// only after its completion was consumed and its cpu-side slot cleared
+    /// (`IoProvider::recycle_io_slot`), so a reissued identity can never alias
+    /// a live operation. Owner-thread only.
+    free_io_slots: UnsafeCell<Vec<u64>>,
+    /// Next never-before-issued cpu-side slot index, consumed only when the
+    /// recycle pool is empty. Tracks peak in-flight operations, not cumulative
+    /// operations (ledger #45).
+    next_slot_index: Cell<u32>,
     /// Fallback completion queue for unsupported ops and as a capacity hint
     /// for the reusable completion buffer.
     completed_ops: UnsafeCell<Vec<Completion>>,
@@ -430,7 +438,8 @@ impl UringBackend {
             pending_ops: UnsafeCell::new(Slab::with_capacity(capacity)),
             descriptor_leases: UnsafeCell::new(Vec::with_capacity(capacity)),
             slot_meta: UnsafeCell::new(vec![SlotMeta::default(); capacity]),
-            next_token_id: Cell::new(1),
+            free_io_slots: UnsafeCell::new(Vec::new()),
+            next_slot_index: Cell::new(0),
             completed_ops: UnsafeCell::new(Vec::with_capacity(capacity)),
             accept_results: UnsafeCell::new(accept_results),
             pending_sqes: Cell::new(0),
@@ -509,6 +518,53 @@ impl UringBackend {
         Some((idx, generation))
     }
 
+    /// Allocate the `IoToken` identity for a new operation.
+    ///
+    /// Cleared cpu-side slot indices are recycled first (ledger #45: without
+    /// recycling, `CpuIoState::io_slots` grows to the highest index ever
+    /// issued and RSS grows linearly with cumulative operations). A recycled
+    /// identity carries the slot's bumped generation, so the new token differs
+    /// from every token ever handed out for that slot index and every
+    /// stale-token check keeps working:
+    ///
+    /// - `CpuIoState::live_slot`/`prepare_slot` compare the full token id, so
+    ///   a stale token for slot `s` cannot observe or reset the slot while a
+    ///   newer operation with a bumped generation owns it;
+    /// - backend cancel matching compares `slot_meta.token_id` (the full id),
+    ///   so a stale cancel cannot hit a reissued slot;
+    /// - kernel CQEs are matched by the independent slab identity
+    ///   `pack_slot(slab_idx, slab_generation)` and reconstruct the token from
+    ///   `slot_meta[idx].token_id`, which always names the current operation.
+    ///
+    /// A fresh index (generation 1) is consumed only when the pool is empty,
+    /// so the cpu-side table length tracks peak in-flight operations. Tokens
+    /// stay unique among live operations: a slot index is reissued only after
+    /// its previous operation reached terminal completion and its cpu-side
+    /// slot was fully consumed.
+    fn allocate_io_token(&self) -> Result<IoToken, IoError> {
+        // SAFETY: `free_io_slots` is shard-local; submit runs on the owner thread.
+        let free = unsafe { &mut *self.free_io_slots.get() };
+        if let Some(id) = free.pop() {
+            return Ok(IoToken::from_id(id));
+        }
+        let idx = self.next_slot_index.get();
+        let next = idx
+            .checked_add(1)
+            .ok_or_else(|| IoError::Other("io slot index space exhausted".into()))?;
+        self.next_slot_index.set(next);
+        Ok(IoToken::from_id(Self::pack_slot(idx as usize, 1)))
+    }
+
+    /// Next packed identity for a released slot: same index, bumped
+    /// generation. Generation 0 stays reserved (fresh indices carry 1),
+    /// mirroring the `slot_meta` generation discipline.
+    #[inline]
+    fn recycled_token_id(token: IoToken) -> u64 {
+        let slot = token.id() & 0xffff_ffff;
+        let generation = ((token.id() >> 32) as u32).wrapping_add(1).max(1);
+        ((generation as u64) << 32) | slot
+    }
+
     /// Fused CQE processing: iterate CQ ring, reconstruct results, and
     /// write directly to CpuIoState slots + wake tasks. No intermediate Vec.
     /// Processes up to `batch_limit` CQEs per call; the event loop calls
@@ -585,6 +641,13 @@ impl UringBackend {
                 self.release_descriptor_lease(idx);
                 slot_meta[idx].token_id = 0;
                 slot_meta[idx].discard_accept_results = false;
+                // The parking poll never prepared a cpu-side slot (no waker,
+                // completion, or pending task is ever stored for it), so its
+                // identity is returned without a slot clear. Without this,
+                // every park/wake cycle would consume one recycled identity.
+                // SAFETY: this drain runs on the owning shard, and the parking
+                // poll's slot was never prepared on this io_state.
+                unsafe { io_state.recycle_unprepared_slot(token) };
                 continue;
             }
 
@@ -678,6 +741,14 @@ impl UringBackend {
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
                     meta.discard_accept_results = false;
+                }
+                if matches!(pending_op, PendingOp::Accept { .. }) {
+                    // A terminal CQE orphans any still-queued accept results:
+                    // their consumer is gone, and with slot recycling a future
+                    // listener could otherwise inherit them (ledger #45).
+                    let _ = accept_results
+                        .get_mut(token.slot_index())
+                        .and_then(Option::take);
                 }
                 // Reconstruct the terminal completion from the slot's pending
                 // operation and this CQE's result.
@@ -1123,6 +1194,10 @@ impl UringBackend {
         };
         let is_accept = matches!(&pending_op, PendingOp::Accept { .. });
 
+        // Allocate the public token identity before taking a slab slot so an
+        // exhausted identity space fails without post-insert cleanup.
+        let token = self.allocate_io_token()?;
+
         // Insert into slab to get efficient O(1) storage.
         let idx = pending_ops.insert(pending_op);
         // Acquire side of the pending-op ledger: released again exactly once
@@ -1154,7 +1229,6 @@ impl UringBackend {
         let generation = slot_meta[idx].generation.wrapping_add(1).max(1);
         slot_meta[idx].generation = generation;
         slot_meta[idx].discard_accept_results = false;
-        let token = IoToken::next_from(&self.next_token_id);
         slot_meta[idx].token_id = token.id();
         if is_accept {
             // SAFETY: accept_results is shard-local and only mutated by this
@@ -1182,6 +1256,10 @@ impl UringBackend {
                 }
                 self.release_descriptor_lease(idx);
                 slot_meta[idx].token_id = 0;
+                // The token never reached a caller and no cpu-side slot was
+                // prepared for it, so its identity can go straight back to
+                // the recycle pool under a bumped generation.
+                self.recycle_io_slot(token);
                 tracing::error!("SQ still full after emergency flush (ring too small?)");
                 return Err(IoError::Io(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -1589,6 +1667,21 @@ impl IoProvider for UringBackend {
         self.ledger.snapshot(live_leases, live_ops)
     }
 
+    /// Return a fully consumed cpu-side slot identity to the recycle pool.
+    ///
+    /// Called from `CpuIoState`'s release paths on the owning shard, after the
+    /// slot's `token_id` was zeroed — the pool entry carries a bumped
+    /// generation, so the reissued token cannot equal any token previously
+    /// issued for that slot index (see `allocate_io_token` for the full
+    /// alias-safety argument). This is what keeps `CpuIoState::io_slots`
+    /// bounded by peak in-flight operations instead of cumulative operations
+    /// (ledger #45).
+    fn recycle_io_slot(&self, token: IoToken) {
+        // SAFETY: `free_io_slots` is shard-local; this trait method is only
+        // reached from cpu-state release paths on the owning thread.
+        unsafe { &mut *self.free_io_slots.get() }.push(Self::recycled_token_id(token));
+    }
+
     fn cancel(&self, token: IoToken) -> bool {
         // SAFETY: `ring` is shard-local; `cancel` runs on the owning runtime thread
         // (see `UringBackend`'s thread-affinity note), so no other borrow is live.
@@ -1882,6 +1975,14 @@ impl IoProvider for UringBackend {
                 if let Some(meta) = slot_meta.get_mut(idx) {
                     meta.token_id = 0;
                     meta.discard_accept_results = false;
+                }
+                if matches!(pending_op, PendingOp::Accept { .. }) {
+                    // A terminal CQE orphans any still-queued accept results:
+                    // their consumer is gone, and with slot recycling a future
+                    // listener could otherwise inherit them (ledger #45).
+                    let _ = accept_results
+                        .get_mut(token.slot_index())
+                        .and_then(Option::take);
                 }
                 // Reconstruct the terminal completion from the slot's pending
                 // operation and this CQE's result.
@@ -2660,5 +2761,103 @@ mod stable_iovec_tests {
                 assert_eq!(unsafe { *(iov.iov_base as *const u8) }, i as u8);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_recycling_tests {
+    use super::*;
+
+    /// Packed identity of the Nth fresh cpu-side slot: generation 1.
+    fn fresh_identity(idx: usize) -> u64 {
+        (1u64 << 32) | idx as u64
+    }
+
+    #[test]
+    fn fresh_identities_are_generation_one_with_unique_indices() {
+        let backend = UringBackend::new(2).expect("io_uring backend must be available");
+        let mut seen = std::collections::HashSet::new();
+        for idx in 0..8 {
+            let token = backend
+                .allocate_io_token()
+                .expect("fresh allocation must succeed");
+            assert_eq!(
+                token.id(),
+                fresh_identity(idx),
+                "fresh identities pack generation 1 with a monotonic index"
+            );
+            assert!(seen.insert(token.id()), "token ids must be unique");
+        }
+    }
+
+    #[test]
+    fn recycled_identities_reissue_the_index_under_a_bumped_generation() {
+        let backend = UringBackend::new(2).expect("io_uring backend must be available");
+        let first = backend
+            .allocate_io_token()
+            .expect("fresh allocation must succeed");
+        // Release: same slot index, generation bumped from 1 to 2.
+        backend.recycle_io_slot(first);
+        let second = backend
+            .allocate_io_token()
+            .expect("the recycle pool must satisfy this allocation");
+        assert_eq!(
+            second.slot_index(),
+            first.slot_index(),
+            "recycling reuses the cleared index"
+        );
+        assert_ne!(
+            second.id(),
+            first.id(),
+            "the reissued identity must differ from every token ever issued for the index"
+        );
+        assert_eq!(
+            second.id(),
+            first.id() + (1u64 << 32),
+            "generation bumps by one"
+        );
+
+        // Releasing again keeps the chain monotone: gen 3 for the next reissue.
+        backend.recycle_io_slot(second);
+        let third = backend
+            .allocate_io_token()
+            .expect("the recycle pool must satisfy this allocation");
+        assert_eq!(third.id(), first.id() + (2u64 << 32));
+    }
+
+    #[test]
+    fn allocation_prefers_the_recycle_pool_over_fresh_indices() {
+        let backend = UringBackend::new(2).expect("io_uring backend must be available");
+        let first = backend
+            .allocate_io_token()
+            .expect("fresh allocation must succeed");
+        let second = backend
+            .allocate_io_token()
+            .expect("fresh allocation must succeed");
+        backend.recycle_io_slot(second);
+        backend.recycle_io_slot(first);
+        let pooled = backend.allocate_io_token().expect("the pool is non-empty");
+        assert_eq!(
+            pooled.id(),
+            first.id() + (1u64 << 32),
+            "the pool is LIFO: the last released identity is reissued first"
+        );
+    }
+
+    #[test]
+    fn stale_identity_cannot_equal_a_reissued_identity() {
+        let backend = UringBackend::new(2).expect("io_uring backend must be available");
+        let stale = backend
+            .allocate_io_token()
+            .expect("fresh allocation must succeed");
+        backend.recycle_io_slot(stale);
+        let reissued = backend
+            .allocate_io_token()
+            .expect("the recycle pool must satisfy this allocation");
+        // The cancel scan and the cpu-side slot checks match by full id
+        // equality; the bumped generation is what keeps a stale identity from
+        // targeting a reissued slot.
+        assert_ne!(stale.id(), reissued.id());
+        assert_eq!(stale.slot_index(), reissued.slot_index());
     }
 }
