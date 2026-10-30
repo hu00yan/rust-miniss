@@ -92,6 +92,34 @@ ring 共享一个 SQPOLL 线程池,大核数机器上若启用 SQPOLL 应连它�
 DEFER_TASKRUN)这一合法组合;gcloud 干净内核上的重测结果将决定 DEFER 是否
 进默认(OrbStack 数据不作数,见下节)。
 
+## Photon 案例:生产级 C++ 代码库的默认层级(2026-10-31,源码核实 HEAD 5641e27)
+
+PhotonLibOS(字节跳动,io_uring 里程最长的生产代码库之一)的默认集回答了
+"该开什么"的问题——它的层级不是对 io_uring 的热情,而是**对用户的一道纪律**:
+
+- **io_uring 本身双重门控**(构建 flag + 显式 init),**epoll 仍是默认引擎**;
+- **自动开启的只有两类**:内核版本门控、省 syscall、语义不可见——
+  COOP_TASKRUN(≥5.19 自动)与 fixed-file 注册(≥5.5 自动,稀疏表 10000);
+- **一切改变时序或线程行为的都是显式 opt-in**:SQPOLL(flag,SQ_AFF 被硬禁,
+  COOP 冲突见其 issue #803)、IOPOLL、send_zc(独立 socket flavor);
+- **DEFER_TASKRUN 从不请求**——代码里只作为 EINVAL 时剥离的对象出现,
+  与我们的 -94% 实测互证;
+- **registered buffers 与 buffer ring 完全缺席**;multishot 只用于不可能
+  有害的 poll/eventfd;issue #784 维护者理由:psync recv + uring poll
+  已达 memcpy 速度,"completion 路径上加任何东西都是先付成本后谈收益";
+- **EINVAL 回退阶梯 + 版本探针处处皆是**(pre-5.15 wait bug、COOP×SQPOLL
+  冲突 el8 6.4.12 等,每个都有代码注释引用内核提交)。
+
+**竞品生态事实**:除 monoio/glommio/compio(io_uring-first)外,主流生态
+默认不用 io_uring——Go 2019 年起拒绝(golang/go#31908),asio 实验性 opt-in,
+netty 4.2 毕业但 epoll 仍是默认,libuv 因 100% CPU bug 默认关闭文件 io_uring
+(libuv#4044),Python 核心缺席。"全打开"的生产先例不存在。
+
+**对 miniss 的映射:现有姿态与 Photon 层级几乎逐条吻合**(COOP 默认开 ✓、
+SQPOLL/DEFER opt-in ✓、send_zc 搁置 ✓、回退阶梯 ✓、multishot recv+buf_ring
+默认关 ✓)。唯一的新增候选:**fixed-file 注册**(Photon 自动开,我们未实现)
+——收益中等、实现中等,列为低优先候选;不改变现有默认集。
+
 ## 硬件前提
 
 任何性能决策的测试环境必须是干净内核:
