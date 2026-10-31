@@ -20,14 +20,15 @@ cd "$PHOTON_DIR"
 # 1. copy the multi-vCPU example
 cp -f "$SCRIPT_DIR/http-server-mc.cpp" examples/perf/http/http-server-mc.cpp
 
-# 2. register the target + link-fix block (idempotent; drop any earlier bare
-#    target line from a previous script revision so it is not duplicated).
-#    NOTE: the perf targets are registered in examples/CMakeLists.txt (there
-#    is no examples/perf/CMakeLists.txt upstream).
+# 2. register the target + link-fix block: always truncate everything appended
+#    by a previous script revision (our block is the last thing in the file),
+#    then append the current block. The perf targets are registered in
+#    examples/CMakeLists.txt (there is no examples/perf/CMakeLists.txt upstream).
 rm -f examples/perf/CMakeLists.txt   # orphan file created by an earlier revision
+sed -i '/# --- appended by rust-miniss/,$d' examples/CMakeLists.txt
 sed -i '/^photon_add_example(http-perf-server-mc perf\/http\/http-server-mc.cpp)$/d' \
     examples/CMakeLists.txt
-if ! grep -q "PHOTON_BENCH_EXTRA_LIBS" examples/CMakeLists.txt; then
+if true; then
     cat >> examples/CMakeLists.txt <<'EOF'
 
 photon_add_example(http-perf-server-mc perf/http/http-server-mc.cpp)
