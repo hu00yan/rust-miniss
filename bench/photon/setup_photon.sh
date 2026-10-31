@@ -72,6 +72,7 @@ if [[ ! -f build/CMakeCache.txt ]]; then
         -DPHOTON_ENABLE_URING=ON \
         -DPHOTON_BUILD_TESTING=ON \
         -DPHOTON_BUILD_DEPENDENCIES=ON \
+        -DPHOTON_ENABLE_LIBCURL=OFF \
         -DCMAKE_CXX_FLAGS="-Wno-error"
 fi
 
@@ -79,9 +80,10 @@ fi
 #    (no-op when the build dir is warm)
 cmake --build build -j"$NPROC" --target photon_static
 
-# 5. phase 2: re-configure so the appended block can pick up the now-existing
-#    vendored lib paths, then build only the HTTP perf targets
-cmake -S . -B build >/dev/null
+# 5. phase 2: enforce LIBCURL=OFF on existing build dirs too (vendored static
+#    curl has a broken link order under BUILD_DEPENDENCIES; curl is unused by
+#    the measured HTTP path), then build only the HTTP perf targets
+cmake -S . -B build -DPHOTON_ENABLE_LIBCURL=OFF >/dev/null
 cmake --build build -j"$NPROC" \
     --target http-perf-server http-perf-client http-perf-server-mc
 
