@@ -28,7 +28,7 @@ rm -f examples/perf/CMakeLists.txt   # orphan file created by an earlier revisio
 sed -i '/^photon_add_example(http-perf-server-mc perf\/http\/http-server-mc.cpp)$/d' \
     examples/CMakeLists.txt
 if ! grep -q "PHOTON_BENCH_EXTRA_LIBS" examples/CMakeLists.txt; then
-    cat >> examples/perf/CMakeLists.txt <<'EOF'
+    cat >> examples/CMakeLists.txt <<'EOF'
 
 photon_add_example(http-perf-server-mc perf/http/http-server-mc.cpp)
 
@@ -64,7 +64,8 @@ if [[ ! -f build/CMakeCache.txt ]]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DPHOTON_ENABLE_URING=ON \
         -DPHOTON_BUILD_TESTING=ON \
-        -DPHOTON_BUILD_DEPENDENCIES=ON
+        -DPHOTON_BUILD_DEPENDENCIES=ON \
+        -DCMAKE_CXX_FLAGS="-Wno-error"
 fi
 
 # 4. phase 1: build photon_static so vendored zlib/openssl/curl are present
