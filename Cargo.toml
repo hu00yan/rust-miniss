@@ -83,6 +83,16 @@ h2 = "0.4"
 # `default-features = false, features = ["rustls-ring"]` pin; feature
 # unification applies to dev builds (benches/tests) only.
 quinn = { version = "0.11", features = ["runtime-tokio"] }
+# T4 compio-quic control bench (benches/compio_quic_churn.rs only): the
+# io_uring-native QUIC stack used as a runtime comparison control. Dev-only —
+# runtime dependencies are untouched. compio-quic 0.8 reuses quinn-proto
+# 0.11 (unified with our quinn 0.11 pin) and rustls 0.23; its default feature
+# is `ring` (quinn-proto/rustls-ring), matching our rustls ring pin.
+# compio-runtime/time is enabled explicitly because the bench wraps every
+# connect in compio_runtime::time::timeout (T3's 5 s wraps); compio-quic
+# already enables it transitively, but the bench depends on the API directly.
+compio-quic = "0.8.2"
+compio-runtime = { version = "0.12", features = ["time"] }
 
 [[example]]
 name = "hello_world"
@@ -147,6 +157,11 @@ harness = false
 [[bench]]
 name = "quic_conn_lifecycle_tokio"
 path = "benches/quic_conn_lifecycle_tokio.rs"
+harness = false
+
+[[bench]]
+name = "compio_quic_churn"
+path = "benches/compio_quic_churn.rs"
 harness = false
 
 [features]
