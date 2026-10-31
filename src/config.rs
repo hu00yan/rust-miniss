@@ -69,7 +69,9 @@ pub const DEFAULT_METRICS_INTERVAL_MS: u64 = 1000;
 /// Resolve the control-plane metrics cadence from `MINISS_METRICS_INTERVAL_MS`.
 ///
 /// Read once at runtime startup, never from a worker.  Invalid or absent
-/// values fall back to [`DEFAULT_METRICS_INTERVAL_MS`].
+/// values fall back to [`DEFAULT_METRICS_INTERVAL_MS`].  See
+/// [`metrics_publish_min_interval`] for the independent worker-side bound on
+/// how often the published slot itself is refreshed.
 pub fn metrics_interval() -> Duration {
     let interval_ms = std::env::var("MINISS_METRICS_INTERVAL_MS")
         .ok()
@@ -77,6 +79,34 @@ pub fn metrics_interval() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_METRICS_INTERVAL_MS);
     Duration::from_millis(interval_ms)
+}
+
+/// Default minimum interval between a worker's loop-boundary metrics
+/// publications, in milliseconds.
+pub const DEFAULT_METRICS_PUBLISH_MIN_MS: u64 = 10_000;
+
+/// Resolve the minimum interval between a worker's loop-boundary metrics
+/// publications from `MINISS_METRICS_PUBLISH_MIN_MS`.
+///
+/// Valid values are milliseconds including `0` (publish on every loop turn);
+/// invalid or absent values fall back to [`DEFAULT_METRICS_PUBLISH_MIN_MS`].
+/// Read once at worker startup, never from the event loop.
+///
+/// Relationship to [`metrics_interval`]: that knob is the embedder-side
+/// scrape/log cadence reference — the runtime itself runs no timer on it —
+/// while this knob bounds how often the owning worker republishes its
+/// single-writer slot at the event-loop boundary. The two are independent by
+/// design: a scrape may therefore observe a slot snapshot up to this interval
+/// old, which is safe because every published snapshot carries cumulative
+/// monotonic counters (staleness costs freshness, never truth), and the
+/// worker's final publication at shutdown always runs regardless of this
+/// knob.
+pub fn metrics_publish_min_interval() -> Duration {
+    std::env::var("MINISS_METRICS_PUBLISH_MIN_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(DEFAULT_METRICS_PUBLISH_MIN_MS))
 }
 
 /// Resolve the I/O park timeout from `MINISS_PARK_TIMEOUT_US`.

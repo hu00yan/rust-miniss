@@ -5,8 +5,10 @@
 //! to a shard, but the runtime does not steal or migrate tasks. Cross-shard
 //! admission, cancellation, I/O retirement, and wakeups use bounded queues or
 //! explicit notifications rather than shared task state. Metrics are pushed by
-//! each worker into its own single-writer slot at the event-loop boundary and
-//! read directly by scrapers — no cross-shard metrics traffic exists.
+//! each worker into its own single-writer slot at the event-loop boundary
+//! (rate-limited to a minimum publication interval; the final publication on
+//! worker exit always runs) and read directly by scrapers — no cross-shard
+//! metrics traffic exists.
 //!
 //! ## Core Principles
 //! 1. **Shard ownership**: Mutable task, timer, connection, and backend state is owner-local.
@@ -577,13 +579,17 @@ const METRICS_SLOT_READ_RETRIES: u32 = 8;
 /// Per-shard single-writer publication slot for control-plane metrics.
 ///
 /// One slot belongs to exactly one worker thread (the shard owner). The owner
-/// publishes once per event-loop turn at the same boundary as
-/// [`CpuCore::publish_ready_hint`], copying its already-maintained shard-local
-/// counters into these atomics; scrapes read the slot directly from the
-/// scraping thread. There is no message, no reply channel, no admission ticket,
-/// and no control-plane thread behind it any more — AGENTS.md MUST #6 holds by
-/// a stronger construction than before: publication happens outside the request
-/// path (between turns), and aggregation happens on the reader's thread.
+/// publishes at the same boundary as [`CpuCore::publish_ready_hint`], copying
+/// its already-maintained shard-local counters into these atomics; scrapes
+/// read the slot directly from the scraping thread. Loop-boundary publication
+/// is rate-limited to the minimum publication interval
+/// (`MINISS_METRICS_PUBLISH_MIN_MS`, default 10 s — see
+/// [`CpuCore::publish_metrics_if_due`]), and the worker's final publication
+/// at exit runs unconditionally (see [`CpuCore::publish_metrics`]). There is
+/// no message, no reply channel, no admission ticket, and no control-plane
+/// thread behind it any more — AGENTS.md MUST #6 holds by a stronger
+/// construction than before: publication happens outside the request path
+/// (between turns), and aggregation happens on the reader's thread.
 ///
 /// Coherence protocol (seqlock-style versioned snapshot):
 ///
@@ -1056,7 +1062,8 @@ pub struct CpuCore {
     task_poll_budget: usize,
     /// Shard-local metrics. Plain fields maintained inline by the owner;
     /// published into the worker's single-writer slot at the event-loop
-    /// boundary (see `publish_metrics`), never touched by another thread.
+    /// boundary, rate-limited by `metrics_publish_min_interval` (see
+    /// `publish_metrics_if_due`), never touched by another thread.
     metrics: CoreMetrics,
     /// Ready-queue depth published for cross-core spawn selection.
     ///
@@ -1070,11 +1077,22 @@ pub struct CpuCore {
     /// Cache-padded so one shard's publication cannot invalidate another
     /// shard's copy of the signal.
     ready_hint: Arc<CachePadded<AtomicUsize>>,
-    /// Single-writer metrics slot this worker publishes into once per
-    /// event-loop turn. Same ownership shape as `ready_hint`: the owning
-    /// worker is the only writer, scrapers read lock-free, and the slot is
-    /// cache-padded against neighbouring shards.
+    /// Single-writer metrics slot this worker publishes into at the
+    /// event-loop boundary, rate-limited by `metrics_publish_min_interval`
+    /// (the final publication at exit bypasses that limit). Same ownership
+    /// shape as `ready_hint`: the owning worker is the only writer, scrapes
+    /// read lock-free, and the slot is cache-padded against neighbouring
+    /// shards.
     metrics_slot: Arc<CachePadded<CoreMetricsSlot>>,
+    /// Minimum interval between loop-boundary publications into
+    /// `metrics_slot`, resolved once at worker startup from
+    /// `MINISS_METRICS_PUBLISH_MIN_MS`. `Duration::ZERO` publishes on every
+    /// turn.
+    metrics_publish_min_interval: Duration,
+    /// When this owner last published `metrics_slot` at the loop boundary.
+    /// Owner-local plain field: no other thread reads or writes it, so the
+    /// freshness check adds no synchronization anywhere.
+    last_metrics_publish: Option<Instant>,
     /// Control-plane report written once after the owner has drained its state.
     // Write-once publication: the owning worker sets it during exit, the
     // coordinator reads it after joining. `OnceLock` gives lock-free reads
@@ -1141,6 +1159,8 @@ impl CpuCore {
             message_poll_ticks: 0,
             task_poll_budget: crate::config::task_poll_budget(),
             metrics: CoreMetrics::default(),
+            metrics_publish_min_interval: crate::config::metrics_publish_min_interval(),
+            last_metrics_publish: None,
             termination_report,
         }
     }
@@ -1225,21 +1245,50 @@ impl CpuCore {
             .store(self.ready_queue.len(), Ordering::Relaxed);
     }
 
-    /// Publish this shard's metrics into its single-writer slot.
+    /// Publish this shard's metrics into its single-writer slot,
+    /// unconditionally.
     ///
-    /// Called at the same event-loop boundary as [`Self::publish_ready_hint`]:
-    /// after messages, completions, timers and task polls have all settled, so
-    /// a scrape reads a turn-boundary view rather than a mid-turn one. The cost
-    /// is one plain copy of counters this thread already maintains — no
-    /// syscalls, no messages, no branch, and no atomics on the request path
+    /// Only the worker's exit path calls this: park accounting and the last
+    /// drain rounds mutate counters after the final rate-limited boundary
+    /// publication, and the slot freezes when this thread goes away, so the
+    /// final publication must always fire — the minimum publication interval
+    /// never suppresses it. The event-loop boundary uses the rate-limited
+    /// [`Self::publish_metrics_if_due`] instead.
+    ///
+    /// The cost is one plain copy of counters this thread already maintains —
+    /// no syscalls, no messages, no branch, and no atomics on the request path
     /// itself (the request-path counters stay plain fields; see AGENTS.md
     /// MUST #6: aggregation happens outside the hot path, on the reader's
-    /// thread). Readers may observe a snapshot that is one turn old; that
-    /// costs freshness, never correctness.
+    /// thread).
     #[inline]
     fn publish_metrics(&self) {
         let snapshot = self.metrics_snapshot();
         self.metrics_slot.publish(&snapshot);
+    }
+
+    /// Publish this shard's metrics at the event-loop boundary if the minimum
+    /// publication interval has elapsed.
+    ///
+    /// Runs at the same boundary as [`Self::publish_ready_hint`]: after
+    /// messages, completions, timers and task polls have all settled, so a
+    /// scrape reads a turn-boundary view rather than a mid-turn one. The
+    /// publication is rate-limited to [`Self::metrics_publish_min_interval`]
+    /// (`MINISS_METRICS_PUBLISH_MIN_MS`, default 10 s, `0` = every turn): a
+    /// slot snapshot carries cumulative counters since process start
+    /// (monotonic, never deltas), so a scrape that observes a rate-limited
+    /// slot reads complete data that is at most one interval old — staleness
+    /// costs freshness, never correctness. The final publication on worker
+    /// exit bypasses this gate (see [`Self::publish_metrics`]).
+    #[inline]
+    fn publish_metrics_if_due(&mut self) {
+        let due = match self.last_metrics_publish {
+            None => true,
+            Some(last) => last.elapsed() >= self.metrics_publish_min_interval,
+        };
+        if due {
+            self.publish_metrics();
+            self.last_metrics_publish = Some(Instant::now());
+        }
     }
 
     fn publish_termination_snapshot(&self) {
@@ -1429,9 +1478,12 @@ impl CpuCore {
                 // the shard's metrics for control-plane scrapes. Placed after
                 // every producer of ready work and before the exit check, so
                 // the stored values reflect this turn's settled state rather
-                // than a mid-turn snapshot.
+                // than a mid-turn snapshot.  The metrics publication is
+                // rate-limited to the minimum publication interval (cumulative
+                // counters make staleness safe); the ready-depth hint is not,
+                // because spawn selection always wants fresh balance data.
                 self.publish_ready_hint();
-                self.publish_metrics();
+                self.publish_metrics_if_due();
 
                 // 6. Nothing left to do — exit inner loop, go park (wait for
                 //    I/O).  This is the event-driven block.  Reaching this
@@ -2044,8 +2096,9 @@ pub struct MultiCoreRuntime {
     /// lock-free by the submission side. Read strictly as a balance hint.
     core_ready_hints: Vec<Arc<CachePadded<AtomicUsize>>>,
     /// One single-writer metrics publication slot per worker. The owning
-    /// worker publishes at its event-loop boundary; scrapes read these
-    /// directly on the scraping thread. See [`CoreMetricsSlot`].
+    /// worker publishes at its event-loop boundary, rate-limited to the
+    /// minimum publication interval; scrapes read these directly on the
+    /// scraping thread. See [`CoreMetricsSlot`].
     core_metrics_slots: Vec<Arc<CachePadded<CoreMetricsSlot>>>,
     /// One owner-published termination report per worker.
     termination_reports: Vec<Arc<std::sync::OnceLock<CoreTerminationSnapshot>>>,
@@ -2059,7 +2112,10 @@ pub struct MultiCoreRuntime {
     /// Startup-resolved metrics interval.  The runtime itself runs no timer on
     /// it any more — publication is worker-side push at the loop boundary and
     /// scrapes read the slots directly; embedders use it as the default
-    /// cadence for their own scrape or log loops.
+    /// cadence for their own scrape or log loops.  Worker-side slot
+    /// publication has its own, independent rate limit
+    /// (`MINISS_METRICS_PUBLISH_MIN_MS`, see
+    /// [`crate::config::metrics_publish_min_interval`]).
     metrics_interval: Duration,
     /// Next core for round-robin task distribution
     next_core: AtomicUsize,
@@ -2295,10 +2351,13 @@ impl MultiCoreRuntime {
                         termination_report.clone(),
                     );
                     let result = core.run();
-                    // Final metrics publication: park accounting and the last
-                    // drain rounds mutate counters after the final loop-boundary
-                    // publish, so quiesced slots must be refreshed once more
-                    // before the worker goes away and they freeze.
+                    // Final metrics publication — always executed, never
+                    // rate-limited (`publish_metrics`, not
+                    // `publish_metrics_if_due`): park accounting and the last
+                    // drain rounds mutate counters after the final
+                    // loop-boundary publish, so quiesced slots must be
+                    // refreshed once more before the worker goes away and
+                    // they freeze.
                     core.publish_metrics();
                     core.publish_termination_snapshot();
                     // Set shutdown flag when core exits
@@ -3148,7 +3207,11 @@ impl MultiCoreRuntime {
     /// The runtime itself runs no sampler thread on this interval any more:
     /// publication happens at the workers' event-loop boundary and scrapes
     /// read the slots directly.  Embedders use this as the default cadence for
-    /// their own scrape or log loops (see `examples/http_echo.rs`).
+    /// their own scrape or log loops (see `examples/http_echo.rs`).  How often
+    /// the workers refresh those slots is bounded separately by
+    /// `MINISS_METRICS_PUBLISH_MIN_MS`
+    /// (see [`crate::config::metrics_publish_min_interval`]); a scrape may
+    /// therefore re-read the same cumulative snapshot across calls.
     pub fn metrics_interval(&self) -> Duration {
         self.metrics_interval
     }
@@ -4118,6 +4181,71 @@ mod tests {
         assert_eq!(final_read.tasks_spawned, GENERATIONS);
         assert_eq!(final_read.tasks_completed, 2 * GENERATIONS);
         assert!(reads > 0, "the reader must have attempted reads");
+    }
+
+    /// The loop-boundary publication is rate-limited: with the default 10 s
+    /// minimum interval, a worker that runs many loop turns publishes exactly
+    /// once (its first turn, because `last_metrics_publish` starts unset), and
+    /// the final publication on shutdown still fires exactly once — the
+    /// interval never suppresses the exit path.
+    #[test]
+    fn loop_boundary_publication_is_rate_limited_final_publication_is_not() {
+        // SAFETY: lib tests may run in parallel, but no other lib test asserts
+        // publication cadence (they only assert task/shutdown behaviour), so a
+        // transiently set variable cannot break them; removed again so the
+        // default applies to the rest of the suite.
+        unsafe {
+            std::env::set_var("MINISS_METRICS_PUBLISH_MIN_MS", "10000");
+        }
+        let runtime = MultiCoreRuntime::new(Some(1)).expect("rate-limit runtime");
+        let slot = &runtime.core_metrics_slots[0];
+
+        // The worker's first turn-boundary publication is unconditional.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while slot.seq.load(Ordering::Acquire) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker never published its first turn"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after_first = slot.seq.load(Ordering::Acquire);
+        assert_eq!(after_first % 2, 0, "the slot must rest on an even version");
+
+        // Two observations 100 ms apart span hundreds of loop turns (the park
+        // timeout wakes the idle worker far more often than that), yet every
+        // boundary publish inside the 10 s minimum interval is suppressed: the
+        // seqlock version must not move.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            slot.seq.load(Ordering::Acquire),
+            after_first,
+            "a second publication ran inside the 10 s minimum interval"
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            slot.seq.load(Ordering::Acquire),
+            after_first,
+            "a third publication ran inside the 10 s minimum interval"
+        );
+
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(2))
+            .unwrap();
+        runtime.join().unwrap();
+
+        // The final publication always fires, regardless of the interval:
+        // exactly one more version (still even), frozen after join.
+        let final_seq = slot.seq.load(Ordering::Acquire);
+        assert_eq!(
+            final_seq,
+            after_first + 2,
+            "the final publication must run exactly once despite the 10 s interval"
+        );
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("MINISS_METRICS_PUBLISH_MIN_MS");
+        }
     }
 
     #[test]

@@ -3,9 +3,14 @@
 //! These tests assert *values*, not presence: the merged runtime-wide series
 //! must be the arithmetic fold of the per-shard series, and the per-shard
 //! values must be the ones the traffic actually produced. Workers publish
-//! their counters into single-writer slots at the event-loop boundary and
+//! their counters into single-writer slots at the event-loop boundary —
+//! rate-limited by `MINISS_METRICS_PUBLISH_MIN_MS` (default 10 s) — and
 //! scrapes read those slots directly, so every assertion here also exercises
-//! that publication path.
+//! that publication path. Published snapshots carry cumulative counters since
+//! process start, so a rate-limited scrape may observe data up to one
+//! interval old without ever being wrong; tests that need turn-fresh values
+//! set the interval to `0`, and the final-publication test proves the exit
+//! path ignores the interval entirely.
 
 use rust_miniss::metrics::{series_descriptors, Merge, MetricType};
 use rust_miniss::MultiCoreRuntime;
@@ -26,6 +31,33 @@ static RUNTIME_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn runtime_test_lock() -> parking_lot::MutexGuard<'static, ()> {
     RUNTIME_TEST_LOCK.lock()
+}
+
+/// Guard that sets `MINISS_METRICS_PUBLISH_MIN_MS` for one test and removes it
+/// again on drop (the default 10 s interval then applies to later tests).
+///
+/// Every runtime-creating test in this binary holds `RUNTIME_TEST_LOCK` for
+/// its whole body, so no sibling creates a worker that would read the variable
+/// concurrently; test binaries are separate processes, so the lib tests never
+/// see it.
+struct PublishMinGuard;
+
+fn set_publish_min_ms(ms: &str) -> PublishMinGuard {
+    // SAFETY: tests serialize on RUNTIME_TEST_LOCK; set_var is safe here
+    // because no other thread reads this variable concurrently.
+    unsafe {
+        std::env::set_var("MINISS_METRICS_PUBLISH_MIN_MS", ms);
+    }
+    PublishMinGuard
+}
+
+impl Drop for PublishMinGuard {
+    fn drop(&mut self) {
+        // SAFETY: as `set_publish_min_ms`.
+        unsafe {
+            std::env::remove_var("MINISS_METRICS_PUBLISH_MIN_MS");
+        }
+    }
 }
 
 fn init_tracing() {
@@ -73,6 +105,9 @@ fn parse_exposition(text: &str) -> BTreeMap<&str, BTreeMap<Option<usize>, u64>> 
 fn aggregation_is_the_arithmetic_fold_of_every_shard() {
     let _test_lock = runtime_test_lock();
     init_tracing();
+    // Exact per-shard values are asserted below, so publication must be
+    // turn-fresh here: `0` publishes on every loop turn.
+    let _publish_min = set_publish_min_ms("0");
 
     const SHARDS: usize = 2;
     const TASKS: usize = 9;
@@ -163,6 +198,12 @@ fn aggregation_is_the_arithmetic_fold_of_every_shard() {
 fn publication_is_visible_without_any_sampler_pass() {
     let _test_lock = runtime_test_lock();
     init_tracing();
+    // This test asserts first-scrape visibility and growing `parks`, both of
+    // which require turn-fresh publication: `0` publishes on every loop turn.
+    // (Under the default 10 s rate limit the same assertions hold against the
+    // first publication's data or after the final one — cumulative counters
+    // make the stale view correct, just older.)
+    let _publish_min = set_publish_min_ms("0");
 
     let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
     let interval = runtime.metrics_interval();
@@ -234,6 +275,66 @@ fn publication_is_visible_without_any_sampler_pass() {
         .shutdown_with_timeout(Duration::from_secs(5))
         .unwrap();
     runtime.join().unwrap();
+}
+
+/// The final publication must ignore the minimum publication interval: with
+/// the loop-boundary publish rate-limited far beyond this test's duration,
+/// any post-shutdown freshness can only come from the exit path's
+/// unconditional publication (`CpuCore::publish_metrics`).
+#[test]
+fn final_publication_fires_regardless_of_the_publication_interval() {
+    let _test_lock = runtime_test_lock();
+    init_tracing();
+    // One hour: no loop-boundary publish can fire during this test after the
+    // worker's first turn.
+    let _publish_min = set_publish_min_ms("3600000");
+
+    const TASKS: u64 = 24;
+    let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..TASKS {
+        let tx = tx.clone();
+        runtime
+            .spawn(async move {
+                tx.send(()).unwrap();
+            })
+            .unwrap();
+    }
+    drop(tx);
+    for _ in 0..TASKS {
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    // Let the idle worker run park cycles: its park accounting accumulates
+    // locally but stays unpublished while the rate limit holds.
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Mid-run the slot may legitimately be stale — cumulative counters mean
+    // the scrape lags behind the traffic, never lies about it.
+    let stale = runtime.metrics_view().unwrap();
+    assert!(stale.runtime.cores[0].tasks_spawned <= TASKS);
+
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(5))
+        .unwrap();
+    runtime.join().unwrap();
+
+    // The final publication ignored the interval: the frozen slot holds the
+    // counters of the worker's last turn exactly.
+    let final_view = runtime.metrics_view().unwrap();
+    assert_eq!(
+        final_view.value("miniss_tasks_spawned_total", None),
+        Some(TASKS),
+        "the final publication must carry the last turn's spawned count"
+    );
+    assert_eq!(
+        final_view.value("miniss_tasks_completed_total", None),
+        Some(TASKS),
+        "the final publication must carry the last turn's completed count"
+    );
+    assert!(
+        final_view.runtime.cores[0].parks > 0,
+        "the final publication must carry post-park accounting despite the rate limit"
+    );
 }
 
 #[test]
@@ -352,6 +453,11 @@ fn a_quiesced_runtime_keeps_answering_from_frozen_slots() {
 fn concurrent_scrapes_during_worker_activity_stay_consistent() {
     let _test_lock = runtime_test_lock();
     init_tracing();
+    // The scraper hammers the slots while workers publish at their boundary;
+    // `0` keeps the publication rate high so the seqlock retry path is
+    // actually stressed, and the post-quiesce convergence scrape below sees
+    // the traffic's terminal state within a turn.
+    let _publish_min = set_publish_min_ms("0");
 
     const SHARDS: usize = 2;
     const TASKS: usize = 400;

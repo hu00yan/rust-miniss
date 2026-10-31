@@ -35,7 +35,12 @@ including its sample time and duration. `metrics_refresh(timeout)` is the same
 read — the `timeout` parameter is retained for API compatibility and has no
 effect, because no shard round trip remains to bound. `MINISS_METRICS_INTERVAL_MS`
 (default 1 second) is the startup-resolved cadence reference for embedder-side
-scrape or log loops; the runtime itself runs no timer on it.
+scrape or log loops; the runtime itself runs no timer on it. How often workers
+refresh those slots is bounded independently by `MINISS_METRICS_PUBLISH_MIN_MS`
+(default 10 seconds, `0` = every loop turn): a scrape may observe a snapshot up
+to that interval old, which is safe because published snapshots carry
+cumulative monotonic counters, and the worker's final publication at shutdown
+always runs regardless of the interval.
 
 ## Optional Prometheus text exposition
 
