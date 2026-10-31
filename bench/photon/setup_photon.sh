@@ -49,11 +49,13 @@ foreach(_l ssl crypto)
         list(APPEND PHOTON_BENCH_EXTRA_LIBS "${_l}")
     endif()
 endforeach()
-foreach(_t http-perf-server http-perf-client http-perf-server-mc)
-    if(TARGET ${_t})
-        target_link_libraries(${_t} PRIVATE ${PHOTON_BENCH_EXTRA_LIBS})
-    endif()
-endforeach()
+# Appending to photon_static (not the example targets) is deliberate: CMake
+# expands a target's transitive deps AFTER its direct deps, so deps recorded on
+# photon_static land after the vendored libcurl.a on every example link line;
+# deps appended to the example executables would land before it.
+if(TARGET photon_static)
+    target_link_libraries(photon_static PRIVATE ${PHOTON_BENCH_EXTRA_LIBS})
+endif()
 EOF
     echo "registered http-perf-server-mc target + link block"
 fi
