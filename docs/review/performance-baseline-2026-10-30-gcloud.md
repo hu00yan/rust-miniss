@@ -1,5 +1,6 @@
 # 跨运行时基准:Cloud Shell 内核 6.18.55(2026-10-29)
 
+
 > 环境:GCP Cloud Shell,2 vCPU = **1 物理核的 SMT 兄弟**(miniss 正确拒绝
 > `--cores 2`),server/wrk 共置无绑核,单 worker。3 轮交错、10 秒/轮、
 > ring 对齐(MINISS_URING_ENTRIES=1024 = monoio harness 的 1024)。
@@ -92,3 +93,69 @@ worker)+ 污染,双变量不可分离,故 orb 数据仍只作形状参考。
 2. 两个新的量化优化目标:park 空转 enter(发现 A)、RSS 异常(发现 B)。
 3. 旧矩阵的混杂变量(ring 1024 vs 4096、单轮)已消除;共享放置仍是硬限制,
    排名性结论仍需 ≥4 专核的 GCE 实例。
+
+## hyper 旗舰路径基准(2026-10-31,同机):h1 keep-alive 可用,h2 与 close-churn 塌陷(台账级发现)
+
+> 回答"runtime 集成了 hyper(tokio 生态)就是完整 HTTP 框架,为什么 benchmark
+> 只走自写 framer"的问题:本节把 hyper 1.x(`hyper::server::conn::http1/http2`)
+> 接到 miniss 上(`examples/http_hyper_echo.rs`、`examples/http_hyper_h2_echo.rs`,
+> IO 层为 `AsyncTcpStream` 直接实现的 `hyper::rt::Read/Write`,`src/net.rs:750,794`;
+> h2 背景任务走 `MinissHyperExecutor`,`src/hyper_rt.rs`)并跑同一方法论
+> (3 轮 × 10s、warmup -t1 -c10 -d3s、`MINISS_URING_ENTRIES=1024`、--cores 1、
+> wrk;h2 因 wrk 不支持 h2c 改用 h2load `-m1`,无 close32 对应模式)。
+> 原始件:gcloud `~/hyper-bench-20261031-011411/`(h1)与
+> `~/hyper-bench-20261031-011848/`(h2,CSV 解析被 VM 重启打断,以 h2load
+> 原始 txt 为准);对照 photon 数据取 `~/photon-bench-20261030-161605/results.csv`。
+
+### 吞吐(3 轮中位数,RPS)
+
+| 服务器(同机同日) | h1 ka8 | h1 ka32 | h1 close32 | h2c ka8 (m1) | h2c ka32 (m1) | RSS |
+|---|---|---|---|---|---|---|
+| miniss 最小 framer(10-29 承诺矩阵) | 68,075 | 77,848 | 77,908 | — | — | 191 MiB(含 #45 缺陷) |
+| miniss 最小 framer(10-31 复测,host 漂移校验) | — | 63,860 | 63,398 | — | — | — |
+| **hyper on miniss**(本节新增) | **31,131**(p99 680µs) | **35,882**(p99 2.55ms) | **2,789**(p50 10.5ms) | **3,376**(mean 2.3ms) | **3,338**(mean 9.5ms) | h1 ~90 MiB / h2 ~35 MiB |
+| photon io_uring(10-30 提交) | 53,179 | 52,968 | 52,913 | — | — | — |
+| **hyper on tokio(对照,本节新增)** | **57,517** | **54,774** | **11,993** | 未测 | 未测 | — |
+
+hyper-on-tokio 对照 = `bench/runtime_comparison/hyper_tokio_echo.rs`
+(同 hyper http1 路径、同 22B payload、tokio 多线程 runtime `--cores 1`)。
+
+### 发现 C(台账级):hyper 在 miniss 上 h2 与连接churn路径塌陷 ~4-20x,签名是串行化 ~300µs/请求
+
+1. **h1 keep-alive 是健康的低效**:31-36k = 0.54-0.66x hyper-on-tokio、
+   0.59-0.68x photon、0.44-0.56x 同日 framer。这是"hyper 每请求做更多事
+   (含 date 头 ~35B、HPACK/帧解析)"与 miniss 唤醒路径损耗的叠加,
+   量级符合"框架税"。
+2. **h1 close-mode 与 h2c 全部压到 ~3.1-3.4k RPS 天花板**,与连接数无关
+   (c8 与 c32 同顶格;h1 close c8 探针 avg 2.39ms、h2 c32 mean 9.5ms
+   ≈ 32/(1/0.3ms)——单请求 ~300µs 的串行资源)。对照:
+   - hyper-on-tokio close32 = 12.0k(hyper 自身的 churn 成本,5.3x 低于其 ka32);
+   - miniss framer close32 = 63.4k(同日)。
+   即 miniss×hyper 交互缺陷把 hyper 的 churn 成本再放大 ~4x
+   (close-mode 0.26x、h2 无 tokio 对照但 3.4k 已低于任何合理框架值)。
+   嫌疑面:hyper 每连接的 spawn/drop 生命周期(`spawn_local` 准入/回收)、
+   readiness 唤醒跨任务传播、或 io_uring 多 op 序列的完成唤醒;
+   framer 单任务长驻循环不触发。**本任务只记录不修复**;修复前,
+   benchmark 故事里 hyper 路径的公平数字只有 h1 keep-alive 行。
+3. **host 漂移**:同机 10-31 比 10-29 慢 ~18%(framer ka32 77.8k→63.9k、
+   tokio-framer 79.4k→62-64k,tokio 同步下移证明是 host 而非 miniss 回退)。
+   跨日比较一律用同日对照,本节已按此执行。
+4. **h3 无负载工具**:cloud shell 无 h2load 之外的 h3 压测器(ngtcp2 h3load
+   未打包),curl 无 --http3。h3 正确性由 `tests/quinn_h3.rs`(5 测试,
+   macOS + orb io_uring 全绿)与 `examples/http_h3_echo.rs --selftest`
+   (in-process h3 客户端,含 2/7 核自检)覆盖,不进吞吐矩阵。
+
+### 例程的架构审计(AGENTS.md MUST #8)
+
+三个 example 与一个对照 bin 的增量:无新增共享可变状态、无锁、无原子、
+无 hot-path runtime 创建(启动时一个 `MultiCoreRuntime`);连接经
+SO_REUSEPORT 每 worker 一监听(内核派发模型,MUST #7),accept 与连接
+处理全部 `spawn_local` 留在本 shard(无跨核流量);h2 的 hyper 背景任务
+经 `MinissHyperExecutor` 在 shard 上 `spawn_local`(hyper_rt 既有代码);
+h3 的 quinn endpoint **必须在其 owning shard 上构造**——quinn 的 endpoint
+driver 与 connection driver 都经 `MinissQuicRuntime::spawn` 落地,主线程
+构造会让两者落到不同 shard 并触发
+"QUIC socket owned by shard X, polled from shard Y"(`src/quic.rs`
+ensure_owner 硬错误;example 已按 shard 构造并在注释中记录该约束)。
+启动路径存在既定模式的阻塞调用(std UDP bind、rcgen 证书生成,setup 期,
+与 `http_echo.rs` 的 bind-in-spawn 同型)。
