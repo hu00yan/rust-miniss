@@ -572,3 +572,30 @@ are not silently mixed into the implementation batch.
       `bench/scripts/park_efficiency_check.pl`(busy/polled≤5 且 parks>0,无
       metrics 即失败),接进 bench_http.sh 多 worker miniss 路径 + `just
       bench-multicore`;实测在 main 上标红(15-48:1)、在修复上通过(0.03-0.14:1)。
+
+47. Performance defect class: O(n) admission cost invisible to the
+    smoke/keep-alive gates. `TaskArena::insert_external` evicted the admitted
+    slot with `free.retain(...)` — an O(|free|) linear scan per admitted task
+    against a free structure that holds all 65,536 slots at arena creation
+    and stays near capacity on churned shards (completion/cancel re-queue
+    through `remove`). Admission runs on every spawn (CoreMessage::Task,
+    `drain_local_spawns`), so a 20k spawn storm paid ~1.3e9 scan steps.
+    Found by the T3 per-connection lifecycle microbenchmark plus sample/perf:
+    93.8% of core-thread samples in the macOS 20k-spawn storm, 99.44% on
+    Linux io_uring perf, spawn baseline 104.6 µs/task vs tokio 0.6 µs
+    (175x), ~200 µs per connection on churn workloads — the root contributor
+    to the hyper close-churn collapse (发现 C) and the QUIC T3 FAIL.
+    Reproduced on `fix/task-arena-admission-cost` pre-fix: 104.445-130.760
+    µs/task vs tokio 0.296-0.528 µs (ratio 201-354x), macOS sample 670/679
+    core-thread samples inside `insert_external`. Fixed with an indexed free
+    structure (`free: Vec<u16>` + `free_pos: Vec<u32>`, one swap_remove per
+    admission; DECISION_LOG 2026-10-31 row); post-fix 0.493-0.709 µs/task,
+    ratio 1.9x. The gate gap: no spawn-heavy cost assertion exists —
+    `bench-smoke` (5 s keep-alive HTTP, HTTP_CORES=1) and the keep-alive
+    matrices never grow admission pressure, so a 175x admission regression
+    shipped green. Follow-up (proposed, deliberately not implemented here):
+    a T5-style spawn-budget assertion — bounded µs/task on the 20k
+    interleaved storm, compared against a same-machine baseline the way
+    `bench-smoke` compares HTTP throughput/p99. Coordinator note: the hyper
+    /framer close32 re-measurement happens on the merged result, not on this
+    branch.
