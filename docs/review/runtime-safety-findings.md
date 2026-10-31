@@ -494,3 +494,30 @@ are not silently mixed into the implementation batch.
     1-worker saturation) that becomes a defect at multi-worker low-rate topologies.
     First-class: it means every published multi-worker number from this runtime
     predates a real scaling bug.
+
+    **#46 溯源补记(2026-10-31,git 法证):**
+    - **何时**:无条件阻塞是 2025 原始行为(`6221496`);自旋形循环分三步进入——
+      `f5721c3`(2026-06-27,"two-level event loop (monoio pattern)",内层循环
+      + MAX_BUSY_ROUNDS=64,park 降级为例外)、`70db335`(2026-07-01,park
+      超时 →100µs)、`c749821`(2026-07-01,64→96 + drain 限额 + flush 算作
+      work_done)。
+    - **为什么**:每一步都是 1-worker 饱和/8 核 c100 场景的实测优化
+      (`f5721c3` 验证点每 worker ~95-190k 事件/秒,事件间隔 5-10µs < park
+      往返;2026-07-13 探针在 4-worker×800 连接饱和下 96 确实胜 48:
+      855k vs 830k)。7-worker×32 连接把每 worker 事件率压到 ~30-50k/s,
+      事件间隔(~20-30µs)> 单轮成本(~1µs),96 轮预算持续重武装——
+      属于"多 worker 加入被单 worker 调优的循环"的涌现交互,单一最责任
+      提交为 `f5721c3`。
+    - **为什么 gate 没拦**:唯一的 gate 内基准 `bench-smoke` 自 `8c4d1d7`
+      (2026-07-12)起硬编码 `HTTP_CORES=1`——1 worker 下该循环是最好的
+      运行时,结构性看不见;多 worker 运行发生过(2026-07-14/15,
+      HTTP_CORES=4)且低连接败象已现(ka32 378-400k vs monoio 457-493k),
+      但 summary.csv 无 CPU 列、单轮、共享 VM,败因被归为尾部不稳/污染;
+      `busy_rounds`/`park_total_us` 计数器自 2026-07-01 存在,唯一的断言
+      只有 `parks > 0`(metrics_aggregation.rs:205,215)——一条
+      park/busy 比率断言第一天就能标红 #46。
+    - **修复兼容性**:`f5721c3`/`c749821` 保护的是饱和时的 syscall 率
+      ("inner loop typically submits once via park",33.5 completions/
+      syscall)。自适应阻塞只在 CQ peek 与 ready 队列同时为空时让出——
+      负载下二者很少同时空,饱和路径逐字节不变;先例 `6ffc0fc`(2026-10-18)
+      已对 draining 空闲路径做过同类修改而未触碰忙路径。
