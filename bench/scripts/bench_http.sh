@@ -327,14 +327,24 @@ run_benchmark() {
     local perf_log="$OUT_DIR/$name.perf.csv"
     local rss_log="$OUT_DIR/$name.rss.txt"
 
+    # Park-efficiency gate feed (ledger #46): multi-worker miniss runs emit
+    # periodic per-core metrics so bench can fail on the executor-loop spin
+    # signature (busy_rounds/polled >> 1, parks collapsed) instead of
+    # publishing a number from a runtime that burns a core per worker. The
+    # 1 Hz reporter is control-plane traffic; the saturated path is unaffected.
+    local -a server_env=()
+    if [[ "$name" = "miniss" && "$HTTP_CORES" -gt 1 && -z "${MINISS_METRICS_INTERVAL_MS:-}" ]]; then
+        server_env=(MINISS_METRICS_INTERVAL_MS=1000)
+    fi
+
     cleanup
     rm -f "$raw_log" "$server_log"
 
     echo "== $name =="
     if [[ -n "$SERVER_CPUS" ]]; then
-        taskset -c "$SERVER_CPUS" "$binary" --addr "127.0.0.1:$port" "${extra_args[@]}" >"$server_log" 2>&1 &
+        taskset -c "$SERVER_CPUS" env ${server_env[@]+"${server_env[@]}"} "$binary" --addr "127.0.0.1:$port" "${extra_args[@]}" >"$server_log" 2>&1 &
     else
-        "$binary" --addr "127.0.0.1:$port" "${extra_args[@]}" >"$server_log" 2>&1 &
+        env ${server_env[@]+"${server_env[@]}"} "$binary" --addr "127.0.0.1:$port" "${extra_args[@]}" >"$server_log" 2>&1 &
     fi
     server_pid=$!
 
@@ -394,6 +404,12 @@ runtime_enabled() {
 port_offset=0
 if runtime_enabled "miniss"; then
     run_benchmark "miniss" "$ROOT/target/release/examples/http_echo" "$((BASE_PORT + port_offset))" --cores "$HTTP_CORES"
+    # Park-efficiency gate (ledger #46): a multi-worker run must block when
+    # there is nothing to do. Feeding this gate only the miniss server log is
+    # intentional — the spin is miniss's executor-loop pathology.
+    if [[ "$HTTP_CORES" -gt 1 ]]; then
+        perl "$ROOT/bench/scripts/park_efficiency_check.pl" "$OUT_DIR/miniss.server.log"
+    fi
     port_offset=$((port_offset + 1))
 fi
 if runtime_enabled "monoio" && [[ -x "$ROOT/bench/runtime_comparison/target/release/monoio_echo" ]]; then

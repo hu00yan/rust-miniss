@@ -968,8 +968,11 @@ impl CpuCore {
 
         tracing::info!("CPU core {} started", self.id);
 
-        /// Maximum inner-loop iterations before yielding to I/O (prevents
-        /// starvation of completions and timers during a busy-task storm).
+        /// Maximum productive inner-loop iterations (a round that polled a
+        /// task, drained a CQE, processed a message, or expired a timer)
+        /// before forcing a park — the anti-starvation backstop for
+        /// continuously self-waking tasks.  Empty check rounds never count:
+        /// they exit to the event-driven park at step 6 (finding #46).
         const MAX_BUSY_ROUNDS: u32 = 96;
         const MESSAGE_POLL_TICKS_LIGHT: usize = 3;
         const MESSAGE_POLL_TICKS_BUSY: usize = 15;
@@ -1052,23 +1055,35 @@ impl CpuCore {
                 // settled queue rather than a mid-turn snapshot.
                 self.publish_ready_hint();
 
-                if !work_done && self.io_state.io_backend.pending_submission_count() > 0 {
-                    self.metrics.flushes += 1;
-                    let flush_started = Instant::now();
-                    self.io_state.io_backend.flush();
-                    let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
-                    self.metrics.flush_total_us += flush_elapsed_us;
-                    self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
-                    work_done = true;
-                }
-
-                // 6. Nothing left to do — exit inner loop, go park (wait for I/O).
+                // 6. Nothing left to do — exit inner loop, go park (wait for
+                //    I/O).  This is the event-driven block.  Reaching this
+                //    point with `work_done == false` means the CQ peek found
+                //    nothing, the ready and owner queues are empty, no message
+                //    arrived, and no timer expired: the correct move is to
+                //    block in `park(timeout)`, which also hands deferred SQEs
+                //    below the flush batch threshold to the kernel via its
+                //    submit_and_wait ("submit once via park").  Counting that
+                //    deferral as work here — the removed flush-as-work path —
+                //    made the loop re-scan empty queues once per microsecond
+                //    between events: at 7 workers x 32 keep-alive connections
+                //    the event interval (~20-30µs) dwarfs the per-round cost
+                //    (~1µs), so the loop burned ~1 core per worker re-checking
+                //    nothing (finding #46: busy_rounds/polled ≈ 17:1, ~8k
+                //    parks/s, CPU 4.5x monoio).  Under saturation this branch
+                //    is not reached (the ready queue holds work every round),
+                //    so the syscall-rate rationale of the two-level loop is
+                //    untouched.
                 if !work_done {
                     break;
                 }
 
-                // 7. Bounding: prevent I/O starvation.  If we've been busy for
-                //    MAX_BUSY_ROUNDS without a break, force a park to let the
+                // 7. Bounding: prevent I/O starvation.  `busy_rounds` counts
+                //    only productive rounds — at least one task polled, one
+                //    CQE drained, one message processed, or one timer expired.
+                //    Empty check rounds exited at step 6 and never increment
+                //    it, so MAX_BUSY_ROUNDS is purely the anti-starvation
+                //    backstop for continuously self-waking tasks: after 96
+                //    consecutive productive rounds, force a park to let the
                 //    kernel push completions and timers fire.
                 busy_rounds += 1;
                 self.metrics.busy_rounds += 1;

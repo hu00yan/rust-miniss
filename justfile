@@ -160,6 +160,17 @@ bench-http:
     @echo "Unset placement is recorded as unbound and is only a contention diagnostic."
     ./bench/scripts/bench_http.sh
 
+# Multi-worker park-efficiency gate (ledger #46). The 1-core bench-smoke is
+# structurally blind to the executor-loop spin pathology: at 1 worker the loop
+# amortizes best. This recipe runs miniss multi-worker (default 7 workers x 32
+# keep-alive connections, the shape that exposed #46), emits per-core metrics,
+# and fails on the spin signature (busy_rounds/polled high, parks collapsed)
+# via bench/scripts/park_efficiency_check.pl. Override CORES/CONNECTIONS to
+# match the topology under test; run on the healthy multi-core Linux host.
+bench-multicore cores="7" connections="32" duration="10":
+    HTTP_CORES={{cores}} BENCH_RUNTIMES=miniss \
+        ./bench/scripts/bench_http.sh 9090 {{duration}} {{connections}} 2
+
 # Explicit multi-round HTTP/runtime matrix. Set BENCH_SERVER_CPUS,
 # BENCH_CLIENT_CPUS, and HTTP_CORES on Linux when collecting isolated evidence.
 # Every round is retained; this recipe is intentionally outside the default gate.

@@ -555,3 +555,20 @@ are not silently mixed into the implementation batch.
       syscall)。自适应阻塞只在 CQ peek 与 ready 队列同时为空时让出——
       负载下二者很少同时空,饱和路径逐字节不变;先例 `6ffc0fc`(2026-10-18)
       已对 draining 空闲路径做过同类修改而未触碰忙路径。
+    - **修复(2026-10-31,`fix/multiworker-adaptive-blocking`)**:溯源后机制
+      定位到 `c749821` 的 flush-as-work 尾路径(multicore.rs 内层循环末尾):
+      `!work_done && pending_submission_count()>0` 无条件把一次 flush 记为
+      work_done,而 uring `flush()` 低于批阈值(默认 61)时是 no-op——于是
+      "有 SQE 未提交"本身成了永真的 work,循环在事件间隙以 ~1µs/轮重扫空队列,
+      直到 96 轮 backstop。实测配对探针(orb 7-worker ka32,多对交替):pre 修复
+      busy_rounds/polled 25-26:1(95% 的 busy 轮是 no-op flush)、CPU
+      214-243ms/10k、parks 7-8.5k/s/worker;post 修复 0.09-0.10:1、CPU
+      62-67ms/10k(monoio 参考 56.6)、parks 20-22k/s/worker、parked ~810ms/s/w,
+      rps +48-70%(225-333k),p50 减半,p99 配对无回归。1-worker(k32)3 对:
+      rps +6-10%、CPU -9%、p50 改善,p99 从 310-567µs 移到 374-755µs——事件驱动
+      阻塞用亚毫秒尾抖动换掉烧核自旋,与 monoio/glommio 同型。修复 = 删除
+      flush-as-work 分支 + busy_rounds 语义重定义(只计有真实工作的轮:CQE/
+      任务/消息/定时器;空检查轮直接进 park)。gate 补齐:
+      `bench/scripts/park_efficiency_check.pl`(busy/polled≤5 且 parks>0,无
+      metrics 即失败),接进 bench_http.sh 多 worker miniss 路径 + `just
+      bench-multicore`;实测在 main 上标红(15-48:1)、在修复上通过(0.03-0.14:1)。
