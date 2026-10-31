@@ -1,11 +1,27 @@
 # rust-miniss justfile — gate definitions
 #
-# 所有 gate 串成 `just gate` 作为提交前检查。
-# 返回码：
+# [DRAFT refactor/gate-hierarchy — 三层 gate 层级,待业主评审后生效。
+#  设计与逐条理由见 docs/review/gate-hierarchy-2026-10.md;AGENTS.md 的合同
+#  修订清单见该文 §4。本文件保持可运行:旧配方名全部保留。]
+#
+# 三层:
+#   Tier 1 `just fast`    开发内循环,热缓存秒级:只拦"最愚蠢的错误"。
+#                         任何 socket/fd/thread/sleep/wall-clock 型测试不得进入本层
+#                         (业主 2026-10-31 裁定:NOTHING protocol-sim-like)。
+#   Tier 2 `just gate`    提交门,分钟级:check(静态+全量常规测试+后端编译矩阵)
+#                         + affected(受影响目标选择,按改动自动加后端/平台/协议腿)
+#                         + 各审计 + bench-smoke(需显式 BASELINE)。
+#   Tier 3 `just nightly` 周期/手动:feature 矩阵、loom、miri、stress、linux-safety。
+#
+# 返回码(`just gate`):
 #   0 = GREEN (all pass)
-#   1 = YELLOW (compile/test/clippy failure)
+#   1 = YELLOW (compile/test/clippy/affected/bench failure)
 #   2 = RED (architecture violation)
 #   3 = RED (diff out of bounds)
+
+# test-regular / test-all-features 共享的 stress 跳过清单(唯一副本:
+# 两处曾各维护一份,属 gate 系统内部的 P1 漂移面)。
+STRESS_SKIPS := "--skip test_long_running --skip test_udp_stress --skip test_udp_stress_multiple_senders --skip test_multicore_sustained_admission_pressure --skip test_multicore_loaded_shutdown_reclaims_all_state --skip test_multicore_loaded_shutdown_worker_and_task_matrix --skip test_multicore_pending_udp_shutdown_reclaims_socket_leases --skip test_multicore_udp_receive_close_race_reclaims_state --skip test_multicore_accepted_tcp_shutdown_reclaims_descriptor_leases --skip stress_timer_io"
 
 # ─── Basic Check ────────────────────────────────────────────────
 
@@ -14,9 +30,16 @@ check:
     ./scripts/check_no_ignored_tests.sh
     cargo clippy --all-targets -- -D warnings
     cargo check --all-targets --all-features
+    # Backend compile matrix(wired 2026-10-31;此前是零引用孤儿配方 —
+    # gate-hierarchy-2026-10.md §1.6)。cfg(io_backend) 每个组合必须在其
+    # 原生 OS 上编译,防 D22/D16 的 P2 复发。
+    just check-backends
     # Include regular library/integration/example tests; long stress cases
     # have their own explicit gate below.
     just test-regular
+    # docs-audit 此前只在 CI linux-epoll 单腿运行(§1.7);归位提交门。
+    just docs-audit
+    just unsafe-audit
 
 # Backend compile matrix (defect-forensics Tier-1 item 1). Every cfg
 # (io_backend) combination must compile on its native OS — the Linux-epoll
@@ -37,6 +60,14 @@ check-backends:
         cargo check --all-targets --all-features
     fi
     echo "=== backend compile matrix OK ==="
+
+# 受影响目标选择(Tier 2;DRAFT)。读 git diff(相对 BASE,缺省 merge-base
+# origin/main),经 scripts/test-affected-mapping.yaml 自动展开改动子系统对应的
+# 测试二进制 × 后端 × 平台腿(如 src/io/uring.rs → io_uring 腿 + epoll 编译检查;
+# src/io/mio_poll.rs → epoll(Linux)/kqueue(macOS) 腿;src/multicore.rs →
+# lifecycle+shutdown 双后端套件)。绝不静默为空:空选择以退出码 2 拒绝。
+affected base="":
+    ./scripts/test-affected.sh {{base}}
 
 # ─── Documentation Audit ────────────────────────────────────────
 
@@ -131,10 +162,12 @@ review-adversarial:
 
 # ─── Gate (full sequence) ───────────────────────────────────────
 
-gate task="" baseline="":
+gate task="" baseline="" base="":
     @set -e; \
     echo "=== Gate: check ==="; \
     just check || { echo "YELLOW: check failed"; exit 1; }; \
+    echo "=== Gate: affected(受影响目标选择,DRAFT) ==="; \
+    just affected {{base}} || { echo "YELLOW: affected-target selection failed"; exit 1; }; \
     echo "=== Gate: arch-audit ==="; \
     just arch-audit || { echo "RED: architecture violation"; exit 2; }; \
     echo "=== Gate: unsafe-audit ==="; \
@@ -214,16 +247,7 @@ test:
 # balance ledger + fd-count guard) on every run of this recipe.
 test-regular:
     cargo test --lib --tests --examples -- --test-threads=1 \
-        --skip test_long_running \
-        --skip test_udp_stress \
-        --skip test_udp_stress_multiple_senders \
-        --skip test_multicore_sustained_admission_pressure \
-        --skip test_multicore_loaded_shutdown_reclaims_all_state \
-        --skip test_multicore_loaded_shutdown_worker_and_task_matrix \
-        --skip test_multicore_pending_udp_shutdown_reclaims_socket_leases \
-        --skip test_multicore_udp_receive_close_race_reclaims_state \
-        --skip test_multicore_accepted_tcp_shutdown_reclaims_descriptor_leases \
-        --skip stress_timer_io
+        {{STRESS_SKIPS}}
 
 # Bounded multi-core pressure loop. The default tests stay short; this explicit
 # recipe runs the same stress target for 30 seconds and verifies cleanup.
@@ -239,21 +263,12 @@ stress:
 # Protocol/feature-complete test loop. This is explicit because it enables TLS,
 # QUIC/H3, and every optional backend feature; it is slower than the default
 # check and still excludes benchmark binaries.
+# [DRAFT] fmt/clippy 已移出(与调用方 `just check`/CI 步骤重复:每个 CI OS 腿曾
+# 把 clippy 与全量 test 各跑两遍 — gate-hierarchy-2026-10.md §1.5 重复 #2)。
 test-all-features:
-    cargo fmt --all -- --check
     ./scripts/check_no_ignored_tests.sh
-    cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-features --lib --tests --examples -- --test-threads=1 \
-        --skip test_long_running \
-        --skip test_udp_stress \
-        --skip test_udp_stress_multiple_senders \
-        --skip test_multicore_sustained_admission_pressure \
-        --skip test_multicore_loaded_shutdown_reclaims_all_state \
-        --skip test_multicore_loaded_shutdown_worker_and_task_matrix \
-        --skip test_multicore_pending_udp_shutdown_reclaims_socket_leases \
-        --skip test_multicore_udp_receive_close_race_reclaims_state \
-        --skip test_multicore_accepted_tcp_shutdown_reclaims_descriptor_leases \
-        --skip stress_timer_io
+        {{STRESS_SKIPS}}
 
 # Exercise feature-off and feature-on compilation/test surfaces. Benchmark
 # binaries remain excluded because they launch live workloads. Each matrix
@@ -271,10 +286,10 @@ test-feature-matrix:
     cargo check --no-default-features --features debug --all-targets
     just test-all-features
 
-# Run the complete correctness suite without starting benchmark binaries.
-# Kernel- and toolchain-specific gates are included when the host can run them;
-# skipped gates are reported explicitly instead of looking green.
-test-full:
+# [DRAFT — Tier 3 周期入口。test-full 保持旧名为别名(README_CN.md:165、
+# DESIGN.md:727 与 DECISION_LOG 2026-07-14 行引用它)。组成不变,角色重定位:
+# 夜间/每周/合并集成前手动运行,不是每提交义务。]
+nightly:
     #!/usr/bin/env sh
     set -eu
     just check
@@ -297,6 +312,8 @@ test-full:
         echo "SKIP: nightly toolchain is unavailable for miri-safety"
     fi
 
+test-full: nightly
+
 # Reference-model and production-linked differential tests. The current slice
 # covers generational TaskArena behavior; operation/kernel protocols remain
 # split between pure models and backend-specific regression tests until a
@@ -304,15 +321,17 @@ test-full:
 test-differential:
     cargo test --test runtime_safety_models
 
+# [DRAFT — Tier 1 重定义见 `fast`/`test-fast`;此处保留旧定义注释:
 # Fast local safety loop. It excludes Loom, Miri, the separate long Linux
-# lifetime/stress gates, examples, and benchmarks. `runtime_regressions` still
-# includes bounded I/O tests against the backend selected for this host.
-test-fast:
+# lifetime/stress gates, examples, and benchmarks.]
+fast:
     cargo fmt --all -- --check
     ./scripts/check_no_ignored_tests.sh
     ./scripts/audit_architecture.sh
     cargo test --lib --test runtime_safety_models
-    cargo test --test runtime_regressions
+
+# 旧名别名。runtime_regressions 已迁 Tier 2(见 fast 注释;合同修订待批)。
+test-fast: fast
 
 # Explicit unsafe documentation gate. It is included in `just gate`, but not
 # the fast local loop until the existing baseline is fully documented.

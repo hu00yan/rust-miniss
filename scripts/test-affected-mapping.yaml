@@ -1,0 +1,118 @@
+# scripts/test-affected-mapping.yaml — DRAFT 供业主评审(refactor/gate-hierarchy)
+#
+# gate-hierarchy-2026-10.md §3 的机械载体:source-path 前缀 → (test 二进制, 后端, 平台)
+# → 具体 cargo/env 命令。本文件是 gate 契约的一部分:修改本表的提交必须在提交说明里
+# 附 `scripts/test-affected.sh --dry-run <BASE>` 的输出,自证没有静默缩减覆盖。
+#
+# 格式(受约束 YAML 子集,解析器内建于 scripts/test-affected.sh;命令字符串里不得出现 '#'):
+#   rules:
+#     - match: ["<前缀>", ...]        # 目录以 / 结尾;文件用完整路径;"" 是兜底(必须存在)
+#       legs:
+#         - {platform: linux|macos|any, backend: io_uring|epoll|kqueue|host|both, cmd: "..."}
+#
+# backend 语义(build.rs:67-91 的可用性规则由脚本强制):
+#   host   = 当前主机构建的默认后端,不改任何环境变量
+#   both   = Linux 展开为 io_uring(默认 target 目录)+ epoll(target/epoll);macOS 展开为 kqueue
+#   具名后端 = 设 MINISS_IO_BACKEND=<b>;epoll 额外设 CARGO_TARGET_DIR=target/epoll(与 CI 一致,
+#              避免来回重编;切换后端无需 cargo clean — DECISION_LOG 2026-10-17 行)
+#
+# DRAFT 映射起点:子系统 → 套件的对应关系取自 linux_safety.sh 的具名回归、justfile 的
+# --skip 清单与 tests/ 二进制清单。业主评审后逐行增删;新增 tests/*.rs 二进制时必须
+# 同步本表(兜底规则保证未登记文件的测试不静默丢失)。
+
+version: 1
+
+rules:
+  # ── IO 后端实现 ────────────────────────────────────────────────
+  - match: ["src/io/uring.rs", "src/io/buf_ring.rs"]
+    comment: "io_uring 驱动(Linux-only 编译面):io_uring 测试腿 + epoll 编译检查(P2:改动不得让另一后端失去编译)"
+    legs:
+      - {platform: linux, backend: io_uring, cmd: "cargo test --lib io::uring -- --test-threads=1"}
+      - {platform: linux, backend: io_uring, cmd: "cargo test --test runtime_regressions --test vectored_io --test test_fast_poll -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo check --all-targets --all-features"}
+
+  - match: ["src/io/mio_poll.rs"]
+    comment: "共享 mio 后端:epoll 腿(Linux)+ kqueue 腿(macOS)——D10/D12/D13/D23 的平台腿"
+    legs:
+      - {platform: linux, backend: epoll, cmd: "cargo test --test runtime_regressions --test test_fast_poll --test fallback_buffer_init -- --test-threads=1"}
+      - {platform: macos, backend: host, cmd: "cargo test --test runtime_regressions --test test_fast_poll -- --test-threads=1"}
+
+  - match: ["src/io/mod.rs", "src/io/future.rs", "src/fs.rs"]
+    comment: "后端中立 seam:两侧后端同套件(diff-audit 同型规则;P1 差分的测试面)"
+    legs:
+      - {platform: linux, backend: io_uring, cmd: "cargo test --test runtime_regressions --test async_file_tests -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --test runtime_regressions --test async_file_tests --test fallback_buffer_init -- --test-threads=1"}
+      - {platform: macos, backend: host, cmd: "cargo test --test runtime_regressions --test async_file_tests -- --test-threads=1"}
+
+  # ── 执行器 / 生命周期核心 ─────────────────────────────────────
+  - match: ["src/multicore.rs", "src/waker.rs", "src/executor.rs", "src/cpu.rs", "src/task.rs", "src/cancellation.rs", "src/timer/", "src/config.rs"]
+    comment: "lifecycle + shutdown 套件,双后端(#40/#42/D25/D27 类:调度与关闭时序必须跨后端验证)"
+    legs:
+      - {platform: linux, backend: io_uring, cmd: "cargo test --test multicore_tests --test shutdown_quiescence -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --test multicore_tests --test shutdown_quiescence -- --test-threads=1"}
+      - {platform: macos, backend: host, cmd: "cargo test --test multicore_tests --test shutdown_quiescence -- --test-threads=1"}
+
+  # ── HTTP / 网络协议面 ─────────────────────────────────────────
+  - match: ["src/http.rs", "src/net.rs", "src/hyper_rt.rs", "src/compat.rs", "src/buffer.rs"]
+    comment: "integration_http + hyper 双后端;epoll 腿防止 parser/net 修复只在 io_uring 上被验证(D22 类)"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --test integration_http --test hyper_http1 --test hyper_http2 -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --test integration_http -- --test-threads=1"}
+
+  # ── QUIC / TLS 适配面(QUIC 方法论 T2 落位) ──────────────────
+  - match: ["src/quic.rs", "src/tls.rs"]
+    comment: "quinn_h3 全特征套件:host + Linux epoll 腿;T4 sim-flavor 就绪后追加 tests/quic_lifecycle_props 腿"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --all-features --test quinn_h3 -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --all-features --test quinn_h3 -- --test-threads=1"}
+
+  # ── 测试文件本身被改 ──────────────────────────────────────────
+  - match: ["tests/shutdown_quiescence.rs", "tests/multicore_tests.rs"]
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --test multicore_tests --test shutdown_quiescence -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --test shutdown_quiescence -- --test-threads=1"}
+
+  - match: ["tests/runtime_regressions.rs", "tests/vectored_io.rs", "tests/test_fast_poll.rs", "tests/fallback_buffer_init.rs", "tests/integration_io_backend.rs"]
+    comment: "后端回归文件被改:双后端腿"
+    legs:
+      - {platform: linux, backend: io_uring, cmd: "cargo test --test runtime_regressions --test vectored_io --test test_fast_poll --test fallback_buffer_init --test integration_io_backend -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --test runtime_regressions --test test_fast_poll --test fallback_buffer_init --test integration_io_backend -- --test-threads=1"}
+      - {platform: macos, backend: host, cmd: "cargo test --test runtime_regressions --test test_fast_poll -- --test-threads=1"}
+
+  - match: ["tests/integration_http.rs", "tests/hyper_http1.rs", "tests/hyper_http2.rs", "tests/quinn_h3.rs"]
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --test integration_http --test hyper_http1 --test hyper_http2 --test quinn_h3 --all-features -- --test-threads=1"}
+
+  - match: ["tests/stress_test.rs", "tests/stress_timer_io.rs"]
+    comment: "stress 文件改动进不了 Tier 2 预算:提示跑 Tier 3(不静默)"
+    legs:
+      - {platform: any, backend: host, cmd: "echo 'AFFECTED-NOTE: stress files changed; run `just stress` (Tier 3) before merge'"}
+
+  - match: ["tests/"]
+    comment: "其余测试文件改动:整 host 套件(兜底,宁可重跑不可漏跑)"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --tests -- --test-threads=1"}
+
+  # ── 依赖 / 构建 / gate 基建:everything ───────────────────────
+  - match: ["Cargo.toml", "Cargo.lock"]
+    comment: "依赖面 = 全量;quinn/rustls 升级的 QUIC 上游重放(T1 canary)将来挂在本规则"
+    legs:
+      - {platform: any, backend: host, cmd: "just check-backends"}
+      - {platform: any, backend: host, cmd: "just test-regular"}
+
+  - match: ["build.rs", "justfile", ".github/", "scripts/", "bench/"]
+    comment: "构建与 gate 基建 = everything(任务卡 §2 示例)"
+    legs:
+      - {platform: any, backend: host, cmd: "just check-backends"}
+      - {platform: any, backend: host, cmd: "just test-regular"}
+
+  # ── 纯文档 ────────────────────────────────────────────────────
+  - match: ["docs/", "README.md", "README_CN.md", "AGENTS.md", "TODO.md"]
+    legs:
+      - {platform: any, backend: host, cmd: "just docs-audit"}
+
+  # ── 兜底(必须存在;脚本拒绝静默空的机械保证) ─────────────────
+  - match: [""]
+    comment: "未登记路径(杂项):文档审计 + 显式告警;若业主认为某路径需要真腿,加规则而不是依赖兜底"
+    legs:
+      - {platform: any, backend: host, cmd: "just docs-audit"}
