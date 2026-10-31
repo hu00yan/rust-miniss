@@ -77,3 +77,39 @@ arXiv 2512.04859：单线程存储 +32%，~30µs 唤醒延迟；DEFER_TASKRUN �
 **推翻条件：** 在 ≥16 核、干净内核机器上，`just bench-uring-flags` 配对 A/B
 显示 SQPOLL（含 ATTACH_WQ 共享方案）吞吐/尾延迟同时不劣于 baseline，才考虑
 改默认；OrbStack 数据不作为依据。
+
+## 2026-10-31 借式 API 统一到租约：POLLOUT readiness arm 让位于 armed-rent 慢路径（取代 2026-10-16 行）
+
+**选择了什么：** `refactor/unify-io-api-over-rent`（7f64b62）把借式 API 家族
+（`poll_read` / `poll_read_vectored` / `poll_write` / `poll_write_vectored` /
+`HyperRead::poll_read`）统一为租约原语上的薄适配：socket ready 时仍直接对
+调用者切片做 `read(2)`/`write(2)` 系统调用（快路径零拷贝，与旧行为一致）；
+EAGAIN 慢路径不再注册 POLLIN/POLLOUT readiness 并在唤醒后重试裸 syscall
+（旧 `poll_readiness` 核心，零拷贝），而是 armed 一个持有池化 Buffer 拷贝的
+租约 op，完成时再把数据拷入/出调用者切片——**等待路径 +1 拷贝**。
+`readiness_token` / `pollout_token` 与 `poll_readiness` 核心删除，代之以
+`BorrowedRead` / `BorrowedWrite` 两个 armed-rent 状态机；`Drop` / `IntoRawFd`
+经 `clear()` 取消 armed 租约 op。
+
+**拒绝了什么：** (1) 双路径并存——保留 0 拷贝 readiness arm 与租约 arm 共享
+同一套接口。**如实记录：业主复核确认旧设计本可同时支持 tokio 生态所需的
+全部接口，删除 0 拷贝慢路径是本次统一工程中的范围决策，不是必要条件**
+（2026-10-16 行当时拒绝 copy-and-queue 的理由在慢路径上被本决策推翻，
+其 crossover 8-9KB / ~130ns 测量本身仍然成立）；(2) 按缓冲区大小门控的
+混合方案（小拷贝、大 readiness）——业主判定为过度优化，未实现；
+(3) 维持三形状（借式/租式/'static）各自独立驱动原语的现状——业主已批准
+按 monoio 方式合并两端 API：上层只分租约与不租约两种，下层实现对应
+epoll、kqueue、io-uring。
+
+**证据：** 定性为**用慢路径 +1 拷贝换取单一驱动原语**：租约族成为唯一
+驱动原语后，multishot recv、provided buffer ring 等内核特性只需落在租约
+族一次（见 feat/multishot-recv-buf-ring）。Orb ka32 配对测量统一后
+~3.2% 吞吐差（共享 VM 上个位数百分比不可分辨，见
+`docs/review/performance-baseline-2026-10-30-gcloud.md` 方法论），机制
+归因即慢路径拷贝；monoio 的 tokio 兼容层 borrowed API 同样付一次拷贝，
+生态兼容语义对齐。
+
+**推翻条件：** 干净内核（非 OrbStack）配对 A/B 显示统一后 borrowed 写路径
+相对 pre-unify 出现超出噪声的回退，特别是 2026-10-16 行测得的 >8KB 阻塞
+写主导负载；恢复方式是在 `BorrowedWrite` 内整条恢复 readiness arm（不做
+尺寸门控），并把测量回填此行。
