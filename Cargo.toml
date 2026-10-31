@@ -91,8 +91,16 @@ quinn = { version = "0.11", features = ["runtime-tokio"] }
 # compio-runtime/time is enabled explicitly because the bench wraps every
 # connect in compio_runtime::time::timeout (T3's 5 s wraps); compio-quic
 # already enables it transitively, but the bench depends on the API directly.
+# compio-driver/io-uring is enabled explicitly because compio-runtime pins
+# compio-driver with default-features = false and neither compio-runtime nor
+# compio-quic re-exports a backend passthrough feature: without this, Linux
+# builds of the compio stack silently compile compio's STUB driver (see
+# compio-driver build.rs: `stub = linux && !io-uring && !polling`), which is
+# not an I/O backend at all. macOS needs no knob (polling is unconditional
+# there, which the bench's backend label reports as NOT io_uring).
 compio-quic = "0.8.2"
 compio-runtime = { version = "0.12", features = ["time"] }
+compio-driver = { version = "0.12", default-features = false, features = ["io-uring"] }
 
 [[example]]
 name = "hello_world"
