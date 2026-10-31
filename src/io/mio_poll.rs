@@ -2765,10 +2765,8 @@ mod mio_regression_tests {
         assert!(flags >= 0, "F_GETFL failed");
         // SAFETY: `fds[0]` is still the live pipe read end and `flags` came from
         // its successful F_GETFL query above.
-        assert_eq!(
-            unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
+        let ret = unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(ret, 0);
 
         let token = backend
             .submit(Op::Read {
@@ -2785,10 +2783,8 @@ mod mio_regression_tests {
         // deterministically returns WouldBlock when drain processes the event.
         let mut byte = 0u8;
         // SAFETY: byte is writable and fds[0] names the pipe read end.
-        assert_eq!(
-            unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) },
-            1
-        );
+        let ret = unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) };
+        assert_eq!(ret, 1);
         // SAFETY: this test is the sole backend owner and sets this one-shot
         // fault before drain.
         backend.fail_next_reregister.set(true);

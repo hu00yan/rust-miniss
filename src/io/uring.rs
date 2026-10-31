@@ -2233,6 +2233,9 @@ impl IoProvider for UringBackend {
             // Deliver the wake only when a shard's io state is installed:
             // cancellation can also run without one (direct backend tests,
             // teardown sweeps), and there is then no waiter to wake anyway.
+            // SAFETY: when a shard's io state is installed, this runs on the
+            // owning thread and `token` is a live in-flight operation there,
+            // so taking its waker is exclusive access.
             crate::cpu::try_with_io_state(|io_state| unsafe {
                 if let Some(waker) = io_state.take_waker(token) {
                     waker.wake();
@@ -2397,6 +2400,10 @@ impl IoProvider for UringBackend {
                     // wake only when a shard's io state is installed. When it
                     // is, the state belongs to this owner thread — the same
                     // contract the accept path below relies on.
+                    //
+                    // SAFETY: when a shard's io state is installed, this runs
+                    // on the owning thread and `woken` names a live in-flight
+                    // operation there, so taking its waker is exclusive access.
                     crate::cpu::try_with_io_state(|io_state| unsafe {
                         if let Some(waker) = io_state.take_waker(woken) {
                             waker.wake();

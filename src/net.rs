@@ -374,6 +374,8 @@ impl AsyncTcpStream {
     /// on them are equally safe here.
     fn retire_multishot_arm(&self, arm: IoToken) {
         self.multishot_arm.set(None);
+        // SAFETY: this runs on the owning shard; `arm` is this socket's own
+        // live multishot arm token, so the slot is ours to clear.
         try_with_io_state(|state| unsafe { state.clear_slot(arm) });
     }
 
@@ -1863,18 +1865,16 @@ mod macos_sigpipe_tests {
         let mut length = std::mem::size_of_val(&enabled) as libc::socklen_t;
         // SAFETY: `stream` owns a live socket and the output arguments are
         // writable for the duration of getsockopt.
-        assert_eq!(
-            unsafe {
-                libc::getsockopt(
-                    stream.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    &mut enabled as *mut _ as *mut libc::c_void,
-                    &mut length,
-                )
-            },
-            0
-        );
+        let ret = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                &mut enabled as *mut _ as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        assert_eq!(ret, 0);
         assert_eq!(enabled, 1);
     }
 }
