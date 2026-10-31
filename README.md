@@ -42,12 +42,14 @@ See `docs/review/performance-baseline-2026-07-14.md` and
 ## Metrics
 
 The runtime keeps counters shard-local and exposes snapshots independently of
-any monitoring vendor. Read a fresh per-shard snapshot with
-`MultiCoreRuntime::metrics_snapshot(timeout)`, or use `metrics_view()` for the
-latest periodically aggregated view; `metrics_refresh(timeout)` requests a
-fresh bounded sample. Applications can map `RuntimeMetrics` and
+any monitoring vendor. Workers push their counters into single-writer slots at
+the event-loop boundary; a scrape reads those slots directly and never
+messages a worker. Read a fresh per-shard snapshot with
+`MultiCoreRuntime::metrics_snapshot(timeout)`, or use `metrics_view()` /
+`metrics_refresh(timeout)` (same slot read; the `timeout` parameter is
+retained for API compatibility). Applications can map `RuntimeMetrics` and
 `CoreMetricsSnapshot` into their own registry, telemetry SDK, logs, or another
-backend. Sampling is a control-plane operation, not a per-request hook.
+backend. Scraping is a control-plane operation, not a per-request hook.
 
 There is no process-global registry or HTTP endpoint owned by the runtime.
 For convenience, `MetricsView::render_prometheus()` formats the latest view as

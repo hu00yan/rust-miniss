@@ -57,17 +57,19 @@ pub fn io_drain_limit() -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
-/// Default control-plane metrics aggregation interval in milliseconds.
+/// Default control-plane metrics cadence in milliseconds.
 ///
-/// AGENTS.md MUST #6 requires aggregation outside the hot path.  One pass per
-/// interval costs each shard exactly one bounded control-plane message.
+/// AGENTS.md MUST #6 requires aggregation outside the hot path.  Workers push
+/// their counters into single-writer slots at the event-loop boundary and
+/// scrapes read those slots directly, so the runtime itself runs no timer on
+/// this interval; it is the default cadence for embedder-side scrape or log
+/// loops (see `examples/http_echo.rs`).
 pub const DEFAULT_METRICS_INTERVAL_MS: u64 = 1000;
 
-/// Resolve the control-plane metrics aggregation interval from
-/// `MINISS_METRICS_INTERVAL_MS`.
+/// Resolve the control-plane metrics cadence from `MINISS_METRICS_INTERVAL_MS`.
 ///
-/// Read once when a runtime starts its aggregator thread, never from a worker.
-/// Invalid or absent values fall back to [`DEFAULT_METRICS_INTERVAL_MS`].
+/// Read once at runtime startup, never from a worker.  Invalid or absent
+/// values fall back to [`DEFAULT_METRICS_INTERVAL_MS`].
 pub fn metrics_interval() -> Duration {
     let interval_ms = std::env::var("MINISS_METRICS_INTERVAL_MS")
         .ok()

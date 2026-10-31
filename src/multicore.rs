@@ -3,8 +3,10 @@
 //! Each worker owns its task arena, timer wheel, and I/O backend. Tasks remain
 //! on their owner shard after admission; new work can be explicitly dispatched
 //! to a shard, but the runtime does not steal or migrate tasks. Cross-shard
-//! admission, cancellation, metrics requests, I/O retirement, and wakeups use
-//! bounded queues or explicit notifications rather than shared task state.
+//! admission, cancellation, I/O retirement, and wakeups use bounded queues or
+//! explicit notifications rather than shared task state. Metrics are pushed by
+//! each worker into its own single-writer slot at the event-loop boundary and
+//! read directly by scrapers — no cross-shard metrics traffic exists.
 //!
 //! ## Core Principles
 //! 1. **Shard ownership**: Mutable task, timer, connection, and backend state is owner-local.
@@ -21,6 +23,7 @@ use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::fence;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(any(target_os = "linux", loom))]
@@ -41,9 +44,7 @@ use crate::cpu::{
 };
 use crate::error::{Result, RuntimeError};
 use crate::io::{CompletionKind, IoError, IoProvider, IoToken};
-use crate::metrics::{
-    Aggregator, MetricsCommand, MetricsControl, MetricsError, MetricsFanout, MetricsView,
-};
+use crate::metrics::{MetricsError, MetricsView};
 use crate::task::{DetachedTaskFuture, Task};
 use crate::timer::TimerWheel;
 use crate::waker::{next_runtime_generation, OverflowHint, ReadyQueue, TaskArena, TaskId};
@@ -79,8 +80,6 @@ const CANCEL_REAP_ROUNDS: usize = 8;
 /// a latency budget: it exists to turn a worker that cannot quiesce into a
 /// reported failure instead of a process that never exits.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a scrape caller waits for an idle aggregator to answer `View`.
-const METRICS_VIEW_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 const ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
 const ADMISSION_COUNT_MASK: usize = !ADMISSION_CLOSED;
 
@@ -178,14 +177,11 @@ impl Drop for CoreExitGuard {
 
 /// Take one admission ticket on `counter`, or fail once the gate is closed.
 ///
-/// Shared by the spawn paths and by the metrics fan-out so that
-/// `close_admission_and_wait` covers both.  That is what stops a sampling pass
-/// from enqueueing a `CollectMetrics` message into a shard that is about to
-/// pass its drain check and exit, which would otherwise leave a control message
-/// in the post-join termination snapshot.
-///
-/// The cost to `shutdown` is bounded: it waits for an in-flight pass, which is
-/// itself bounded by that pass's own sampling timeout.
+/// Used by every cross-thread spawn path so `close_admission_and_wait` covers
+/// all of them: shutdown cannot return while a spawn is still enqueueing into
+/// a shard that is about to pass its drain check and exit.  Metrics
+/// publication needs no ticket — it is written by the owning worker inside its
+/// own loop and read without ever touching a shard inbox.
 pub(crate) fn begin_admission_on(counter: &Arc<AtomicUsize>) -> Result<AdmissionGuard> {
     let mut current = counter.load(Ordering::Acquire);
     loop {
@@ -211,12 +207,11 @@ pub(crate) fn begin_admission_on(counter: &Arc<AtomicUsize>) -> Result<Admission
 
 /// Per-shard control-plane wake transport.
 ///
-/// Owning the sleep gate and the eventfd together behind one `Arc` is what lets
-/// the control plane hand a notification handle to
-/// [`crate::metrics::MetricsFanout`] without duplicating the ownership rules for
-/// the eventfd.  Worker threads keep borrowing a raw fd from it exactly as
-/// before; the `Arc` makes that borrow strictly outlive the runtime instead of
-/// merely matching it.
+/// Owning the sleep gate and the eventfd together behind one `Arc` lets the
+/// control plane hand a notification handle to shutdown and spawn paths
+/// without duplicating the ownership rules for the eventfd.  Worker threads
+/// keep borrowing a raw fd from it exactly as before; the `Arc` makes that
+/// borrow strictly outlive the runtime instead of merely matching it.
 ///
 /// On non-Linux there is no parked-worker poll to feed, so this is empty and
 /// `notify` is the `unpark` half only.
@@ -478,10 +473,6 @@ pub enum CoreMessage {
         task_id: TaskId,
         reply: std::sync::mpsc::Sender<CancelOutcome>,
     },
-    /// Control-plane metrics snapshot request.
-    CollectMetrics {
-        reply: std::sync::mpsc::Sender<CoreMetricsSnapshot>,
-    },
     /// Retire an I/O token on the shard that owns it.
     ///
     /// Posted by the owner of the underlying resource when that owner is
@@ -520,7 +511,6 @@ impl std::fmt::Debug for CoreMessage {
                 .debug_struct("CancelTask")
                 .field("task_id", task_id)
                 .finish(),
-            Self::CollectMetrics { .. } => write!(f, "CollectMetrics"),
             Self::CancelIoToken { token } => f
                 .debug_struct("CancelIoToken")
                 .field("token", token)
@@ -573,6 +563,350 @@ pub struct CoreMetricsSnapshot {
     pub quic_handshakes_accepted: u64,
     pub quic_handshakes_refused: u64,
     pub quic_connections_active: usize,
+}
+
+/// How many times the scrape-side reader retries a seqlock read before falling
+/// back to the partially-updated values of its last attempt.
+///
+/// The fallback is deliberate: every field of a slot is an aligned atomic, so
+/// even a torn read yields per-series values that were each true at some
+/// instant during the scrape. Exhausted retries degrade series *coherence*
+/// (fields may come from different publication turns), never series *truth*.
+const METRICS_SLOT_READ_RETRIES: u32 = 8;
+
+/// Per-shard single-writer publication slot for control-plane metrics.
+///
+/// One slot belongs to exactly one worker thread (the shard owner). The owner
+/// publishes once per event-loop turn at the same boundary as
+/// [`CpuCore::publish_ready_hint`], copying its already-maintained shard-local
+/// counters into these atomics; scrapes read the slot directly from the
+/// scraping thread. There is no message, no reply channel, no admission ticket,
+/// and no control-plane thread behind it any more — AGENTS.md MUST #6 holds by
+/// a stronger construction than before: publication happens outside the request
+/// path (between turns), and aggregation happens on the reader's thread.
+///
+/// Coherence protocol (seqlock-style versioned snapshot):
+///
+/// - Writer (the single owning worker): store `seq` odd (`Relaxed`), store the
+///   fields (`Relaxed`), store `seq` even (`Release`).
+/// - Reader (any scraping thread): load `seq` (`Acquire`, retry while odd),
+///   load the fields (`Relaxed`), issue `fence(Acquire)`, re-load `seq`
+///   (`Acquire`); the snapshot is accepted only when both loads agree.
+///
+/// Ordering justification, per access:
+/// - The field stores are `Relaxed` because the writer's final `Release` store
+///   of `seq` is what publishes them; a reader that acquires that store (or a
+///   later even value) observes all field stores of the completed round.
+/// - The odd `seq` store is `Relaxed` because it needs no visibility guarantee
+///   of its own: any reader that observes it (or any odd value) retries, and a
+///   reader that observes the preceding even value is already covered by that
+///   value's own `Release`.
+/// - The reader's first `seq` load is `Acquire` so an accepted even value
+///   carries the completed round's field stores; the fence plus the second
+///   `Acquire` load keep the field loads ordered before the final `seq` load,
+///   which is what makes `seq1 == seq2` mean "no publication round overlapped
+///   these field reads" on weakly-ordered targets, not just on x86.
+///
+/// The writer never blocks, never allocates, and issues no syscalls: 35 plain
+/// stores to cache lines it already owns (this slot is `CachePadded` so
+/// neighbouring shards' publication does not share a line, mirroring
+/// `core_ready_hints`). Readers are wait-free up to
+/// [`METRICS_SLOT_READ_RETRIES`] and then degrade as documented above.
+struct CoreMetricsSlot {
+    seq: AtomicU64,
+    local_task_count: AtomicUsize,
+    ready_queue_len: AtomicUsize,
+    max_ready_queue_len: AtomicUsize,
+    tasks_spawned: AtomicU64,
+    tasks_completed: AtomicU64,
+    tasks_polled: AtomicU64,
+    io_completions: AtomicU64,
+    messages_processed: AtomicU64,
+    message_batches: AtomicU64,
+    max_message_inbox_len: AtomicUsize,
+    busy_rounds: AtomicU64,
+    flushes: AtomicU64,
+    flush_total_us: AtomicU64,
+    max_flush_us: AtomicU64,
+    park_flushes: AtomicU64,
+    park_flush_total_us: AtomicU64,
+    max_park_flush_us: AtomicU64,
+    io_completion_batches: AtomicU64,
+    io_completion_total_ns: AtomicU64,
+    max_io_completion_batch_ns: AtomicU64,
+    max_io_completion_batch_len: AtomicUsize,
+    inline_poll_total_ns: AtomicU64,
+    max_inline_poll_ns: AtomicU64,
+    wake_total_ns: AtomicU64,
+    max_wake_ns: AtomicU64,
+    parks: AtomicU64,
+    park_timeouts: AtomicU64,
+    park_completions: AtomicU64,
+    park_total_us: AtomicU64,
+    max_park_us: AtomicU64,
+    timer_expirations: AtomicU64,
+    inline_completion_hits: AtomicU64,
+    waker_wakeups: AtomicU64,
+}
+
+impl Default for CoreMetricsSlot {
+    fn default() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            local_task_count: AtomicUsize::new(0),
+            ready_queue_len: AtomicUsize::new(0),
+            max_ready_queue_len: AtomicUsize::new(0),
+            tasks_spawned: AtomicU64::new(0),
+            tasks_completed: AtomicU64::new(0),
+            tasks_polled: AtomicU64::new(0),
+            io_completions: AtomicU64::new(0),
+            messages_processed: AtomicU64::new(0),
+            message_batches: AtomicU64::new(0),
+            max_message_inbox_len: AtomicUsize::new(0),
+            busy_rounds: AtomicU64::new(0),
+            flushes: AtomicU64::new(0),
+            flush_total_us: AtomicU64::new(0),
+            max_flush_us: AtomicU64::new(0),
+            park_flushes: AtomicU64::new(0),
+            park_flush_total_us: AtomicU64::new(0),
+            max_park_flush_us: AtomicU64::new(0),
+            io_completion_batches: AtomicU64::new(0),
+            io_completion_total_ns: AtomicU64::new(0),
+            max_io_completion_batch_ns: AtomicU64::new(0),
+            max_io_completion_batch_len: AtomicUsize::new(0),
+            inline_poll_total_ns: AtomicU64::new(0),
+            max_inline_poll_ns: AtomicU64::new(0),
+            wake_total_ns: AtomicU64::new(0),
+            max_wake_ns: AtomicU64::new(0),
+            parks: AtomicU64::new(0),
+            park_timeouts: AtomicU64::new(0),
+            park_completions: AtomicU64::new(0),
+            park_total_us: AtomicU64::new(0),
+            max_park_us: AtomicU64::new(0),
+            timer_expirations: AtomicU64::new(0),
+            inline_completion_hits: AtomicU64::new(0),
+            waker_wakeups: AtomicU64::new(0),
+        }
+    }
+}
+
+impl CoreMetricsSlot {
+    /// Publish one worker-side snapshot into this slot.
+    ///
+    /// Called only by the shard's owning worker at the event-loop boundary, so
+    /// the odd/even seq dance below has exactly one concurrent writer by
+    /// construction. `snapshot` is a plain copy of counters this thread already
+    /// maintains; publication adds no atomics to the request path itself.
+    fn publish(&self, snapshot: &CoreMetricsSnapshot) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        // Relaxed: no reader trusts an odd value; see the type's coherence notes.
+        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        self.local_task_count
+            .store(snapshot.local_task_count, Ordering::Relaxed);
+        self.ready_queue_len
+            .store(snapshot.ready_queue_len, Ordering::Relaxed);
+        self.max_ready_queue_len
+            .store(snapshot.max_ready_queue_len, Ordering::Relaxed);
+        self.tasks_spawned
+            .store(snapshot.tasks_spawned, Ordering::Relaxed);
+        self.tasks_completed
+            .store(snapshot.tasks_completed, Ordering::Relaxed);
+        self.tasks_polled
+            .store(snapshot.tasks_polled, Ordering::Relaxed);
+        self.io_completions
+            .store(snapshot.io_completions, Ordering::Relaxed);
+        self.messages_processed
+            .store(snapshot.messages_processed, Ordering::Relaxed);
+        self.message_batches
+            .store(snapshot.message_batches, Ordering::Relaxed);
+        self.max_message_inbox_len
+            .store(snapshot.max_message_inbox_len, Ordering::Relaxed);
+        self.busy_rounds
+            .store(snapshot.busy_rounds, Ordering::Relaxed);
+        self.flushes.store(snapshot.flushes, Ordering::Relaxed);
+        self.flush_total_us
+            .store(snapshot.flush_total_us, Ordering::Relaxed);
+        self.max_flush_us
+            .store(snapshot.max_flush_us, Ordering::Relaxed);
+        self.park_flushes
+            .store(snapshot.park_flushes, Ordering::Relaxed);
+        self.park_flush_total_us
+            .store(snapshot.park_flush_total_us, Ordering::Relaxed);
+        self.max_park_flush_us
+            .store(snapshot.max_park_flush_us, Ordering::Relaxed);
+        self.io_completion_batches
+            .store(snapshot.io_completion_batches, Ordering::Relaxed);
+        self.io_completion_total_ns
+            .store(snapshot.io_completion_total_ns, Ordering::Relaxed);
+        self.max_io_completion_batch_ns
+            .store(snapshot.max_io_completion_batch_ns, Ordering::Relaxed);
+        self.max_io_completion_batch_len
+            .store(snapshot.max_io_completion_batch_len, Ordering::Relaxed);
+        self.inline_poll_total_ns
+            .store(snapshot.inline_poll_total_ns, Ordering::Relaxed);
+        self.max_inline_poll_ns
+            .store(snapshot.max_inline_poll_ns, Ordering::Relaxed);
+        self.wake_total_ns
+            .store(snapshot.wake_total_ns, Ordering::Relaxed);
+        self.max_wake_ns
+            .store(snapshot.max_wake_ns, Ordering::Relaxed);
+        self.parks.store(snapshot.parks, Ordering::Relaxed);
+        self.park_timeouts
+            .store(snapshot.park_timeouts, Ordering::Relaxed);
+        self.park_completions
+            .store(snapshot.park_completions, Ordering::Relaxed);
+        self.park_total_us
+            .store(snapshot.park_total_us, Ordering::Relaxed);
+        self.max_park_us
+            .store(snapshot.max_park_us, Ordering::Relaxed);
+        self.timer_expirations
+            .store(snapshot.timer_expirations, Ordering::Relaxed);
+        self.inline_completion_hits
+            .store(snapshot.inline_completion_hits, Ordering::Relaxed);
+        self.waker_wakeups
+            .store(snapshot.waker_wakeups, Ordering::Relaxed);
+        // Release: publishes every field store above to any reader that
+        // acquires this even value.
+        self.seq.store(seq.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Read one coherent snapshot of this slot from a scraping thread.
+    ///
+    /// Retries while a publication round overlaps the read; after
+    /// [`METRICS_SLOT_READ_RETRIES`] failed attempts it returns the last
+    /// attempt's values, which are each individually true but may straddle two
+    /// publication turns (monitoring semantics; see the type's notes).
+    fn load(&self, core_id: usize) -> CoreMetricsSnapshot {
+        let mut attempt = 0;
+        loop {
+            let seq1 = self.seq.load(Ordering::Acquire);
+            if seq1 & 1 == 0 {
+                let local_task_count = self.local_task_count.load(Ordering::Relaxed);
+                let ready_queue_len = self.ready_queue_len.load(Ordering::Relaxed);
+                let max_ready_queue_len = self.max_ready_queue_len.load(Ordering::Relaxed);
+                let tasks_spawned = self.tasks_spawned.load(Ordering::Relaxed);
+                let tasks_completed = self.tasks_completed.load(Ordering::Relaxed);
+                let tasks_polled = self.tasks_polled.load(Ordering::Relaxed);
+                let io_completions = self.io_completions.load(Ordering::Relaxed);
+                let messages_processed = self.messages_processed.load(Ordering::Relaxed);
+                let message_batches = self.message_batches.load(Ordering::Relaxed);
+                let max_message_inbox_len = self.max_message_inbox_len.load(Ordering::Relaxed);
+                let busy_rounds = self.busy_rounds.load(Ordering::Relaxed);
+                let flushes = self.flushes.load(Ordering::Relaxed);
+                let flush_total_us = self.flush_total_us.load(Ordering::Relaxed);
+                let max_flush_us = self.max_flush_us.load(Ordering::Relaxed);
+                let park_flushes = self.park_flushes.load(Ordering::Relaxed);
+                let park_flush_total_us = self.park_flush_total_us.load(Ordering::Relaxed);
+                let max_park_flush_us = self.max_park_flush_us.load(Ordering::Relaxed);
+                let io_completion_batches = self.io_completion_batches.load(Ordering::Relaxed);
+                let io_completion_total_ns = self.io_completion_total_ns.load(Ordering::Relaxed);
+                let max_io_completion_batch_ns =
+                    self.max_io_completion_batch_ns.load(Ordering::Relaxed);
+                let max_io_completion_batch_len =
+                    self.max_io_completion_batch_len.load(Ordering::Relaxed);
+                let inline_poll_total_ns = self.inline_poll_total_ns.load(Ordering::Relaxed);
+                let max_inline_poll_ns = self.max_inline_poll_ns.load(Ordering::Relaxed);
+                let wake_total_ns = self.wake_total_ns.load(Ordering::Relaxed);
+                let max_wake_ns = self.max_wake_ns.load(Ordering::Relaxed);
+                let parks = self.parks.load(Ordering::Relaxed);
+                let park_timeouts = self.park_timeouts.load(Ordering::Relaxed);
+                let park_completions = self.park_completions.load(Ordering::Relaxed);
+                let park_total_us = self.park_total_us.load(Ordering::Relaxed);
+                let max_park_us = self.max_park_us.load(Ordering::Relaxed);
+                let timer_expirations = self.timer_expirations.load(Ordering::Relaxed);
+                let inline_completion_hits = self.inline_completion_hits.load(Ordering::Relaxed);
+                let waker_wakeups = self.waker_wakeups.load(Ordering::Relaxed);
+                // Acquire fence: keeps the field loads above ordered before the
+                // `seq` re-load below, so agreement on the even value proves no
+                // publication round overlapped them on any target architecture.
+                fence(Ordering::Acquire);
+                let seq2 = self.seq.load(Ordering::Acquire);
+                if seq1 == seq2 {
+                    return CoreMetricsSnapshot {
+                        core_id,
+                        local_task_count,
+                        ready_queue_len,
+                        max_ready_queue_len,
+                        tasks_spawned,
+                        tasks_completed,
+                        tasks_polled,
+                        io_completions,
+                        messages_processed,
+                        message_batches,
+                        max_message_inbox_len,
+                        busy_rounds,
+                        flushes,
+                        flush_total_us,
+                        max_flush_us,
+                        park_flushes,
+                        park_flush_total_us,
+                        max_park_flush_us,
+                        io_completion_batches,
+                        io_completion_total_ns,
+                        max_io_completion_batch_ns,
+                        max_io_completion_batch_len,
+                        inline_poll_total_ns,
+                        max_inline_poll_ns,
+                        wake_total_ns,
+                        max_wake_ns,
+                        parks,
+                        park_timeouts,
+                        park_completions,
+                        park_total_us,
+                        max_park_us,
+                        timer_expirations,
+                        inline_completion_hits,
+                        waker_wakeups,
+                    };
+                }
+            }
+            attempt += 1;
+            if attempt > METRICS_SLOT_READ_RETRIES {
+                // Torn-tolerant fallback: return the fields of the last attempt.
+                // Every value is still a real observation of this shard.
+                return CoreMetricsSnapshot {
+                    core_id,
+                    local_task_count: self.local_task_count.load(Ordering::Relaxed),
+                    ready_queue_len: self.ready_queue_len.load(Ordering::Relaxed),
+                    max_ready_queue_len: self.max_ready_queue_len.load(Ordering::Relaxed),
+                    tasks_spawned: self.tasks_spawned.load(Ordering::Relaxed),
+                    tasks_completed: self.tasks_completed.load(Ordering::Relaxed),
+                    tasks_polled: self.tasks_polled.load(Ordering::Relaxed),
+                    io_completions: self.io_completions.load(Ordering::Relaxed),
+                    messages_processed: self.messages_processed.load(Ordering::Relaxed),
+                    message_batches: self.message_batches.load(Ordering::Relaxed),
+                    max_message_inbox_len: self.max_message_inbox_len.load(Ordering::Relaxed),
+                    busy_rounds: self.busy_rounds.load(Ordering::Relaxed),
+                    flushes: self.flushes.load(Ordering::Relaxed),
+                    flush_total_us: self.flush_total_us.load(Ordering::Relaxed),
+                    max_flush_us: self.max_flush_us.load(Ordering::Relaxed),
+                    park_flushes: self.park_flushes.load(Ordering::Relaxed),
+                    park_flush_total_us: self.park_flush_total_us.load(Ordering::Relaxed),
+                    max_park_flush_us: self.max_park_flush_us.load(Ordering::Relaxed),
+                    io_completion_batches: self.io_completion_batches.load(Ordering::Relaxed),
+                    io_completion_total_ns: self.io_completion_total_ns.load(Ordering::Relaxed),
+                    max_io_completion_batch_ns: self
+                        .max_io_completion_batch_ns
+                        .load(Ordering::Relaxed),
+                    max_io_completion_batch_len: self
+                        .max_io_completion_batch_len
+                        .load(Ordering::Relaxed),
+                    inline_poll_total_ns: self.inline_poll_total_ns.load(Ordering::Relaxed),
+                    max_inline_poll_ns: self.max_inline_poll_ns.load(Ordering::Relaxed),
+                    wake_total_ns: self.wake_total_ns.load(Ordering::Relaxed),
+                    max_wake_ns: self.max_wake_ns.load(Ordering::Relaxed),
+                    parks: self.parks.load(Ordering::Relaxed),
+                    park_timeouts: self.park_timeouts.load(Ordering::Relaxed),
+                    park_completions: self.park_completions.load(Ordering::Relaxed),
+                    park_total_us: self.park_total_us.load(Ordering::Relaxed),
+                    max_park_us: self.max_park_us.load(Ordering::Relaxed),
+                    timer_expirations: self.timer_expirations.load(Ordering::Relaxed),
+                    inline_completion_hits: self.inline_completion_hits.load(Ordering::Relaxed),
+                    waker_wakeups: self.waker_wakeups.load(Ordering::Relaxed),
+                };
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -720,7 +1054,9 @@ pub struct CpuCore {
     message_poll_ticks: usize,
     /// Maximum local tasks polled in one turn before returning to the event loop.
     task_poll_budget: usize,
-    /// Shard-local metrics. Aggregated only by explicit control-plane request.
+    /// Shard-local metrics. Plain fields maintained inline by the owner;
+    /// published into the worker's single-writer slot at the event-loop
+    /// boundary (see `publish_metrics`), never touched by another thread.
     metrics: CoreMetrics,
     /// Ready-queue depth published for cross-core spawn selection.
     ///
@@ -734,6 +1070,11 @@ pub struct CpuCore {
     /// Cache-padded so one shard's publication cannot invalidate another
     /// shard's copy of the signal.
     ready_hint: Arc<CachePadded<AtomicUsize>>,
+    /// Single-writer metrics slot this worker publishes into once per
+    /// event-loop turn. Same ownership shape as `ready_hint`: the owning
+    /// worker is the only writer, scrapers read lock-free, and the slot is
+    /// cache-padded against neighbouring shards.
+    metrics_slot: Arc<CachePadded<CoreMetricsSlot>>,
     /// Control-plane report written once after the owner has drained its state.
     // Write-once publication: the owning worker sets it during exit, the
     // coordinator reads it after joining. `OnceLock` gives lock-free reads
@@ -754,6 +1095,7 @@ impl CpuCore {
         shutdown: Arc<AtomicBool>,
         force_shutdown: Arc<AtomicBool>,
         ready_hint: Arc<CachePadded<AtomicUsize>>,
+        metrics_slot: Arc<CachePadded<CoreMetricsSlot>>,
         #[cfg(target_os = "linux")] sleep_gate: Arc<WorkerSleepGate>,
         message_inbox: Receiver<CoreMessage>,
         retirement: Arc<IoRetirementMailbox>,
@@ -793,6 +1135,7 @@ impl CpuCore {
             shutdown,
             force_shutdown,
             ready_hint,
+            metrics_slot,
             draining: false,
             local_task_count: 0,
             message_poll_ticks: 0,
@@ -880,6 +1223,23 @@ impl CpuCore {
     fn publish_ready_hint(&self) {
         self.ready_hint
             .store(self.ready_queue.len(), Ordering::Relaxed);
+    }
+
+    /// Publish this shard's metrics into its single-writer slot.
+    ///
+    /// Called at the same event-loop boundary as [`Self::publish_ready_hint`]:
+    /// after messages, completions, timers and task polls have all settled, so
+    /// a scrape reads a turn-boundary view rather than a mid-turn one. The cost
+    /// is one plain copy of counters this thread already maintains — no
+    /// syscalls, no messages, no branch, and no atomics on the request path
+    /// itself (the request-path counters stay plain fields; see AGENTS.md
+    /// MUST #6: aggregation happens outside the hot path, on the reader's
+    /// thread). Readers may observe a snapshot that is one turn old; that
+    /// costs freshness, never correctness.
+    #[inline]
+    fn publish_metrics(&self) {
+        let snapshot = self.metrics_snapshot();
+        self.metrics_slot.publish(&snapshot);
     }
 
     fn publish_termination_snapshot(&self) {
@@ -1065,11 +1425,13 @@ impl CpuCore {
                     work_done |= self.process_timers(now, &mut ready_timers);
                 }
 
-                // 5b. Republish the runnable-work depth for spawn selection.
-                // Placed after every producer of ready work and before the
-                // exit check, so the stored value reflects this turn's
-                // settled queue rather than a mid-turn snapshot.
+                // 5b. Republish the runnable-work depth for spawn selection and
+                // the shard's metrics for control-plane scrapes. Placed after
+                // every producer of ready work and before the exit check, so
+                // the stored values reflect this turn's settled state rather
+                // than a mid-turn snapshot.
                 self.publish_ready_hint();
+                self.publish_metrics();
 
                 // 6. Nothing left to do — exit inner loop, go park (wait for
                 //    I/O).  This is the event-driven block.  Reaching this
@@ -1336,10 +1698,6 @@ impl CpuCore {
                     // before sending, so the token names this core's own
                     // backend state and no other shard's.
                     unsafe { self.io_state.cancel_and_discard(token) };
-                    processed += 1;
-                }
-                Ok(CoreMessage::CollectMetrics { reply }) => {
-                    let _ = reply.send(self.metrics_snapshot());
                     processed += 1;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1672,8 +2030,8 @@ pub struct MultiCoreRuntime {
     core_exited: Vec<Arc<AtomicBool>>,
     /// Per-core escalation flags; only workers mutate local task/driver state.
     force_shutdowns: Vec<Arc<AtomicBool>>,
-    /// Per-shard control-plane wake transport, shared with the metrics
-    /// aggregator. See [`CoreWakeup`].
+    /// Per-shard control-plane wake transport, shared with shutdown and spawn
+    /// paths. See [`CoreWakeup`].
     core_wakeups: Vec<Arc<CoreWakeup>>,
     /// Thread join handles. This lock is control-plane only: worker hot paths
     /// never access it, while it lets the global OnceLock owner join safely.
@@ -1685,6 +2043,10 @@ pub struct MultiCoreRuntime {
     /// Per-core ready-queue depth, written only by the owning worker and read
     /// lock-free by the submission side. Read strictly as a balance hint.
     core_ready_hints: Vec<Arc<CachePadded<AtomicUsize>>>,
+    /// One single-writer metrics publication slot per worker. The owning
+    /// worker publishes at its event-loop boundary; scrapes read these
+    /// directly on the scraping thread. See [`CoreMetricsSlot`].
+    core_metrics_slots: Vec<Arc<CachePadded<CoreMetricsSlot>>>,
     /// One owner-published termination report per worker.
     termination_reports: Vec<Arc<std::sync::OnceLock<CoreTerminationSnapshot>>>,
     /// Runtime state
@@ -1694,10 +2056,11 @@ pub struct MultiCoreRuntime {
     /// owner-shard send completes, so shutdown cannot cut across an in-flight
     /// admission.
     admission: Arc<AtomicUsize>,
-    /// Control-plane metrics aggregator. Owned by this runtime rather than by a
-    /// process-global registry; see `src/metrics.rs` for why a global is both
-    /// forbidden by AGENTS.md MUST NOT #4 and wrong here.
-    metrics: MetricsControl,
+    /// Startup-resolved metrics interval.  The runtime itself runs no timer on
+    /// it any more — publication is worker-side push at the loop boundary and
+    /// scrapes read the slots directly; embedders use it as the default
+    /// cadence for their own scrape or log loops.
+    metrics_interval: Duration,
     /// Next core for round-robin task distribution
     next_core: AtomicUsize,
 }
@@ -1709,24 +2072,6 @@ impl std::fmt::Debug for MultiCoreRuntime {
             .field("num_cores", &self.num_cores)
             .field("state", &state)
             .finish()
-    }
-}
-
-fn shutdown_and_join_started_workers(
-    shutdowns: &[Arc<AtomicBool>],
-    threads: &[thread::Thread],
-    wakeups: &[Arc<CoreWakeup>],
-    join_handles: Vec<thread::JoinHandle<Result<()>>>,
-) {
-    for shutdown in shutdowns {
-        shutdown.store(true, Ordering::Release);
-    }
-    for (worker, wakeup) in threads.iter().zip(wakeups) {
-        worker.unpark();
-        wakeup.notify();
-    }
-    for handle in join_handles {
-        let _ = handle.join();
     }
 }
 
@@ -1837,27 +2182,6 @@ impl MultiCoreRuntime {
 
     /// Create new multi-core runtime
     pub fn new(num_cores: Option<usize>) -> Result<Arc<Self>> {
-        Self::new_with_sampler(num_cores, Self::spawn_metrics_sampler)
-    }
-
-    fn spawn_metrics_sampler(
-        fanout: Arc<MetricsFanout>,
-        interval: Duration,
-        receiver: std::sync::mpsc::Receiver<MetricsCommand>,
-    ) -> std::io::Result<thread::JoinHandle<()>> {
-        thread::Builder::new()
-            .name("miniss-metrics".to_string())
-            .spawn(move || Aggregator::new(interval).run(fanout, receiver))
-    }
-
-    fn new_with_sampler(
-        num_cores: Option<usize>,
-        spawn_sampler: impl FnOnce(
-            Arc<MetricsFanout>,
-            Duration,
-            std::sync::mpsc::Receiver<MetricsCommand>,
-        ) -> std::io::Result<thread::JoinHandle<()>>,
-    ) -> Result<Arc<Self>> {
         let cpu_plan = Self::startup_cpu_plan(num_cores)?;
         let num_cores = cpu_plan.len();
         let runtime_generation = next_runtime_generation();
@@ -1881,8 +2205,9 @@ impl MultiCoreRuntime {
         let mut task_counters = Vec::with_capacity(num_cores);
         let mut core_ready_hints = Vec::with_capacity(num_cores);
         let mut termination_reports = Vec::with_capacity(num_cores);
-        // Shared with the metrics fan-out so a sampling pass is covered by the
-        // same shutdown cutoff as a spawn.
+        let mut core_metrics_slots = Vec::with_capacity(num_cores);
+        // Closes over the spawn paths only; metrics publication is worker-owned
+        // and needs no admission ticket.
         let admission = Arc::new(AtomicUsize::new(0));
 
         // Create cores and start threads
@@ -1893,6 +2218,7 @@ impl MultiCoreRuntime {
             let core_exited_flag = Arc::new(AtomicBool::new(false));
             let force_shutdown = Arc::new(AtomicBool::new(false));
             let ready_hint = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+            let metrics_slot = Arc::new(CachePadded::new(CoreMetricsSlot::default()));
             let termination_report = Arc::new(std::sync::OnceLock::new());
             let wakeup = Arc::new(CoreWakeup::new()?);
             let retirement = Arc::new(IoRetirementMailbox::new());
@@ -1904,6 +2230,7 @@ impl MultiCoreRuntime {
             force_shutdowns.push(force_shutdown.clone());
             core_ready_hints.push(ready_hint.clone());
             termination_reports.push(termination_report.clone());
+            core_metrics_slots.push(metrics_slot.clone());
             core_wakeups.push(wakeup.clone());
             ready_receivers.push((core_id, ready_receiver));
             task_counters.push(AtomicU64::new(1));
@@ -1942,6 +2269,7 @@ impl MultiCoreRuntime {
                             core_shutdown.clone(),
                             force_shutdown.clone(),
                             ready_hint.clone(),
+                            metrics_slot.clone(),
                             sleep_gate,
                             receiver,
                             retirement,
@@ -1959,6 +2287,7 @@ impl MultiCoreRuntime {
                         core_shutdown.clone(),
                         force_shutdown.clone(),
                         ready_hint.clone(),
+                        metrics_slot.clone(),
                         receiver,
                         retirement,
                         ready_sender,
@@ -1966,6 +2295,11 @@ impl MultiCoreRuntime {
                         termination_report.clone(),
                     );
                     let result = core.run();
+                    // Final metrics publication: park accounting and the last
+                    // drain rounds mutate counters after the final loop-boundary
+                    // publish, so quiesced slots must be refreshed once more
+                    // before the worker goes away and they freeze.
+                    core.publish_metrics();
                     core.publish_termination_snapshot();
                     // Set shutdown flag when core exits
                     // Publish worker teardown before the coordinator observes
@@ -2011,39 +2345,17 @@ impl MultiCoreRuntime {
             }
         }
 
-        // Control-plane metrics aggregator.  Started here, in the same pass
-        // that starts the workers, so nothing is created after startup
-        // (AGENTS.md MUST #2).  It is a plain OS thread with no executor,
-        // reactor, task queue, or shard state, and it is joined by
-        // `Drop for MultiCoreRuntime`.
-        //
-        // It samples through a `MetricsFanout` handle rather than through an
-        // `Arc<MultiCoreRuntime>`.  A background thread that keeps the runtime
-        // alive would make `Arc::try_unwrap(runtime)` permanently fail for
-        // embedders, and a `Weak` would leave that call racy.
+        // Control-plane metrics.  Workers push their shard-local counters into
+        // single-writer slots at the event-loop boundary (see
+        // `CoreMetricsSlot`); scrapes read those slots directly on the
+        // calling thread.  No aggregator thread, no `CollectMetrics` message,
+        // no reply channel, and no control-plane work on any clock: at steady
+        // state this runtime spawns exactly one thread per shard and nothing
+        // else.  The interval is still resolved at startup for embedders that
+        // run their own scrape/log cadence (the startup path resolves it once,
+        // so nothing is read from the environment after AGENTS.md MUST #2's
+        // startup pass).
         let metrics_interval = crate::config::metrics_interval();
-        let metrics_fanout = Arc::new(MetricsFanout {
-            senders: core_senders.clone(),
-            threads: core_threads.clone(),
-            wakeups: core_wakeups.clone(),
-            admission: Arc::clone(&admission),
-        });
-        let (metrics_tx, metrics_rx) = std::sync::mpsc::channel();
-        let metrics_sampler =
-            match spawn_sampler(Arc::clone(&metrics_fanout), metrics_interval, metrics_rx) {
-                Ok(sampler) => sampler,
-                Err(error) => {
-                    shutdown_and_join_started_workers(
-                        &core_shutdowns,
-                        &core_threads,
-                        &core_wakeups,
-                        join_handles,
-                    );
-                    return Err(RuntimeError::TaskFailed(format!(
-                        "Failed to spawn metrics thread: {error}"
-                    )));
-                }
-            };
 
         let runtime = Arc::new(Self {
             num_cores,
@@ -2058,15 +2370,11 @@ impl MultiCoreRuntime {
             task_counters,
             core_ready_hints,
             termination_reports,
+            core_metrics_slots,
             state: AtomicU8::new(RuntimeState::Initializing as u8),
             shutdown_phase: AtomicU8::new(ShutdownPhase::Running as u8),
             admission,
-            metrics: MetricsControl {
-                commands: metrics_tx,
-                fanout: metrics_fanout,
-                sampler: Some(metrics_sampler),
-                interval: metrics_interval,
-            },
+            metrics_interval,
             next_core: AtomicUsize::new(0),
         });
 
@@ -2783,57 +3091,96 @@ impl MultiCoreRuntime {
         Ok(())
     }
 
-    /// Return the most recent control-plane aggregation pass.
+    /// Assemble a metrics view from the per-shard publication slots, inline on
+    /// the calling thread.
     ///
-    /// This never triggers sampling, so it is safe to call from a scrape
-    /// handler: it answers from whatever the aggregator's periodic clock last
-    /// merged.  Returns [`MetricsError::NotSampled`] until the first pass has
-    /// completed.  See [`MultiCoreRuntime::metrics_refresh`] to force one.
-    pub fn metrics_view(&self) -> std::result::Result<MetricsView, MetricsError> {
-        self.metrics
-            .ask(METRICS_VIEW_REPLY_TIMEOUT, MetricsCommand::View)
+    /// This is the whole aggregation path: the merged runtime is the fold of
+    /// the per-shard slot values, and the fold happens here on the scraping
+    /// thread from snapshots each worker published at its own event-loop
+    /// boundary.  No message, no wakeup, no waiting on any worker.
+    fn metrics_view_inline(&self) -> MetricsView {
+        let started = Instant::now();
+        let runtime = self.read_metrics_slots();
+        MetricsView {
+            runtime,
+            sampled_at: Instant::now(),
+            sample_duration: started.elapsed(),
+            consecutive_failures: 0,
+        }
     }
 
-    /// Force one bounded aggregation pass and return the merged view.
+    /// Return a metrics view assembled from the per-shard publication slots.
     ///
-    /// `timeout` bounds both the shard round trip and the caller's wait.  The
-    /// wait can be up to twice `timeout` in the worst case: once for the
-    /// aggregator to finish the pass, once for this call to collect the reply.
+    /// The view is computed inline on the calling thread by reading every
+    /// shard's single-writer slot (see [`CoreMetricsSlot`]); the unlabelled
+    /// total of every series is the fold of the per-shard values in the same
+    /// view.  A shard whose worker has not run a loop turn yet reads as
+    /// all-zero, which is that shard's true counter state.
     ///
-    /// This is a control-plane call and blocks the calling thread.  It must not
-    /// be used from a worker shard's request path; per-request hot-path metrics
-    /// do not exist by design (AGENTS.md MUST #6).
+    /// This never wakes a worker and never sends a message, so it is safe to
+    /// call from a scrape handler as often as the embedder likes.  See
+    /// [`MultiCoreRuntime::metrics_refresh`] for the historically forcing
+    /// variant.
+    pub fn metrics_view(&self) -> std::result::Result<MetricsView, MetricsError> {
+        Ok(self.metrics_view_inline())
+    }
+
+    /// Return a freshly assembled metrics view.
+    ///
+    /// Historically this forced one bounded aggregation pass and `timeout`
+    /// bounded the shard round trip.  Publication is now worker-side push at
+    /// the loop boundary and the slots are read directly, so no round trip
+    /// remains to bound: the call never waits on a worker.  The `timeout`
+    /// parameter is retained so existing callers keep compiling; it has no
+    /// effect.  A shard whose worker has exited keeps answering from its
+    /// frozen final publication.
     pub fn metrics_refresh(
         &self,
         timeout: Duration,
     ) -> std::result::Result<MetricsView, MetricsError> {
-        self.metrics
-            .ask(timeout.saturating_mul(2), |reply| MetricsCommand::Refresh {
-                timeout,
-                reply,
-            })
+        let _ = timeout;
+        Ok(self.metrics_view_inline())
     }
 
-    /// How often this runtime's aggregator thread runs a sampling pass.
-    pub fn metrics_interval(&self) -> Duration {
-        self.metrics.interval
-    }
-
-    /// Collect per-core runtime metrics through control-plane shard messages.
+    /// The startup-resolved metrics interval
+    /// (see [`crate::config::metrics_interval`]).
     ///
-    /// Metrics counters are shard-local; this method aggregates snapshots on
-    /// demand and is not intended for per-request hot-path use.
+    /// The runtime itself runs no sampler thread on this interval any more:
+    /// publication happens at the workers' event-loop boundary and scrapes
+    /// read the slots directly.  Embedders use this as the default cadence for
+    /// their own scrape or log loops (see `examples/http_echo.rs`).
+    pub fn metrics_interval(&self) -> Duration {
+        self.metrics_interval
+    }
+
+    /// Collect per-core runtime metrics by reading the per-shard slots.
+    ///
+    /// Metrics counters are shard-local; this method folds the published
+    /// snapshots on demand, on the calling thread, and is not intended for
+    /// per-request hot-path use (AGENTS.md MUST #6).  `timeout` is retained
+    /// for signature compatibility and has no effect: reading a publication
+    /// slot never waits on a worker.
     pub fn metrics_snapshot(&self, timeout: Duration) -> Result<RuntimeMetrics> {
+        let _ = timeout;
         let state = self.state.load(Ordering::Acquire);
         if state != RuntimeState::Running as u8 && state != RuntimeState::ShuttingDown as u8 {
             return Err(RuntimeError::TaskFailed(
                 "Runtime is not running".to_string(),
             ));
         }
-        self.metrics
-            .fanout
-            .sample(timeout)
-            .map_err(RuntimeError::TaskFailed)
+        Ok(self.read_metrics_slots())
+    }
+
+    /// Fold of every shard's published metrics slot, on the calling thread.
+    fn read_metrics_slots(&self) -> RuntimeMetrics {
+        RuntimeMetrics {
+            cores: self
+                .core_metrics_slots
+                .iter()
+                .enumerate()
+                .map(|(core_id, slot)| slot.load(core_id))
+                .collect(),
+        }
     }
 
     /// Wait, bounded, for every worker to acknowledge exit.
@@ -3017,6 +3364,26 @@ impl MultiCoreRuntime {
             .get(core_id)
             .map(|hint| hint.load(Ordering::Relaxed))
     }
+
+    /// Test-visible thread registry: the names of every thread this runtime
+    /// spawned, in shard order.
+    ///
+    /// The steady-state thread inventory test uses this as the deterministic,
+    /// /proc-free half of its evidence: a runtime must own exactly its worker
+    /// threads and nothing else (no aggregator, no helper). On Linux the test
+    /// additionally cross-checks the OS thread table by name.
+    #[cfg(test)]
+    fn owned_thread_names(&self) -> Vec<String> {
+        self.core_threads
+            .iter()
+            .map(|thread| {
+                thread
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "<unnamed>".to_owned())
+            })
+            .collect()
+    }
 }
 
 /// Runtime statistics
@@ -3040,13 +3407,6 @@ impl RuntimeStats {
 
 impl Drop for MultiCoreRuntime {
     fn drop(&mut self) {
-        // Stop and join the control-plane aggregator first.  It samples the
-        // workers, so it must be retired before the join handles are drained
-        // and before the eventfds they borrow are dropped.
-        let _ = self.metrics.commands.send(MetricsCommand::Stop);
-        if let Some(sampler) = self.metrics.sampler.take() {
-            let _ = sampler.join();
-        }
         let state = self.state.load(Ordering::Acquire);
         if state == RuntimeState::Terminated as u8 || self.join_handles.lock().is_empty() {
             return;
@@ -3068,9 +3428,9 @@ impl Drop for MultiCoreRuntime {
         // Worker owns raw eventfd numbers borrowed from `core_wakeups`;
         // always join before those OwnedFd values are dropped.  Drop is a
         // control-plane blocking path, never a data-plane operation.  The
-        // metrics aggregator is retired first: it holds `Arc<CoreWakeup>`
-        // clones, and retiring it first is what guarantees no notification can
-        // reach a descriptor this runtime is about to close.
+        // workers are the only holders of `Arc<CoreWakeup>` clones besides
+        // this struct, so joining them first is what guarantees no
+        // notification can reach a descriptor this runtime is about to close.
         for handle in self.join_handles.lock().drain(..) {
             let _ = handle.join();
         }
@@ -3230,36 +3590,6 @@ mod tests {
             })
             .expect("helper probe task admitted");
         guard.finish_quiescent("lib quiescence helper");
-    }
-
-    #[test]
-    fn injected_metrics_sampler_spawn_failure_joins_started_workers() {
-        let error = MultiCoreRuntime::new_with_sampler(Some(1), |_, _, _| {
-            Err(std::io::Error::other("injected sampler spawn failure"))
-        })
-        .expect_err("injected sampler failure should reject runtime startup");
-        assert!(error.to_string().contains("injected sampler spawn failure"));
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let worker_shutdown = Arc::clone(&shutdown);
-        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
-        let worker = thread::spawn(move || {
-            while !worker_shutdown.load(Ordering::Acquire) {
-                thread::park();
-            }
-            let _ = exited_tx.send(());
-            Ok(())
-        });
-        let worker_thread = worker.thread().clone();
-        shutdown_and_join_started_workers(
-            &[shutdown],
-            &[worker_thread],
-            &[Arc::new(CoreWakeup::new().expect("create test wakeup"))],
-            vec![worker],
-        );
-        exited_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("rollback helper must join exited workers");
     }
 
     #[test]
@@ -3633,23 +3963,161 @@ mod tests {
         runtime.join().unwrap();
     }
 
-    /// The control-plane aggregator must not take a strong reference to the
-    /// runtime, or `Arc::try_unwrap` would never succeed for an embedder and
-    /// the runtime would never be released.
+    /// No metrics control plane may take a strong reference to the runtime, or
+    /// `Arc::try_unwrap` would never succeed for an embedder and the runtime
+    /// would never be released.
     #[test]
-    fn metrics_aggregator_does_not_extend_runtime_lifetime() {
+    fn metrics_slots_do_not_extend_runtime_lifetime() {
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
-        // Exercise both the periodic clock and the forced path, then let a full
-        // interval elapse so at least one background pass has completed.
+        // Exercise every scrape path, then require the runtime to be
+        // releasable: the publication slots live inside the runtime itself and
+        // nothing outside it holds a reference.
         let _ = runtime.metrics_refresh(Duration::from_secs(2));
         let _ = runtime.metrics_view();
         let _ = runtime.metrics_snapshot(Duration::from_secs(1));
-        thread::sleep(crate::config::metrics_interval() + Duration::from_millis(200));
 
         runtime.shutdown().unwrap();
         let owned = Arc::try_unwrap(runtime)
-            .expect("the metrics aggregator must not hold the runtime alive");
+            .expect("the metrics control plane must not hold the runtime alive");
         owned.join().unwrap();
+    }
+
+    /// Steady-state thread inventory: a runtime owns exactly its worker
+    /// threads and nothing else.  Metrics publication is worker-side push at
+    /// the loop boundary, so there is no aggregator thread at steady state —
+    /// the deterministic, /proc-free half of the evidence is the runtime's own
+    /// thread registry (exact per runtime); on Linux the OS thread table is
+    /// cross-checked by name, `cfg`-gated rather than ignored so it stays in
+    /// the default suite on Linux (the linux-safety pattern).  Sibling tests
+    /// may own their own workers, so the OS check asserts no non-worker
+    /// `miniss-*` thread rather than an exact process total.
+    #[test]
+    fn steady_state_thread_inventory_is_exactly_the_workers() {
+        const SHARDS: usize = 2;
+        let runtime = MultiCoreRuntime::new(Some(SHARDS)).unwrap();
+        // Let every worker reach its event loop; any late-spawned helper would
+        // have to exist by now.
+        thread::sleep(Duration::from_millis(50));
+
+        let mut names = runtime.owned_thread_names();
+        names.sort();
+        let expected: Vec<String> = (0..SHARDS)
+            .map(|core_id| format!("miniss-core-{core_id}"))
+            .collect();
+        assert_eq!(
+            names, expected,
+            "the runtime must own exactly its worker threads"
+        );
+        assert_eq!(
+            runtime.core_metrics_slots.len(),
+            SHARDS,
+            "one single-writer metrics slot per shard"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut miniss_core_threads = 0usize;
+            for entry in std::fs::read_dir("/proc/self/task").expect("read /proc/self/task") {
+                let entry = entry.expect("read task entry");
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                let name = comm.trim();
+                if name.starts_with("miniss-") {
+                    assert!(
+                        name.starts_with("miniss-core-"),
+                        "unexpected non-worker miniss thread {name:?} at steady state"
+                    );
+                    miniss_core_threads += 1;
+                }
+            }
+            assert!(
+                miniss_core_threads >= SHARDS,
+                "expected at least {SHARDS} worker threads, found {miniss_core_threads}"
+            );
+        }
+
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(2))
+            .unwrap();
+        runtime.join().unwrap();
+    }
+
+    /// A published snapshot must read back fully coherent, and a reader that
+    /// keeps losing the seqlock race (odd `seq`, writer never finishes its
+    /// round) must fall back to individually-true values instead of hanging or
+    /// panicking.
+    #[test]
+    fn metrics_slot_reads_are_coherent_or_individually_true() {
+        let slot = CoreMetricsSlot::default();
+        let snapshot = CoreMetricsSnapshot {
+            core_id: 3,
+            tasks_spawned: 7,
+            tasks_completed: 7,
+            parks: 7,
+            max_ready_queue_len: 9,
+            ..CoreMetricsSnapshot::default()
+        };
+        slot.publish(&snapshot);
+
+        let read = slot.load(3);
+        assert_eq!(read, snapshot, "a stable slot must read back exactly");
+
+        // Freeze the version mid-publication: every retry attempt fails, so
+        // the reader must take the documented torn-tolerant fallback and still
+        // report each field's true value.
+        slot.seq.store(1, Ordering::Relaxed);
+        let torn = slot.load(3);
+        assert_eq!(torn.core_id, 3);
+        assert_eq!(torn.tasks_spawned, 7);
+        assert_eq!(torn.tasks_completed, 7);
+        assert_eq!(torn.parks, 7);
+        assert_eq!(torn.max_ready_queue_len, 9);
+    }
+
+    /// Stress the retry path: a writer publishing at full speed while a reader
+    /// loads in a tight loop.  During the churn every field must hold a value
+    /// some real generation wrote (no fabrication, no hang); once the writer
+    /// stops, the next read must be exactly the final generation.
+    #[test]
+    fn metrics_slot_publication_survives_a_concurrent_reader() {
+        const GENERATIONS: u64 = 20_000;
+        let slot = Arc::new(CoreMetricsSlot::default());
+        let writer_slot = Arc::clone(&slot);
+        let writer = thread::spawn(move || {
+            for generation in 1..=GENERATIONS {
+                let snapshot = CoreMetricsSnapshot {
+                    tasks_spawned: generation,
+                    tasks_completed: 2 * generation,
+                    ..CoreMetricsSnapshot::default()
+                };
+                writer_slot.publish(&snapshot);
+            }
+        });
+
+        let mut reads = 0u64;
+        while !writer.is_finished() {
+            let read = slot.load(0);
+            reads += 1;
+            // Per-field truth: each value came from one real generation.
+            assert!(
+                read.tasks_spawned <= GENERATIONS,
+                "fabricated tasks_spawned {}",
+                read.tasks_spawned
+            );
+            assert!(
+                read.tasks_completed <= 2 * GENERATIONS,
+                "fabricated tasks_completed {}",
+                read.tasks_completed
+            );
+        }
+        writer.join().unwrap();
+
+        // After the writer is gone the slot is stable: one coherent read must
+        // recover the final generation exactly, whatever retries happened
+        // during the churn.
+        let final_read = slot.load(0);
+        assert_eq!(final_read.tasks_spawned, GENERATIONS);
+        assert_eq!(final_read.tasks_completed, 2 * GENERATIONS);
+        assert!(reads > 0, "the reader must have attempted reads");
     }
 
     #[test]

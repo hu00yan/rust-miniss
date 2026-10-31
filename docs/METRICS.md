@@ -1,13 +1,16 @@
 # Runtime metrics and integrations
 
-`MultiCoreRuntime` owns shard-local counters and aggregates them on a control-plane
-thread. The runtime does not own a process-global registry or a metrics HTTP
-endpoint. Applications choose how to consume or export the snapshots.
+`MultiCoreRuntime` owns shard-local counters. Each worker pushes its counters
+into a single-writer slot at its event-loop boundary, and a scrape reads those
+slots directly on the calling thread — no control-plane thread exists. The
+runtime does not own a process-global registry or a metrics HTTP endpoint.
+Applications choose how often to scrape and how to consume or export the
+snapshots.
 
 ## Provider-neutral snapshot API
 
-Use `metrics_snapshot` when the application wants a fresh bounded collection of
-all shard values:
+Use `metrics_snapshot` when the application wants a fresh collection of all
+shard values:
 
 ```rust,no_run
 use rust_miniss::MultiCoreRuntime;
@@ -23,14 +26,16 @@ for core in &snapshot.cores {
 `RuntimeMetrics` contains the per-shard `CoreMetricsSnapshot` values. These
 public data structures are the general integration surface: an application can
 map them to its chosen metrics SDK, telemetry pipeline, diagnostics endpoint, or
-logs without requiring the runtime to know that backend. Sampling is bounded
-control-plane work; do not call it in a per-request hot path.
+logs without requiring the runtime to know that backend. A scrape is control
+plane work that never messages or wakes a worker; do not call it in a
+per-request hot path.
 
-For periodic collection, `metrics_view()` returns the latest successful view
-from the runtime-owned sampler, including its sample time, duration, and
-consecutive failure count. `metrics_refresh(timeout)` asks that sampler for a
-fresh bounded pass. The default periodic interval is 1 second and can be
-configured at startup with `MINISS_METRICS_INTERVAL_MS`.
+`metrics_view()` returns a view assembled from the current slot contents,
+including its sample time and duration. `metrics_refresh(timeout)` is the same
+read — the `timeout` parameter is retained for API compatibility and has no
+effect, because no shard round trip remains to bound. `MINISS_METRICS_INTERVAL_MS`
+(default 1 second) is the startup-resolved cadence reference for embedder-side
+scrape or log loops; the runtime itself runs no timer on it.
 
 ## Optional Prometheus text exposition
 

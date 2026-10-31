@@ -1,13 +1,19 @@
-//! Control-plane metrics aggregation and Prometheus export.
+//! Control-plane metrics publication and Prometheus export.
 //!
 //! These tests assert *values*, not presence: the merged runtime-wide series
 //! must be the arithmetic fold of the per-shard series, and the per-shard
-//! values must be the ones the traffic actually produced.
+//! values must be the ones the traffic actually produced. Workers publish
+//! their counters into single-writer slots at the event-loop boundary and
+//! scrapes read those slots directly, so every assertion here also exercises
+//! that publication path.
 
-use rust_miniss::metrics::{series_descriptors, Merge, MetricsError};
+use rust_miniss::metrics::{series_descriptors, Merge, MetricType};
 use rust_miniss::MultiCoreRuntime;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// A runtime owns worker threads and pins them to shard CPUs.  Serialize this
@@ -71,7 +77,7 @@ fn aggregation_is_the_arithmetic_fold_of_every_shard() {
     const SHARDS: usize = 2;
     const TASKS: usize = 9;
     // Explicit shard placement keeps the expected per-shard split exact instead
-    // of depending on round-robin racing the sampler thread's own messages.
+    // of depending on round-robin racing the publication of other traffic.
     const TASKS_ON_SHARD_0: usize = 5;
 
     let runtime = MultiCoreRuntime::new(Some(SHARDS)).unwrap();
@@ -101,7 +107,7 @@ fn aggregation_is_the_arithmetic_fold_of_every_shard() {
     assert_eq!(view.runtime.cores.len(), SHARDS);
     assert_eq!(view.runtime.cores[0].core_id, 0);
     assert_eq!(view.runtime.cores[1].core_id, 1);
-    assert_eq!(view.consecutive_failures, 0, "the pass must be fresh");
+    assert_eq!(view.consecutive_failures, 0, "a slot read cannot fail");
 
     let rendered = view.render_prometheus();
     let parsed = parse_exposition(&rendered);
@@ -154,7 +160,7 @@ fn aggregation_is_the_arithmetic_fold_of_every_shard() {
 }
 
 #[test]
-fn the_aggregator_runs_on_its_own_clock() {
+fn publication_is_visible_without_any_sampler_pass() {
     let _test_lock = runtime_test_lock();
     init_tracing();
 
@@ -163,54 +169,63 @@ fn the_aggregator_runs_on_its_own_clock() {
     assert_eq!(
         interval,
         rust_miniss::config::metrics_interval(),
-        "the runtime must use the startup-resolved aggregation interval"
+        "the runtime must use the startup-resolved metrics cadence"
     );
 
-    // The aggregator samples on a timer, not on request traffic.  No task is
-    // spawned and no scrape is in flight here, so the view can only change if
-    // the periodic clock fired on its own.
-    let deadline = Instant::now() + 3 * interval + Duration::from_secs(5);
-    let mut previous = loop {
-        match runtime.metrics_view() {
-            Ok(view) => break view,
-            Err(MetricsError::NotSampled) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "aggregator never completed a periodic pass within {:?}",
-                    3 * interval + Duration::from_secs(5)
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(err) => panic!("aggregator must be answering: {err}"),
-        }
-    };
-    let first_sampled_at = previous.sampled_at;
-
-    // A second periodic pass must arrive on the clock, with no scrape and no
-    // task traffic in between.
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "aggregator did not run a second periodic pass within {:?}",
-            3 * interval + Duration::from_secs(5)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-        previous = runtime
-            .metrics_view()
-            .unwrap_or_else(|err| panic!("aggregator must be answering: {err}"));
-        if previous.sampled_at > first_sampled_at {
-            break;
+    // No control-plane thread and no periodic pass exists: the first scrape
+    // after traffic must already reflect what the workers published at their
+    // own event-loop boundaries.  Nothing here waits on a clock before the
+    // first scrape.
+    const TASKS: usize = 4;
+    const TASKS_PER_SHARD: usize = TASKS / 2;
+    let (tx, rx) = mpsc::channel();
+    for core_id in 0..2 {
+        for _ in 0..TASKS_PER_SHARD {
+            let tx = tx.clone();
+            runtime
+                .spawn_on(core_id, async move {
+                    tx.send(()).unwrap();
+                })
+                .unwrap();
         }
     }
-    assert!(previous.runtime.cores.iter().all(|shard| shard.parks > 0));
+    drop(tx);
+    for _ in 0..TASKS {
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
 
-    let later = runtime.metrics_refresh(Duration::from_secs(2)).unwrap();
+    let first = runtime.metrics_view().unwrap();
+    assert_eq!(first.consecutive_failures, 0);
+    assert_eq!(first.runtime.cores.len(), 2);
+    let spawned: u64 = first
+        .runtime
+        .cores
+        .iter()
+        .map(|shard| shard.tasks_spawned)
+        .sum();
     assert!(
-        later.sampled_at > previous.sampled_at,
-        "a forced pass must be newer than the periodic one"
+        spawned >= TASKS as u64,
+        "loop-boundary publication must be visible on the first scrape, got {spawned}"
     );
-    // Counters are monotonic, so a later pass never reports less work.
-    for (before, after) in previous.runtime.cores.iter().zip(&later.runtime.cores) {
+
+    // Park accounting is published by idle workers on their own loop boundary.
+    // No scrape triggers it and no sampler clock exists, so growing `parks`
+    // here is direct evidence of worker-side push without any reader.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let latest = loop {
+        assert!(
+            Instant::now() < deadline,
+            "idle workers never published park accounting"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        let view = runtime.metrics_view().unwrap();
+        if view.runtime.cores.iter().all(|shard| shard.parks > 0) {
+            break view;
+        }
+    };
+
+    // Counters are monotonic across scrapes.
+    for (before, after) in first.runtime.cores.iter().zip(&latest.runtime.cores) {
         assert!(after.tasks_polled >= before.tasks_polled);
         assert!(after.parks >= before.parks);
     }
@@ -222,14 +237,16 @@ fn the_aggregator_runs_on_its_own_clock() {
 }
 
 #[test]
-fn sampling_never_leaves_a_control_message_in_a_terminating_worker() {
+fn scrapes_during_shutdown_leave_no_control_state_behind() {
     let _test_lock = runtime_test_lock();
     init_tracing();
 
-    // Repeated shutdowns while the periodic clock is firing: a sampling pass
-    // must never enqueue `CollectMetrics` into a shard that has already passed
-    // its drain check, which would show up as a non-empty inbox in the
-    // post-join termination snapshot.
+    // Repeated shutdowns while a scrape loop is running: a slot read never
+    // enqueues anything into a worker inbox, so a scrape concurrent with
+    // `shutdown()` must leave no control message — and no other control state
+    // — behind in the post-join termination snapshot.  This is the regression
+    // guard for any future change that reintroduces control-plane traffic into
+    // the scrape path.
     for round in 0..8 {
         let runtime = MultiCoreRuntime::new(Some(2)).unwrap();
         let (tx, rx) = mpsc::channel();
@@ -245,14 +262,15 @@ fn sampling_never_leaves_a_control_message_in_a_terminating_worker() {
         for _ in 0..2 {
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        // Keep scraping right up to the shutdown cutoff so a pass is as likely
-        // as possible to be in flight when `shutdown()` closes admission.
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Keep scraping right up to the shutdown cutoff so any hidden
+        // control-plane round trip would be as likely as possible to be in
+        // flight when `shutdown()` closes admission.
+        let stop = Arc::new(AtomicBool::new(false));
         let scraper = {
-            let runtime = std::sync::Arc::clone(&runtime);
-            let stop = std::sync::Arc::clone(&stop);
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            let runtime = Arc::clone(&runtime);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
                     let _ = runtime.metrics_refresh(Duration::from_millis(200));
                 }
             })
@@ -261,7 +279,7 @@ fn sampling_never_leaves_a_control_message_in_a_terminating_worker() {
         runtime
             .shutdown_with_timeout(Duration::from_secs(5))
             .unwrap();
-        stop.store(true, std::sync::atomic::Ordering::Release);
+        stop.store(true, Ordering::Release);
         scraper.join().unwrap();
         runtime.join().unwrap();
 
@@ -275,43 +293,186 @@ fn sampling_never_leaves_a_control_message_in_a_terminating_worker() {
 }
 
 #[test]
-fn a_stopped_aggregator_reports_instead_of_hanging() {
+fn a_quiesced_runtime_keeps_answering_from_frozen_slots() {
     let _test_lock = runtime_test_lock();
     init_tracing();
 
     let runtime = MultiCoreRuntime::new(Some(1)).unwrap();
-    let successful = runtime.metrics_refresh(Duration::from_secs(2)).unwrap();
-    assert_eq!(successful.consecutive_failures, 0);
+    let baseline = runtime.metrics_refresh(Duration::from_secs(2)).unwrap();
+    assert_eq!(baseline.consecutive_failures, 0);
 
-    let started = Instant::now();
     runtime
         .shutdown_with_timeout(Duration::from_secs(5))
         .unwrap();
     runtime.join().unwrap();
 
-    // A pass against terminated shards cannot succeed. The aggregator must
-    // return the last good view with an updated failure count, not block or
-    // return a stale view that still looks fresh.
-    let stale = runtime
+    // The workers are gone and their slots are frozen at the final
+    // publication, but the runtime object still owns the slots: scrapes must
+    // keep answering, bounded, with identical counter values.
+    let scrape_started = Instant::now();
+    let frozen = runtime
         .metrics_refresh(Duration::from_millis(500))
-        .unwrap_or_else(|err| panic!("must retain the prior good view: {err}"));
+        .unwrap_or_else(|err| panic!("frozen slots must stay readable: {err}"));
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "a post-join refresh must stay bounded"
+        scrape_started.elapsed() < Duration::from_secs(10),
+        "a post-join scrape must stay bounded"
     );
-    assert_eq!(stale.sampled_at, successful.sampled_at);
-    assert_eq!(stale.runtime.cores.len(), 1);
-    assert!(
-        stale.consecutive_failures > successful.consecutive_failures,
-        "the returned last-good view must reflect the failed sample"
-    );
+    assert_eq!(frozen.consecutive_failures, 0);
+    assert_eq!(frozen.runtime.cores.len(), 1);
 
-    // The read-only path keeps answering with the same updated failure count.
-    let retained = runtime
-        .metrics_view()
-        .unwrap_or_else(|err| panic!("last good view should remain readable: {err}"));
-    assert_eq!(retained.sampled_at, successful.sampled_at);
-    assert_eq!(retained.consecutive_failures, stale.consecutive_failures);
+    let frozen_again = runtime.metrics_view().unwrap();
+    for descriptor in series_descriptors() {
+        assert_eq!(
+            frozen.value(descriptor.name, Some(0)),
+            frozen_again.value(descriptor.name, Some(0)),
+            "{} must be frozen after join",
+            descriptor.name
+        );
+    }
+
+    // Between the baseline and the freeze the workers may still have worked,
+    // so counters only move forward.
+    for descriptor in series_descriptors() {
+        if descriptor.metric_type != MetricType::Counter {
+            continue;
+        }
+        let before = baseline.value(descriptor.name, Some(0));
+        let after = frozen.value(descriptor.name, Some(0));
+        assert!(
+            after >= before,
+            "{} must not go backwards across shutdown",
+            descriptor.name
+        );
+    }
 
     drop(runtime);
+}
+
+#[test]
+fn concurrent_scrapes_during_worker_activity_stay_consistent() {
+    let _test_lock = runtime_test_lock();
+    init_tracing();
+
+    const SHARDS: usize = 2;
+    const TASKS: usize = 400;
+    const TASKS_PER_SHARD: usize = TASKS / SHARDS;
+
+    let runtime = Arc::new(MultiCoreRuntime::new(Some(SHARDS)).unwrap());
+
+    // One scraper hammering `metrics_view` while workers publish at their loop
+    // boundary: this is the publication retry-path stress.  Every scrape must
+    // be internally consistent (merged total == fold of the per-shard series
+    // in the same view), per-shard counters must never go backwards, and no
+    // shard may report more completed than spawned at a turn boundary.
+    let stop = Arc::new(AtomicBool::new(false));
+    let scraper = {
+        let runtime = Arc::clone(&runtime);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut last: BTreeMap<usize, BTreeMap<&'static str, u64>> = BTreeMap::new();
+            let mut scrapes = 0usize;
+            while !stop.load(Ordering::Acquire) {
+                let view = runtime.metrics_view().unwrap_or_else(|err| {
+                    panic!("scrape {scrapes} must succeed under load: {err}")
+                });
+                for descriptor in series_descriptors() {
+                    let shard_values: Vec<(usize, u64)> = view
+                        .runtime
+                        .cores
+                        .iter()
+                        .map(|shard| (shard.core_id, descriptor.read(shard)))
+                        .collect();
+                    let folded = match descriptor.merge {
+                        Merge::Sum => shard_values
+                            .iter()
+                            .map(|(_, value)| *value)
+                            .fold(0u64, u64::saturating_add),
+                        Merge::Max => shard_values
+                            .iter()
+                            .map(|(_, value)| *value)
+                            .max()
+                            .unwrap_or(0),
+                    };
+                    assert_eq!(
+                        view.value(descriptor.name, None),
+                        Some(folded),
+                        "{} total must equal the shard fold during concurrent publication",
+                        descriptor.name
+                    );
+                    if descriptor.metric_type == MetricType::Counter {
+                        for (core_id, value) in shard_values {
+                            let previous = last
+                                .entry(core_id)
+                                .or_default()
+                                .insert(descriptor.name, value);
+                            if let Some(previous) = previous {
+                                assert!(
+                                    value >= previous,
+                                    "{} on shard {core_id} went backwards: \
+                                     {previous} -> {value}",
+                                    descriptor.name
+                                );
+                            }
+                        }
+                    }
+                }
+                for shard in &view.runtime.cores {
+                    assert!(
+                        shard.tasks_spawned >= shard.tasks_completed,
+                        "shard {} reported completed > spawned at a turn boundary",
+                        shard.core_id
+                    );
+                }
+                scrapes += 1;
+            }
+            scrapes
+        })
+    };
+
+    let (tx, rx) = mpsc::channel();
+    for index in 0..TASKS {
+        let core_id = index % SHARDS;
+        let tx = tx.clone();
+        runtime
+            .spawn_on(core_id, async move {
+                tx.send(()).unwrap();
+            })
+            .unwrap();
+    }
+    drop(tx);
+    for _ in 0..TASKS {
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    stop.store(true, Ordering::Release);
+    let scrapes = scraper.join().unwrap();
+    assert!(
+        scrapes > 0,
+        "the scraper must have completed at least one scrape"
+    );
+
+    // Convergence: once traffic quiesces and publication settles, one more
+    // scrape must show exactly the traffic's terminal state, per shard.
+    let view = runtime.metrics_refresh(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        view.value("miniss_tasks_spawned_total", None),
+        Some(TASKS as u64)
+    );
+    assert_eq!(
+        view.value("miniss_tasks_completed_total", None),
+        Some(TASKS as u64)
+    );
+    assert_eq!(
+        view.value("miniss_tasks_spawned_total", Some(0)),
+        Some(TASKS_PER_SHARD as u64)
+    );
+    assert_eq!(
+        view.value("miniss_tasks_spawned_total", Some(1)),
+        Some(TASKS_PER_SHARD as u64)
+    );
+
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(5))
+        .unwrap();
+    runtime.join().unwrap();
 }

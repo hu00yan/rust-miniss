@@ -1,10 +1,11 @@
 //! Export runtime metrics in Prometheus text exposition format.
 //!
-//! The aggregator is owned by the [`MultiCoreRuntime`]: every runtime starts
-//! one control-plane sampler thread inside `MultiCoreRuntime::new`, and no
-//! process-global registry is involved.  This example picks the documented API
-//! route — the embedder owns the HTTP endpoint, the runtime only owns the
-//! numbers.
+//! The metrics control plane is owned by the [`MultiCoreRuntime`]: workers
+//! push their shard-local counters into single-writer slots at the event-loop
+//! boundary, and a scrape reads those slots directly on the calling thread —
+//! no sampler thread exists and no process-global registry is involved.  This
+//! example picks the documented API route — the embedder owns the HTTP
+//! endpoint, the runtime only owns the numbers.
 //!
 //! Run with:
 //!
@@ -26,9 +27,8 @@ const SERVE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Render one scrape response for `runtime`.
 ///
-/// This never triggers sampling: it answers from whatever the aggregator's own
-/// periodic clock last merged, so a fast scrape loop cannot starve the timer
-/// and costs the data plane nothing.
+/// This never wakes a worker: the view is assembled inline from the per-shard
+/// publication slots, so a fast scrape loop costs the data plane nothing.
 fn scrape_response(runtime: &MultiCoreRuntime) -> Vec<u8> {
     let body = match runtime.metrics_view() {
         Ok(view) => view.render_prometheus(),
@@ -58,10 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9090".into());
 
-    // One runtime, one aggregator thread, started here with the workers.
+    // One runtime; workers publish to their slots at the loop boundary and
+    // this process holds no control-plane thread beyond them.
     let runtime = MultiCoreRuntime::new(Some(2))?;
     println!(
-        "aggregating every {:?} on a control-plane sampler thread",
+        "workers publish per loop turn; embedder scrape cadence reference {:?}",
         runtime.metrics_interval()
     );
 
@@ -113,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     runtime.shutdown_with_timeout(Duration::from_secs(5))?;
     runtime.join()?;
-    // Dropping the runtime stops and joins its aggregator thread.
+    // Dropping the runtime joins its workers and releases the slots.
     drop(runtime);
     Ok(())
 }

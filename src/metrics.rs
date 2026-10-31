@@ -1,41 +1,35 @@
-//! Control-plane metrics aggregation and Prometheus text exposition.
+//! Control-plane metrics publication and Prometheus text exposition.
 //!
-//! One aggregator thread is started per [`MultiCoreRuntime`](crate::multicore::MultiCoreRuntime)
-//! inside `new`, in the same pass that starts the workers, and `Drop` stops and
-//! joins it. It is deliberately not a process-global registry: AGENTS.md
-//! MUST NOT #4 forbids the statics such a registry needs, and an aggregator can
-//! only see the shards of one runtime, so two runtimes in one process would
-//! merge into a meaningless series set.
+//! Publication is worker-side push at the event-loop boundary: every worker
+//! copies its already-maintained shard-local counters into its own
+//! single-writer slot ([`crate::multicore::CoreMetricsSlot`]) once per loop
+//! turn, at the same boundary as the ready-queue hint. A scrape assembles the
+//! runtime-wide view inline on the scraping thread by reading the per-shard
+//! slots directly; the merged total is the fold of the per-shard values in the
+//! same view. There is no sampler thread, no periodic pass, no
+//! `CollectMetrics` message, no reply channel, and no worker work on the
+//! control plane's clock — at steady state a runtime owns exactly its worker
+//! threads.
 //!
-//! The aggregator wakes on its own clock (default 1s, see
-//! [`crate::config::metrics_interval`]) and fans one
-//! [`crate::multicore::CoreMessage::CollectMetrics`] message per shard out over
-//! the existing bounded inbox. A worker answers by copying its shard-local
-//! counters, so AGENTS.md MUST #6 holds by construction: no atomics, no locks,
-//! and no per-request work.
+//! This is deliberately not a process-global registry: AGENTS.md MUST NOT #4
+//! forbids the statics such a registry needs, and slots can only belong to the
+//! shards of one runtime, so two runtimes in one process would merge into a
+//! meaningless series set. The metrics control plane is owned by one
+//! [`MultiCoreRuntime`](crate::multicore::MultiCoreRuntime).
 //!
-//! Sampling is bounded: a full inbox, a disconnected shard, or a stalled shard
-//! aborts the pass and the previous good view is retained. A pass holds one
-//! admission ticket for its whole fan-out, so `shutdown()` cannot close the gate
-//! while a pass is still enqueueing.
+//! Coherence between the per-series values of one shard snapshot is provided
+//! by the slot's seqlock-style version (see [`crate::multicore::CoreMetricsSlot`]);
+//! coherence of the runtime-wide fold is by construction, because the fold is
+//! computed from one read of each slot on one thread. AGENTS.md MUST #6 holds
+//! by a stronger construction than the message-passing design it replaced:
+//! publication happens outside the request path (between loop turns, stores of
+//! counters the worker already maintains) and aggregation happens entirely on
+//! the reader's thread.
 
 use std::fmt::Write as _;
-use std::sync::atomic::AtomicUsize;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender as ReplySender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::multicore::{CoreMessage, CoreMetricsSnapshot, CoreWakeup, RuntimeMetrics};
-use crossbeam_channel::Sender;
-
-/// Deadline for a sampling pass started by the periodic clock.
-const DEFAULT_SAMPLE_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// The answer channel a [`MetricsCommand`] is answered on.
-pub(crate) type MetricsReply = ReplySender<Result<MetricsView, MetricsError>>;
-
-/// Command channel: aggregator replies, runtime and scrapers request.
-pub(crate) type MetricsCommandSender = ReplySender<MetricsCommand>;
+use crate::multicore::{CoreMetricsSnapshot, RuntimeMetrics};
 
 /// How one shard-local series merges into the runtime-wide series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,26 +465,36 @@ pub struct MetricsView {
     pub consecutive_failures: u32,
 }
 
-/// Failure modes of the control-plane aggregator.
+/// Failure modes of the metrics scrape path.
+///
+/// Slot-backed scrapes read the per-shard publication slots directly on the
+/// calling thread and cannot fail on a live runtime; the variants are retained
+/// for API compatibility with the aggregator-thread design they described.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricsError {
-    /// The periodic clock has not completed a pass yet.
+    /// Historically: the periodic clock had not completed a pass yet.  Slot
+    /// reads never produce this — a shard that has not published yet reports
+    /// its true all-zero state.
     NotSampled,
-    /// The aggregator thread is gone; the runtime is shutting down or dropped.
+    /// Historically: the aggregator thread was gone.  No aggregator thread
+    /// exists any more; a quiesced runtime keeps answering from its frozen
+    /// slots.
     AggregatorStopped,
-    /// A pass failed and no earlier pass produced a view to fall back on.
+    /// Historically: a sampling pass failed with no earlier view to fall back
+    /// on.  Slot reads cannot fail mid-scrape.
     SampleFailed(String),
-    /// The caller stopped waiting for the aggregator.
+    /// Historically: the caller stopped waiting for the aggregator.  Slot
+    /// reads never wait, so this is never produced.
     Timeout,
 }
 
 impl std::fmt::Display for MetricsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotSampled => f.write_str("metrics aggregator has not completed a pass yet"),
-            Self::AggregatorStopped => f.write_str("metrics aggregator thread is not running"),
+            Self::NotSampled => f.write_str("metrics have not been published yet"),
+            Self::AggregatorStopped => f.write_str("metrics control plane is not running"),
             Self::SampleFailed(reason) => write!(f, "metrics sampling failed: {reason}"),
-            Self::Timeout => f.write_str("timed out waiting for the metrics aggregator"),
+            Self::Timeout => f.write_str("timed out waiting for metrics"),
         }
     }
 }
@@ -573,223 +577,6 @@ impl MetricsView {
             ),
             None => descriptor.merge_all(self.runtime.cores.iter()),
         })
-    }
-}
-
-/// Control-plane sampling transport handed to the aggregator.
-///
-/// This is what the aggregator thread holds instead of an
-/// `Arc<MultiCoreRuntime>`.  A background thread that kept the runtime alive
-/// would make `Arc::try_unwrap(runtime)` permanently fail for embedders, and a
-/// `Weak` would leave that call racy whenever a pass happened to be in flight.
-/// Holding only the fan-out keeps the runtime's ownership graph exactly as it
-/// was: the caller still decides when the runtime dies.
-///
-/// Everything in here is read-only after startup.  The per-shard
-/// `Sender`s are clones of the same bounded inboxes the spawn path uses, and
-/// the [`CoreWakeup`] handles are `Arc`s the workers do not own, so no lock,
-/// atomic, or `Rc` crosses the thread boundary here.
-pub(crate) struct MetricsFanout {
-    pub(crate) senders: Vec<Sender<CoreMessage>>,
-    pub(crate) threads: Vec<std::thread::Thread>,
-    pub(crate) wakeups: Vec<Arc<CoreWakeup>>,
-    /// Same admission counter the spawn paths use.  A sampling pass holds one
-    /// ticket for its whole fan-out, so `close_admission_and_wait` cannot
-    /// return while a pass is still enqueueing.
-    pub(crate) admission: Arc<AtomicUsize>,
-}
-
-impl MetricsFanout {
-    /// Fan one `CollectMetrics` message out to every shard and collect the
-    /// answers.
-    ///
-    /// This is the same bounded control-plane path `spawn` uses: one admission
-    /// ticket, a `try_send` per shard (so a saturated inbox fails the pass
-    /// instead of blocking), a wake per shard, and an overall deadline.  A
-    /// worker answers by copying its shard-local counters, so the worker pays
-    /// nothing per request.
-    ///
-    /// Holding an admission ticket is what makes shutdown safe: `shutdown()`
-    /// closes the gate and waits for outstanding tickets, so a pass can never
-    /// enqueue into a shard that has already passed its drain check.
-    pub(crate) fn sample(&self, timeout: Duration) -> std::result::Result<RuntimeMetrics, String> {
-        let _admission =
-            crate::multicore::begin_admission_on(&self.admission).map_err(|err| err.to_string())?;
-        let (reply, receiver) = std::sync::mpsc::channel();
-        for (core_id, sender) in self.senders.iter().enumerate() {
-            sender
-                .try_send(CoreMessage::CollectMetrics {
-                    reply: reply.clone(),
-                })
-                .map_err(|err| format!("Core {core_id} metrics request failed: {err}"))?;
-            self.wake(core_id);
-        }
-        drop(reply);
-
-        let deadline = Instant::now() + timeout;
-        let mut cores = Vec::with_capacity(self.senders.len());
-        while cores.len() < self.senders.len() {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(format!(
-                    "Timed out collecting metrics: got {}/{} cores",
-                    cores.len(),
-                    self.senders.len()
-                ));
-            }
-            match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
-                Ok(snapshot) => cores.push(snapshot),
-                Err(err) => return Err(format!("Metrics collection failed: {err}")),
-            }
-        }
-        cores.sort_by_key(|snapshot| snapshot.core_id);
-        Ok(RuntimeMetrics { cores })
-    }
-
-    fn wake(&self, core_id: usize) {
-        self.threads[core_id].unpark();
-        self.wakeups[core_id].notify();
-    }
-}
-
-/// Requests the aggregator thread serves.  This enum is the *only* shared
-/// state between the aggregator and its callers.
-pub(crate) enum MetricsCommand {
-    /// Answer with the most recently merged view, without forcing a pass.
-    View(MetricsReply),
-    /// Run one bounded pass now and answer with the fresh view.
-    Refresh {
-        timeout: Duration,
-        reply: MetricsReply,
-    },
-    /// Leave the loop; sent by `Drop for MultiCoreRuntime`.
-    Stop,
-}
-
-/// Owns the merged view.  Never shared: it is a local of the aggregator thread
-/// for the whole life of the thread.
-pub(crate) struct Aggregator {
-    interval: Duration,
-    latest: Option<MetricsView>,
-    consecutive_failures: u32,
-}
-
-impl Aggregator {
-    pub(crate) fn new(interval: Duration) -> Self {
-        Self {
-            interval,
-            latest: None,
-            consecutive_failures: 0,
-        }
-    }
-
-    fn latest_view(&self) -> Result<MetricsView, MetricsError> {
-        self.latest.clone().ok_or(MetricsError::NotSampled)
-    }
-
-    /// Run one bounded aggregation pass and adopt the result.
-    ///
-    /// A failed pass keeps the previous view and records the failure, so a
-    /// saturated inbox degrades into a stale sample instead of an outage.
-    fn sample(
-        &mut self,
-        fanout: &MetricsFanout,
-        timeout: Duration,
-    ) -> Result<MetricsView, MetricsError> {
-        let started = Instant::now();
-        match fanout.sample(timeout) {
-            Ok(sharded) => {
-                self.consecutive_failures = 0;
-                let view = MetricsView {
-                    runtime: sharded,
-                    sampled_at: Instant::now(),
-                    sample_duration: started.elapsed(),
-                    consecutive_failures: 0,
-                };
-                self.latest = Some(view.clone());
-                Ok(view)
-            }
-            Err(err) => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                tracing::debug!(
-                    failures = self.consecutive_failures,
-                    "metrics sampling pass failed: {err}"
-                );
-                match self.latest.as_mut() {
-                    Some(view) => {
-                        view.consecutive_failures = self.consecutive_failures;
-                        Ok(view.clone())
-                    }
-                    None => Err(MetricsError::SampleFailed(err)),
-                }
-            }
-        }
-    }
-
-    /// Periodic sampling loop.  Runs until `Stop` or until the command channel
-    /// is dropped, which is why `Drop for MultiCoreRuntime` joins it.
-    pub(crate) fn run(mut self, fanout: Arc<MetricsFanout>, commands: Receiver<MetricsCommand>) {
-        // The deadline is carried across iterations on purpose.  Recomputing it
-        // from `recv_timeout` per iteration would let a scrape stream faster
-        // than the interval hold the timer off forever: every command resets
-        // the wait and the periodic pass never becomes due.
-        let mut next_pass = Instant::now() + self.interval;
-        loop {
-            let wait = next_pass.saturating_duration_since(Instant::now());
-            match commands.recv_timeout(wait) {
-                // Answering is free, so a scrape must not delay the clock.
-                Ok(MetricsCommand::View(reply)) => {
-                    let _ = reply.send(self.latest_view());
-                }
-                Ok(MetricsCommand::Refresh { timeout, reply }) => {
-                    let result = self.sample(&fanout, timeout);
-                    let _ = reply.send(result);
-                    next_pass = Instant::now() + self.interval;
-                }
-                Ok(MetricsCommand::Stop) => break,
-                // Periodic pass.  Bounded by `DEFAULT_SAMPLE_TIMEOUT`; it never
-                // blocks the data plane because each shard answers from its own
-                // shard-local counters.
-                Err(RecvTimeoutError::Timeout) => {
-                    let _ = self.sample(&fanout, DEFAULT_SAMPLE_TIMEOUT);
-                    next_pass = Instant::now() + self.interval;
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    }
-}
-
-/// Control-plane handles to the aggregator, owned by one `MultiCoreRuntime`.
-pub(crate) struct MetricsControl {
-    /// Commands.  MPSC, so many scrape threads can share one aggregator.
-    pub(crate) commands: MetricsCommandSender,
-    /// Sampling transport, shared with `MultiCoreRuntime::metrics_snapshot`.
-    pub(crate) fanout: Arc<MetricsFanout>,
-    /// Aggregator thread; stopped and joined on runtime drop.
-    pub(crate) sampler: Option<std::thread::JoinHandle<()>>,
-    /// Periodic pass interval chosen at startup.
-    pub(crate) interval: Duration,
-}
-
-impl MetricsControl {
-    /// Ask the aggregator a question and wait a bounded time for the answer.
-    ///
-    /// This is the only cross-thread path into the merged view.  There is no
-    /// lock to take and no shared cell to tear: the aggregator thread holds the
-    /// view as a plain local and answers through this per-call channel.
-    pub(crate) fn ask(
-        &self,
-        timeout: Duration,
-        build: impl FnOnce(MetricsReply) -> MetricsCommand,
-    ) -> Result<MetricsView, MetricsError> {
-        let (reply, answers) = std::sync::mpsc::channel();
-        self.commands
-            .send(build(reply))
-            .map_err(|_| MetricsError::AggregatorStopped)?;
-        answers
-            .recv_timeout(timeout)
-            .map_err(|_| MetricsError::Timeout)?
     }
 }
 

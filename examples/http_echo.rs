@@ -237,6 +237,10 @@ fn main() -> io::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|interval_ms| *interval_ms > 0)
     {
+        // Opt-in embedder-side logger. Workers push metrics into their
+        // single-writer slots at the loop boundary; this thread only reads
+        // those slots on its own cadence — it never messages a worker, and the
+        // runtime spawns no sampler thread of its own.
         let metrics_runtime = runtime.clone();
         std::thread::Builder::new()
             .name("miniss-metrics".to_string())
