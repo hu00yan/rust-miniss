@@ -737,7 +737,7 @@ fn udp_pingpong_cross_thread(iterations: usize) -> (f64, f64, f64) {
     percentile3(&mut samples)
 }
 
-fn percentile3(samples: &mut Vec<u64>) -> (f64, f64, f64) {
+fn percentile3(samples: &mut [u64]) -> (f64, f64, f64) {
     samples.sort_unstable();
     let n = samples.len();
     let p50 = samples[n / 2] as f64;
