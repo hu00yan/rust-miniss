@@ -7,7 +7,8 @@
 #
 # 用法:
 #   scripts/test-affected.sh [--dry-run] [BASE_REF]
-#     BASE_REF 缺省 = git merge-base HEAD origin/main;任务卡工作流传 baseline 提交。
+#     BASE_REF 缺省 = 依次尝试 origin/main、main 的 merge-base,再退 HEAD~1;
+#       任务卡工作流传 baseline 提交。
 #   环境变量:
 #     MINISS_AFFECTED_BASE          优先于位置参数
 #     MINISS_AFFECTED_ALLOW_EMPTY=1 允许空选择继续(默认拒绝——绝不静默为空)
@@ -45,7 +46,13 @@ if [ -z "$BASE" ]; then
     BASE="$(git merge-base HEAD origin/main 2>/dev/null || true)"
 fi
 if [ -z "$BASE" ]; then
-    echo "REFUSAL: no BASE given and 'origin/main' is unavailable." >&2
+    BASE="$(git merge-base HEAD main 2>/dev/null || true)"
+fi
+if [ -z "$BASE" ]; then
+    BASE="$(git rev-parse HEAD~1 2>/dev/null || true)"
+fi
+if [ -z "$BASE" ]; then
+    echo "REFUSAL: no BASE given and none of origin/main / main / HEAD~1 resolve." >&2
     echo "  Pass the task card's baseline: scripts/test-affected.sh <baseline-commit>" >&2
     exit 2
 fi

@@ -39,7 +39,10 @@ check:
     just test-regular
     # docs-audit 此前只在 CI linux-epoll 单腿运行(§1.7);归位提交门。
     just docs-audit
-    just unsafe-audit
+    # unsafe-audit 不在 check 内(业主评审 2026-10-31):它是 RED(exit 2)语义,
+    # 被 check 捕获会沦为 YELLOW(exit 1),且 gate 顶层已独立运行(不重复)。
+
+# Backend compile matrix (defect-forensics Tier-1 item 1). Every cfg
 
 # Backend compile matrix (defect-forensics Tier-1 item 1). Every cfg
 # (io_backend) combination must compile on its native OS — the Linux-epoll
@@ -166,8 +169,10 @@ gate task="" baseline="" base="":
     @set -e; \
     echo "=== Gate: check ==="; \
     just check || { echo "YELLOW: check failed"; exit 1; }; \
-    echo "=== Gate: affected(受影响目标选择,DRAFT) ==="; \
-    just affected {{base}} || { echo "YELLOW: affected-target selection failed"; exit 1; }; \
+    echo "=== Gate: affected(受影响目标选择) ==="; \
+    rc=0; just affected {{base}} || rc=$?; \
+    if [ "$rc" -eq 2 ]; then echo "RED: affected-target selection REFUSED (rc=2 — mapping/config error is never silenced)"; exit 2; fi; \
+    if [ "$rc" -ne 0 ]; then echo "YELLOW: affected-target selection failed"; exit 1; fi; \
     echo "=== Gate: arch-audit ==="; \
     just arch-audit || { echo "RED: architecture violation"; exit 2; }; \
     echo "=== Gate: unsafe-audit ==="; \
@@ -180,6 +185,13 @@ gate task="" baseline="" base="":
     just bench-smoke "{{baseline}}" || { echo "YELLOW: bench-smoke failed"; exit 1; }; \
     echo ""; \
     echo "=== GATE PASSED (GREEN) ==="
+
+# ─── Tier 3: mutation testing(业主批准 2026-10-31;nightly/手动,严禁进 fast/gate)───
+# 只打核心状态机文件;--timeout 必须带,防变异死循环。结果人工判读:
+# 存活变体 = 性质/套件对应当覆盖洞,补性质或补映射,而不是放宽判据。
+test-mutants-quic:
+    @command -v cargo-mutants >/dev/null 2>&1 || { echo "REFUSAL: cargo-mutants not installed (cargo install cargo-mutants)" >&2; exit 2; }
+    cargo mutants --file src/quic.rs --file src/multicore.rs --timeout 60
 
 # ─── Utility ────────────────────────────────────────────────────
 

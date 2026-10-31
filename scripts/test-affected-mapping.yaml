@@ -46,25 +46,41 @@ rules:
 
   # ── 执行器 / 生命周期核心 ─────────────────────────────────────
   - match: ["src/multicore.rs", "src/waker.rs", "src/executor.rs", "src/cpu.rs", "src/task.rs", "src/cancellation.rs", "src/timer/", "src/config.rs"]
-    comment: "lifecycle + shutdown 套件,双后端(#40/#42/D25/D27 类:调度与关闭时序必须跨后端验证)"
+    comment: "lifecycle + shutdown 套件,双后端(#40/#42/D25/D27 类:调度与关闭时序必须跨后端验证;integration_multicore 为业主评审 2026-10-31 补)"
     legs:
-      - {platform: linux, backend: io_uring, cmd: "cargo test --test multicore_tests --test shutdown_quiescence -- --test-threads=1"}
-      - {platform: linux, backend: epoll, cmd: "cargo test --test multicore_tests --test shutdown_quiescence -- --test-threads=1"}
-      - {platform: macos, backend: host, cmd: "cargo test --test multicore_tests --test shutdown_quiescence -- --test-threads=1"}
+      - {platform: linux, backend: io_uring, cmd: "cargo test --test multicore_tests --test shutdown_quiescence --test integration_multicore -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --test multicore_tests --test shutdown_quiescence --test integration_multicore -- --test-threads=1"}
+      - {platform: macos, backend: host, cmd: "cargo test --test multicore_tests --test shutdown_quiescence --test integration_multicore -- --test-threads=1"}
+
+  - match: ["src/metrics.rs"]
+    comment: "指标系统:聚合不变量(merged total == fold of per-shard series;业主评审 2026-10-31 补)"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --test metrics_aggregation -- --test-threads=1"}
+
+  - match: ["src/signal.rs"]
+    comment: "信号处理:integration_signal(业主评审 2026-10-31 补)"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --test integration_signal -- --test-threads=1"}
 
   # ── HTTP / 网络协议面 ─────────────────────────────────────────
   - match: ["src/http.rs", "src/net.rs", "src/hyper_rt.rs", "src/compat.rs", "src/buffer.rs"]
-    comment: "integration_http + hyper 双后端;epoll 腿防止 parser/net 修复只在 io_uring 上被验证(D22 类)"
+    comment: "integration_http + hyper + vectored_io 双后端;epoll 腿防止 parser/net 修复只在 io_uring 上被验证(D22 类;vectored_io 为业主评审 2026-10-31 补——net.rs 重度关联 poll_write 租约改造)"
     legs:
-      - {platform: any, backend: host, cmd: "cargo test --test integration_http --test hyper_http1 --test hyper_http2 -- --test-threads=1"}
-      - {platform: linux, backend: epoll, cmd: "cargo test --test integration_http -- --test-threads=1"}
+      - {platform: any, backend: host, cmd: "cargo test --test integration_http --test hyper_http1 --test hyper_http2 --test vectored_io -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --test integration_http --test vectored_io -- --test-threads=1"}
 
-  # ── QUIC / TLS 适配面(QUIC 方法论 T2 落位) ──────────────────
-  - match: ["src/quic.rs", "src/tls.rs"]
+  # ── QUIC 适配面(QUIC 方法论 T2 落位) ─────────────────────────
+  - match: ["src/quic.rs"]
     comment: "quinn_h3 全特征套件:host + Linux epoll 腿;T4 sim-flavor 就绪后追加 tests/quic_lifecycle_props 腿"
     legs:
       - {platform: any, backend: host, cmd: "cargo test --all-features --test quinn_h3 -- --test-threads=1"}
       - {platform: linux, backend: epoll, cmd: "cargo test --all-features --test quinn_h3 -- --test-threads=1"}
+
+  - match: ["src/tls.rs"]
+    comment: "TLS 配置面:tls_tests —— quinn_h3 只覆盖 h3 握手,不覆盖 TLS 版本策略/证书加载(业主评审 2026-10-31 补)"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --all-features --test tls_tests -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo test --all-features --test tls_tests -- --test-threads=1"}
 
   # ── 测试文件本身被改 ──────────────────────────────────────────
   - match: ["tests/shutdown_quiescence.rs", "tests/multicore_tests.rs"]
@@ -110,6 +126,18 @@ rules:
   - match: ["docs/", "README.md", "README_CN.md", "AGENTS.md", "TODO.md"]
     legs:
       - {platform: any, backend: host, cmd: "just docs-audit"}
+
+  # ── crate 根与未细分源码(业主评审 2026-10-31 补) ─────────────
+  - match: ["src/lib.rs", "src/"]
+    comment: "导出/特性面变化影响一切:全量 host 套件 + epoll 编译检查;绝不跌入文档兜底造成假绿"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --tests -- --test-threads=1"}
+      - {platform: linux, backend: epoll, cmd: "cargo check --all-targets --all-features"}
+
+  - match: ["examples/"]
+    comment: "示例代码:cargo test 默认不编译其测试目标,必须显式跑(业主评审 2026-10-31 补)"
+    legs:
+      - {platform: any, backend: host, cmd: "cargo test --examples -- --test-threads=1"}
 
   # ── 兜底(必须存在;脚本拒绝静默空的机械保证) ─────────────────
   - match: [""]
