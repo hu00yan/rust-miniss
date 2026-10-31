@@ -27,7 +27,10 @@ const COMPLETION_DEADLINE: Duration = Duration::from_secs(60);
 fn main() {
     let miniss_us = miniss_spawn_baseline(SPAWN_BASE_TASKS);
     let tokio_us = tokio_spawn_baseline(SPAWN_BASE_TASKS);
-    println!("spawn_admission_storm ({} tasks per side)", SPAWN_BASE_TASKS);
+    println!(
+        "spawn_admission_storm ({} tasks per side)",
+        SPAWN_BASE_TASKS
+    );
     println!("  miniss spawn_local: {:>9.3} µs/task", miniss_us);
     println!("  tokio spawn_local:  {:>9.3} µs/task", tokio_us);
     println!("  ratio miniss/tokio: {:>9.1}x", miniss_us / tokio_us);

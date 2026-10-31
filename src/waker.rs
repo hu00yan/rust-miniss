@@ -7,7 +7,6 @@
 //! to another thread or retained after task cancellation/shutdown.
 
 use crossbeam_queue::ArrayQueue;
-use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{
@@ -73,18 +72,38 @@ impl TaskKey {
 
 /// Bounded shard-local arena with generational slot allocation.
 ///
-/// A slot is returned to the free list only through `remove`; `reserve` then
-/// advances its generation before handing it out again. Once a slot reaches
-/// `u16::MAX`, it is permanently retired rather than wrapping to a prior key.
-/// Keys from a prior occupant therefore cannot alias a later task.
+/// A slot is returned to the free structure only through `remove`; `reserve`
+/// then advances its generation before handing it out again. Once a slot
+/// reaches `u16::MAX`, it is permanently retired rather than wrapping to a
+/// prior key. Keys from a prior occupant therefore cannot alias a later task.
 pub struct TaskArena<T> {
     runtime_generation: u16,
     shard: u16,
     slots: Vec<Option<T>>,
     generations: Vec<u16>,
-    free: VecDeque<u16>,
+    /// Free-slot stack. Stack order (LIFO) is not part of any contract:
+    /// cross-shard and local admission keys come from monotonic per-core
+    /// counters and `reserve` only needs *a* vacant slot. Membership is
+    /// indexed by `free_pos`, which is what makes external admission O(1):
+    /// the admitted slot is evicted with one swap_remove instead of the
+    /// O(|free|) linear scan this structure used before (65,536 entries at
+    /// arena creation, scanned once per admitted task — the 175x spawn-storm
+    /// admission cost, DECISION_LOG 2026-10-31).
+    free: Vec<u16>,
+    /// `free_pos[slot]` is the slot's index in `free`, or [`NOT_IN_FREE`].
+    /// Invariant: a slot appears in `free` at most once, and only while it is
+    /// vacant — `insert` rejects and `insert_external` evicts on this
+    /// structure, so no admission path can push a duplicate.
+    free_pos: Vec<u32>,
+    #[cfg(test)]
+    scan_steps: usize,
     _local: PhantomData<Rc<()>>,
 }
+
+/// Sentinel in [`TaskArena::free_pos`] for a slot absent from the free
+/// structure. `u32` (not `u16`) keeps the sentinel disjoint from real
+/// indices at the 65,536-slot capacity bound.
+const NOT_IN_FREE: u32 = u32::MAX;
 
 impl<T> TaskArena<T> {
     pub fn with_capacity(runtime_generation: u16, shard: u16, capacity: usize) -> Self {
@@ -92,9 +111,11 @@ impl<T> TaskArena<T> {
             capacity <= u16::MAX as usize + 1,
             "task arena capacity exceeds key space"
         );
-        let mut free = VecDeque::with_capacity(capacity);
+        let mut free = Vec::with_capacity(capacity);
+        let mut free_pos = Vec::with_capacity(capacity);
         for slot in 0..capacity {
-            free.push_back(slot as u16);
+            free.push(slot as u16);
+            free_pos.push(slot as u32);
         }
         Self {
             runtime_generation,
@@ -102,6 +123,9 @@ impl<T> TaskArena<T> {
             slots: (0..capacity).map(|_| None).collect(),
             generations: vec![0; capacity],
             free,
+            free_pos,
+            #[cfg(test)]
+            scan_steps: 0,
             _local: PhantomData,
         }
     }
@@ -109,10 +133,12 @@ impl<T> TaskArena<T> {
     /// Reserve a vacant slot. `None` means bounded capacity is exhausted or
     /// every remaining slot has exhausted its generation space.
     pub fn reserve(&mut self) -> Option<TaskKey> {
-        while let Some(slot) = self.free.pop_front() {
+        while let Some(slot) = self.free.pop() {
+            self.note_scan(1);
+            self.free_pos[slot as usize] = NOT_IN_FREE;
             let Some(generation) = self.generations[slot as usize].checked_add(1) else {
                 // Reusing this slot would eventually recreate a stale TaskKey.
-                // Keep it out of the free list permanently instead.
+                // Keep it out of the free structure permanently instead.
                 continue;
             };
             self.generations[slot as usize] = generation;
@@ -135,6 +161,11 @@ impl<T> TaskArena<T> {
             || key.generation == 0
             || self.generations[key.slot as usize] != key.generation
             || slot.is_some()
+            // A vacant slot that is still in the free structure belongs to no
+            // live key: admitting a replayed completed key here would occupy
+            // a slot that `reserve` can still hand out, which is the
+            // resurrection the no-duplicate-slot invariant exists to prevent.
+            || self.free_pos[key.slot as usize] != NOT_IN_FREE
         {
             return false;
         }
@@ -146,15 +177,51 @@ impl<T> TaskArena<T> {
     /// message). The first key initializes a vacant slot; every reuse must
     /// advance the arena generation without wrapping, so a delayed old message
     /// cannot recreate a terminal occupant.
+    ///
+    /// O(1) worst case: the admitted slot leaves the free structure through
+    /// one indexed swap_remove, never a scan.
     pub fn insert_external(&mut self, key: TaskKey, value: T) -> bool {
         if !self.can_insert_external(key) {
             return false;
         }
         let slot_index = key.slot as usize;
         self.generations[slot_index] = key.generation;
-        self.free.retain(|free_slot| *free_slot != key.slot);
+        self.evict_from_free(slot_index);
         self.slots[slot_index] = Some(value);
         true
+    }
+
+    /// Remove `slot_index` from the free structure in O(1).
+    fn evict_from_free(&mut self, slot_index: usize) {
+        self.note_scan(1);
+        let pos = self.free_pos[slot_index];
+        if pos == NOT_IN_FREE {
+            // Vacant slot that was never re-queued (a reserved-but-dropped
+            // key): nothing to evict.
+            return;
+        }
+        debug_assert!((pos as usize) < self.free.len());
+        self.free_pos[slot_index] = NOT_IN_FREE;
+        let last = self.free.len() - 1;
+        self.free.swap_remove(pos as usize);
+        if pos as usize != last {
+            // Fix the position of the element swapped into the vacated index.
+            let moved = self.free[pos as usize] as usize;
+            self.free_pos[moved] = pos;
+        }
+    }
+
+    /// Return a just-vacated slot to the free structure in O(1).
+    fn return_to_free(&mut self, slot: u16) {
+        self.note_scan(1);
+        if self.free_pos[slot as usize] != NOT_IN_FREE {
+            // Unreachable while "occupied implies not in free" holds; the
+            // guard keeps a duplicate push structurally impossible even if a
+            // future path breaks that invariant.
+            return;
+        }
+        self.free_pos[slot as usize] = self.free.len() as u32;
+        self.free.push(slot);
     }
 
     /// Check owner-side admission without consuming the task value. This lets
@@ -197,7 +264,7 @@ impl<T> TaskArena<T> {
         }
         let value = self.slots[key.slot as usize].take();
         if value.is_some() {
-            self.free.push_back(key.slot);
+            self.return_to_free(key.slot);
         }
         value
     }
@@ -220,6 +287,53 @@ impl<T> TaskArena<T> {
         self.free.clear();
         self.free
             .extend((0..self.slots.len()).map(|slot| slot as u16));
+        self.free_pos.clear();
+        self.free_pos
+            .extend((0..self.slots.len()).map(|slot| slot as u32));
+        self.note_scan(self.slots.len());
+    }
+
+    /// Test-only scan-cost accounting: every free-structure element examined
+    /// by any arena operation is reported here. O(1) admission reports a
+    /// constant per operation; any future traversal of `free` must report its
+    /// element count through this helper so
+    /// `insert_external_storm_admission_is_constant_cost` fails if admission
+    /// ever becomes a linear scan again.
+    #[cfg(test)]
+    fn note_scan(&mut self, steps: usize) {
+        self.scan_steps += steps;
+    }
+
+    #[cfg(not(test))]
+    fn note_scan(&mut self, _steps: usize) {}
+
+    #[cfg(test)]
+    fn scanned_steps(&self) -> usize {
+        self.scan_steps
+    }
+
+    /// Test-only integrity check of the free-structure invariants:
+    /// no duplicate slots, `free_pos` agrees with `free`, and no occupied
+    /// slot is present in the free structure.
+    #[cfg(test)]
+    fn free_structure_is_consistent(&self) -> bool {
+        if self.free.len() > self.slots.len() {
+            return false;
+        }
+        let mut seen = vec![false; self.slots.len()];
+        for (pos, &slot) in self.free.iter().enumerate() {
+            if self.free_pos[slot as usize] != pos as u32 {
+                return false;
+            }
+            if seen[slot as usize] {
+                return false;
+            }
+            seen[slot as usize] = true;
+            if self.slots[slot as usize].is_some() {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn is_empty(&self) -> bool {
@@ -572,6 +686,135 @@ mod tests {
         assert!(!arena.can_insert_external(wrapped));
         assert!(!arena.insert_external(wrapped, 8));
         assert_eq!(arena.get(exhausted), None);
+    }
+
+    /// Adversarial spawn-storm regression: 20,000 interleaved external
+    /// admission/completion cycles against a production-sized (65,536-slot)
+    /// arena. This is the shape the 5 s keep-alive smoke never produces and
+    /// the T3 spawn storm does: the free structure stays near its capacity
+    /// bound for every admission, so the pre-fix `retain` scan cost
+    /// ~65,536 steps per task (~1.3e9 steps for this storm; measured
+    /// 104.6 µs/task vs tokio's 0.6 µs). Admission must stay O(1): the
+    /// test-only scan counter must remain a small constant multiple of the
+    /// operation count.
+    #[test]
+    fn insert_external_storm_admission_is_constant_cost() {
+        const RUNTIME_GENERATION: u16 = 9;
+        const CAPACITY: usize = 65_536;
+        const STORM: usize = 20_000;
+        let mut arena = TaskArena::<()>::with_capacity(RUNTIME_GENERATION, 0, CAPACITY);
+        for i in 0..STORM {
+            let slot = (i % CAPACITY) as u16;
+            // Same derivation as the production per-core counter: the slot
+            // wraps through the whole key space, the generation strictly
+            // increases per slot across wraps.
+            let generation = (i / CAPACITY + 1) as u16;
+            let key = TaskKey::new(RUNTIME_GENERATION, 0, slot, generation);
+            assert!(arena.insert_external(key, ()), "admission {i} rejected");
+            assert_eq!(arena.remove(key), Some(()));
+            if i % 1_000 == 0 {
+                // Keep the `reserve` path hot under the same counter: one
+                // executor-style reserve/insert/remove cycle.
+                let reserved = arena.reserve().expect("executor slot available");
+                assert!(arena.insert(reserved, ()));
+                assert_eq!(arena.remove(reserved), Some(()));
+            }
+        }
+        assert!(
+            arena.scanned_steps() <= 4 * STORM,
+            "free-structure scan cost {} for {STORM} admissions: O(n) admission regression",
+            arena.scanned_steps()
+        );
+        assert!(arena.is_empty());
+        assert!(arena.free_structure_is_consistent());
+    }
+
+    /// Double-free and stale-replay adversarial: the no-duplicate-slot
+    /// invariant the old `retain` enforced must hold when a completed key is
+    /// replayed through every admission path, and `reserve` must hand each
+    /// slot out exactly once.
+    #[test]
+    fn double_free_and_stale_replay_cannot_duplicate_free_slots() {
+        let mut arena = TaskArena::<u8>::with_capacity(5, 1, 4);
+        let key = TaskKey::new(5, 1, 2, 1);
+        assert!(arena.insert_external(key, 7));
+        assert_eq!(arena.remove(key), Some(7));
+        // Double free: the second remove has nothing to take and must not
+        // queue the slot twice.
+        assert_eq!(arena.remove(key), None);
+        // Stale replay through `insert`: the completed key's generation still
+        // matches the vacant slot, but the slot is already queued for
+        // `reserve`, so admission must reject the resurrection.
+        assert!(!arena.insert(key, 8));
+        // Stale replay through `insert_external`: the same-generation key is
+        // not strictly newer.
+        assert!(!arena.insert_external(key, 8));
+        assert!(arena.free_structure_is_consistent());
+
+        // Every slot is handed out exactly once, and the replayed slot comes
+        // back with a fresh generation only through `reserve`.
+        let reserved: Vec<u16> = (0..4)
+            .map(|_| arena.reserve().expect("slot available").slot)
+            .collect();
+        let mut sorted = reserved.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3]);
+        assert!(arena.reserve().is_none());
+        assert!(arena.free_structure_is_consistent());
+
+        // Reuse, complete, then replay both the old and the new key: only the
+        // first remove wins, and the slot is re-queued exactly once.
+        let replacement = TaskKey::new(5, 1, 2, 2);
+        assert!(arena.insert(replacement, 9));
+        assert_eq!(arena.remove(replacement), Some(9));
+        assert_eq!(arena.remove(replacement), None);
+        assert_eq!(arena.remove(key), None);
+        assert!(arena.free_structure_is_consistent());
+        let mut handed_out = Vec::new();
+        while let Some(reserved) = arena.reserve() {
+            handed_out.push(reserved.slot);
+        }
+        // Slots 0, 1, 3 are still held by the first drain's keys; the only
+        // slot returned to the free structure is slot 2, exactly once.
+        assert_eq!(handed_out, vec![2]);
+        assert!(arena.free_structure_is_consistent());
+    }
+
+    /// Storm + generation-exhaustion interaction: churning a slot through its
+    /// whole generation space with interleaved admission/completion must
+    /// still retire it at `u16::MAX` without wrap, while the other slot
+    /// keeps serving the storm.
+    #[test]
+    fn admission_storm_retires_slots_at_generation_exhaustion_without_wrapping() {
+        let mut arena = TaskArena::<u8>::with_capacity(4, 3, 2);
+        for generation in 1..=u16::MAX {
+            let key = TaskKey::new(4, 3, 0, generation);
+            assert!(arena.insert_external(key, 1), "generation {generation}");
+            assert_eq!(arena.remove(key), Some(1));
+            if generation % 997 == 0 {
+                // Interleave churn on the neighbouring slot so the free
+                // structure exercises middle-element eviction and re-queue.
+                let neighbour = TaskKey::new(4, 3, 1, generation / 997);
+                assert!(arena.insert_external(neighbour, 2));
+                assert_eq!(arena.remove(neighbour), Some(2));
+            }
+            if generation % 8_191 == 0 {
+                assert!(arena.free_structure_is_consistent());
+            }
+        }
+        // Slot 0 reached `u16::MAX` and is permanently retired: `reserve`
+        // must only ever return slot 1, and no wrapped key may revive slot 0.
+        let other = arena.reserve().expect("the other slot remains available");
+        assert_eq!(other.slot, 1);
+        assert!(
+            arena.reserve().is_none(),
+            "exhausted slot must stay retired"
+        );
+        let wrapped = TaskKey::new(4, 3, 0, 1);
+        assert!(!arena.can_insert_external(wrapped));
+        assert!(!arena.insert_external(wrapped, 8));
+        assert!(arena.is_empty());
+        assert!(arena.free_structure_is_consistent());
     }
 
     #[test]
