@@ -120,6 +120,41 @@ SQPOLL/DEFER opt-in ✓、send_zc 搁置 ✓、回退阶梯 ✓、multishot recv
 默认关 ✓)。唯一的新增候选:**fixed-file 注册**(Photon 自动开,我们未实现)
 ——收益中等、实现中等,列为低优先候选;不改变现有默认集。
 
+## 生态共识:八个运行时的默认集(2026-10-31,第二半调研,含 kimojio 源码核实)
+
+ Photon 之外,补齐 kimojio(Azure,2025-11,架构上与 miniss 最近的兄弟)/
+glommio / tokio-uring / ntex-neon(已归档)/ libxev 的源码级核实:
+
+- **共识默认集惊人保守**:全部八个运行时的默认 = 纯 opcode + 零或近零
+  setup flag + 阻塞 submit_and_wait。7/8 默认无 SQPOLL、无 DEFER_TASKRUN;
+  6/8 无 COOP_TASKRUN;5/8 无 registered buffers;**没有任何运行时把
+  buf ring / multishot recv / SEND_ZC 作为默认**。
+- **"全打开"不存在,而且结构性不可能**:COOP/DEFER 互斥,DEFER 要求
+  SINGLE_ISSUER 且与 SQPOLL 冲突,内核对 SQPOLL ring 清除 SINGLE_ISSUER。
+  实测上限 = 一种 taskrun 模式 **或** SQPOLL **或** IOPOLL,三者不叠加。
+- **内核风险史支持保守默认**:2023-2026 的每一波稳定树修复——DEFER 停顿
+  (6.7.x/6.8.x + liburing #1645 无界 taskwork 积压)、multishot recv 的
+  buffer 回收回归(6.1.y 至 6.13)、PBUF_RING 生命周期/ENOBUFS、SEND_ZC
+  通知/生命周期(6.9-6.12 滴灌式修复)、SQPOLL parking/sharing/teardown——
+  **恰好落在生产运行时全部 opt-in 或缺席的那部分特性集里**;零 flag 纯
+  opcode 默认集几乎没有回归史。
+- **分歧由负载解释而非口味**:glommio 与 kimojio 都常备一条 IOPOLL 副环,
+  因为它们是存储导向(可假设 NVMe poll 队列)——纯网络运行时无人这么做。
+  kimojio 的用户态 BusyPoll(默认 **Never**,即阻塞)与 libxev 的拒绝
+  IORING_TIMEOUT_UPDATE(压低内核地板)是同一权衡的两个方向:可预测延迟。
+  libxev 是全调研中最明确"为压内核地板而拒绝特性"的案例。
+- **Apache Iggy**(2026-02 生产迁移博客)选 compio 用纯 opcode +
+  IOSQE_IO_LINK、零 flag,并称 registered buffers 对普通人是"够不着的天花板"
+  ——又一例生产 thread-per-core 的保守姿态;glommio 被其评为
+  "unmaintained, too opinionated"(最后发版 2024-03,无官方声明)。
+
+**对 miniss 默认集的最终定论**:现有姿态(COOP 默认开 + 其余全 opt-in)
+已获八运行时共识背书——COOP 比其中 6/8 激进,但有自有实测(+12%/+3.34%)
+且语义不可见,保留。multishot recv + buf_ring 维持默认关(共识如此,且
+内核风险史里 multishot recv 回归贯穿 6.1.y→6.13,在目标内核 A/B 前不进
+默认)。#46 修复方向获得 kimojio 佐证:其 BusyPoll 默认 Never = 默认阻塞,
+忙轮询是显式选项——与本运行时的自适应阻塞方案同构。
+
 ## 硬件前提
 
 任何性能决策的测试环境必须是干净内核:
