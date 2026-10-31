@@ -114,3 +114,37 @@ epoll、kqueue、io-uring。
 相对 pre-unify 出现超出噪声的回退，特别是 2026-10-16 行测得的 >8KB 阻塞
 写主导负载；恢复方式是在 `BorrowedWrite` 内整条恢复 readiness arm（不做
 尺寸门控），并把测量回填此行。
+
+## 2026-10-31 执行循环空闲即阻塞：删除 flush-as-work 尾路径，busy_rounds 只计产出轮（#46 修复）
+
+**选择了什么：** `CpuCore::run` 的轮次在没有 CQE、没有就绪任务、没有跨核
+消息、没有 timer 到期时**直接进入 `park(timeout)`**（100µs 上界保留）；
+park 的 `submit_and_wait` 把 batched flush 攒下的 SQE 交给内核并事件驱动
+阻塞。`busy_rounds` 重定义为只计产出轮（poll 到任务/CQE/消息/timer），
+`MAX_BUSY_ROUNDS=96` 只保留为自唤醒任务的反饥饿兜底。mio 后端行为字节级
+不变（其 `pending_submission_count` 恒 0，被删分支在 mio 上本是死代码）。
+
+**拒绝了什么：** (1) 保留自旋地板、只调小 `MAX_BUSY_ROUNDS`——自旋烧整核
+是并发编程大忌（业主定性：满足条件唤醒，否则主动让出 CPU），调参不纠正
+"把空转当工作"的错误本身；(2) 速率/尺寸门控的自适应自旋——与过度优化
+原则一致；(3) 把批量 flush 阈值（61）改小让"flush 成为真工作"——把修复
+押在批量参数上，且增加 syscall 数。
+
+**证据：** 根因定位到 c749821 的 flush-as-work 尾路径与 batched flush 的
+碰撞：uring `flush()` 在 61-SQE 阈值以下是 no-op，"有未提交 SQE"本身成了
+永久工作，循环以 ~1µs/轮重扫空队列、永不进 park，直到 96 轮兜底。配对
+探针（Orb ka32，同会话交替）：7 worker busy:polled 25-26:1 → 0.09-0.10:1
+（其中 95% 的 busy 轮是 no-op flush 轮），CPU/万请求 214-243ms → 62-67ms
+（monoio 56.6），parks 7-8.5k/s → 20-22k/s，吞吐 +48-70%，p50 减半；
+1 worker 吞吐 +6-10%、CPU -9%、p50 改善，p99 310-567µs → 374-755µs
+（不自旋的预期唤醒抖动代价）。**验证系统缺口同步闭合**：新门禁
+`bench/scripts/park_efficiency_check.pl`（每个 polled≥1000 的核
+busy:polled ≤5 且 parks>0，缺指标即失败）接入 `bench_http.sh` 多 worker
+路径与 `just bench-multicore`，实测 main 上 RED（15-48:1）、修复上 GREEN
+（0.03-0.14:1）——当初没拦下该缺陷的正是这条缺失的断言（成因取证见
+`docs/review/defect-forensics-2026-10.md`）。
+
+**推翻条件：** 若生产出现大量自唤醒任务（timer 密集 / tick 型负载），
+使 park 唤醒延迟在 p99 上可测地差于自旋，则以该负载的测量重新评估 96 轮
+兜底与 park 超时；单 worker 饱和场景的亚毫秒 p99 抖动若触及生产 SLO，
+同上。
