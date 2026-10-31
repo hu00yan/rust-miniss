@@ -46,6 +46,10 @@ const UDP_FLOOR_ITERATIONS: usize = 2_000;
 //   MINISS_T3_SCALE=<n>
 //       Multiply every iteration count by n (default 1). Used to make an
 //       isolated phase outlast a `sample` window.
+//   MINISS_T3_WAKE_SCALE=<n>
+//       Wake-phase-only iteration multiplier (default 1): the spawn phase
+//       is capped by the 65,536-slot local admission queue so SCALE <= 3,
+//       but profiling the full-context wake phase needs a longer phase.
 //   MINISS_T3_WAKE_PACE_US=<µs>
 //       Writer pacing interval for the wake phase (default 200). Lower it to
 //       shrink the pacing share of the measured wake latency when the raw
@@ -94,6 +98,18 @@ fn scale_factor() -> usize {
         .unwrap_or(1)
 }
 
+/// Wake-phase-only multiplier (default 1). The spawn phase is capped by the
+/// 65,536-slot local admission queue, so MINISS_T3_SCALE cannot exceed 3 in
+/// the full bench; profiling the full-context wake phase needs a longer
+/// phase than that, hence this separate knob.
+fn wake_scale_factor() -> usize {
+    std::env::var("MINISS_T3_WAKE_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
 fn wake_pace_us() -> u64 {
     std::env::var("MINISS_T3_WAKE_PACE_US")
         .ok()
@@ -103,8 +119,14 @@ fn wake_pace_us() -> u64 {
 
 /// Marker for profiling drivers: emitted only when a phase is isolated
 /// (MINISS_T3_ONLY set), so the default run's stdout stays unchanged.
-fn phase_marker(msg: &str) {
-    println!("T3 [phase {msg}]");
+/// Phase markers go to stderr (unbuffered, so a profiling driver can attach
+/// a sampler while the phase is still running) and ONLY when a diagnostic
+/// knob is active: with no env var set, stdout AND stderr are byte-identical
+/// to the pre-tooling bench.
+fn phase_marker(markers: bool, msg: &str) {
+    if markers {
+        eprintln!("T3 [phase {msg}]");
+    }
 }
 
 struct BenchReport {
@@ -120,6 +142,7 @@ struct BenchReport {
 fn main() {
     let phase = selected_phase();
     let scale = scale_factor();
+    let wake_scale = wake_scale_factor();
     let pace_us = wake_pace_us();
     let backend = if cfg!(io_backend = "io_uring") {
         "io_uring"
@@ -169,7 +192,7 @@ fn main() {
         .spawn_on(0, {
             let tx = tx.clone();
             async move {
-                let report = run_bench(runtime_for_bench, phase, scale, pace_us).await;
+                let report = run_bench(runtime_for_bench, phase, scale, wake_scale, pace_us).await;
                 let _ = tx.send(report);
             }
         })
@@ -378,12 +401,16 @@ async fn run_bench(
     runtime: Arc<MultiCoreRuntime>,
     phase: Phase,
     scale: usize,
+    wake_scale: usize,
     wake_pace_us: u64,
 ) -> BenchReport {
+    // Markers are diagnostics: emit them iff any knob deviates from the
+    // default so the plain run's output streams stay byte-identical.
+    let markers = phase != Phase::All || scale != 1 || wake_scale != 1 || wake_pace_us != 200;
     let spawns = SPAWN_BASE_TASKS * scale;
     let churn_connections = CHURN_CONNECTIONS * scale;
     let concurrent_connections = CONCURRENT_CONNECTIONS * scale;
-    let wake_iterations = WAKE_ITERATIONS * scale;
+    let wake_iterations = WAKE_ITERATIONS * scale * wake_scale;
 
     let mut report = BenchReport {
         spawn_baseline_us: 0.0,
@@ -398,9 +425,9 @@ async fn run_bench(
     // Isolated spawn phase: measures the bare executor with no QUIC
     // endpoints in the process at all.
     if phase == Phase::Spawn {
-        phase_marker("spawn begin");
+        phase_marker(markers, "spawn begin");
         report.spawn_baseline_us = spawn_baseline(&runtime, spawns).await;
-        phase_marker("spawn end");
+        phase_marker(markers, "spawn end");
         report.idle_cpu_fraction = idle_cpu_probe();
         return report;
     }
@@ -456,20 +483,14 @@ async fn run_bench(
         // 1. Spawn baseline: spawn + poll + drop of an immediately-completing
         // task, measured from spawn start until every task ran.
         if matches!(phase, Phase::All | Phase::Spawn) {
-            if phase != Phase::All {
-                phase_marker("spawn begin");
-            }
+            phase_marker(markers, "spawn begin");
             report.spawn_baseline_us = spawn_baseline(&runtime, spawns).await;
-            if phase != Phase::All {
-                phase_marker("spawn end");
-            }
+            phase_marker(markers, "spawn end");
         }
 
         // 2. Sequential handshake churn.
         if matches!(phase, Phase::All | Phase::Churn) {
-            if phase != Phase::All {
-                phase_marker("seq churn begin");
-            }
+            phase_marker(markers, "seq churn begin");
             let mut sequential_samples = Vec::with_capacity(churn_connections);
             for _ in 0..churn_connections {
                 let start = Instant::now();
@@ -486,9 +507,7 @@ async fn run_bench(
             }
             report.sequential_churn_us =
                 sequential_samples.iter().sum::<f64>() / sequential_samples.len() as f64;
-            if phase != Phase::All {
-                phase_marker("seq churn end");
-            }
+            phase_marker(markers, "seq churn end");
             rust_miniss::timer::sleep(Duration::from_millis(100)).await;
         }
 
@@ -520,21 +539,13 @@ async fn run_bench(
             }
         };
         if matches!(phase, Phase::All | Phase::Churn) {
-            if phase != Phase::All {
-                phase_marker("conc churn c8 begin");
-            }
+            phase_marker(markers, "conc churn c8 begin");
             report.concurrent_c8_us = concurrent(&client, 8).await;
-            if phase != Phase::All {
-                phase_marker("conc churn c8 end");
-            }
+            phase_marker(markers, "conc churn c8 end");
             rust_miniss::timer::sleep(Duration::from_millis(100)).await;
-            if phase != Phase::All {
-                phase_marker("conc churn c32 begin");
-            }
+            phase_marker(markers, "conc churn c32 begin");
             report.concurrent_c32_us = concurrent(&client, 32).await;
-            if phase != Phase::All {
-                phase_marker("conc churn c32 end");
-            }
+            phase_marker(markers, "conc churn c32 end");
             rust_miniss::timer::sleep(Duration::from_millis(100)).await;
         }
 
@@ -542,9 +553,7 @@ async fn run_bench(
         // serves the wake phase (the churn acceptor drops every churn
         // connection by design, which would close these two).
         if matches!(phase, Phase::All | Phase::Wake) {
-            if phase != Phase::All {
-                phase_marker("wake begin");
-            }
+            phase_marker(markers, "wake begin");
             let server2 = quinn::Endpoint::new(
                 Default::default(),
                 Some(server_config(&cert, &key)),
@@ -642,9 +651,7 @@ async fn run_bench(
             wake_samples.sort_unstable();
             report.wake_p50_us = wake_samples[wake_samples.len() / 2] as f64;
             report.wake_p99_us = wake_samples[(wake_samples.len() as f64 * 0.99) as usize] as f64;
-            if phase != Phase::All {
-                phase_marker("wake end");
-            }
+            phase_marker(markers, "wake end");
         }
     }
 
