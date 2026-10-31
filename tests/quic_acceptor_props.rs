@@ -848,3 +848,157 @@ fn inv4_metrics_fold_and_generator_truth() {
     drop(server_handles);
     guard.finish_quiescent("inv4");
 }
+
+/// INV-7 (sim): with the A5 profile's bounded windows, a transfer whose
+/// receiver reads late still completes, and the network-side backlog the
+/// sim observes stays inside the documented per-endpoint memory formula.
+#[test]
+fn inv7_profile_bounds_sim() {
+    use rust_miniss::quic::profile::{
+        memory_bound_bytes, recommended_transport_config, QuicSocketBuffers,
+    };
+
+    let net = SimNetwork::new(SimFaultSchedule {
+        seed: 11,
+        delay: (Duration::from_millis(2), Duration::from_millis(1)),
+        ..SimFaultSchedule::default()
+    });
+    let (cert, key) = certs();
+    let buffers = QuicSocketBuffers::default();
+
+    let scenario_net = net.clone();
+    let peak = net
+        .drive(Duration::from_secs(90), async move {
+            let net = &scenario_net;
+            let key = key.clone_key();
+            let (socket, server_addr) = net.bind();
+            let server = quinn::Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                Some(sim_server_config(
+                    &cert,
+                    &key,
+                    Arc::new(recommended_transport_config()),
+                )),
+                socket,
+                net.runtime(),
+            )
+            .expect("profiled sim server endpoint");
+            let server_for_close = server.clone();
+
+            // The receiver accepts connections but reads after the writers
+            // finished: the written bytes sit in quinn's buffers, bounded
+            // by the profile windows.
+            let server_task = async move {
+                let mut acceptor =
+                    QuicAcceptor::new(server, Arc::new(rust_miniss::quic::QuicLimits::default()));
+                let mut bodies = Vec::new();
+                for _ in 0..2 {
+                    let connection = acceptor.next_connection().await.expect("connection");
+                    let body = connection
+                        .accept_uni()
+                        .await
+                        .expect("stream accept")
+                        .read_to_end(2 * 1024 * 1024)
+                        .await
+                        .expect("late read");
+                    bodies.push(body.len());
+                    drop(connection);
+                }
+                bodies
+            };
+
+            let clients_task = async {
+                for _ in 0..2 {
+                    let mut client = quic_sim::sim_client_endpoint(net, cert.clone());
+                    client.set_default_client_config(sim_client_config(
+                        &cert,
+                        // The client uses the same bounded profile.
+                        Arc::new(recommended_transport_config()),
+                    ));
+                    let connection = net
+                        .sim_timeout(
+                            SCENARIO_BOUND,
+                            client.connect(server_addr, "localhost").expect("connect"),
+                        )
+                        .await
+                        .expect("handshake bounded")
+                        .expect("handshake ok");
+                    // One 64 KiB stream per connection: well inside the
+                    // 16 MiB connection window, so the writer never blocks.
+                    let mut send = connection.open_uni().await.expect("open uni");
+                    let payload: Vec<u8> = (0..(64 * 1024)).map(|o| o as u8).collect();
+                    send.write_all(&payload).await.expect("write");
+                    send.finish().expect("finish");
+                    // Hold the connection until the server read and closed.
+                    let _ = net
+                        .sim_timeout(Duration::from_secs(10), connection.closed())
+                        .await;
+                    drop(connection);
+                    drop(client);
+                }
+            };
+
+            let (bodies, ()) = futures::future::join(server_task, clients_task).await;
+            assert_eq!(bodies, vec![64 * 1024, 64 * 1024], "late reads corrupted");
+            server_for_close.close(0u32.into(), b"inv7 done");
+            server_for_close.close(0u32.into(), b"inv7 done");
+            net.advance(Duration::from_secs(2));
+            net.counters().peak_unread_socket_bytes
+        })
+        .expect("INV-7 sim scenario completes");
+
+    let bound = memory_bound_bytes(&buffers, 8);
+    assert!(
+        peak <= bound,
+        "INV-7: sim network backlog {peak} exceeded the documented bound {bound}"
+    );
+}
+
+/// A5/S5: the socket buffer configuration is honored by the wrapped
+/// sockets — getsockopt returns at least the configured sizes (the Linux
+/// kernel reports doubled SO_SNDBUF values, macOS the requested ones).
+#[test]
+fn socket_buffers_are_configurable() {
+    use rust_miniss::quic::profile::QuicSocketBuffers;
+    use std::os::fd::AsRawFd;
+
+    let runtime = rust_miniss::MultiCoreRuntime::new(Some(1)).expect("runtime");
+    let configured = QuicSocketBuffers {
+        send_bytes: 1024 * 1024,
+        recv_bytes: 2 * 1024 * 1024,
+    };
+    let quic_runtime =
+        rust_miniss::quic::MinissQuicRuntime::with_socket_buffers(Arc::clone(&runtime), configured);
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let wrapped =
+        quinn::Runtime::wrap_udp_socket(&quic_runtime, socket.try_clone().expect("clone"))
+            .expect("wrap");
+    let _ = wrapped.local_addr().expect("addr");
+
+    for (option, expected) in [
+        (libc::SO_SNDBUF, configured.send_bytes),
+        (libc::SO_RCVBUF, configured.recv_bytes),
+    ] {
+        let mut actual: libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&actual) as libc::socklen_t;
+        // SAFETY: `socket` owns a live descriptor and the output arguments
+        // are writable for the duration of getsockopt.
+        let ret = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                &mut actual as *mut _ as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        assert_eq!(ret, 0, "getsockopt failed");
+        assert!(
+            actual >= expected,
+            "socket buffer for option {option} was {actual}, expected at least {expected}"
+        );
+    }
+    runtime
+        .shutdown_with_timeout(Duration::from_secs(2))
+        .expect("shutdown");
+}

@@ -21,19 +21,37 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub mod acceptor;
+pub mod profile;
 pub mod shutdown;
 pub mod stats;
 
 pub use acceptor::{AcceptDecision, AcceptorCounters, QuicAcceptor, QuicLimits};
+pub use profile::{recommended_transport_config, QuicSocketBuffers};
 
 #[derive(Clone)]
 pub struct MinissQuicRuntime {
     runtime: Arc<MultiCoreRuntime>,
+    socket_buffers: QuicSocketBuffers,
 }
 
 impl MinissQuicRuntime {
     pub fn new(runtime: Arc<MultiCoreRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            socket_buffers: QuicSocketBuffers::default(),
+        }
+    }
+
+    /// A5: configure the per-endpoint socket buffers instead of the 4 MiB
+    /// per-direction default.
+    pub fn with_socket_buffers(
+        runtime: Arc<MultiCoreRuntime>,
+        socket_buffers: QuicSocketBuffers,
+    ) -> Self {
+        Self {
+            runtime,
+            socket_buffers,
+        }
     }
 
     pub fn runtime(&self) -> &Arc<MultiCoreRuntime> {
@@ -69,7 +87,7 @@ impl QuinnRuntimeTrait for MinissQuicRuntime {
     }
 
     fn wrap_udp_socket(&self, socket: UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-        Ok(Arc::new(MinissUdpSocket::new(socket)?))
+        Ok(Arc::new(MinissUdpSocket::new(socket, self.socket_buffers)?))
     }
 
     fn now(&self) -> Instant {
@@ -128,7 +146,6 @@ pub struct MinissUdpSocket {
 }
 
 const UNOWNED_CORE: usize = usize::MAX;
-const QUIC_UDP_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
 
 /// Record the shard that owns `slot` when it is first claimed, so that a later
 /// drop from another thread still knows where a pending operation must be
@@ -183,9 +200,12 @@ fn retire_token(owner_shard: &OnceLock<CoreHandle>, reserved: &AtomicBool, token
 }
 
 impl MinissUdpSocket {
-    fn new(socket: UdpSocket) -> io::Result<Self> {
+    fn new(socket: UdpSocket, buffers: QuicSocketBuffers) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
-        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        for (option, size) in [
+            (libc::SO_SNDBUF, buffers.send_bytes),
+            (libc::SO_RCVBUF, buffers.recv_bytes),
+        ] {
             // SAFETY: the descriptor belongs to `socket`, and `size` remains
             // valid for the duration of the synchronous setsockopt call.
             let result = unsafe {
@@ -193,8 +213,8 @@ impl MinissUdpSocket {
                     socket.as_raw_fd(),
                     libc::SOL_SOCKET,
                     option,
-                    &QUIC_UDP_BUFFER_SIZE as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&QUIC_UDP_BUFFER_SIZE) as libc::socklen_t,
+                    &size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&size) as libc::socklen_t,
                 )
             };
             if result != 0 {
@@ -583,8 +603,11 @@ mod tests {
     fn cross_shard_socket_drop_retires_under_full_inbox_pressure() {
         let runtime = MultiCoreRuntime::new(Some(2)).expect("two worker shards");
         let socket = Arc::new(
-            MinissUdpSocket::new(UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"))
-                .expect("create miniss UDP socket"),
+            MinissUdpSocket::new(
+                UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"),
+                QuicSocketBuffers::default(),
+            )
+            .expect("create miniss UDP socket"),
         );
         let (setup_tx, setup_rx) = std::sync::mpsc::channel();
         runtime
@@ -683,8 +706,11 @@ mod tests {
     fn udp_socket_and_poller_reject_foreign_shards() {
         let runtime = MultiCoreRuntime::new(Some(2)).expect("two worker shards");
         let socket = Arc::new(
-            MinissUdpSocket::new(UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"))
-                .expect("create miniss UDP socket"),
+            MinissUdpSocket::new(
+                UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"),
+                QuicSocketBuffers::default(),
+            )
+            .expect("create miniss UDP socket"),
         );
         let poller = Arc::new(MinissUdpPoller::new(socket.clone()));
 
@@ -752,8 +778,11 @@ mod tests {
     fn dropping_owner_socket_drains_pending_receive() {
         let runtime = MultiCoreRuntime::new(Some(1)).expect("worker shard");
         let socket = Arc::new(
-            MinissUdpSocket::new(UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"))
-                .expect("create miniss UDP socket"),
+            MinissUdpSocket::new(
+                UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket"),
+                QuicSocketBuffers::default(),
+            )
+            .expect("create miniss UDP socket"),
         );
         let (tx, rx) = oneshot::channel();
         runtime
