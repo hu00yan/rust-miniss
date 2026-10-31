@@ -120,6 +120,11 @@ path = "bench/internal/scheduling_throughput.rs"
 harness = false
 
 [[bench]]
+name = "spawn_admission_storm"
+path = "bench/internal/spawn_admission_storm.rs"
+harness = false
+
+[[bench]]
 name = "perf_benchmark"
 path = "bench/criterion/perf_benchmark.rs"
 harness = false
