@@ -58,6 +58,11 @@ EOF
     echo "registered http-perf-server-mc target + link block"
 fi
 
+# 2b. relax photon's -Werror for toolchains newer than what upstream CI uses
+#     (warnings-only change, no behavioral effect; no-op when already applied)
+sed -i 's/photon_cc_options(-Werror -Wall -Wno-error=pragmas)/photon_cc_options(-Wall -Wno-error=pragmas)/' \
+    CMake/photon-helpers.cmake
+
 # 3. configure (only if the build dir does not exist yet)
 if [[ ! -f build/CMakeCache.txt ]]; then
     cmake -S . -B build \
