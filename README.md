@@ -61,3 +61,37 @@ API and the optional Prometheus example in `examples/metrics_export.rs`.
 Performance is tracked as reproducible Linux snapshots, not as a permanent
 throughput claim. See the [2026-07-15 source matrix](docs/review/performance-baseline-2026-07-14.md)
 and the [latest same-host A/B record](docs/review/performance-baseline-2026-10-15-vm.md).
+
+## Environment variables
+
+The I/O backend is selected at build time (`MINISS_IO_BACKEND`, see `build.rs`).
+On the io_uring backend every setup feature takes a three-state runtime knob
+read once per ring construction — `auto` (the documented default plus the
+documented fallback, never failing setup), `on` (unconditional; loud failure on
+a kernel that predates the feature, never a silent downgrade), `off`:
+
+| Variable | Kernel | Default | Feature |
+|---|---|---|---|
+| `MINISS_URING_COOP_TASKRUN` | 5.19+ | `auto` → on | `IORING_SETUP_COOP_TASKRUN`, plain-builder fallback |
+| `MINISS_URING_DEFER_TASKRUN` | 6.1+ | `auto` → off | `IORING_SETUP_DEFER_TASKRUN` |
+| `MINISS_URING_SINGLE_ISSUER` | 6.0+ | `auto` → off | `IORING_SETUP_SINGLE_ISSUER` |
+| `MINISS_URING_SQPOLL` | 5.1+ | `auto` → off | `IORING_SETUP_SQPOLL` (one kernel thread per ring) |
+| `MINISS_URING_MULTISHOT_RECV` | 6.0+ | `auto` → off | long-lived multishot receive arms; promotes the provided buffer ring as its inseparable pair |
+
+Contradictions the kernel rejects (or that would silently change the requested
+semantics) fail construction with a structured error naming the requested
+flags, the kernel constraint verbatim, and the minimum kernel versions;
+`auto` resolves conflicts by yielding and every auto resolution is logged at
+construction. Legacy spellings keep working (`=1`/`=0` on every knob,
+`MINISS_URING_NO_COOP_TASKRUN` as the COOP opt-out, `MINISS_URING_BUF_RING`
+for registering the provided buffer ring alone). On the epoll/kqueue backends
+these knobs are inert. See
+[the io_uring feature policy](docs/review/io-uring-feature-policy.md) for the
+constraint table and the decision history.
+
+Other knobs: `MINISS_URING_ENTRIES` (ring size, clamped to `[64, 32768]`),
+`MINISS_URING_BUF_RING_COUNT` / `MINISS_URING_BUF_RING_SIZE` (provided
+buffer-ring geometry), `MINISS_URING_FLUSH_BATCH_SIZE` /
+`MINISS_URING_DRAIN_BATCH_SIZE` (submission/completion batching),
+`MINISS_METRICS_INTERVAL_MS` (metrics aggregation interval),
+`MINISS_PARK_TIMEOUT_US`, `MINISS_TASK_POLL_BUDGET`, `MINISS_IO_DRAIN_LIMIT`.

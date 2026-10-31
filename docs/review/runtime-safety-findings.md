@@ -599,3 +599,24 @@ are not silently mixed into the implementation batch.
     `bench-smoke` compares HTTP throughput/p99. Coordinator note: the hyper
     /framer close32 re-measurement happens on the merged result, not on this
     branch.
+
+48. **Orb VM kernel update breaks three multishot recv tests on `main`**
+    (found 2026-10-31, `feat/uring-feature-knobs` spot-check). On
+    OrbStack kernel `7.2.12-orbstack-00394-gbecdd6130068` (built 2026-10-22,
+    newer than the kernel the 2026-10-29 multishot row was validated on),
+    `MINISS_IO_BACKEND=io_uring cargo test --lib -- --test-threads=1` fails
+    with `pending op ledger imbalance at io_uring drain tail:
+    acquired=1 released=0 in_flight=0` in exactly three tests:
+    `multishot_cancel_republishes_held_buffers_and_signals_termination`,
+    `multishot_peer_close_posts_eof_marker_and_releases_the_slot`,
+    `multishot_ring_exhaustion_terminates_arm_and_republishes_on_pop`.
+    Baseline comparison: identical failures on `main` at b96cb24 (182
+    passed / 4 failed; `quic::tests::cross_shard_socket_drop_retires_under_
+    full_inbox_pressure` also failed once per branch, flaky), so the
+    regressions predate the feature-knob work and are environmental
+    (kernel/VM), not code. The net-level multishot round-trip tests and
+    `multishot_capability_requires_buffer_ring_and_kernel_support` pass on
+    the same kernel, so the defect is narrow. Backend recorded per test
+    hygiene: io_uring backend, OrbStack arm64 VM. Do not mask by weakening
+    the ledger assertion; re-run on a clean kernel (gcloud 6.18+) or after
+    the next OrbStack kernel update before treating it as a code defect.

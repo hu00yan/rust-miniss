@@ -4,6 +4,9 @@
 
 use crate::buffer::Buffer;
 use crate::io::buf_ring::BufRing;
+use crate::io::uring_features::{
+    legacy_buf_ring_from_env, resolve_uring_flags, FeatureKnob, FeatureRequest, ResolvedFlags,
+};
 use crate::io::{
     CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op, MULTISHOT_ARM_TERMINATED,
     MULTISHOT_BUF_GROUP,
@@ -203,66 +206,20 @@ fn write_entry_for_descriptor(
     }
 }
 
-/// Resolve the mutually-constrained taskrun setup flags into what the kernel
-/// will actually accept.
-///
-/// Kernel rules (io_uring_setup(2)): DEFER_TASKRUN requires SINGLE_ISSUER and
-/// is an *alternative* to COOP_TASKRUN — the two taskrun modes cannot be
-/// combined, so requesting DEFER promotes SINGLE_ISSUER and drops COOP.
-/// SQPOLL cannot combine with DEFER_TASKRUN at all; the SQPOLL caller passes
-/// `defer_requested = false` and warns instead of failing setup.
-fn resolve_taskrun_flags(
-    coop_requested: bool,
-    defer_requested: bool,
-    single_issuer_requested: bool,
-) -> (bool, bool, bool) {
-    if defer_requested {
-        (true, false, true)
-    } else {
-        (single_issuer_requested, coop_requested, false)
-    }
-}
-
 /// Multishot accept was added in Linux 5.19. The opcode probe alone cannot
 /// report SQE flag support, so gate the flag on the running kernel release and
 /// retain the single-shot fallback for unknown/malformed releases.
 fn kernel_supports_multishot_accept() -> bool {
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .or_else(|_| std::fs::read_to_string("/proc/version"))
-        .ok();
-    let Some(release) = release else {
-        return false;
-    };
-    let mut numbers = release
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse::<u32>().ok());
-    let Some(major) = numbers.next() else {
-        return false;
-    };
-    let minor = numbers.next().unwrap_or(0);
-    major > 5 || (major == 5 && minor >= 19)
+    crate::io::uring_features::probe_kernel_release()
+        .is_some_and(|(major, minor)| (major, minor) >= (5, 19))
 }
 
 /// Multishot receive (`IORING_RECV_MULTISHOT` on `IORING_OP_RECV`) landed in
 /// Linux 6.0, one release after the provided buffer ring it depends on. Same
 /// release-file gate as [`kernel_supports_multishot_accept`].
 fn kernel_supports_multishot_recv() -> bool {
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .or_else(|_| std::fs::read_to_string("/proc/version"))
-        .ok();
-    let Some(release) = release else {
-        return false;
-    };
-    let mut numbers = release
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse::<u32>().ok());
-    let Some(major) = numbers.next() else {
-        return false;
-    };
-    let _minor = numbers.next().unwrap_or(0);
-    major >= 6
+    crate::io::uring_features::probe_kernel_release()
+        .is_some_and(|(major, minor)| (major, minor) >= (6, 0))
 }
 
 /// Default number of buffers in the provided buffer ring.
@@ -270,14 +227,17 @@ const DEFAULT_BUF_RING_COUNT: u16 = 256;
 /// Default per-buffer size in the provided buffer ring.
 const DEFAULT_BUF_RING_SIZE: usize = 4096;
 
-/// Explicit feature switches for the io_uring backend.
+/// Explicit feature switches for the io_uring backend (programmatic API).
 ///
-/// Both feature flags default to off. `new()` derives them from the
-/// environment (`MINISS_URING_BUF_RING`, `MINISS_URING_BUF_RING_COUNT`,
-/// `MINISS_URING_BUF_RING_SIZE`, `MINISS_URING_MULTISHOT_RECV`); tests and
-/// embedders construct backends directly via
-/// [`UringBackend::new_with_options`] so feature state never leaks through
-/// process-global environment reads.
+/// Both feature flags default to off. `new()` derives the full feature set
+/// from the environment through the three-state feature knobs
+/// (`MINISS_URING_<FEATURE>=auto|on|off`, see
+/// `crate::io::uring_features`); tests and embedders construct backends
+/// directly via [`UringBackend::new_with_options`] so feature state never
+/// leaks through process-global environment reads. An explicit
+/// `multishot_recv: true` is an `on` request: it promotes the provided
+/// buffer ring (the inseparable pair) and fails loudly on kernels predating
+/// multishot receive instead of silently serving single-shot reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UringOptions {
     /// Register one provided buffer ring (group id 1) per backend at
@@ -289,7 +249,8 @@ pub struct UringOptions {
     /// Bytes per buffer in the provided buffer ring.
     pub buf_ring_size: usize,
     /// Serve `AsyncTcpStream::read_rent` from long-lived multishot receive
-    /// arms. Requires `buf_ring`; without it this flag has no effect.
+    /// arms. Inseparable from the provided buffer ring: the resolver
+    /// promotes the ring whenever this is on.
     pub multishot_recv: bool,
 }
 
@@ -305,16 +266,15 @@ impl Default for UringOptions {
 }
 
 impl UringOptions {
-    /// Read the opt-in environment switches. The feature flags require the
-    /// literal value `1`; the geometry knobs accept any positive number.
+    /// Read the environment geometry and the legacy buffer-ring switch.
+    ///
+    /// The feature knobs (`MINISS_URING_<FEATURE>=auto|on|off`, including
+    /// the legacy `MINISS_URING_MULTISHOT_RECV=1`) are parsed once by
+    /// [`FeatureRequest::from_env`]; this constructor only owns the buffer
+    /// ring geometry and the legacy `MINISS_URING_BUF_RING` binary switch.
     fn from_env() -> Self {
         let mut options = Self {
-            buf_ring: std::env::var("MINISS_URING_BUF_RING")
-                .map(|value| value == "1")
-                .unwrap_or(false),
-            multishot_recv: std::env::var("MINISS_URING_MULTISHOT_RECV")
-                .map(|value| value == "1")
-                .unwrap_or(false),
+            buf_ring: legacy_buf_ring_from_env(),
             ..Self::default()
         };
         if let Ok(count) = std::env::var("MINISS_URING_BUF_RING_COUNT") {
@@ -332,6 +292,28 @@ impl UringOptions {
             }
         }
         options
+    }
+}
+
+impl FeatureRequest {
+    /// The explicit-constructor mapping: the `UringOptions` booleans become
+    /// feature requests (`multishot_recv: true` is an `on` request),
+    /// everything else stays at its `auto` default, and the kernel release
+    /// is probed for the version gates.
+    fn from_options(options: &UringOptions) -> Self {
+        Self {
+            coop_taskrun: FeatureKnob::Auto,
+            defer_taskrun: FeatureKnob::Auto,
+            single_issuer: FeatureKnob::Auto,
+            sqpoll: FeatureKnob::Auto,
+            multishot_recv: if options.multishot_recv {
+                FeatureKnob::On
+            } else {
+                FeatureKnob::Auto
+            },
+            legacy_buf_ring: options.buf_ring,
+            kernel_release: crate::io::uring_features::probe_kernel_release(),
+        }
     }
 }
 
@@ -390,6 +372,12 @@ pub struct UringBackend {
     park_flushes: Cell<u64>,
     park_flush_total_us: Cell<u64>,
     max_park_flush_us: Cell<u64>,
+    /// The resolved feature flags for this ring (see
+    /// `crate::io::uring_features`): construction-time resolutions — auto
+    /// defaults, conflict drops, pair promotions — stay visible after the
+    /// fact. Shard-local, immutable after construction; read through
+    /// [`UringBackend::resolved_features`].
+    resolved_features: ResolvedFlags,
     /// Acquire/release ledger for descriptor leases and pending ops. Plain
     /// `Cell` counters mutated only by this owner thread; see
     /// [`crate::io::ResourceLedger`] for the balance equations asserted at
@@ -409,6 +397,14 @@ const FLUSH_BATCH_SIZE: usize = 61;
 const MAX_COMPLETIONS_PER_DRAIN: usize = 256;
 
 impl UringBackend {
+    /// The resolved feature flags for this ring (see
+    /// `crate::io::uring_features`): the flags the kernel actually got, plus
+    /// every recorded auto-resolution — construction-time diagnostics that
+    /// stay readable after the fact.
+    pub fn resolved_features(&self) -> &ResolvedFlags {
+        &self.resolved_features
+    }
+
     #[inline]
     fn descriptor_fd(op: &Op) -> Option<RawFd> {
         match op {
@@ -685,20 +681,39 @@ impl UringBackend {
 
     pub fn new(entries: u32) -> io::Result<Self> {
         // Environment switches are read exactly here, as the default source
-        // for the explicit `UringOptions` constructor below.
-        Self::new_with_options(entries, UringOptions::from_env())
+        // for the explicit constructors below: geometry + the legacy
+        // buffer-ring switch into `UringOptions`, the five three-state
+        // feature knobs into `FeatureRequest`.
+        let options = UringOptions::from_env();
+        let request = FeatureRequest::from_env();
+        Self::new_with_features(entries, options, request)
     }
 
-    /// Construct a backend with explicit feature switches.
+    /// Construct a backend with explicit feature switches (no environment
+    /// reads).
     ///
-    /// `options.buf_ring` mmaps + registers one provided buffer ring
-    /// (group id 1, `options.buf_ring_count` buffers of
-    /// `options.buf_ring_size` bytes). Registration failure — the typical
+    /// The feature knobs resolve at their `auto` defaults — `COOP_TASKRUN`
+    /// on (with the plain-builder fallback), everything else off — plus the
+    /// explicit `options` switches: `options.buf_ring` mmaps + registers one
+    /// provided buffer ring (group id 1, `options.buf_ring_count` buffers of
+    /// `options.buf_ring_size` bytes), registration failure — the typical
     /// cause is a kernel older than 5.19 — logs a warning and leaves the
-    /// feature off instead of failing backend creation, mirroring the
-    /// COOP_TASKRUN fallback. `options.multishot_recv` additionally requires
-    /// the buffer ring and kernel 6.0+.
+    /// feature off; `options.multishot_recv` is an `on` request that
+    /// promotes the buffer ring (the inseparable pair) and fails loudly on
+    /// kernels predating multishot receive. See
+    /// `crate::io::uring_features` for the knob semantics.
     pub fn new_with_options(entries: u32, options: UringOptions) -> io::Result<Self> {
+        Self::new_with_features(entries, options, FeatureRequest::from_options(&options))
+    }
+
+    /// The one construction path: explicit options + an explicit feature
+    /// request, resolved through the single table-driven
+    /// [`resolve_uring_flags`] before any ring exists.
+    fn new_with_features(
+        entries: u32,
+        options: UringOptions,
+        request: FeatureRequest,
+    ) -> io::Result<Self> {
         let flush_batch_size = std::env::var("MINISS_URING_FLUSH_BATCH_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -709,63 +724,55 @@ impl UringBackend {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(MAX_COMPLETIONS_PER_DRAIN);
-        fn base_builder(
-            enable_coop_taskrun: bool,
-            enable_defer_taskrun: bool,
-        ) -> io_uring::Builder {
-            let mut builder = IoUring::builder();
-            // Keep optional flags explicit so each one has an isolated
-            // benchmark and an unsupported-kernel fallback. The flags are NOT
-            // freely combinable at the kernel level; resolve_taskrun_flags
-            // below owns that policy so an invalid combination cannot reach
-            // the kernel.
-            let (single_issuer, coop, defer) = resolve_taskrun_flags(
-                enable_coop_taskrun,
-                enable_defer_taskrun,
-                std::env::var_os("MINISS_URING_SINGLE_ISSUER").is_some(),
-            );
-            if single_issuer {
-                builder.setup_single_issuer();
+        let resolved = match resolve_uring_flags(&request) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // Setup-time structured refusal: names the requested flags,
+                // the kernel constraint verbatim, and the minimum kernel
+                // versions (see `FeatureError`).
+                tracing::error!("io_uring feature setup refused: {error}");
+                return Err(error.into());
             }
-            if coop {
-                builder.setup_coop_taskrun();
-            }
-            if defer {
-                builder.setup_defer_taskrun();
-            }
-            builder
+        };
+        // Surface the resolution so runtime behavior is never silently
+        // different from flags-as-asked (owner decision 2026-10-31: no
+        // silent auto-resolution).
+        tracing::info!("io_uring features resolved: {resolved}");
+        for resolution in &resolved.resolutions {
+            tracing::info!("io_uring feature resolution: {resolution}");
         }
 
-        // COOP_TASKRUN lets the kernel run deferred io_uring work at natural
-        // ring transitions instead of forcing extra task-work interrupts. It
-        // is safe to request on modern kernels and falls back cleanly when the
-        // running kernel rejects the setup flag.
-        let enable_coop_taskrun = std::env::var_os("MINISS_URING_NO_COOP_TASKRUN").is_none();
-        let enable_defer_taskrun = std::env::var_os("MINISS_URING_DEFER_TASKRUN").is_some();
-
-        let (ring, sqpoll_enabled) = if std::env::var_os("MINISS_URING_SQPOLL").is_some() {
-            // The kernel disallows DEFER_TASKRUN alongside SQPOLL (the SQPOLL
-            // thread is the issuer); drop DEFER for this ring instead of
-            // failing setup. The standalone DEFER experiment is run without
-            // SQPOLL.
-            if enable_defer_taskrun {
-                tracing::warn!("MINISS_URING_SQPOLL with DEFER_TASKRUN: kernel rejects the pair, running SQPOLL without DEFER");
-            }
-            let mut builder = base_builder(enable_coop_taskrun, false);
-            builder.setup_sqpoll(1000);
-            match builder.build(entries) {
-                Ok(ring) => (ring, true),
-                Err(err) => {
-                    tracing::warn!("io_uring SQPOLL unavailable, falling back: {err}");
-                    (base_builder(false, false).build(entries)?, false)
-                }
-            }
+        // The resolver owns every combination rule (CONSTRAINT_TABLE in
+        // src/io/uring_features.rs), so this builder only applies the
+        // resolved flags.
+        let mut builder = IoUring::builder();
+        if resolved.single_issuer {
+            builder.setup_single_issuer();
+        }
+        if resolved.coop_taskrun {
+            builder.setup_coop_taskrun();
+        }
+        if resolved.defer_taskrun {
+            builder.setup_defer_taskrun();
+        }
+        let (ring, sqpoll_enabled) = if resolved.sqpoll {
+            // SQPOLL is explicit-on only (auto resolves off): setup failures
+            // propagate instead of degrading to a plain ring.
+            (builder.setup_sqpoll(1000).build(entries)?, true)
         } else {
-            match base_builder(enable_coop_taskrun, enable_defer_taskrun).build(entries) {
+            match builder.build(entries) {
                 Ok(ring) => (ring, false),
-                Err(error) if enable_coop_taskrun || enable_defer_taskrun => {
-                    tracing::warn!("io_uring taskrun flags unavailable, using plain ring: {error}");
-                    (base_builder(false, false).build(entries)?, false)
+                // Auto fallback ladder (the COOP_TASKRUN default-on
+                // precedent): retry a plain builder only when the taskrun
+                // flags came from `auto`. An explicit request never degrades
+                // silently.
+                Err(error)
+                    if resolved.coop_taskrun && request.coop_taskrun == FeatureKnob::Auto =>
+                {
+                    tracing::warn!(
+                        "io_uring COOP_TASKRUN unavailable (auto), using plain ring: {error}"
+                    );
+                    (IoUring::builder().build(entries)?, false)
                 }
                 Err(error) => return Err(error),
             }
@@ -776,12 +783,22 @@ impl UringBackend {
             && probe.is_supported(opcode::Accept::CODE)
             && kernel_supports_multishot_accept();
 
-        // Provided buffer ring: opt-in, degrades to off when the kernel
-        // cannot register it (registration is the kernel-version probe).
-        let buf_ring = if options.buf_ring {
+        // Provided buffer ring: the legacy request degrades to off when the
+        // kernel cannot register it (registration is the kernel-version
+        // probe); a resolved-on MULTISHOT_RECV never degrades — the pair is
+        // inseparable and the request was explicit.
+        let buf_ring = if resolved.buf_ring {
             match BufRing::create(&ring, options.buf_ring_count, options.buf_ring_size) {
                 Ok(buf_ring) => Some(buf_ring),
                 Err(error) => {
+                    if resolved.multishot_recv {
+                        let message = format!(
+                            "MINISS_URING_MULTISHOT_RECV=on requires the provided buffer \
+                             ring, which failed to register: {error}"
+                        );
+                        tracing::error!("{message}");
+                        return Err(io::Error::other(message));
+                    }
                     tracing::warn!(
                         "MINISS_URING_BUF_RING requested but the provided buffer ring \
                          could not be registered ({error}); continuing without it"
@@ -792,19 +809,24 @@ impl UringBackend {
         } else {
             None
         };
-        let multishot_recv_enabled = if options.multishot_recv {
+        let multishot_recv_enabled = if resolved.multishot_recv {
             if buf_ring.is_none() {
+                // Unreachable through the resolver (the pair is promoted and
+                // the registration failure above is fatal for explicit-on);
+                // kept as a defensive guard.
                 tracing::warn!(
                     "MINISS_URING_MULTISHOT_RECV requires a provided buffer ring; \
                      continuing with single-shot reads"
                 );
                 false
             } else if !kernel_supports_multishot_recv() {
-                tracing::warn!(
-                    "MINISS_URING_MULTISHOT_RECV requires Linux 6.0+; \
-                     continuing with single-shot reads"
-                );
-                false
+                // The resolver's version gate passed or the release file was
+                // unreadable; an explicit request must not degrade silently.
+                let message = "MINISS_URING_MULTISHOT_RECV=on requires Linux 6.0+; refusing \
+                     instead of silently serving single-shot reads"
+                    .to_string();
+                tracing::error!("{message}");
+                return Err(io::Error::other(message));
             } else {
                 true
             }
@@ -839,6 +861,7 @@ impl UringBackend {
             park_flushes: Cell::new(0),
             park_flush_total_us: Cell::new(0),
             max_park_flush_us: Cell::new(0),
+            resolved_features: resolved,
             ledger: crate::io::ResourceLedger::default(),
             thread_id: std::thread::current().id(),
             _local: std::marker::PhantomData,
@@ -2656,30 +2679,53 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     #[test]
-    fn taskrun_flag_resolution_encodes_kernel_constraints() {
-        // DEFER_TASKRUN promotes SINGLE_ISSUER and excludes COOP_TASKRUN —
-        // the two taskrun modes are alternatives at the kernel level.
+    fn default_construction_resolves_the_documented_defaults() {
+        // Defaults MUST NOT change with the knobs: COOP_TASKRUN auto -> on,
+        // everything else auto -> off, and every auto default is recorded.
+        let backend = UringBackend::new_with_options(8, UringOptions::default())
+            .expect("io_uring backend must be available");
+        let features = backend.resolved_features();
+        assert!(features.coop_taskrun);
+        assert!(!features.defer_taskrun);
+        assert!(!features.single_issuer);
+        assert!(!features.sqpoll);
+        assert!(!features.multishot_recv);
+        assert!(!features.buf_ring);
         assert_eq!(
-            resolve_taskrun_flags(true, true, false),
-            (true, false, true)
+            features
+                .resolutions
+                .iter()
+                .filter(|resolution| resolution.action
+                    == crate::io::uring_features::ResolutionAction::Defaulted)
+                .count(),
+            5
         );
-        assert_eq!(
-            resolve_taskrun_flags(false, true, false),
-            (true, false, true)
-        );
-        // Without DEFER, COOP and SINGLE_ISSUER keep whatever was requested.
-        assert_eq!(
-            resolve_taskrun_flags(true, false, false),
-            (false, true, false)
-        );
-        assert_eq!(
-            resolve_taskrun_flags(false, false, true),
-            (true, false, false)
-        );
-        assert_eq!(
-            resolve_taskrun_flags(false, false, false),
-            (false, false, false)
-        );
+    }
+
+    #[test]
+    fn explicit_defer_request_resolves_through_the_constraint_table() {
+        // Programmatic path (no env reads): DEFER=on promotes SINGLE_ISSUER
+        // and drops the auto COOP default; on a kernel predating DEFER (6.1)
+        // the setup fails with the structured message instead of a silent
+        // plain-ring fallback.
+        let request = FeatureRequest {
+            defer_taskrun: FeatureKnob::On,
+            ..FeatureRequest::all_auto(false)
+        };
+        let backend = match UringBackend::new_with_features(8, UringOptions::default(), request) {
+            Ok(backend) => backend,
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("unavailable") || message.contains("requires Linux"),
+                    "unexpected setup failure: {message}"
+                );
+                return;
+            }
+        };
+        assert!(backend.resolved_features().defer_taskrun);
+        assert!(backend.resolved_features().single_issuer);
+        assert!(!backend.resolved_features().coop_taskrun);
     }
 
     #[test]
@@ -3551,18 +3597,12 @@ mod multishot_recv_tests {
 
     #[test]
     fn multishot_capability_requires_buffer_ring_and_kernel_support() {
-        let without_ring = UringBackend::new_with_options(
-            8,
-            UringOptions {
-                multishot_recv: true,
-                buf_ring: false,
-                ..Default::default()
-            },
-        )
-        .expect("io_uring backend must be available");
+        // Submit-time refusal stays reachable as defensive coverage: no
+        // buffer ring registered -> RecvMultishot is refused, not queued as
+        // an arm that would die on the kernel's -EINVAL.
+        let without_ring = UringBackend::new_with_options(8, UringOptions::default())
+            .expect("io_uring backend must be available");
         assert!(!without_ring.supports_multishot_recv());
-        // A RecvMultishot without a registered ring is refused, not queued
-        // as an arm that would die on the kernel's -EINVAL.
         let mut fds = [-1; 2];
         // SAFETY: `fds` is a live two-element array for pipe output.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -3578,6 +3618,36 @@ mod multishot_recv_tests {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
+
+        // The pair is inseparable (kernel: IORING_RECV_MULTISHOT requires
+        // REQ_F_BUFFER_SELECT): requesting multishot alone promotes the
+        // provided buffer ring, recorded as a resolution.
+        let multishot_alone = UringBackend::new_with_options(
+            8,
+            UringOptions {
+                multishot_recv: true,
+                buf_ring: false,
+                ..Default::default()
+            },
+        )
+        .expect("io_uring backend must be available");
+        assert!(
+            multishot_alone.buf_ring.is_some(),
+            "multishot promotes the provided buffer ring"
+        );
+        assert!(
+            multishot_alone
+                .resolved_features()
+                .resolutions
+                .iter()
+                .any(|resolution| resolution.feature
+                    == crate::io::uring_features::UringFeature::BufRing),
+            "the pair promotion is recorded on the backend"
+        );
+        assert_eq!(
+            multishot_alone.supports_multishot_recv(),
+            kernel_supports_multishot_recv()
+        );
 
         let with_ring = UringBackend::new_with_options(8, multishot_options(8, 4096))
             .expect("io_uring backend must be available");

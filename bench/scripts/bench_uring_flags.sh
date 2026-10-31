@@ -38,10 +38,15 @@ CONNECTIONS=${BENCH_FLAG_CONNECTIONS:-200}
 THREADS=${BENCH_FLAG_THREADS:-2}
 
 # Each entry is NAME=VAR=value,VAR=value. The first entry is the baseline.
-# Flagsets must be kernel-legal: src/io/uring.rs resolve_taskrun_flags()
-# encodes the constraints (DEFER promotes SINGLE_ISSUER and excludes COOP;
-# SQPOLL drops DEFER with a warning), so "turn everything on" degrades to the
-# nearest legal subset instead of a dead ring.
+# Flagsets must be kernel-legal: src/io/uring_features.rs resolve_uring_flags()
+# is the ONE table-driven resolver (CONSTRAINT_TABLE): DEFER promotes
+# SINGLE_ISSUER and excludes COOP; the kernel rejects SQPOLL with COOP or
+# DEFER (-EINVAL), so an explicit-on pair errors at startup while an auto
+# side yields (recorded) — since 2026-10-31 the sqpoll flagset actually
+# engages SQPOLL (the pre-resolver path sent COOP+SQPOLL, hit -EINVAL, and
+# silently degraded to a plain ring), so pre/post numbers are not comparable.
+# Legacy binary spellings (=1) keep working; three-state
+# MINISS_URING_<FEATURE>=auto|on|off is the preferred spelling.
 DEFAULT_FLAGSETS=(
     "default"
     "no_coop=MINISS_URING_NO_COOP_TASKRUN=1"

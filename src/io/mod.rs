@@ -976,6 +976,13 @@ pub mod mio_poll;
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 pub mod uring;
 
+/// The io_uring feature knobs (`MINISS_URING_<FEATURE>=auto|on|off`), the
+/// one table-driven constraint resolver and the structured setup errors.
+/// Backend-independent: compiled on every target so the exhaustive
+/// constraint-table tests run everywhere; only `src/io/uring.rs` applies
+/// the resolved flags.
+pub mod uring_features;
+
 #[cfg(all(target_os = "linux", io_backend = "io_uring"))]
 pub(crate) mod buf_ring;
 

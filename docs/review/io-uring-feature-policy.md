@@ -75,7 +75,10 @@ ring 共享一个 SQPOLL 线程池,大核数机器上若启用 SQPOLL 应连它�
    与 recv 路径无关,引用时要分开。recvzc 存在但强制 multishot 且依赖
    网卡 zcrx 基础设施(`io_zcrx_ifq`),不适用,维持搁置。
 
-## setup flag 的内核级冲突矩阵(2026-10-29 起由代码强制)
+## setup flag 的内核级冲突矩阵(2026-10-29 起由代码强制;2026-10-31 起由
+## src/io/uring_features.rs 的 CONSTRAINT_TABLE 取代——SQPOLL⊕COOP 为本次
+## 新核实出的内核 -EINVAL 对,"内核清除 SQPOLL ring 的 SINGLE_ISSUER"更正为
+## 非约束,见下方"三态特性开关"一节)
 
 "全打开"在 io_uring 是不可能的——部分 flag 互斥,内核直接拒绝整个 ring。
 `src/io/uring.rs` 的 `resolve_taskrun_flags()` 现在持有这张表,非法组合自动
@@ -154,6 +157,89 @@ glommio / tokio-uring / ntex-neon(已归档)/ libxev 的源码级核实:
 内核风险史里 multishot recv 回归贯穿 6.1.y→6.13,在目标内核 A/B 前不进
 默认)。#46 修复方向获得 kimojio 佐证:其 BusyPoll 默认 Never = 默认阻塞,
 忙轮询是显式选项——与本运行时的自适应阻塞方案同构。
+
+## 三态特性开关(2026-10-31,业主批准)
+
+业主定调:**"他可以选择关掉我们默认开启的特性,然后开启我们默认关闭的
+特性。我们只需要做好检测,像有些矛盾的特性不能同时开这些,然后返回一个
+恰当的失败信息。"** 据此,每个 io_uring 特性获得一个运行时三态开关
+`MINISS_URING_<FEATURE>=auto|on|off`(ring 构造期生效,不是编译期门控):
+
+- `auto`(默认)= 文档化默认 + 文档化回退,永不因 setup 失败;
+- `on` = 无条件请求;内核不支持时**响亮失败**(版本可读 → 结构化错误;
+  版本不可读 → 让 setup 的内核错误直接传播),绝不静默降级;
+- `off` = 永不请求。
+
+每一条 auto 决议(默认展开、冲突让位、前置提升、配对提升)都被记录并在
+构造时经 `tracing::info!` 逐条浮出——**行为永远不静默偏离 flags-as-asked**。
+非法取值(如 `MINISS_URING_SQPOLL=banana`)按 `MINISS_IO_BACKEND` 未知后端
+的先例**启动即 panic**,报文含变量名、坏值与合法拼写。
+
+### 开关清单与四档支持层级
+
+| 特性 | 开关 | 内核门槛 | 默认 | 层级(沿用既定词汇) |
+|---|---|---|---|---|
+| `COOP_TASKRUN` | `MINISS_URING_COOP_TASKRUN` | 5.19+ | **auto→on**,失败回退 | 默认开(2026-07-12 实测) |
+| `DEFER_TASKRUN` | `MINISS_URING_DEFER_TASKRUN` | 6.1+ | auto→off | 开关保留,未验证(待干净内核重测) |
+| `SINGLE_ISSUER` | `MINISS_URING_SINGLE_ISSUER` | 6.0+ | auto→off | 默认关(仅作 DEFER 前置再评估) |
+| `SQPOLL` | `MINISS_URING_SQPOLL` | 5.1+ | auto→off | 开关保留,未验证(非拒绝,2026-10-29 重新定性) |
+| multishot recv + buf_ring(一个原子对) | `MINISS_URING_MULTISHOT_RECV` | 6.0+(对内 5.19+) | auto→off | 默认关(八运行时共识 + 内核回归史) |
+| provided buf_ring 单独注册 | `MINISS_URING_BUF_RING`(遗留二进制拼写,保留) | 5.19+ | off | 遗留兼容,配对由 multishot 开关覆盖 |
+
+**遗留拼写兼容**:`=1`/`=0` 在所有开关上继续有效(1=on,0=off);
+`MINISS_URING_NO_COOP_TASKRUN`(旧 COOP 退出)在新开关无显式意见
+(auto/未设)时映射为 `off`。一处文档化的语义修正:旧检查只看"是否设置",
+所以 `MINISS_URING_DEFER_TASKRUN=0` 旧含义是"开";现在 `0`=off
+(文档化的 `=1` 用法不变)。空值视同未设置(与 `MINISS_IO_BACKEND` 约定一致)。
+
+**多后端无关性**:这些开关是 io_uring setup flag;epoll/kqueue 后端既不
+应用也不校验(构造成功,debug 级 trace 注记一次)。开关只在
+`UringBackend::new` 的环境路径读取;`new_with_options` 是纯显式构造,
+无环境读取。
+
+**文档缺席(不实现)**:`SEND_ZC`(22 字节 echo 负载明确吃亏,搁置;
+recvzc 依赖网卡 zcrx 基础设施)与 fixed files(低优先,若做与 buf_ring
+共享注册路径)——保持其"已评估、未实现、记录在案"状态。
+
+### 内核级约束表(表驱动,`src/io/uring_features.rs` CONSTRAINT_TABLE)
+
+决议函数只有一条:`resolve_uring_flags(request)`,由一张约束表驱动;
+表的行 = 约束 + 逐字内核依据,判定优先级 = 声明顺序。**显式 on + 显式 on
+跨内核拒绝对 = 构造期结构化冲突错误**(报文含:请求的开关、约束原文、
+双方最低内核版本);一侧为 auto 时 auto 让位并记录。
+
+| 组合 | 内核语义(2026-10-31 核实 v6.1 + master `io_uring/io_uring.c`) | 决议 |
+|---|---|---|
+| COOP_TASKRUN + DEFER_TASKRUN | **内核并不拒绝该原始对**(两版内核均无此检查);io_uring_setup(2) 定性为两种 taskrun 模式、DEFER 完全覆盖 COOP | 运行时强制互斥:双显式→冲突错误;auto 让位并记录 |
+| DEFER_TASKRUN 无 SINGLE_ISSUER | `-EINVAL`(硬性前置,setup(2) 明文) | auto 提升 SINGLE_ISSUER 并记录;显式 off 撞显式 on → 冲突错误 |
+| SQPOLL + DEFER_TASKRUN | `-EINVAL`:`io_uring_sanitise_params()`"IPI related flags don't make sense with SQPOLL" | 双显式→冲突错误;auto 让位并记录 |
+| SQPOLL + COOP_TASKRUN | 同上 `-EINVAL`(**本次核实新发现的约束**) | 双显式→冲突错误;auto 让位并记录 |
+| SQPOLL + SINGLE_ISSUER | **核实为非约束**:内核既不拒绝也不清除(SQPOLL 线程天然是唯一提交者);此前"内核清除 SINGLE_ISSUER"的记录有误,更正 | 不编码规则;冗余记录一次,两个 flag 照传 |
+| MULTISHOT_RECV 无 buf_ring | 实现内原子对(内核 prep 阶段 `IORING_RECV_MULTISHOT` 强制 `REQ_F_BUFFER_SELECT`) | 构造前自动提升 buf_ring 并记录;永不对用户表现为冲突 |
+
+注:`MINISS_URING_MULTISHOT_RECV=on` 在 buf ring 注册失败时响亮失败
+(对不可拆分);`MINISS_URING_BUF_RING=1` 单独注册失败沿用既定的
+降级+warn(注册失败无法可靠区分"内核太旧"与其他原因)。
+
+**行为修正(证据驱动)**:旧构造路径在 SQPOLL 分支发送
+COOP+SQPOLL——6.1+ 内核对这对返回 `-EINVAL`,然后静默回退到普通 ring。
+即旧代码里 `MINISS_URING_SQPOLL` 配默认 COOP **从未真正启用过 SQPOLL**。
+决议器把 auto COOP 让位给 SQPOLL(记录),SQPOLL 才第一次真正生效。
+`just bench-uring-flags` 的 `sqpoll` flagset 在此修正之后的数字才算数。
+
+### 拒绝项(与 DECISION_LOG 同步)
+
+- **编译期门控(cfg)**:特性属于 ring 构造参数,同一二进制必须能对同一
+  内核换开关做 A/B;cfg 门控需要重新编译,把"试一个 flag"变成"重建一次",
+  与 `just bench-uring-flags` 的同机配对方法学直接冲突。
+- **静默 auto 决议不浮出**:旧路径的三处静默(SQPOLL⊕COOP 回退普通
+  ring、SQPOLL⊕DEFER warn、multishot 降级单发)是这次要杀掉的东西;
+  每条 auto 决议必须可观测。
+- **发明未核实的内核约束**:SQPOLL×SINGLE_ISSUER 按 man page 与内核源码
+  核实为非约束,不编码;COOP⊕DEFER 保留为运行时互斥但注释如实标注
+  "内核接受原始对,运行时为语义诚实而强制"。
+
+
 
 ## 硬件前提
 

@@ -130,6 +130,18 @@ cargo build --all-features
 | Linux（低于 6.12 或探测失败） | mio / epoll | 兼容与正确性路径 |
 | macOS | mio / kqueue | 正确性与开发路径 |
 
+io_uring 后端的每个 setup 特性都有三态运行时开关
+`MINISS_URING_<FEATURE>=auto|on|off`（`auto`=文档化默认+文档化回退，`on`=显式
+请求、内核不支持时响亮失败，`off`=不请求）：`MINISS_URING_COOP_TASKRUN`
+（默认 auto→on）、`MINISS_URING_DEFER_TASKRUN`、`MINISS_URING_SINGLE_ISSUER`、
+`MINISS_URING_SQPOLL`、`MINISS_URING_MULTISHOT_RECV`（自动携带其不可拆分的
+provided buffer ring）。内核拒绝的组合在构造期返回结构化错误（含请求开关、
+约束原文与最低内核版本），auto 决议逐条记录并浮出；遗留拼写（`=1`/`=0`、
+`MINISS_URING_NO_COOP_TASKRUN`、`MINISS_URING_BUF_RING`）继续有效；
+epoll/kqueue 后端上这些开关惰性。详见
+[io_uring 特性开关决策框架](docs/review/io-uring-feature-policy.md)与 README
+的环境变量表。
+
 ## 示例
 
 - `examples/hello_world.rs` – 单线程运行时入门

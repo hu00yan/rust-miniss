@@ -283,6 +283,10 @@ struct SlotTables<'a> {
 impl MioBackend {
     /// Creates a new `MioBackend`.
     pub fn new() -> io::Result<Self> {
+        // The MINISS_URING_* feature knobs are io_uring setup flags; on the
+        // readiness backend they are inert (neither applied nor validated).
+        // One construction-time note when they are set, never a hot path.
+        crate::io::uring_features::note_uring_knobs_ignored_on("epoll/kqueue");
         // Create a small thread pool for blocking I/O operations
         let pool_size = std::cmp::max(2, num_cpus::get() / 4);
         let thread_pool = Arc::new(ThreadPool::new(pool_size));
