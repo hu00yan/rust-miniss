@@ -20,7 +20,10 @@ cd "$PHOTON_DIR"
 # 1. copy the multi-vCPU example
 cp -f "$SCRIPT_DIR/http-server-mc.cpp" examples/perf/http/http-server-mc.cpp
 
-# 2. register the target + link-fix block (idempotent)
+# 2. register the target + link-fix block (idempotent; drop any earlier bare
+#    target line from a previous script revision so it is not duplicated)
+sed -i '/^photon_add_example(http-perf-server-mc perf\/http\/http-server-mc.cpp)$/d' \
+    examples/perf/CMakeLists.txt
 if ! grep -q "PHOTON_BENCH_EXTRA_LIBS" examples/perf/CMakeLists.txt; then
     cat >> examples/perf/CMakeLists.txt <<'EOF'
 
