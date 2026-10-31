@@ -46,7 +46,7 @@ printf 'cores,server,scenario,round,rps,p50,p75,p90,p99,rss_kib,loader,order_not
 } > "$META"
 
 port_cursor=$BASE_PORT
-next_port() { port_cursor=$((port_cursor + 1)); echo "$port_cursor"; }
+next_port() { port_cursor=$((port_cursor + 1)); }
 
 SERVER_PID=""
 cleanup() {
@@ -133,7 +133,7 @@ H1_SERVERS="miniss-framer miniss-hyper-h1 hyper-tokio photon-epoll photon-uring 
 
 run_h1_server() { # tag cores scenario round threads conns close
     local tag=$1 cores=$2 scenario=$3 round=$4 threads=$5 conns=$6 close=$7
-    local port; port=$(next_port)
+    next_port; local port=$port_cursor
     local raw="$OUT/${tag}-${scenario}-c${cores}-r${round}.wrk.txt"
     cleanup
     if ! start_server "$tag" "$cores" "$port"; then return 1; fi
@@ -193,7 +193,7 @@ run_h1_server() { # tag cores scenario round threads conns close
 
 run_h2_server() { # tag cores scenario round threads conns
     local tag=$1 cores=$2 scenario=$3 round=$4 threads=$5 conns=$6
-    local port; port=$(next_port)
+    next_port; local port=$port_cursor
     local raw="$OUT/${tag}-${scenario}-c${cores}-r${round}.h2load.txt"
     cleanup
     if ! start_server "$tag" "$cores" "$port"; then return 1; fi
@@ -229,7 +229,7 @@ run_h2_server() { # tag cores scenario round threads conns
 
 run_official_client() { # cores engine
     local cores=$1 engine=$2
-    local port; port=$(next_port)
+    next_port; local port=$port_cursor
     local log="$OUT/photon-official-${engine}-c${cores}.server.log"
     cleanup
     "$PHOTON_BIN/http-perf-server-mc" --port "$port" --vcpus "$cores" \
