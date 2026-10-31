@@ -158,6 +158,14 @@ fn aggregation_is_the_arithmetic_fold_of_every_shard() {
     assert!(parsed["miniss_tasks_polled_total"][&None] >= TASKS as u64);
 
     // And every exported series merges exactly as its descriptor promises.
+    // The fold loop below is generic over `series_descriptors()`; pin the
+    // coverage so the 5 QUIC bridge series (33 runtime series + 5 QUIC)
+    // cannot silently drop out of it again.
+    assert_eq!(
+        series_descriptors().len(),
+        38,
+        "the fold invariant must cover every exported series, QUIC included"
+    );
     for descriptor in series_descriptors() {
         let exported = parsed
             .get(descriptor.name)

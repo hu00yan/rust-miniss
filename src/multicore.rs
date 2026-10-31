@@ -613,11 +613,25 @@ const METRICS_SLOT_READ_RETRIES: u32 = 8;
 ///   which is what makes `seq1 == seq2` mean "no publication round overlapped
 ///   these field reads" on weakly-ordered targets, not just on x86.
 ///
-/// The writer never blocks, never allocates, and issues no syscalls: 35 plain
+/// The writer never blocks, never allocates, and issues no syscalls: 40 plain
 /// stores to cache lines it already owns (this slot is `CachePadded` so
 /// neighbouring shards' publication does not share a line, mirroring
 /// `core_ready_hints`). Readers are wait-free up to
 /// [`METRICS_SLOT_READ_RETRIES`] and then degrade as documented above.
+///
+/// Series semantics of the QUIC bridge fields (A2):
+///
+/// - `quic_udp_tx_packets`, `quic_udp_rx_packets`,
+///   `quic_handshakes_accepted`, `quic_handshakes_refused` are monotonic
+///   cumulative counters, like every other `*_total` series here.
+/// - `quic_connections_active` is a gauge sampled point-in-time at each
+///   publication round: the owning worker copies its shard-local gauge state
+///   at the loop boundary, and between rounds the slot simply holds that
+///   last sample. Under the rate limit (`MINISS_METRICS_PUBLISH_MIN_MS`,
+///   default 10 s) the gauge can therefore lag the live connection count by
+///   up to one publication interval. That bounded staleness is normal gauge
+///   behavior for push publication, not a coherence defect: a scrape always
+///   sees exactly the value the owning worker last published.
 struct CoreMetricsSlot {
     seq: AtomicU64,
     local_task_count: AtomicUsize,
@@ -653,6 +667,14 @@ struct CoreMetricsSlot {
     timer_expirations: AtomicU64,
     inline_completion_hits: AtomicU64,
     waker_wakeups: AtomicU64,
+    // QUIC service-lifecycle bridge (A2): same single-writer seqlock protocol
+    // as every field above. The owner copies these out of its shard-local
+    // thread-local (`crate::quic::stats`) at the same publication boundary.
+    quic_udp_tx_packets: AtomicU64,
+    quic_udp_rx_packets: AtomicU64,
+    quic_handshakes_accepted: AtomicU64,
+    quic_handshakes_refused: AtomicU64,
+    quic_connections_active: AtomicUsize,
 }
 
 impl Default for CoreMetricsSlot {
@@ -692,6 +714,11 @@ impl Default for CoreMetricsSlot {
             timer_expirations: AtomicU64::new(0),
             inline_completion_hits: AtomicU64::new(0),
             waker_wakeups: AtomicU64::new(0),
+            quic_udp_tx_packets: AtomicU64::new(0),
+            quic_udp_rx_packets: AtomicU64::new(0),
+            quic_handshakes_accepted: AtomicU64::new(0),
+            quic_handshakes_refused: AtomicU64::new(0),
+            quic_connections_active: AtomicUsize::new(0),
         }
     }
 }
@@ -771,6 +798,16 @@ impl CoreMetricsSlot {
             .store(snapshot.inline_completion_hits, Ordering::Relaxed);
         self.waker_wakeups
             .store(snapshot.waker_wakeups, Ordering::Relaxed);
+        self.quic_udp_tx_packets
+            .store(snapshot.quic_udp_tx_packets, Ordering::Relaxed);
+        self.quic_udp_rx_packets
+            .store(snapshot.quic_udp_rx_packets, Ordering::Relaxed);
+        self.quic_handshakes_accepted
+            .store(snapshot.quic_handshakes_accepted, Ordering::Relaxed);
+        self.quic_handshakes_refused
+            .store(snapshot.quic_handshakes_refused, Ordering::Relaxed);
+        self.quic_connections_active
+            .store(snapshot.quic_connections_active, Ordering::Relaxed);
         // Release: publishes every field store above to any reader that
         // acquires this even value.
         self.seq.store(seq.wrapping_add(2), Ordering::Release);
@@ -822,6 +859,12 @@ impl CoreMetricsSlot {
                 let timer_expirations = self.timer_expirations.load(Ordering::Relaxed);
                 let inline_completion_hits = self.inline_completion_hits.load(Ordering::Relaxed);
                 let waker_wakeups = self.waker_wakeups.load(Ordering::Relaxed);
+                let quic_udp_tx_packets = self.quic_udp_tx_packets.load(Ordering::Relaxed);
+                let quic_udp_rx_packets = self.quic_udp_rx_packets.load(Ordering::Relaxed);
+                let quic_handshakes_accepted =
+                    self.quic_handshakes_accepted.load(Ordering::Relaxed);
+                let quic_handshakes_refused = self.quic_handshakes_refused.load(Ordering::Relaxed);
+                let quic_connections_active = self.quic_connections_active.load(Ordering::Relaxed);
                 // Acquire fence: keeps the field loads above ordered before the
                 // `seq` re-load below, so agreement on the even value proves no
                 // publication round overlapped them on any target architecture.
@@ -863,6 +906,11 @@ impl CoreMetricsSlot {
                         timer_expirations,
                         inline_completion_hits,
                         waker_wakeups,
+                        quic_udp_tx_packets,
+                        quic_udp_rx_packets,
+                        quic_handshakes_accepted,
+                        quic_handshakes_refused,
+                        quic_connections_active,
                     };
                 }
             }
@@ -909,6 +957,11 @@ impl CoreMetricsSlot {
                     timer_expirations: self.timer_expirations.load(Ordering::Relaxed),
                     inline_completion_hits: self.inline_completion_hits.load(Ordering::Relaxed),
                     waker_wakeups: self.waker_wakeups.load(Ordering::Relaxed),
+                    quic_udp_tx_packets: self.quic_udp_tx_packets.load(Ordering::Relaxed),
+                    quic_udp_rx_packets: self.quic_udp_rx_packets.load(Ordering::Relaxed),
+                    quic_handshakes_accepted: self.quic_handshakes_accepted.load(Ordering::Relaxed),
+                    quic_handshakes_refused: self.quic_handshakes_refused.load(Ordering::Relaxed),
+                    quic_connections_active: self.quic_connections_active.load(Ordering::Relaxed),
                 };
             }
         }
@@ -1166,6 +1219,12 @@ impl CpuCore {
     }
 
     fn metrics_snapshot(&self) -> CoreMetricsSnapshot {
+        // A2: the shard's QUIC bridge counters live in a shard-local
+        // thread-local (crate::quic::stats) and are folded here on the
+        // worker thread, outside the hot path — one coherent sample per
+        // publication, copied verbatim into the snapshot (and from there into
+        // the single-writer slot).
+        let quic = crate::quic::stats::snapshot();
         CoreMetricsSnapshot {
             core_id: self.id,
             local_task_count: self.local_task_count,
@@ -1201,14 +1260,11 @@ impl CpuCore {
             timer_expirations: self.metrics.timer_expirations,
             inline_completion_hits: self.metrics.inline_completion_hits,
             waker_wakeups: self.metrics.waker_wakeups,
-            // A2: the shard's QUIC bridge counters live in a shard-local
-            // thread-local (crate::quic::stats) and are folded here on the
-            // worker thread, outside the hot path.
-            quic_udp_tx_packets: crate::quic::stats::snapshot().udp_tx_packets,
-            quic_udp_rx_packets: crate::quic::stats::snapshot().udp_rx_packets,
-            quic_handshakes_accepted: crate::quic::stats::snapshot().handshakes_accepted,
-            quic_handshakes_refused: crate::quic::stats::snapshot().handshakes_refused,
-            quic_connections_active: crate::quic::stats::snapshot().connections_active,
+            quic_udp_tx_packets: quic.udp_tx_packets,
+            quic_udp_rx_packets: quic.udp_rx_packets,
+            quic_handshakes_accepted: quic.handshakes_accepted,
+            quic_handshakes_refused: quic.handshakes_refused,
+            quic_connections_active: quic.connections_active,
         }
     }
 
@@ -4134,6 +4190,64 @@ mod tests {
         assert_eq!(torn.tasks_completed, 7);
         assert_eq!(torn.parks, 7);
         assert_eq!(torn.max_ready_queue_len, 9);
+    }
+
+    /// The QUIC bridge series ride the same single-writer seqlock as every
+    /// other series. `quic_connections_active` is a gauge *sampled at
+    /// publication*: a later turn with fewer live connections must replace
+    /// the previous value rather than clamp to it, while the four QUIC
+    /// counters keep their cumulative semantics. Written through the slot
+    /// directly — hermetic, no quinn endpoint involved.
+    #[test]
+    fn quic_bridge_series_publish_through_the_slot() {
+        let slot = CoreMetricsSlot::default();
+
+        // Turn 1: three live connections, some traffic.
+        slot.publish(&CoreMetricsSnapshot {
+            core_id: 2,
+            quic_udp_tx_packets: 100,
+            quic_udp_rx_packets: 90,
+            quic_handshakes_accepted: 5,
+            quic_handshakes_refused: 1,
+            quic_connections_active: 3,
+            ..CoreMetricsSnapshot::default()
+        });
+        let first = slot.load(2);
+        assert_eq!(first.quic_udp_tx_packets, 100);
+        assert_eq!(first.quic_udp_rx_packets, 90);
+        assert_eq!(first.quic_handshakes_accepted, 5);
+        assert_eq!(first.quic_handshakes_refused, 1);
+        assert_eq!(first.quic_connections_active, 3);
+
+        // Turn 2: two connections closed between publications, traffic
+        // counters still growing. The gauge must follow the sample down.
+        slot.publish(&CoreMetricsSnapshot {
+            core_id: 2,
+            quic_udp_tx_packets: 160,
+            quic_udp_rx_packets: 150,
+            quic_handshakes_accepted: 9,
+            quic_handshakes_refused: 1,
+            quic_connections_active: 1,
+            ..CoreMetricsSnapshot::default()
+        });
+        let second = slot.load(2);
+        assert_eq!(
+            second.quic_connections_active, 1,
+            "the gauge is a point-in-time sample at publication, not a high-water mark"
+        );
+        assert!(second.quic_udp_tx_packets >= first.quic_udp_tx_packets);
+        assert!(second.quic_udp_rx_packets >= first.quic_udp_rx_packets);
+        assert!(second.quic_handshakes_accepted >= first.quic_handshakes_accepted);
+        assert!(second.quic_handshakes_refused >= first.quic_handshakes_refused);
+
+        // And the torn-tolerant fallback reports the QUIC fields too.
+        slot.seq.store(1, Ordering::Relaxed);
+        let torn = slot.load(2);
+        assert_eq!(torn.quic_udp_tx_packets, 160);
+        assert_eq!(torn.quic_udp_rx_packets, 150);
+        assert_eq!(torn.quic_handshakes_accepted, 9);
+        assert_eq!(torn.quic_handshakes_refused, 1);
+        assert_eq!(torn.quic_connections_active, 1);
     }
 
     /// Stress the retry path: a writer publishing at full speed while a reader
