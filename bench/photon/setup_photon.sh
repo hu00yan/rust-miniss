@@ -21,10 +21,13 @@ cd "$PHOTON_DIR"
 cp -f "$SCRIPT_DIR/http-server-mc.cpp" examples/perf/http/http-server-mc.cpp
 
 # 2. register the target + link-fix block (idempotent; drop any earlier bare
-#    target line from a previous script revision so it is not duplicated)
+#    target line from a previous script revision so it is not duplicated).
+#    NOTE: the perf targets are registered in examples/CMakeLists.txt (there
+#    is no examples/perf/CMakeLists.txt upstream).
+rm -f examples/perf/CMakeLists.txt   # orphan file created by an earlier revision
 sed -i '/^photon_add_example(http-perf-server-mc perf\/http\/http-server-mc.cpp)$/d' \
-    examples/perf/CMakeLists.txt
-if ! grep -q "PHOTON_BENCH_EXTRA_LIBS" examples/perf/CMakeLists.txt; then
+    examples/CMakeLists.txt
+if ! grep -q "PHOTON_BENCH_EXTRA_LIBS" examples/CMakeLists.txt; then
     cat >> examples/perf/CMakeLists.txt <<'EOF'
 
 photon_add_example(http-perf-server-mc perf/http/http-server-mc.cpp)
