@@ -134,6 +134,11 @@ name = "memory_perf"
 path = "bench/criterion/memory_perf.rs"
 harness = false
 
+[[bench]]
+name = "quic_conn_lifecycle"
+path = "benches/quic_conn_lifecycle.rs"
+harness = false
+
 [features]
 # No optional dependencies. `default` previously enabled an `arena` feature that
 # gated nothing but four buffer constructors duplicated verbatim from the
