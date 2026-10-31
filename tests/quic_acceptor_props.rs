@@ -611,3 +611,240 @@ fn inv2_cap_enforced_and_accounted_real() {
     );
     guard.finish_quiescent("inv2 real");
 }
+
+/// INV-4 (methodology §4.2): the per-shard QUIC counters fold exactly into
+/// the runtime aggregate and equal the generator truth; quinn's own
+/// endpoint stats cross-check the acceptor's accounting (mirrors
+/// tests/metrics_aggregation.rs:67). Endpoints are constructed ON their
+/// owning shard (the tests/quinn_h3.rs multi-shard model): the socket
+/// owner-shard contract binds the endpoint driver, the acceptor and every
+/// connection driver of that endpoint to one shard.
+#[test]
+fn inv4_metrics_fold_and_generator_truth() {
+    let guard = quiescent::QuiescenceGuard::start(Some(2));
+    let runtime = Arc::clone(guard.runtime());
+    let app = rust_miniss::Runtime::new();
+    const SHARDS: usize = 2;
+    const CLIENTS_PER_SHARD: usize = 2;
+    const PAYLOAD: usize = 1000;
+
+    let (cert, key) = certs();
+    let limits = Arc::new(QuicLimits {
+        max_connections: 16,
+        use_retry: false,
+    });
+
+    // Per shard: server endpoint + acceptor on the shard, CLIENTS_PER_SHARD
+    // sequential echo clients on the same shard. Main only collects the
+    // addresses, closes the endpoints, and reads the verdicts.
+    let mut addr_rxs = Vec::new();
+    let mut handle_rxs = Vec::new();
+    let mut verdict_rxs = Vec::new();
+    for shard in 0..SHARDS {
+        let (addr_tx, addr_rx) = futures::channel::oneshot::channel();
+        let (handle_tx, handle_rx) = futures::channel::oneshot::channel();
+        let (verdict_tx, verdict_rx) = futures::channel::oneshot::channel();
+        addr_rxs.push(addr_rx);
+        handle_rxs.push(handle_rx);
+        verdict_rxs.push(verdict_rx);
+        runtime
+            .spawn_on(shard, {
+                let cert = cert.clone();
+                let key = key.clone_key();
+                let limits = Arc::clone(&limits);
+                let quic_runtime: Arc<dyn quinn::Runtime> = Arc::new(
+                    rust_miniss::quic::MinissQuicRuntime::new(Arc::clone(&runtime)),
+                );
+                async move {
+                    let server = quinn::Endpoint::new(
+                        Default::default(),
+                        Some(sim_server_config(
+                            &cert,
+                            &key,
+                            sim_transport(HOLD_IDLE, Some(KEEP_ALIVE)),
+                        )),
+                        std::net::UdpSocket::bind("127.0.0.1:0").expect("bind server"),
+                        Arc::clone(&quic_runtime),
+                    )
+                    .expect("server endpoint");
+                    let _ = addr_tx.send(server.local_addr().expect("server addr"));
+                    let _ = handle_tx.send(server.clone());
+
+                    let mut acceptor = QuicAcceptor::new(server.clone(), limits);
+                    while let Some(connection) = acceptor.next_connection().await {
+                        // Echo PAYLOAD bytes for each accepted connection.
+                        if let Ok(mut incoming) = connection.accept_uni().await {
+                            if incoming.read_to_end(PAYLOAD + 8).await.is_ok() {
+                                if let Ok(mut reply) = connection.open_uni().await {
+                                    let echo: Vec<u8> =
+                                        (0..PAYLOAD).map(|o| (o * 3) as u8).collect();
+                                    let _ = reply.write_all(&echo).await;
+                                    let _ = reply.finish();
+                                }
+                            }
+                        }
+                    }
+                    // Final bridge tick after the endpoint closed.
+                    acceptor.stats_tick();
+                    acceptor.reclaim_closed();
+                    let _ = verdict_tx.send(acceptor.counters());
+                }
+            })
+            .expect("admit shard server task");
+    }
+
+    // Per shard: one client endpoint ON the shard, CLIENTS_PER_SHARD
+    // sequential echo flows.
+    let mut client_done_rxs = Vec::new();
+    for (shard, addr_rx) in addr_rxs.into_iter().enumerate() {
+        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        client_done_rxs.push(done_rx);
+        runtime
+            .spawn_on(shard, {
+                let cert = cert.clone();
+                let quic_runtime: Arc<dyn quinn::Runtime> = Arc::new(
+                    rust_miniss::quic::MinissQuicRuntime::new(Arc::clone(&runtime)),
+                );
+                async move {
+                    let addr = addr_rx.await.expect("server address delivered");
+                    let mut client = quinn::Endpoint::new(
+                        Default::default(),
+                        None,
+                        std::net::UdpSocket::bind("127.0.0.1:0").expect("bind client"),
+                        quic_runtime,
+                    )
+                    .expect("client endpoint");
+                    client.set_default_client_config(sim_client_config(
+                        &cert,
+                        sim_transport(HOLD_IDLE, Some(KEEP_ALIVE)),
+                    ));
+                    for _ in 0..CLIENTS_PER_SHARD {
+                        let connection = rust_miniss::timer::timeout(
+                            SCENARIO_BOUND,
+                            client.connect(addr, "localhost").expect("connect"),
+                        )
+                        .await
+                        .expect("handshake bounded")
+                        .expect("handshake ok");
+                        let mut send = connection.open_uni().await.expect("open uni");
+                        let payload: Vec<u8> = (0..PAYLOAD).map(|o| (o * 3) as u8).collect();
+                        send.write_all(&payload).await.expect("write");
+                        send.finish().expect("finish");
+                        let mut reply = connection.accept_uni().await.expect("accept echo");
+                        let echoed = reply.read_to_end(PAYLOAD + 8).await.expect("read echo");
+                        assert_eq!(echoed.len(), PAYLOAD, "echo round trip truncated");
+                        connection.close(0u32.into(), b"inv4 done");
+                    }
+                    client.wait_idle().await;
+                    drop(client);
+                    let _ = done_tx.send(());
+                }
+            })
+            .expect("admit shard client task");
+    }
+
+    // Bounded readiness: every client flow asserts itself. Wait for the
+    // client shard tasks, collect the server handles, then close the
+    // server endpoints from the control plane (Endpoint::close is
+    // thread-safe) so the acceptor loops drain and report.
+    let (server_handles, view, verdicts) = app.block_on(async {
+        for done in client_done_rxs {
+            rust_miniss::timer::timeout(SCENARIO_BOUND, done)
+                .await
+                .expect("client shard task bounded")
+                .expect("client shard task completed");
+        }
+        let mut handles = Vec::new();
+        for handle_rx in handle_rxs {
+            handles.push(handle_rx.await.expect("server handle delivered"));
+        }
+        for server in &handles {
+            server.close(0u32.into(), b"inv4 done");
+            server.close(0u32.into(), b"inv4 done");
+        }
+        let mut verdicts = Vec::new();
+        for verdict_rx in verdict_rxs {
+            verdicts.push(
+                rust_miniss::timer::timeout(SCENARIO_BOUND, verdict_rx)
+                    .await
+                    .expect("acceptor verdict bounded")
+                    .expect("acceptor verdict delivered"),
+            );
+        }
+        let view = runtime
+            .metrics_refresh(Duration::from_secs(2))
+            .expect("metrics refresh");
+        (handles, view, verdicts)
+    });
+
+    // INV-4 assertions: per-shard generator truth, cross-check against the
+    // acceptor's own accounting, and the fold identity for every series.
+    let value = |name: &str, shard: Option<usize>| view.value(name, shard).expect("series present");
+    for (shard, counters) in verdicts.iter().enumerate() {
+        // Cross-check: quinn's endpoint stats (the series source) match the
+        // acceptor's own accounting and the generator truth.
+        assert_eq!(
+            counters.accepted, CLIENTS_PER_SHARD as u64,
+            "shard {shard}: acceptor accepted != generator truth: {counters:?}"
+        );
+        assert_eq!(counters.refused, 0, "shard {shard}: unexpected refusals");
+        assert_eq!(
+            value("miniss_quic_handshakes_accepted_total", Some(shard)),
+            CLIENTS_PER_SHARD as u64,
+            "shard {shard}: accepted handshakes != generator truth"
+        );
+        assert_eq!(
+            value("miniss_quic_handshakes_refused_total", Some(shard)),
+            0,
+            "shard {shard}: refused handshakes != generator truth"
+        );
+        assert_eq!(
+            value("miniss_quic_connections_active", Some(shard)),
+            CLIENTS_PER_SHARD as u64,
+            "shard {shard}: active high-water != generator truth"
+        );
+        assert!(
+            value("miniss_quic_udp_tx_packets_total", Some(shard)) >= CLIENTS_PER_SHARD as u64,
+            "shard {shard}: udp tx counters empty"
+        );
+        assert!(
+            value("miniss_quic_udp_rx_packets_total", Some(shard)) >= CLIENTS_PER_SHARD as u64,
+            "shard {shard}: udp rx counters empty"
+        );
+    }
+    // Fold identity: the unlabelled aggregate is the arithmetic fold of the
+    // per-shard series — a sum for counters, a max for the active-connections
+    // gauge — exactly as tests/metrics_aggregation.rs asserts for the
+    // runtime's own series.
+    for name in [
+        "miniss_quic_udp_tx_packets_total",
+        "miniss_quic_udp_rx_packets_total",
+        "miniss_quic_handshakes_accepted_total",
+        "miniss_quic_handshakes_refused_total",
+    ] {
+        let per_shard: u64 = (0..SHARDS).map(|shard| value(name, Some(shard))).sum();
+        assert_eq!(value(name, None), per_shard, "{name}: fold identity broken");
+    }
+    {
+        let name = "miniss_quic_connections_active";
+        let per_shard = (0..SHARDS)
+            .map(|shard| value(name, Some(shard)))
+            .max()
+            .expect("shards present");
+        assert_eq!(
+            value(name, None),
+            per_shard,
+            "{name}: max-fold identity broken"
+        );
+    }
+    assert_eq!(
+        value("miniss_quic_handshakes_accepted_total", None),
+        (SHARDS * CLIENTS_PER_SHARD) as u64,
+        "aggregate accepted handshakes != generator truth"
+    );
+
+    // Release the endpoint handles (each owns a UDP fd) before the
+    // quiescence oracle measures the process fd balance.
+    drop(server_handles);
+    guard.finish_quiescent("inv4");
+}

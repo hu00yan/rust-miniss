@@ -21,6 +21,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub mod acceptor;
+pub mod stats;
 
 pub use acceptor::{AcceptDecision, AcceptorCounters, QuicAcceptor, QuicLimits};
 

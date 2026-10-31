@@ -361,6 +361,41 @@ const SERIES: &[SeriesDescriptor] = &[
         Merge::Sum,
         |s| s.waker_wakeups,
     ),
+    series(
+        "miniss_quic_udp_tx_packets_total",
+        "QUIC UDP datagrams transmitted by connections accepted on the shard.",
+        MetricType::Counter,
+        Merge::Sum,
+        |s| s.quic_udp_tx_packets,
+    ),
+    series(
+        "miniss_quic_udp_rx_packets_total",
+        "QUIC UDP datagrams received by connections accepted on the shard.",
+        MetricType::Counter,
+        Merge::Sum,
+        |s| s.quic_udp_rx_packets,
+    ),
+    series(
+        "miniss_quic_handshakes_accepted_total",
+        "QUIC handshakes accepted by endpoints on the shard.",
+        MetricType::Counter,
+        Merge::Sum,
+        |s| s.quic_handshakes_accepted,
+    ),
+    series(
+        "miniss_quic_handshakes_refused_total",
+        "QUIC handshakes refused by endpoints on the shard.",
+        MetricType::Counter,
+        Merge::Sum,
+        |s| s.quic_handshakes_refused,
+    ),
+    series(
+        "miniss_quic_connections_active",
+        "Live QUIC connections tracked by acceptors on the shard.",
+        MetricType::Gauge,
+        Merge::Max,
+        |s| s.quic_connections_active as u64,
+    ),
 ];
 
 /// Previous exposition names accepted only by [`MetricsView::value`] lookups.
@@ -798,6 +833,11 @@ mod tests {
             timer_expirations: 31,
             inline_completion_hits: 32,
             waker_wakeups: 33,
+            quic_udp_tx_packets: 34,
+            quic_udp_rx_packets: 35,
+            quic_handshakes_accepted: 36,
+            quic_handshakes_refused: 37,
+            quic_connections_active: 38,
         }
     }
 
@@ -841,6 +881,11 @@ mod tests {
             timer_expirations,
             inline_completion_hits,
             waker_wakeups,
+            quic_udp_tx_packets,
+            quic_udp_rx_packets,
+            quic_handshakes_accepted,
+            quic_handshakes_refused,
+            quic_connections_active,
         } = snapshot;
         let by_declaration_order = [
             local_task_count as u64,
@@ -876,6 +921,11 @@ mod tests {
             timer_expirations,
             inline_completion_hits,
             waker_wakeups,
+            quic_udp_tx_packets,
+            quic_udp_rx_packets,
+            quic_handshakes_accepted,
+            quic_handshakes_refused,
+            quic_connections_active as u64,
         ];
 
         assert_eq!(

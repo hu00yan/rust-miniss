@@ -16,6 +16,7 @@
 //! `accepted + refused + retried + handshake_failures` accounts for every
 //! arrival.
 
+use super::stats::{sample_endpoint, EndpointSample, QuicShardStats};
 use quinn::{Connection, Endpoint, Incoming};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -73,13 +74,22 @@ struct FlowCounters {
     handshake_failures: u64,
 }
 
+/// One tracked connection: the held handle reserves the slot, and the
+/// last-sampled UDP counters delta-encode its traffic into the A2 bridge.
+#[derive(Debug)]
+struct TrackedConn {
+    connection: Connection,
+    last_udp_tx: u64,
+    last_udp_rx: u64,
+}
+
 /// Tracked connections: each held handle reserves one slot; the sweep
 /// frees the slot once the connection is observed closed.
 #[derive(Debug, Default)]
 struct ConnTable {
     active: usize,
     high_water: usize,
-    tracked: Vec<Connection>,
+    tracked: Vec<TrackedConn>,
 }
 
 /// Shard-local accept-point policy wrapper over one `quinn::Endpoint`.
@@ -96,6 +106,8 @@ pub struct QuicAcceptor {
     flow: RefCell<FlowCounters>,
     /// Remotes that already went through a stateless retry round.
     retried_remotes: RefCell<BTreeSet<u16>>,
+    /// Last-sampled endpoint handshake counters (A2 delta encoding).
+    endpoint_sample: RefCell<EndpointSample>,
 }
 
 impl std::fmt::Debug for QuicAcceptor {
@@ -134,6 +146,7 @@ impl QuicAcceptor {
             table: RefCell::new(ConnTable::default()),
             flow: RefCell::new(FlowCounters::default()),
             retried_remotes: RefCell::new(BTreeSet::new()),
+            endpoint_sample: RefCell::new(EndpointSample::default()),
         }
     }
 
@@ -185,8 +198,23 @@ impl QuicAcceptor {
         let mut cx = Context::from_waker(waker);
         let mut table = self.table.borrow_mut();
         let before = table.tracked.len();
-        table.tracked.retain(|connection| {
-            let mut closed = Box::pin(connection.closed());
+        // Sample the closing connections first: their final UDP deltas
+        // would otherwise be lost to the bridge.
+        let mut final_deltas = QuicShardStats::default();
+        for entry in &mut table.tracked {
+            let mut closed = Box::pin(entry.connection.closed());
+            if !matches!(
+                std::future::Future::poll(closed.as_mut(), &mut cx),
+                Poll::Pending
+            ) {
+                let stats = entry.connection.stats();
+                final_deltas.udp_tx_packets += stats.udp_tx.datagrams - entry.last_udp_tx;
+                final_deltas.udp_rx_packets += stats.udp_rx.datagrams - entry.last_udp_rx;
+            }
+        }
+        super::stats::record(&final_deltas);
+        table.tracked.retain(|entry| {
+            let mut closed = Box::pin(entry.connection.closed());
             matches!(
                 std::future::Future::poll(closed.as_mut(), &mut cx),
                 Poll::Pending
@@ -232,8 +260,13 @@ impl QuicAcceptor {
                     match incoming.accept() {
                         Ok(connecting) => match connecting.await {
                             Ok(connection) => {
-                                self.table.borrow_mut().tracked.push(connection.clone());
+                                self.table.borrow_mut().tracked.push(TrackedConn {
+                                    connection: connection.clone(),
+                                    last_udp_tx: 0,
+                                    last_udp_rx: 0,
+                                });
                                 self.flow.borrow_mut().accepted += 1;
+                                self.stats_tick();
                                 return Some(connection);
                             }
                             Err(_handshake) => {
@@ -250,5 +283,35 @@ impl QuicAcceptor {
                 }
             }
         }
+    }
+
+    /// A2 bridge tick: delta-sample quinn's endpoint and per-connection
+    /// counters into the shard's `QuicShardStats`. Called automatically on
+    /// every accepted connection; the owner may call it at any cadence for
+    /// liveness of the traffic counters on quiet accept loops.
+    pub fn stats_tick(&self) {
+        let table = self.table.borrow();
+        let mut delta = QuicShardStats::default();
+        for entry in table.tracked.iter() {
+            let stats = entry.connection.stats();
+            delta.udp_tx_packets += stats.udp_tx.datagrams - entry.last_udp_tx;
+            delta.udp_rx_packets += stats.udp_rx.datagrams - entry.last_udp_rx;
+        }
+        drop(table);
+        delta.connections_active = self.table.borrow().active;
+        super::stats::record(&delta);
+        // Persist the new baselines.
+        let mut table = self.table.borrow_mut();
+        for entry in &mut table.tracked {
+            let stats = entry.connection.stats();
+            entry.last_udp_tx = stats.udp_tx.datagrams;
+            entry.last_udp_rx = stats.udp_rx.datagrams;
+        }
+        drop(table);
+        sample_endpoint(
+            &mut self.endpoint_sample.borrow_mut(),
+            &self.endpoint,
+            self.active(),
+        );
     }
 }

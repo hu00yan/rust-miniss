@@ -565,6 +565,14 @@ pub struct CoreMetricsSnapshot {
     pub timer_expirations: u64,
     pub inline_completion_hits: u64,
     pub waker_wakeups: u64,
+    // QUIC service-lifecycle bridge (A2): delta-encoded per-shard counters
+    // sampled from quinn's Endpoint/Connection stats. `connections_active`
+    // is a high-water gauge; the rest are monotonic counters.
+    pub quic_udp_tx_packets: u64,
+    pub quic_udp_rx_packets: u64,
+    pub quic_handshakes_accepted: u64,
+    pub quic_handshakes_refused: u64,
+    pub quic_connections_active: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -830,6 +838,14 @@ impl CpuCore {
             timer_expirations: self.metrics.timer_expirations,
             inline_completion_hits: self.metrics.inline_completion_hits,
             waker_wakeups: self.metrics.waker_wakeups,
+            // A2: the shard's QUIC bridge counters live in a shard-local
+            // thread-local (crate::quic::stats) and are folded here on the
+            // worker thread, outside the hot path.
+            quic_udp_tx_packets: crate::quic::stats::snapshot().udp_tx_packets,
+            quic_udp_rx_packets: crate::quic::stats::snapshot().udp_rx_packets,
+            quic_handshakes_accepted: crate::quic::stats::snapshot().handshakes_accepted,
+            quic_handshakes_refused: crate::quic::stats::snapshot().handshakes_refused,
+            quic_connections_active: crate::quic::stats::snapshot().connections_active,
         }
     }
 
