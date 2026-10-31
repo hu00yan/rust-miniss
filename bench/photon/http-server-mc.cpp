@@ -77,9 +77,15 @@ public:
 };
 
 static int select_event_engine() {
-    if (FLAGS_event_engine == "epoll") return photon::INIT_EVENT_EPOLL;
-    if (FLAGS_event_engine == "iouring") return photon::INIT_EVENT_IOURING;
-    return photon::INIT_EVENT_DEFAULT;
+    int engine;
+    if (FLAGS_event_engine == "epoll") engine = photon::INIT_EVENT_EPOLL;
+    else if (FLAGS_event_engine == "iouring") engine = photon::INIT_EVENT_IOURING;
+    else engine = photon::INIT_EVENT_DEFAULT;
+    // The official example gets signal handling from INIT_EVENT_DEFAULT's
+    // INIT_EVENT_SIGNAL bit; explicit engine choices must add it or
+    // photon::sync_signal() has no consumer (block_all_signal swallows
+    // SIGTERM and the process cannot stop).
+    return engine | photon::INIT_EVENT_SIGNAL;
 }
 
 static void serve_on_vcpu(int port) {

@@ -52,6 +52,14 @@ SERVER_PID=""
 cleanup() {
     [[ -n "$SERVER_PID" ]] || return 0
     kill "$SERVER_PID" 2>/dev/null
+    # bounded wait for graceful exit, then escalate (never leak a server)
+    for _ in $(seq 1 20); do
+        kill -0 "$SERVER_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill -KILL "$SERVER_PID" 2>/dev/null
+    fi
     wait "$SERVER_PID" 2>/dev/null
     SERVER_PID=""
 }
