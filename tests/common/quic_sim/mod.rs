@@ -525,7 +525,21 @@ impl SimNetwork {
         self.world.inner.lock().trace.clone()
     }
 
+    /// Debug projection of whatever keeps the world from draining.
+    #[allow(dead_code)]
+    pub fn debug_leftovers(&self) -> String {
+        let world = self.world.inner.lock();
+        format!(
+            "tasks={} deliveries={} timers={} queued_bytes={}",
+            world.tasks.iter().filter(|s| s.is_some()).count(),
+            world.deliveries.len(),
+            world.timers.len(),
+            world.total_queued_bytes()
+        )
+    }
+
     /// True when no task, timer, delivery or queued datagram remains.
+    #[allow(dead_code)] // consumed by the canary + property binaries
     pub fn is_quiescent(&self) -> bool {
         let world = self.world.inner.lock();
         world.tasks.iter().all(|slot| slot.is_none())
@@ -746,6 +760,7 @@ impl AsyncTimer for SimTimer {
 
 /// One rcgen self-signed "localhost" certificate pair (methodology §9.5:
 /// handshake-success claims only, no byte-level TLS replay).
+#[allow(dead_code)] // consumed by the canary + property binaries
 pub fn sim_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let cert = generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen self-signed");
     (
@@ -754,6 +769,7 @@ pub fn sim_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     )
 }
 
+#[allow(dead_code)] // consumed by the canary + property binaries
 fn sim_crypto_server(
     cert: &CertificateDer<'static>,
     key: &PrivateKeyDer<'static>,
@@ -770,6 +786,7 @@ fn sim_crypto_server(
     QuicServerConfig::try_from(crypto).expect("quic server crypto")
 }
 
+#[allow(dead_code)] // consumed by the canary + property binaries
 fn sim_crypto_client(cert: &CertificateDer<'static>) -> quinn::crypto::rustls::QuicClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).expect("valid certificate");
@@ -786,6 +803,7 @@ fn sim_crypto_client(cert: &CertificateDer<'static>) -> quinn::crypto::rustls::Q
 
 /// Bind a server endpoint over the sim network; the returned certificate is
 /// what clients must trust.
+#[allow(dead_code)] // consumed by the canary + property binaries
 pub fn sim_server_endpoint(
     net: &SimNetwork,
     transport: Option<Arc<quinn::TransportConfig>>,

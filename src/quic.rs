@@ -20,6 +20,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
 
+pub mod acceptor;
+
+pub use acceptor::{AcceptDecision, AcceptorCounters, QuicAcceptor, QuicLimits};
+
 #[derive(Clone)]
 pub struct MinissQuicRuntime {
     runtime: Arc<MultiCoreRuntime>,
