@@ -78,6 +78,11 @@ http-body-util = "0.1"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 h2 = "0.4"
+# T3 tokio control bench: enables quinn's TokioRuntime for
+# benches/quic_conn_lifecycle_tokio.rs only. Additive to the main
+# `default-features = false, features = ["rustls-ring"]` pin; feature
+# unification applies to dev builds (benches/tests) only.
+quinn = { version = "0.11", features = ["runtime-tokio"] }
 
 [[example]]
 name = "hello_world"
@@ -137,6 +142,11 @@ harness = false
 [[bench]]
 name = "quic_conn_lifecycle"
 path = "benches/quic_conn_lifecycle.rs"
+harness = false
+
+[[bench]]
+name = "quic_conn_lifecycle_tokio"
+path = "benches/quic_conn_lifecycle_tokio.rs"
 harness = false
 
 [features]
