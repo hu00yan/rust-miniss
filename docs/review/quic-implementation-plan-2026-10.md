@@ -215,3 +215,101 @@ QUIC 的一个关键事实让这些设计比 TCP 侧简单:**endpoint 在其 own
 管理面自建 A1-A5;拒绝原生 QUIC 实现(gm-quic 路线)与 quiche 封装路线
 (monoio-quiche 先例);证据 = 本文档 §1 源码清单 + §2 先例表 + 步骤零
 微基准;推翻条件 = 上述 1-3 条触发。
+
+## 6. io_uring 运行时对照(T4 compio-quic control,2026-10-31)
+
+> Owner 决策输入:"io_uring 的运行时我要看到性能差距再做决定"(§5.1 推翻
+> 条件的评估步骤)。分支 `bench/compio-quic-control`;bench =
+> `benches/compio_quic_churn.rs`(measurement only,无 pass-line assert、
+> 无 spawn baseline——compio 没有 TaskArena 可比)。所有数字逐字记录,
+> 未调整。
+
+### 6.1 对照物与环境
+
+| 栈 | 运行时 | I/O 驱动(实测) | QUIC 协议栈 | TLS |
+|---|---|---|---|---|
+| compio-quic | compio thread-local executor | **io_uring**(strace:2× `io_uring_setup`、2679× `io_uring_enter`) | quinn-proto 0.11.19 | rustls ring,TLS1.3,ALPN t3/1 |
+| miniss(T3) | miniss 单 shard | **io_uring**(`MINISS_URING_ENTRIES=1024`) | quinn-proto 0.11.19 | 同上 |
+| tokio 对照 | tokio current_thread | **epoll**(quinn TokioRuntime;tokio 无 io_uring) | quinn-proto 0.11.19 | 同上 |
+
+三栈共享同一 quinn-proto 状态机与同一 rustls-ring TLS 实现;唯一变量是
+运行时与 I/O 驱动。环境:orb(OrbStack Ubuntu aarch64 VM,7 vCPU,内核
+7.2.12-orbstack),3 轮 round-robin 交错(`compio → miniss → tokio` × 3,
+每轮间隔 2s)。**这不是 pass-line 环境**(pass line 的参照环境是 gcloud
+裸金属,见 performance-baseline-2026-10-30-gcloud.md);运行期间 Mac 宿主
+load ~7.7、orb VM 内部 idle(load 0.66/7,vmstat 99% idle)。compio 的
+io_uring 驱动是显式 feature 结果:compio-runtime 0.12 以
+`default-features = false` 钉住 compio-driver,链条上无任何 crate 传递
+启用后端——不显式加 `compio-driver/io-uring` 时 Linux 编译产物是 **stub
+驱动**(compio-driver build.rs:`stub = linux && !io-uring && !polling`),
+即无 I/O 后端;macOS 因 polling 无条件编译而恰好可用。该陷阱已作为
+`fix(bench)` 提交记录在分支上。
+
+### 6.2 orb 实测(µs/conn,逐字,3 轮 + 中位数)
+
+| 栈 | 指标 | r1 | r2 | r3 | **中位数** |
+|---|---|---|---|---|---|
+| compio-quic (io_uring) | seq churn | 537.7 | 624.6 | 450.3 | **537.7** |
+| compio-quic (io_uring) | c8 | 435.7 | 416.5 | 435.2 | **435.7** |
+| compio-quic (io_uring) | c32 | 371.3 | 377.6 | 373.1 | **373.1** |
+| miniss (io_uring) | seq churn | 546.1 | 398.9 | 447.3 | **447.3** |
+| miniss (io_uring) | c8 | 428.3 | 405.0 | 458.7 | **428.3** |
+| miniss (io_uring) | c32 | 390.6 | 404.5 | 403.3 | **403.3** |
+| tokio (epoll) | seq churn | 585.4 | 583.0 | 456.7 | **583.0** |
+| tokio (epoll) | c8 | 438.2 | 423.6 | 413.3 | **423.6** |
+| tokio (epoll) | c32 | 394.5 | 370.1 | 400.1 | **394.5** |
+
+附带观测:miniss spawn baseline 0.4-0.8 µs/task(与 T3 记录一致);
+miniss 与 tokio 的 cross-task wake p50/p99 在 2876-2997 / 4700-6765 µs
+(VM 网络路径噪声,macOS 对照 232-1415 / 1588-4464 µs)。三栈在此环境
+全部未过 T3 的 100 µs pass line(miniss bench 退出码 2,逐字记录)。
+
+### 6.3 macOS 方向性运行(kqueue,非 io_uring,单轮)
+
+| 栈 | seq | c8 | c32 |
+|---|---|---|---|
+| compio-quic(polling/kqueue) | 765.4 | 483.6 | 486.8 |
+| miniss(kqueue) | 731.0 | 535.1 | 501.6 |
+| tokio(kqueue) | 671.6 | 500.2 | 468.4 |
+
+仅方向性参考:compio 的 mac 驱动是 polling/kqueue,不是 io_uring;该组
+数字不能用于 io_uring 决策。
+
+### 6.4 结论(对照 §5.1 推翻条件)
+
+1. **运行时差距不存在(本指标上)**:三栈每列中位数互相差距 ≤12%
+   (seq 447-583、c8 424-436、c32 373-403),且轮间方差(seq 398-625)
+   大于栈间差距——栈间排序在轮间不稳定。每连接成本的主导项是完整
+   QUIC 握手环(rcgen 证书无关、ring TLS1.3 加解密 + quinn-proto 状态机
+   + loopback 包轮唤醒),三栈共享同一实现;I/O 驱动(io_uring vs
+   epoll)与执行器(thread-per-core vs thread-local vs current_thread)
+   在该成本里不可分辨。
+2. **§5.1 的前提未被复现**:compio-quic 式"quinn-proto + 融合驱动"路线
+   的推翻理由是"每连接 runtime 序列化成本";实测 c8/c32 无发现 C 型
+   塌陷(T3 已记录 seq≈c8≈c32 的平坦形态,本对照在 compio 上同样平坦:
+   537.7/435.7/373.1),且 io_uring-native 的 compio 相对 miniss 的
+   io_uring **没有优势**(中位数差距在噪声内)。就 churn 指标而言,
+   **没有性能依据从 miniss+quinn 迁往 compio-quic**;§5.1 所述设计变更
+   在本证据下不触发。
+3. **绝对 pass-line 判断仍缺**:本环境(VM + 宿主忙)连 miniss 自身都
+   未过线,与 T3 在 macOS 的 GO/NO-GO FAIL 记录一致;过线与否的最终
+   判定需要在 pass-line 参照环境(gcloud 裸金属 Linux)复测三栈——本
+   对照只回答"运行时之间有无差距",不回答"绝对值过不过线"。
+4. **API 形态偏差(fairness caveats)**:compio-quic 的 Endpoint 为
+   `!Send`(thread-local),accept 走 `wait_incoming()` 循环,无
+   QuicAcceptor 式准入门(compio 侧没有 max_connections 上限——这是
+   功能缺口而非性能差异);buffer 模型(owned `IoBuf`/`BufResult`)与
+   quinn 不同;endpoint driver 由 compio runtime 自行 spawn。完整清单
+   见 `benches/compio_quic_churn.rs` 头注释。对照语义是"io_uring-native
+   运行时上一次完整 QUIC 握手环的成本",不是 API 等价声明。
+
+复现命令(orb):
+
+```sh
+# compio 侧(feature 缺一不可,否则 Linux 下编译出 stub 驱动)
+cargo bench --bench compio_quic_churn
+# miniss 侧
+MINISS_URING_ENTRIES=1024 cargo bench --bench quic_conn_lifecycle
+# tokio 对照
+cargo bench --bench quic_conn_lifecycle_tokio
+```

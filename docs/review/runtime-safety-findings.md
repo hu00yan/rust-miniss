@@ -620,3 +620,27 @@ are not silently mixed into the implementation batch.
     hygiene: io_uring backend, OrbStack arm64 VM. Do not mask by weakening
     the ledger assertion; re-run on a clean kernel (gcloud 6.18+) or after
     the next OrbStack kernel update before treating it as a code defect.
+
+49. **QUIC fd-count oracle flake: parallel-in-binary runs only, inherited
+    from the QUIC lifecycle branch** (found 2026-10-31 during the
+    `feat/quic-service-lifecycle` ff-to-main sanity pass; recorded, not
+    fixed). Two tests use the process-wide open-fd-count oracle in
+    `tests/common/quiescent.rs` (`QuiescenceGuard`, FD_TOLERANCE = 2) while
+    sibling tests in the same binary hold their own runtimes' descriptors:
+    (a) `quic_shutdown_props::guard_drop_reports_drain_outcome` — known
+    inherited flake recorded at merge time (fails only parallel-in-binary;
+    passes `--test-threads=1`); (b) same class, observed the same day:
+    `quic_acceptor_props::inv4_metrics_fold_and_generator_truth` —
+    `inv4: open fd count grew 7 -> 11` under the default parallel harness,
+    passing `cargo test --test quic_acceptor_props -- --test-threads=1`
+    (8/8) and passing in a combined four-binary run minutes earlier. The
+    oracle counts the whole process's fds, so a sibling test's live runtime
+    (its acceptor sockets and descriptor leases) lands inside the measured
+    window of another test's guard; the +2 tolerance cannot absorb a
+    sibling runtime's endpoint pair. Platform: macOS/kqueue, release.
+    Not a leak signal in the guarded code — each guarded runtime is fully
+    dropped before the assert; the growth is the sibling's, transiently.
+    Fix belongs to the oracle, not the tests (shard-local fd accounting or
+    serializing the guard across the binary), and is out of scope here.
+    Both tests are green single-threaded; do not weaken the guard's
+    assertion or raise the timeout to mask this.
