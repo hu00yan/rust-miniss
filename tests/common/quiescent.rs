@@ -96,6 +96,7 @@ impl Drop for QuiescenceGuard {
 /// against a fresh runtime, then apply the full shutdown-quiescence oracle.
 /// `runtime` binds as `&Arc<MultiCoreRuntime>`. Requires the including file
 /// to expose this module as `mod quiescent`.
+#[allow(unused_macros)] // used by some test binaries, not all
 macro_rules! assert_quiescent {
     ($workers:expr, $context:expr, |$runtime:ident| $body:block) => {{
         let guard = $crate::quiescent::QuiescenceGuard::start($workers);
@@ -105,4 +106,5 @@ macro_rules! assert_quiescent {
     }};
 }
 
+#[allow(unused_imports)]
 pub(crate) use assert_quiescent;

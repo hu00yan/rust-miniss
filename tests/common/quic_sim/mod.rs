@@ -478,7 +478,21 @@ impl SimNetwork {
         std::future::poll_fn(|cx| timer.as_mut().poll(cx)).await;
     }
 
+    /// Race `future` against a virtual sleep; `None` means the limit hit.
+    #[allow(dead_code)] // consumed by the property-test binary, not canaries
+    pub async fn sim_timeout<T>(
+        &self,
+        limit: Duration,
+        future: impl Future<Output = T>,
+    ) -> Option<T> {
+        match futures::future::select(Box::pin(future), Box::pin(self.sim_sleep(limit))).await {
+            futures::future::Either::Left((value, _)) => Some(value),
+            futures::future::Either::Right(_) => None,
+        }
+    }
+
     /// Spawn a future, drive the world up to `limit`, return its output.
+    #[allow(dead_code)] // consumed by the canary binary, not properties
     pub fn drive<T, F>(&self, limit: Duration, future: F) -> Result<T, SimRunReport>
     where
         F: Future<Output = T> + Send + 'static,
@@ -506,6 +520,7 @@ impl SimNetwork {
         self.world.inner.lock().counters
     }
 
+    #[allow(dead_code)] // consumed by the canary binary, not properties
     pub fn trace(&self) -> Vec<TraceEvent> {
         self.world.inner.lock().trace.clone()
     }
@@ -520,6 +535,7 @@ impl SimNetwork {
     }
 }
 
+#[allow(dead_code)] // paired with drive, canary-binary only
 struct DriveSlot<T> {
     value: Mutex<Option<T>>,
 }
