@@ -1,4 +1,4 @@
-# scripts/test-affected-mapping.yaml — DRAFT 供业主评审(refactor/gate-hierarchy)
+# scripts/test-affected-mapping.yaml — 受影响目标选择映射表(业主批准 2026-10-31,refactor/gate-hierarchy)
 #
 # gate-hierarchy-2026-10.md §3 的机械载体:source-path 前缀 → (test 二进制, 后端, 平台)
 # → 具体 cargo/env 命令。本文件是 gate 契约的一部分:修改本表的提交必须在提交说明里
@@ -16,9 +16,11 @@
 #   具名后端 = 设 MINISS_IO_BACKEND=<b>;epoll 额外设 CARGO_TARGET_DIR=target/epoll(与 CI 一致,
 #              避免来回重编;切换后端无需 cargo clean — DECISION_LOG 2026-10-17 行)
 #
-# DRAFT 映射起点:子系统 → 套件的对应关系取自 linux_safety.sh 的具名回归、justfile 的
-# --skip 清单与 tests/ 二进制清单。业主评审后逐行增删;新增 tests/*.rs 二进制时必须
-# 同步本表(兜底规则保证未登记文件的测试不静默丢失)。
+# 映射起点:子系统 → 套件的对应关系取自 linux_safety.sh 的具名回归、justfile 的
+# --skip 清单与 tests/ 二进制清单;业主评审轮(2026-10-31)补齐 src/lib.rs+src/
+# 通配、metrics、signal、examples、tls 拆分、net+=vectored_io、multicore+=
+# integration_multicore。新增 tests/*.rs 二进制时必须同步本表(兜底规则保证
+# 未登记文件的测试不静默丢失)。
 
 version: 1
 

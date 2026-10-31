@@ -149,45 +149,53 @@ busy:polled ≤5 且 parks>0，缺指标即失败）接入 `bench_http.sh` 多 w
 兜底与 park 超时；单 worker 饱和场景的亚毫秒 p99 抖动若触及生产 SLO，
 同上。
 
-## 2026-10-31 Gate 三层层级与受影响目标选择(DRAFT,`refactor/gate-hierarchy`,待业主批准)
+## 2026-10-31 Gate 三层层级与受影响目标选择（业主批准；`refactor/gate-hierarchy`）
 
-**选择了什么：** 测试/gate 配方收拢为三层——Tier 1 `just fast`（秒级：fmt +
-ignored 扫描 + arch-audit + `--lib` + 纯性质模型；负清单：任何 socket/fd/
-thread/sleep/wall-clock 测试不得进入，protocol-sim 一律不收编——业主 2026-10-31
-裁定）；Tier 2 `just gate`（提交门：check 新增 check-backends 编译矩阵、
-docs-audit、unsafe-audit 三步，再加 **`just affected` 受影响目标选择**——
-`scripts/test-affected.sh` 读 diff 相对 BASE，经 `scripts/test-affected-mapping.yaml`
-把改动子系统映射为具体测试二进制 × 后端 × 平台腿并执行，空选择以退出码 2 拒绝；
-序列 check → affected → arch → unsafe → diff → bench-smoke，返回码契约不变）；
-Tier 3 `just nightly`（原 test-full 角色重定位：feature 矩阵、differential、
-loom、stress、linux-safety、miri，夜间 schedule + 合并集成前手动）。justfile
-抽取 `STRESS_SKIPS` 唯一副本，test-fast 重定义为 fast 别名（runtime_regressions
-迁 Tier 2），test-all-features 去重复的 fmt/clippy；CI 修改不在本卡授权内，
-作为 §4 待批清单给出。
+**选择了什么：** 测试/gate 配方收拢为三层——Tier 1 `just fast`（`test-fast`
+别名；秒级：fmt + ignored 扫描 + arch-audit + `--lib` + 纯性质模型；负清单：
+任何 socket/fd/thread/sleep/wall-clock 测试不得进入，protocol-sim 一律不收编
+——业主 2026-10-31 裁定）；Tier 2 `just gate`（提交门：check 增 check-backends
+编译矩阵与 docs-audit，**unsafe-audit 留在 gate 顶层不进 check**；串入 **`just
+affected` 受影响目标选择**——`scripts/test-affected.sh` 读 diff 相对 BASE
+（缺省依次 origin/main → main → HEAD~1 的 merge-base），经
+`scripts/test-affected-mapping.yaml` 把改动子系统映射为具体测试二进制 × 后端 ×
+平台腿并执行；序列 check → affected → arch-audit → unsafe-audit → diff-audit
+→ bench-smoke）；Tier 3 `just nightly`（`test-full` 别名；feature 矩阵、
+differential、loom、stress、linux-safety、miri，**新增业主批准的变异测试
+`test-mutants-quic`**：cargo-mutants 打 `src/quic.rs` + `src/multicore.rs`，
+强制 `--timeout 60`，nightly/手动，存活变体补性质/补映射、永不放宽 oracle）。
 
-**拒绝了什么：** (1) 把 QUIC 方法论（quic-test-methodology-2026-10.md §3）提议的
-T4 sim-flavor 收进 test-fast——业主裁定 test-fast 不收编任何 protocol-sim 测试，
-落位改为 Tier 2 受影响选择（该文档需一行修订，见 gate-hierarchy-2026-10.md §2.4）；
-(2) 用"每次全跑"解决选择问题——Tier 2 预算被 everything 腿吃掉，开发者会绕过
-gate；(3) 把映射做成 bash 关联数组或引入 YAML 依赖——保持与
-audit_architecture.sh 相同的 bash 3.2 + python3 既有依赖面；(4) 本卡顺带改
-ci.yml——超出授权文件清单，CI 去重（每腿 clippy/test 双跑）作为待批项单列。
+**拒绝了什么：** (1) 把 unsafe-audit 并入 `check`——业主评审否决：它是 RED
+（exit 2）语义，被 check 捕获会沦为 YELLOW（exit 1），违反返回码契约，gate
+顶层本已独立运行；(2) 把 affected 的 rc=2 拒绝降级为 YELLOW——业主评审否决：
+拒绝 = 映射/配置错误，静默即假绿，gate 按 RED 透传；(3) QUIC 方法论
+（quic-test-methodology-2026-10.md §3）提议的 T4 sim-flavor 收进 test-fast——
+业主裁定 test-fast 不收编任何 protocol-sim 测试，落位改为 Tier 2 受影响选择
+（该文档需一行修订，见 gate-hierarchy-2026-10.md §2.4）；(4) 人脑枚举测试
+用例法——维护比否决（同 v2 方法论 C2）；(5) 用"每次全跑"解决选择问题——
+Tier 2 预算被 everything 腿吃掉，开发者会绕过 gate；(6) 映射实现用 bash
+关联数组或引入 YAML 依赖——保持与 audit_architecture.sh 相同的 bash 3.2 +
+python3 既有依赖面。
 
-**证据：** 盘点（gate-hierarchy-2026-10.md §1）发现 5 处结构性重复与 1 个零引用
-孤儿配方：`check-backends`（P2 编译矩阵，`13fcca1` 引入起无任何 check/gate/
-test-full/CI 调用）；CI 三条 OS 腿内联复刻 recipe 且 feature-matrix 内部把
-clippy+全量 test 各再跑一遍；test-regular 与 test-all-features 维护逐字相同的
-10 行 `--skip` 清单；test-fast 含 runtime_regressions（socket I/O）失去秒级资格
-且 CI 五个 job 无一运行它（违反 AGENTS.md "默认开发与 CI 先跑 just test-fast"）；
-stress × linux-safety 重复同一用例×3 轮。合同漂移 5 条（§1.7）。覆盖评估
-（§3.3）：P2 大部分转本地拦截（touch src/io/uring.rs → epoll 编译检查；mio_poll.rs
-→ epoll/kqueue 腿；macOS-only 测试当次必跑——D39 型）；P1/P3/P4 部分（lifecycle+
-shutdown 双后端套件提交时同跑）；P5 与跨子系统语义交互不可拦（§6——这是
-integration-merge ritual 仍然必要的原因）。脚本已实测：混合清单在 macos/linux
-两平台各产出正确腿集、真实执行 GREEN、空 diff 拒绝（rc=2）。
+**证据：** 盘点（gate-hierarchy-2026-10.md §1）发现 5 处结构性重复与 1 个零
+引用孤儿配方：`check-backends`（P2 编译矩阵，`13fcca1` 引入起无任何 check/
+gate/test-full/CI 调用）；CI 三条 OS 腿内联复刻 recipe 且 feature-matrix 内部
+把 clippy+全量 test 各再跑一遍；test-regular 与 test-all-features 维护逐字
+相同的 10 行 `--skip` 清单；test-fast 含 runtime_regressions（socket I/O）
+失去秒级资格且 CI 五个 job 无一运行它（违反旧合同"默认开发与 CI 先跑
+just test-fast"）；stress × linux-safety 重复同一用例×3 轮。合同漂移 5 条
+（§1.7）。业主评审轮找出映射表假绿缺口并已闭合（`9f898c3`）：src/lib.rs +
+src/ 通配（src/ 下未登记文件绝不落 docs 兜底）、metrics、signal、examples
+各得专属腿、tls 从 quic 拆分（quinn_h3 只覆盖 h3 握手）、net 腿补 vectored_io、
+multicore 腿补 integration_multicore。自证：scratch 仓合成 9 文件 diff → 8 条
+精确选择（新规则全触发、最长前缀优先级保持）；契约 dry-run vs 分支基线
+ccaf11b → 3 条命令（docs-audit、check-backends、test-regular）；脚本实测
+匹配/去重/平台过滤/真实执行 GREEN/空 diff 拒绝（rc=2）。
 
-**推翻条件：** 若映射表在真实使用中两次以上产出 false green（该跑的腿没配），
-则受影响选择降级为"提示层"（只打印不阻塞），Tier 2 恢复整包 test-regular +
-双后端全量；若 Tier 2 热缓存超 15 分钟常态化，把 affected 改为可选步并重新
-划分腿的预算；映射表被三个以上子系统共用后出现规则冲突，则升级为 per-目录
-映射文件。以上任一触发时，先在本日志记一条推翻行再动 gate。
+**推翻条件：** 若 affected 选择在真实使用中产出假绿（该跑的腿没配），**优先
+收紧映射（加规则/加腿）而不是放宽兜底**；同一映射规则两次以上假绿，则受影响
+选择降级为"提示层"（只打印不阻塞），Tier 2 恢复整包 test-regular + 双后端
+全量；若 Tier 2 热缓存超 15 分钟常态化，把 affected 改为可选步并重新划分腿的
+预算；映射表被三个以上子系统共用后出现规则冲突，则升级为 per-目录映射文件；
+变异测试若在 nightly 常态化超时或产生不可判读的存活清单，先收窄 --file 范围
+再议扩面。以上任一触发时，先在本日志记一条推翻行再动 gate。

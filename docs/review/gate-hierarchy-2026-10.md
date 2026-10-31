@@ -1,4 +1,4 @@
-# Gate 层级整理与受影响目标选择(2026-10-31,DRAFT 供业主评审)
+# Gate 层级整理与受影响目标选择(2026-10-31,业主批准版)
 
 > **目的:** 回答业主 2026-10-31 的三条裁定:(1) `just test-fast` 收窄为"拦下最
 > 愚蠢错误"的秒级内循环,任何 protocol-sim 型测试不得进入;(2) 提交门加重,并
@@ -12,15 +12,17 @@
 > 修复设计为三层:**Tier 1 `fast`(秒级)/ Tier 2 `gate`(分钟级,新增
 > `affected` 受影响目标选择)/ Tier 3 `nightly`(周期全量)**。受影响选择的
 > 机械载体是 `scripts/test-affected.sh` + `scripts/test-affected-mapping.yaml`
-> (本分支 DRAFT,已实测匹配/去重/拒绝空选择三条路径)。对 forensics 五个根因
+> (业主批准;已实测匹配/去重/拒绝空选择三条路径,`9f898c3` 补假绿缺口自证)。对 forensics 五个根因
 > 模式的覆盖估计:P2 大部分转为本地拦截,P1/P3/P4 部分(提交时同跑双后端腿),
 > P5 与跨子系统语义交互**不可拦**(§6 诚实边界——这是 integration-merge ritual
 > 仍然必要的原因)。
 >
 > 分支 `refactor/gate-hierarchy`(基线 = `integration/2026-10-31` ccaf11b,
-> GREEN 树)。本文件、`scripts/test-affected.sh`、映射表、justfile 草案编辑与
-> DECISION_LOG 草案行均以 **REVIEWABLE PROPOSAL** 提交;业主逐条批准后才改
-> AGENTS.md 与 CI,不批准即整体丢弃。
+> GREEN 树)。61d4f02 以 **REVIEWABLE PROPOSAL** 提交。**2026-10-31 业主评审
+> (Antigravity)裁定:1改 2改 3改 4改 5可 6可**——代码侧修复已由 9f898c3 落地
+> (返回码契约:unsafe-audit 出 check、affected rc=2 按 RED 透传;映射表假绿
+> 缺口闭合;Tier 3 新增 `test-mutants-quic`);本 commit 将本文档与 AGENTS.md
+> 同步到批准后的最终状态;CI 去重(§4-7)仍待另卡执行。
 
 ## 0. 业主裁定(本设计的输入)
 
@@ -36,7 +38,7 @@
 
 | 配方 | 用途 | 调用方 | 重叠/问题 | 判定 |
 |------|------|--------|-----------|------|
-| `check` | fmt+ignored 扫描+clippy+cargo check+test-regular | dev、gate | 不含 arch-audit(与 test-fast 责任倒挂,§1.7-D4) | **keep**,补 check-backends/docs-audit/unsafe-audit |
+| `check` | fmt+ignored 扫描+clippy+cargo check+test-regular | dev、gate | 不含 arch-audit(与 test-fast 责任倒挂,§1.7-D4) | **keep**,补 check-backends/docs-audit(unsafe-audit 不入 check——业主评审:RED(exit 2)语义不得被 check 捕获沦为 YELLOW,gate 顶层独立运行) |
 | `check-backends` | cfg(io_backend) 双后端编译矩阵 | **零引用** | P2 杀手(Tier-1 item 1,`13fcca1` 引入)却从未被 check/gate/test-full/CI 任何一个调用;CI 三条 OS 腿各只编译自己的单后端 | **keep,接进 check**(孤儿是本审计最大单点发现) |
 | `docs-audit` | README 链接与基线行核对 | 仅 CI linux-epoll 单腿 | 三条 OS 腿只有一条跑;gate 不跑 | **keep,进 check** |
 | `arch-audit` | 架构红线 grep(src/tests/bench/examples) | test-fast、gate、CI×3 | 在 fast 有、在 check 没有;合同写 "benches/" 实扫 "bench/"(§1.7-D5) | keep |
@@ -56,7 +58,7 @@
 | `test-full` | check+feature-matrix+differential+loom+stress+linux-safety+miri | 文档引用(README_CN.md:165、DESIGN.md:727、DECISION_LOG 2026-07-14 行) | 名字暗示"完整"实为周期聚合器 | **重定位 Tier 3**,别名 `nightly`(本分支已加) |
 | `test-differential` | runtime_safety_models | test-full | 与 test-fast 的同一 `--test` 重复入口 | keep(Tier 3) |
 | `test-fast` | fmt+ignored+arch+`--lib`+models+**runtime_regressions** | dev;**CI 不跑**(§1.7-D1) | check 的子集+arch-audit;runtime_regressions 含 socket I/O(accept multishot 等 15 测)——V1 下失去秒级资格 | **重定义 = `fast`**(本分支已改,旧名别名) |
-| `unsafe-audit` | SAFETY 注释门(clippy undocumented_unsafe + # Safety 扫描) | gate | CI 0/5 job 跑 | keep,进 check |
+| `unsafe-audit` | SAFETY 注释门(clippy undocumented_unsafe + # Safety 扫描) | gate | CI 0/5 job 跑 | keep,**gate 顶层**(业主评审否决并入 check:RED(exit 2)语义不得被 check 捕获沦为 YELLOW(exit 1)) |
 | `fmt` / `clippy` | 便利单步 | 手动 | check 子集 | keep |
 | `miri-safety` | 8 具名 TLS/waker/buffer Miri 测试 | CI miri 腿、test-full | 与 loom 同属"生产 seam 未抽取则失败"纪律 | keep(Tier 3) |
 | `no-ignored-tests` | ignored 扫描别名 | 手动 | 各 gate 已内嵌 | keep |
@@ -74,7 +76,7 @@
 | `check_unsafe_safety.sh` | unsafe-audit | keep |
 | `linux_safety.sh` | linux-safety | keep |
 | `run_exact_test.sh` | loom、miri-safety、linux-safety | keep |
-| `test-affected.sh`(本分支新增) | affected、gate | **DRAFT,§3** |
+| `test-affected.sh`(本分支新增) | affected、gate | **业主批准,§3** |
 
 ### 1.3 bench/scripts/(7 个)
 
@@ -132,8 +134,8 @@
 | 层 | 入口 | 职责(一句话) | 预算 | 所有人 |
 |----|------|---------------|------|--------|
 | Tier 1 | `just fast`(`test-fast` 别名) | 拦最愚蠢错误:格式、ignored 测试、架构红线 grep、单测/静态断言、纯性质模型 | 热缓存 ≤30s(冷构建吃 cargo 增量) | 开发者本人,每次保存/提交前 |
-| Tier 2 | `just gate TASK=… BASELINE=… [BASE=…]` | 提交门:check(静态+编译矩阵+全量常规测试)+ **affected(受影响目标选择)** + arch/unsafe/docs 审计 + diff-audit + bench-smoke | 热缓存 ≤10 分钟;CI 后端腿各自计时 | 提交者;Decide GREEN 的机械前置 |
-| Tier 3 | `just nightly`(`test-full` 别名)+ 显式 bench/quic 配方 | 周期全量:feature 矩阵、differential、loom、stress、linux-safety、miri;QUIC interop/h3spec/h2spec;T3 微基准;跨运行时矩阵 | 30-90 分钟 | nightly CI schedule + 合并集成前手动 |
+| Tier 2 | `just gate TASK=… BASELINE=… [BASE=…]` | 提交门:check(静态+编译矩阵+docs 审计+全量常规测试)+ **affected(受影响目标选择;拒绝=RED)** + arch-audit + unsafe-audit(gate 顶层,不入 check) + diff-audit + bench-smoke | 热缓存 ≤10 分钟;CI 后端腿各自计时 | 提交者;Decide GREEN 的机械前置 |
+| Tier 3 | `just nightly`(`test-full` 别名)+ `test-mutants-quic` + 显式 bench/quic 配方 | 周期全量:feature 矩阵、differential、loom、stress、linux-safety、miri、**变异测试(cargo-mutants,§2.5)**;QUIC interop/h3spec/h2spec;T3 微基准;跨运行时矩阵 | 30-90 分钟 | nightly CI schedule + 合并集成前手动 |
 
 ### 2.1 Tier 1 `fast`(V1 的机械化)
 
@@ -145,13 +147,20 @@
 
 ### 2.2 Tier 2 `gate`(V2 的机械化)
 
-组成(顺序即失败顺序):`check`(现在含 check-backends/docs-audit/unsafe-audit)→ `affected` → `arch-audit` → `unsafe-audit` → `diff-audit TASK` → `bench-smoke BASELINE`。返回码契约不变(0/1/2/3)。
+组成(顺序即失败顺序):`check`(含 check-backends + docs-audit;**不含 unsafe-audit**——业主评审 2026-10-31 裁定:unsafe-audit 是 RED(exit 2)语义,被 check 捕获会沦为 YELLOW(exit 1),且 gate 顶层本已独立运行)→ `affected` → `arch-audit` → `unsafe-audit` → `diff-audit TASK` → `bench-smoke BASELINE`。返回码契约(0=GREEN、1=YELLOW、2=RED、3=RED)扩展一条:**affected 的 rc=2(空选择/映射配置错误)按 RED 透传,永不降级为 YELLOW**——拒绝=映射或配置错误,静默即假绿;rc=1(选中的腿失败)仍是 YELLOW。
 
-对比旧 gate 的三处加重:后端编译矩阵进主门(P2 的本地半边);docs/unsafe 审计进主门(原 0/5 job 或 1/3 腿);affected 把"改动子系统的专属腿"变成机械义务(原来完全没有这个能力——linux-safety 的 28 条具名回归只能整包跑或靠人记)。
+对比旧 gate 的加重:后端编译矩阵进主门(P2 的本地半边);docs 审计进主门(原仅 1/3 CI 腿);affected 把"改动子系统的专属腿"变成机械义务(原来完全没有这个能力——linux-safety 的 28 条具名回归只能整包跑或靠人记);unsafe-audit 维持 gate 顶层(既有位置,经评审确认不降级)。
 
 ### 2.3 Tier 3 `nightly`
 
-组成不变(§1.1 test-full 行),角色重定位:不是每提交义务。触发:CI schedule(nightly)+ 合并集成前手动。结果记录:CI artifacts + `docs/review/runtime-safety-findings.md`(安全类)/ `performance-baseline-*.md`(性能类)。stress 从 CI per-push linux 腿移到 nightly 是一条待批 delta(§4-CI-3)——linux-safety 的具名回归仍在 per-push 腿,生命周期义务不缩。
+组成 = §1.1 test-full 行的全量(check、feature-matrix、differential、loom、stress、linux-safety、miri)**加业主批准的变异测试 `test-mutants-quic`(§2.5)**,角色重定位:不是每提交义务。触发:CI schedule(nightly)+ 合并集成前手动。结果记录:CI artifacts + `docs/review/runtime-safety-findings.md`(安全类)/ `performance-baseline-*.md`(性能类)。stress 从 CI per-push linux 腿移到 nightly 是一条待批 delta(§4-CI-3)——linux-safety 的具名回归仍在 per-push 腿,生命周期义务不缩。
+
+### 2.5 变异测试(mutation testing,业主批准 2026-10-31)
+
+- **落位:Tier 3,nightly/手动,严禁进 fast/gate**——Tier 1/2 的秒级/分钟级预算与受影响选择的确定性不可被变异测试污染。
+- **范围(业主批准,`9f898c3` 落地 `just test-mutants-quic`)**:cargo-mutants 只打核心状态机文件 `src/quic.rs` + `src/multicore.rs`;**`--timeout 60` 必须携带**(变异体可制造挂死/死循环,无超时会把 nightly 拖成无限等待——AGENTS.md test-hygiene 的 bounded 原则对变异体同样成立);工具缺失时明确失败(exit 2),不静默跳过。
+- **判读纪律(写进合同)**:**存活变体 = 性质/套件对应当补的覆盖洞**。处置只有两条:补性质(proptest 生成器/不变量 oracle)或补映射腿(把对应套件挂进受影响选择);**永不以放宽 oracle、删弱断言、跳过用例换取 GREEN**——那会把覆盖洞变成假装没有洞。
+- 边界:变异测试度量的是"套件能否杀死变体",不是生产正确性;存活变体清单由人工判读后回填 `runtime-safety-findings.md`,不自动进 RED。
 
 ### 2.4 QUIC 方法论 T1-T5 的落位(V1 裁定Applied)
 
@@ -174,21 +183,26 @@
 
 ### 3.1 形态
 
-- `scripts/test-affected-mapping.yaml`(DRAFT):source-path 前缀 → (测试二进制, 后端, 平台) → 具体 cargo/env 命令。规则 = `match` 前缀列表 + `legs`(platform: linux/macos/any;backend: io_uring/epoll/kqueue/host/both)。**最长前缀命中**,每文件贡献其命中规则的全部 legs,跨文件去重。兜底规则 `""` 必须存在。
-- `scripts/test-affected.sh`(DRAFT):`[--dry-run] [BASE_REF]`,BASE 缺省 `git merge-base HEAD origin/main`,任务卡工作流传 baseline 提交。后端可用性镜像 build.rs:67-91(io_uring/epoll 仅 Linux,kqueue 仅 macOS);具名后端设 `MINISS_IO_BACKEND` 并按 CI 惯例给 epoll 独立 `CARGO_TARGET_DIR=target/epoll`(切换后端无需 cargo clean,DECISION_LOG 2026-10-17 行)。跑完全部腿再汇总失败(失败清单一次给全,不首败即停)。
-- **绝不静默为空**:选中 0 条命令 → 退出码 2 + 明细;未匹配路径被兜底规则接住并告警;唯一豁免开关 `MINISS_AFFECTED_ALLOW_EMPTY=1` 显式写明。本分支已实测:匹配/去重正确(uring/mio/quic/multicore/tests/docs 混合清单在 macos 与 linux 两平台各产出正确腿集)、真实执行路径 GREEN、空 diff 以退出码 2 拒绝。
-- `just affected base=""` 与 `just gate task="" baseline="" base=""` 已串入(本分支 justfile 草案)。
+- `scripts/test-affected-mapping.yaml`(业主批准,`9f898c3` 修订):source-path 前缀 → (测试二进制, 后端, 平台) → 具体 cargo/env 命令。规则 = `match` 前缀列表 + `legs`(platform: linux/macos/any;backend: io_uring/epoll/kqueue/host/both)。**最长前缀命中**,每文件贡献其命中规则的全部 legs,跨文件去重。兜底规则 `""` 必须存在。
+- `scripts/test-affected.sh`(业主批准,`9f898c3` 修订):`[--dry-run] [BASE_REF]`,BASE 缺省**依次尝试 `origin/main`、`main`、`HEAD~1` 的 merge-base**,全部失败才拒绝(业主评审:无 origin 的环境不得硬失败);任务卡工作流传 baseline 提交。后端可用性镜像 build.rs:67-91(io_uring/epoll 仅 Linux,kqueue 仅 macOS);具名后端设 `MINISS_IO_BACKEND` 并按 CI 惯例给 epoll 独立 `CARGO_TARGET_DIR=target/epoll`(切换后端无需 cargo clean,DECISION_LOG 2026-10-17 行)。跑完全部腿再汇总失败(失败清单一次给全,不首败即停)。
+- **绝不静默为空**:选中 0 条命令 → 退出码 2 + 明细;`just gate` 将该 rc=2 按 **RED** 透传(§2.2)。未匹配路径被兜底规则接住并告警;唯一豁免开关 `MINISS_AFFECTED_ALLOW_EMPTY=1` 显式写明。已实测:匹配/去重正确(uring/mio/quic/multicore/tests/docs 混合清单在 macos 与 linux 两平台各产出正确腿集)、真实执行路径 GREEN、空 diff 以退出码 2 拒绝;`9f898c3` 补充自证——scratch 仓合成 9 文件 diff → 8 条精确选择(新规则全数触发、最长前缀优先级保持),契约 dry-run vs ccaf11b → 3 条命令(docs-audit、check-backends、test-regular)。
+- `just affected base=""` 已串入 `just gate`(61d4f02 引入,9f898c3 修正 rc 语义:rc=2 按 RED 透传)。
 
-### 3.2 映射表 DRAFT 的子系统 → 腿(节选,全文见文件)
+### 3.2 映射表的子系统 → 腿(业主批准后状态;节选,全文见文件)
 
 | 触碰 | 自动腿 |
 |------|--------|
 | `src/io/uring.rs`、`src/io/buf_ring.rs` | Linux:io_uring `--lib io::uring` + runtime_regressions/vectored_io/test_fast_poll;**epoll 编译检查**(改动不得让另一后端失去编译——P2) |
 | `src/io/mio_poll.rs` | Linux:epoll 回归腿;macOS:kqueue 回归腿(D10/D12/D13/D23 的平台腿) |
 | `src/io/mod.rs`、`src/io/future.rs`、`src/fs.rs` | 双后端同套件(runtime_regressions + async_file_tests) |
-| `src/multicore.rs`、`src/waker.rs`、`src/executor.rs`、`src/cpu.rs`、`src/task.rs`、`src/cancellation.rs`、`src/timer/` | **lifecycle+shutdown 套件双后端**(multicore_tests + shutdown_quiescence;#40/#42/D25/D27 类) |
-| `src/http.rs`、`src/net.rs`、`src/hyper_rt.rs`、`src/compat.rs`、`src/buffer.rs` | integration_http + hyper_http1/2 host;Linux 另跑 epoll integration_http |
-| `src/quic.rs`、`src/tls.rs` | quinn_h3(--all-features)host + Linux epoll(T2 落位) |
+| `src/multicore.rs`、`src/waker.rs`、`src/executor.rs`、`src/cpu.rs`、`src/task.rs`、`src/cancellation.rs`、`src/timer/`、`src/config.rs` | **lifecycle+shutdown 套件双后端**(multicore_tests + shutdown_quiescence + integration_multicore;#40/#42/D25/D27 类) |
+| `src/metrics.rs` | metrics_aggregation(业主评审补:改指标不得只靠全量兜底) |
+| `src/signal.rs` | integration_signal(业主评审补) |
+| `src/http.rs`、`src/net.rs`、`src/hyper_rt.rs`、`src/compat.rs`、`src/buffer.rs` | integration_http + hyper_http1/2 + vectored_io host;Linux 另跑 epoll integration_http + vectored_io(业主评审补 vectored_io:net 臂路径与 writev 压力面同源) |
+| `src/quic.rs` | quinn_h3(--all-features)host + Linux epoll(T2 落位) |
+| `src/tls.rs` | tls_tests(--all-features)host + Linux epoll(**业主评审拆分**:quinn_h3 只覆盖 h3 握手,tls_tests 才是 TLS 面) |
+| `src/lib.rs`、`src/`(通配) | 整 host 测试套件(`cargo test --tests`)+ Linux epoll 编译检查——**src/ 下任何未专门登记的文件绝不落到 docs 兜底**(业主评审堵假绿) |
+| `examples/` | `cargo test --examples`(例程编译+运行面) |
 | `Cargo.toml`/`Cargo.lock`、`build.rs`/`justfile`/`.github/`/`scripts/`/`bench/` | everything:check-backends + test-regular |
 | `tests/shutdown_quiescence.rs` 等 | 直接跑该二进制(部分登记);`tests/` 兜底 = 整 host 套件 |
 | `docs/`、README、AGENTS.md | docs-audit |
@@ -205,30 +219,34 @@
 | **P5 测试环境假象** | D44/D45/D41-D43/D14(8) | **不能** | 泄漏进程、污染基线、±40% 仪器需要的是 PROBE/环境有效性断言(#46 的 park_efficiency_check 是正确形态),与测试选择正交;bench-smoke 的 baseline 纪律照旧 |
 | 流程(D37-D39 连锁) | PR #3 四 gate 未跑被合并 | **能** | gate 一条命令串全部门 + affected;不再依赖注记自觉 |
 
-## 4. 合同修订清单(AGENTS.md,逐条待业主批准)
+## 4. 合同修订清单(已应用进 AGENTS.md;业主批准 2026-10-31)
 
-1. **Gate Definitions → `just test-fast`**:定义改为 Tier 1(fmt + ignored 扫描 + arch-audit + `--lib` + 纯性质模型);**新增负清单:Tier 1 任何测试不得使用 socket/fd/thread/sleep/wall-clock**;`runtime_regressions` 迁 Tier 2。理由:V1;关闭 D3 漂移的红线漏洞。
-2. **Gate Definitions → `just check`**:补 check-backends、docs-audit、unsafe-audit 三步进定义。理由:三者现无家或单点(§1.5-#1、§1.4)。
-3. **Gate Definitions → `just gate`**:序列改为 check → **affected** → arch-audit → unsafe-audit → diff-audit → bench-smoke;affected 的 BASE 缺省 merge-base origin/main,任务卡必须传 baseline。
-4. **新增:`scripts/test-affected-mapping.yaml` 是 gate 契约的一部分**;修改映射表的提交必须附 `scripts/test-affected.sh --dry-run <BASE>` 输出自证未缩覆盖(本分支映射表头已写明)。
-5. **Gate Definitions → `just test-full`**:重定位为 Tier 3 周期入口,别名 `nightly`;组成不变。
+业主评审(Antigravity,2026-10-31)裁定:**1改 2改 3改 4改 5可 6可**。两条核心修正落在返回码契约上(下述 2、3 的粗体处);另批准 §2.5 变异测试与 `9f898c3` 的映射缺口闭合(§3.2)。以下为最终措辞,已逐条写入 AGENTS.md Gate Definitions(文末"修订注记"逐条可对):
+
+1. **Gate Definitions → Tier 1 `just fast`(`test-fast` 别名)**:定义改为 fmt + ignored 扫描 + arch-audit + `--lib` + 纯性质模型;**负清单扩到整层:Tier 1 任何测试不得使用 socket/fd/thread/sleep/wall-clock,protocol-sim 一律禁入**;`runtime_regressions` 迁 Tier 2。理由:V1;关闭 D3 漂移的红线漏洞。
+2. **Gate Definitions → `just check`**:补 check-backends、docs-audit 两步进定义(三者现无家或单点,§1.5-#1、§1.4)。**业主修正:unsafe-audit 不并入 check**——它是 RED(exit 2)语义,被 check 捕获会沦为 YELLOW(exit 1),违反返回码契约;维持 gate 顶层。
+3. **Gate Definitions → `just gate`**:序列改为 check → affected → arch-audit → unsafe-audit → diff-audit → bench-smoke;BASE 缺省依次尝试 origin/main、main、HEAD~1 的 merge-base(业主评审:无 origin 环境不得硬失败),任务卡必须传 baseline。**业主修正:affected 的 rc=2(拒绝)按 RED 透传,永不降级 YELLOW**——拒绝=映射/配置错误,静默即假绿。
+4. **新增:`scripts/test-affected-mapping.yaml` 是 gate 契约的一部分**;修改映射表的提交必须附 `scripts/test-affected.sh --dry-run <BASE>` 输出自证未缩覆盖(映射表头与 AGENTS.md 均已写明)。
+5. **Gate Definitions → `just test-full`**:重定位为 Tier 3 周期入口,别名 `nightly`;组成加 `test-mutants-quic`(§2.5)。
 6. **arch-audit 描述**:扫描目录 "src/、tests/、benches/" 修正为 "src/、tests/、bench/、examples/"(D5)。
-7. **CI 章节(给业主选)**:(a) 三条 OS 腿改调 `just check` + 各自 backend env,消除内联复刻与双跑(§1.5-#2);(b) stress 从 per-push linux 腿移 nightly schedule,linux-safety 留 per-push;(c) docs-audit/unsafe-audit 不再单腿。**本分支不改 ci.yml**(超出授权文件清单;批准后另卡执行)。
-8. **`just review`**:三条 stub 合并或删除(§1.6)。
+7. **CI 章节(批准但待另卡)**:(a) 三条 OS 腿改调 `just check` + 各自 backend env,消除内联复刻与双跑(§1.5-#2);(b) stress 从 per-push linux 腿移 nightly schedule,linux-safety 留 per-push;(c) docs-audit/unsafe-audit 不再单腿。**本分支不改 ci.yml**(超出授权文件清单)。
+8. **`just review`**:收拢单入口,标准/对抗为两个模式(review-diff/review-adversarial 保留为模式名,不再是三个平行 stub 的印象)。
+9. **新增(业主批准):Tier 3 变异测试 `test-mutants-quic`**(§2.5):nightly/手动,`src/quic.rs`+`src/multicore.rs`,强制 `--timeout 60`;存活变体补性质/补映射,永不放宽 oracle。
 
-## 5. justfile 草案编辑(本分支已提交,业主审 diff 而非散文)
+## 5. justfile 草案编辑(61d4f02 提交 + 9f898c3 业主轮修正,业主审 diff 而非散文)
 
 | hunk | 内容 | 理由 |
 |------|------|------|
 | 头注 | 三层模型 + 返回码不变 | 评审入口 |
 | `STRESS_SKIPS :=` | 10 行跳过清单提为唯一变量,test-regular/test-all-features 引用 | 杀重复 #3 |
-| `check` | +check-backends +docs-audit +unsafe-audit | §4-2 |
+| `check` | +check-backends +docs-audit(**unsafe-audit 不入 check**,9f898c3 按业主裁定移出并留注) | §4-2 |
 | `affected base=""` | 新配方,调 test-affected.sh | §3 |
-| `gate` | 插 affected 步,返回码契约不变 | §4-3 |
+| `gate` | 插 affected 步;**9f898c3 修正:rc=2 按 RED 透传("RED: ... REFUSED"),仅 rc=1 是 YELLOW** | §4-3 |
 | `fast` + `test-fast: fast` | Tier 1 重定义,旧名别名 | V1 |
 | `test-all-features` | 去 fmt/clippy(调用方已有) | 杀重复 #2 |
 | `nightly` + `test-full: nightly` | Tier 3 重定位 | §4-5 |
-| 其余 24 条配方 | 一字未动 | 最小 diff |
+| `test-mutants-quic`(9f898c3 新增) | cargo-mutants,`--file src/quic.rs --file src/multicore.rs`,`--timeout 60`,工具缺失 rc=2 | §2.5 |
+| 其余配方 | 61d4f02 时一字未动;9f898c3 仅按上表改动 | 最小 diff |
 
 ## 6. 诚实边界
 
@@ -240,12 +258,13 @@
 
 ## 7. 交付物清单(本分支)
 
-| 文件 | 性质 |
-|------|------|
-| `docs/review/gate-hierarchy-2026-10.md`(本文) | 设计提案 |
-| `scripts/test-affected-mapping.yaml` | DRAFT 映射表(契约候选) |
-| `scripts/test-affected.sh` | DRAFT 脚本(已实测:匹配/去重/平台过滤/真实执行/空选择拒绝) |
-| `justfile` 草案编辑 | 8 个 hunk(§5) |
-| `docs/DECISION_LOG.md` 追加一行 | 决策草案(选择/拒绝/证据/推翻条件) |
+| 提交 | 文件 | 性质 |
+|------|------|------|
+| 61d4f02 | `docs/review/gate-hierarchy-2026-10.md`(本文) | 设计提案 |
+| 61d4f02 + 9f898c3 | `scripts/test-affected-mapping.yaml` | 映射表(业主批准;9f898c3 闭合假绿缺口) |
+| 61d4f02 + 9f898c3 | `scripts/test-affected.sh` | 选择脚本(已实测:匹配/去重/平台过滤/真实执行/空选择拒绝;9f898c3 加 BASE 缺省链) |
+| 61d4f02 + 9f898c3 | `justfile` 编辑 | §5 的 hunk 表(9f898c3:rc 语义 + `test-mutants-quic`) |
+| 61d4f02 | `docs/DECISION_LOG.md` 追加行 | 决策(选择/拒绝/证据/推翻条件;本 commit 同步为最终设计) |
+| 本 commit | `AGENTS.md` | §4 的 9 条合同修订应用(文末"修订注记"逐条对应) |
 
-未动:`.github/workflows/ci.yml`、`AGENTS.md`(§4 是给业主的修订清单,批准后另卡)、其余 24 条配方、所有 bench 脚本。
+未动:`.github/workflows/ci.yml`(§4-7 待另卡)、其余 24 条配方、所有 bench 脚本、wt-quic-lifecycle 的方法论文档(其一行修订由实现侧执行,§2.4 已给出措辞)。

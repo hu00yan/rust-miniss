@@ -43,8 +43,6 @@ check:
     # 被 check 捕获会沦为 YELLOW(exit 1),且 gate 顶层已独立运行(不重复)。
 
 # Backend compile matrix (defect-forensics Tier-1 item 1). Every cfg
-
-# Backend compile matrix (defect-forensics Tier-1 item 1). Every cfg
 # (io_backend) combination must compile on its native OS — the Linux-epoll
 # path once went uncompiled for 14 months and produced the 18-CPU-hour
 # D22 incident. Linux compiles both backend cfgs; macOS compiles its
