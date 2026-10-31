@@ -31,8 +31,18 @@ DUR=${BENCH_DUR:-10}
 ROUNDS=${BENCH_ROUNDS:-3}
 BASE_PORT=${BENCH_BASE_PORT:-17700}
 
-WRK=${WRK:-$(command -v wrk || echo "$HOME/wrk-src/wrk")}
+WRK=${WRK:-$(command -v wrk || true)}
+if [[ -z "$WRK" && -x "$HOME/wrk-src/wrk" ]]; then WRK="$HOME/wrk-src/wrk"; fi
+if [[ -z "$WRK" && -x "$HOME/bin/wrk" ]]; then WRK="$HOME/bin/wrk"; fi
+if [[ -z "$WRK" || ! -x "$WRK" ]]; then
+    echo "FATAL: no executable wrk found (tried PATH, ~/wrk-src/wrk, ~/bin/wrk)" >&2
+    exit 2
+fi
 H2LOAD=${H2LOAD:-$(command -v h2load || echo /usr/bin/h2load)}
+if [[ ! -x "$H2LOAD" ]]; then
+    echo "FATAL: h2load not usable at $H2LOAD" >&2
+    exit 2
+fi
 
 mkdir -p "$OUT"
 CSV="$OUT/results.csv"
