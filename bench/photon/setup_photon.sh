@@ -67,13 +67,17 @@ sed -i 's/photon_cc_options(-Werror -Wall -Wno-error=pragmas)/photon_cc_options(
 
 # 3. configure (only if the build dir does not exist yet)
 if [[ ! -f build/CMakeCache.txt ]]; then
+    extra_src=()
+    [[ -n "${PHOTON_ZLIB_SOURCE:-}" ]] && extra_src+=(-DPHOTON_ZLIB_SOURCE="$PHOTON_ZLIB_SOURCE")
+    [[ -n "${PHOTON_OPENSSL_SOURCE:-}" ]] && extra_src+=(-DPHOTON_OPENSSL_SOURCE="$PHOTON_OPENSSL_SOURCE")
     cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DPHOTON_ENABLE_URING=ON \
         -DPHOTON_BUILD_TESTING=ON \
         -DPHOTON_BUILD_DEPENDENCIES=ON \
         -DPHOTON_ENABLE_LIBCURL=OFF \
-        -DCMAKE_CXX_FLAGS="-Wno-error"
+        -DCMAKE_CXX_FLAGS="-Wno-error" \
+        "${extra_src[@]}"
 fi
 
 # 4. phase 1: build photon_static so vendored zlib/openssl/curl are present
