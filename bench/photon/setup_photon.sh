@@ -57,7 +57,7 @@ if [[ ! -f build/CMakeCache.txt ]]; then
     cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DPHOTON_ENABLE_URING=ON \
-        -DPHOTON_BUILD_TESTING=OFF
+        -DPHOTON_BUILD_TESTING=ON
 fi
 
 # 4. phase 1: build photon_static so vendored zlib/openssl/curl are present
