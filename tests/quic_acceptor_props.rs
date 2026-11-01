@@ -26,6 +26,31 @@ const KEEP_ALIVE: Duration = Duration::from_millis(400);
 const REAP_IDLE: Duration = Duration::from_millis(1200);
 const SCENARIO_BOUND: Duration = Duration::from_secs(60);
 
+// The fd baseline in the quiescence oracle is process-global: serialize the
+// real-network legs so a sibling test runtime cannot inflate a sibling's count
+// (ledger #49; mirrors tests/quic_lifecycle_props.rs:38).
+static REAL_LEG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+struct PublishMinGuard;
+
+fn set_publish_min_ms(ms: &str) -> PublishMinGuard {
+    // SAFETY: tests serialize on REAL_LEG_LOCK; set_var is safe here
+    // because no other thread reads this variable concurrently.
+    unsafe {
+        std::env::set_var("MINISS_METRICS_PUBLISH_MIN_MS", ms);
+    }
+    PublishMinGuard
+}
+
+impl Drop for PublishMinGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized under REAL_LEG_LOCK.
+        unsafe {
+            std::env::remove_var("MINISS_METRICS_PUBLISH_MIN_MS");
+        }
+    }
+}
+
 /// Cap model: the pure accept-point decision table, exhaustively (the
 /// methodology's "intercepted by the cap model"). `use_retry` makes first
 /// contact from a remote a stateless retry (anti-flood), which consumes no
@@ -490,6 +515,7 @@ fn inv2_idle_timeout_reclaims_slot_sim() {
 /// adapter, with the quiescence oracle on top.
 #[test]
 fn inv2_cap_enforced_and_accounted_real() {
+    let _leg_lock = REAL_LEG_LOCK.lock();
     let guard = quiescent::QuiescenceGuard::start(Some(1));
     let runtime = Arc::clone(guard.runtime());
     let app = rust_miniss::Runtime::new();
@@ -621,6 +647,8 @@ fn inv2_cap_enforced_and_accounted_real() {
 /// connection driver of that endpoint to one shard.
 #[test]
 fn inv4_metrics_fold_and_generator_truth() {
+    let _leg_lock = REAL_LEG_LOCK.lock();
+    let _publish_guard = set_publish_min_ms("0");
     let guard = quiescent::QuiescenceGuard::start(Some(2));
     let runtime = Arc::clone(guard.runtime());
     let app = rust_miniss::Runtime::new();
@@ -959,6 +987,7 @@ fn inv7_profile_bounds_sim() {
 /// kernel reports doubled SO_SNDBUF values, macOS the requested ones).
 #[test]
 fn socket_buffers_are_configurable() {
+    let _leg_lock = REAL_LEG_LOCK.lock();
     use rust_miniss::quic::profile::QuicSocketBuffers;
     use std::os::fd::AsRawFd;
 

@@ -28,6 +28,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const BOUND: Duration = Duration::from_secs(10);
 const IDLE: Duration = Duration::from_secs(30);
 
+// The fd baseline in the quiescence oracle is process-global: serialize the
+// real-network legs so a sibling test runtime cannot inflate a sibling's count
+// (ledger #49; mirrors tests/quic_lifecycle_props.rs:38).
+static REAL_LEG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 fn certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen");
     (
@@ -93,6 +98,7 @@ async fn connect_client(
 /// publishes Drained, and the runtime terminates quiescently afterwards.
 #[test]
 fn guard_drains_bounded_and_visible() {
+    let _leg_lock = REAL_LEG_LOCK.lock();
     let guard_runtime = quiescent::QuiescenceGuard::start(Some(1));
     let runtime = Arc::clone(guard_runtime.runtime());
     let app = rust_miniss::Runtime::new();
@@ -170,6 +176,7 @@ fn guard_drains_bounded_and_visible() {
 /// bounded background drain; the owner observes the outcome afterwards.
 #[test]
 fn guard_drop_reports_drain_outcome() {
+    let _leg_lock = REAL_LEG_LOCK.lock();
     let guard_runtime = quiescent::QuiescenceGuard::start(Some(1));
     let runtime = Arc::clone(guard_runtime.runtime());
     let app = rust_miniss::Runtime::new();
@@ -247,6 +254,7 @@ fn guard_drop_reports_drain_outcome() {
 /// `TimedOut` within the bound instead of hanging forever.
 #[test]
 fn driver_loss_is_bounded_visible() {
+    let _leg_lock = REAL_LEG_LOCK.lock();
     let runtime = rust_miniss::MultiCoreRuntime::new(Some(1)).expect("runtime");
     let app = rust_miniss::Runtime::new();
     let (cert, key) = certs();
