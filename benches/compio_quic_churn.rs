@@ -22,6 +22,19 @@
 //! timeout like T3. Server side accepts and drops (implicit close) — the
 //! full server-side lifecycle cost.
 //!
+//! Diagnostic knobs (same names and semantics as the T3 benches so one
+//! driver drives all three stacks identically; defaults below are the
+//! unmodified T4 behavior and the default output is byte-identical):
+//!   MINISS_T3_SCALE=<n>           multiply CHURN_CONNECTIONS and
+//!                                 CONCURRENT_CONNECTIONS by n (default 1).
+//!                                 No spawn phase here, so no admission-queue
+//!                                 cap constrains the scale.
+//!   MINISS_T3_WIDTHS=<comma list> concurrent-churn widths to run, in order
+//!                                 (default "8,32"). Each width is its own
+//!                                 measured phase with the same 100 ms settle
+//!                                 between widths; per-connection cost stays
+//!                                 total elapsed / CONCURRENT_CONNECTIONS.
+//!
 //! Runtime model. `compio_runtime::Runtime::new().block_on(run_bench())` is
 //! the closest compio analogue of one miniss shard and of the tokio
 //! control's `current_thread` flavor: a single thread runs the thread-local
@@ -69,6 +82,35 @@ const CHURN_CONNECTIONS: usize = 100;
 const CONCURRENT_CONNECTIONS: usize = 200;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn scale_factor() -> usize {
+    std::env::var("MINISS_T3_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
+/// Concurrent-churn widths (default 8, 32 — the unmodified T3/T4 behavior).
+/// Same parsing rules as the T3 benches so all three stacks see the same
+/// widths under one env var.
+fn churn_widths() -> Vec<usize> {
+    match std::env::var("MINISS_T3_WIDTHS").ok() {
+        Some(raw) => {
+            let widths: Vec<usize> = raw
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .filter(|&w| w > 0)
+                .collect();
+            if widths.is_empty() {
+                vec![8, 32]
+            } else {
+                widths
+            }
+        }
+        None => vec![8, 32],
+    }
+}
+
 /// compio I/O driver label. compio-driver compiles io-uring (its default
 /// feature) on Linux and only `polling` on every other unix, so the label is
 /// a compile-time fact, verified per-build via `cargo tree -e features`.
@@ -84,20 +126,22 @@ fn compio_backend() -> &'static str {
 
 struct BenchReport {
     sequential_churn_us: f64,
-    concurrent_c8_us: f64,
-    concurrent_c32_us: f64,
+    /// (width, µs/conn) per measured concurrent-churn width, in run order.
+    concurrent: Vec<(usize, f64)>,
     idle_cpu_fraction: f64,
 }
 
 fn main() {
     let backend = compio_backend();
+    let scale = scale_factor();
+    let widths = churn_widths();
 
     // PROBE (T3 D44): the process must be idle over a 200 ms window, measured
     // before the runtime exists — same placement as both T3 benches.
     let idle_cpu_fraction_before = idle_cpu_probe();
 
     let runtime = compio_runtime::Runtime::new().expect("compio runtime");
-    let report = runtime.block_on(run_bench());
+    let report = runtime.block_on(run_bench(scale, &widths));
 
     println!("T4 compio_quic_churn (compio backend={backend}, compio-quic 0.8/quinn-proto 0.11)");
     println!(
@@ -108,14 +152,10 @@ fn main() {
         "  sequential churn:          {:>9.1} µs/conn",
         report.sequential_churn_us
     );
-    println!(
-        "  concurrent churn c8:       {:>9.1} µs/conn",
-        report.concurrent_c8_us
-    );
-    println!(
-        "  concurrent churn c32:      {:>9.1} µs/conn",
-        report.concurrent_c32_us
-    );
+    for (width, value) in &report.concurrent {
+        let label = format!("  concurrent churn c{width}:");
+        println!("{label:<29}{:>9.1} µs/conn", value);
+    }
     println!(
         "  PROBE post-bench idle cpu fraction: {:.4}",
         report.idle_cpu_fraction
@@ -123,7 +163,9 @@ fn main() {
     // No pass-line assert: this bench measures, the miniss bench decides.
 }
 
-async fn run_bench() -> BenchReport {
+async fn run_bench(scale: usize, widths: &[usize]) -> BenchReport {
+    let churn_connections = CHURN_CONNECTIONS * scale;
+    let concurrent_connections = CONCURRENT_CONNECTIONS * scale;
     let (cert, key) = certs();
 
     let server = Endpoint::server("127.0.0.1:0", server_config(&cert, &key))
@@ -174,8 +216,8 @@ async fn run_bench() -> BenchReport {
     compio_runtime::time::sleep(Duration::from_millis(50)).await;
 
     // 1. Sequential handshake churn (T3 phase 2, spawn baseline skipped).
-    let mut sequential_samples = Vec::with_capacity(CHURN_CONNECTIONS);
-    for _ in 0..CHURN_CONNECTIONS {
+    let mut sequential_samples = Vec::with_capacity(churn_connections);
+    for _ in 0..churn_connections {
         let start = Instant::now();
         let connection = compio_runtime::time::timeout(
             CONNECT_TIMEOUT,
@@ -192,12 +234,17 @@ async fn run_bench() -> BenchReport {
         sequential_samples.iter().sum::<f64>() / sequential_samples.len() as f64;
     compio_runtime::time::sleep(Duration::from_millis(100)).await;
 
-    // 2. Concurrent churn c8 and c32 (T3 phase 3): `width` async blocks
-    // joined inside one task, 200 connections total, per-conn = total/200.
+    // 2. Concurrent churn: one measured phase per width (default 8, 32 —
+    // the unmodified T3/T4 behavior; MINISS_T3_WIDTHS replaces the list).
     let concurrent = |client: &Endpoint, addr: SocketAddr, width: usize| {
+        assert!(
+            width <= concurrent_connections,
+            "concurrent churn width {width} cannot exceed total connections {concurrent_connections}"
+        );
         let client = client.clone();
         async move {
-            let per_task = CONCURRENT_CONNECTIONS / width;
+            let per_task = concurrent_connections / width;
+            let total_conns = per_task * width;
             let start = Instant::now();
             let mut tasks = Vec::with_capacity(width);
             for _ in 0..width {
@@ -217,18 +264,19 @@ async fn run_bench() -> BenchReport {
                 });
             }
             join_all(tasks).await;
-            start.elapsed().as_secs_f64() * 1e6 / CONCURRENT_CONNECTIONS as f64
+            start.elapsed().as_secs_f64() * 1e6 / total_conns as f64
         }
     };
-    let concurrent_c8_us = concurrent(&client, addr, 8).await;
-    compio_runtime::time::sleep(Duration::from_millis(100)).await;
-    let concurrent_c32_us = concurrent(&client, addr, 32).await;
-    compio_runtime::time::sleep(Duration::from_millis(100)).await;
+    let mut concurrent_results = Vec::with_capacity(widths.len());
+    for width in widths {
+        let value = concurrent(&client, addr, *width).await;
+        concurrent_results.push((*width, value));
+        compio_runtime::time::sleep(Duration::from_millis(100)).await;
+    }
 
     BenchReport {
         sequential_churn_us,
-        concurrent_c8_us,
-        concurrent_c32_us,
+        concurrent: concurrent_results,
         idle_cpu_fraction: idle_cpu_probe(),
     }
 }
@@ -262,6 +310,7 @@ fn getrusage_self() -> RusageSelf {
         // The rest of the struct is not needed here; zero it.
         _rest: [u64; 14],
     }
+    // SAFETY: RUsage consists purely of integer primitives, zeroed is valid representation.
     let mut ru: RUsage = unsafe { std::mem::zeroed() };
     // SAFETY: `ru` is a valid RUsage layout for RUSAGE_SELF (macOS/Linux
     // layouts agree on the first two timevals), and libc::getrusage only

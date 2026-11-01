@@ -21,6 +21,7 @@
 //! driver treats both identically:
 //!   MINISS_T3_ONLY=spawn|churn|wake|udp   isolate one phase (skip assert)
 //!   MINISS_T3_SCALE=<n>                   multiply iteration counts
+//!   MINISS_T3_WIDTHS=<comma list>         concurrent-churn widths (default 8,32)
 //!   MINISS_T3_WAKE_PACE_US=<µs>           wake writer pacing (default 200)
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -74,6 +75,27 @@ fn scale_factor() -> usize {
         .unwrap_or(1)
 }
 
+/// Concurrent-churn widths (default 8, 32 — the unmodified T3 behavior).
+/// Same parsing rules as the miniss bench so both benches see the same
+/// widths under one env var.
+fn churn_widths() -> Vec<usize> {
+    match std::env::var("MINISS_T3_WIDTHS").ok() {
+        Some(raw) => {
+            let widths: Vec<usize> = raw
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .filter(|&w| w > 0)
+                .collect();
+            if widths.is_empty() {
+                vec![8, 32]
+            } else {
+                widths
+            }
+        }
+        None => vec![8, 32],
+    }
+}
+
 fn wake_pace_us() -> u64 {
     std::env::var("MINISS_T3_WAKE_PACE_US")
         .ok()
@@ -88,8 +110,8 @@ fn phase_marker(msg: &str) {
 struct BenchReport {
     spawn_baseline_us: f64,
     sequential_churn_us: f64,
-    concurrent_c8_us: f64,
-    concurrent_c32_us: f64,
+    /// (width, µs/conn) per measured concurrent-churn width, in run order.
+    concurrent: Vec<(usize, f64)>,
     wake_p50_us: f64,
     wake_p99_us: f64,
     idle_cpu_fraction: f64,
@@ -100,6 +122,7 @@ async fn main() {
     let phase = selected_phase();
     let scale = scale_factor();
     let pace_us = wake_pace_us();
+    let widths = churn_widths();
     let backend = if cfg!(io_backend = "io_uring") {
         "io_uring"
     } else if cfg!(io_backend = "epoll") {
@@ -139,7 +162,7 @@ async fn main() {
         return;
     }
 
-    let report = run_bench(phase, scale, pace_us).await;
+    let report = run_bench(phase, scale, pace_us, &widths).await;
 
     println!(
         "T3 quic_conn_lifecycle tokio control (backend={backend}, quinn runtime-tokio) [phase: {}]",
@@ -160,14 +183,10 @@ async fn main() {
             "  sequential churn:          {:>9.1} µs/conn",
             report.sequential_churn_us
         );
-        println!(
-            "  concurrent churn c8:       {:>9.1} µs/conn",
-            report.concurrent_c8_us
-        );
-        println!(
-            "  concurrent churn c32:      {:>9.1} µs/conn",
-            report.concurrent_c32_us
-        );
+        for (width, value) in &report.concurrent {
+            let label = format!("  concurrent churn c{width}:");
+            println!("{label:<29}{:>9.1} µs/conn", value);
+        }
     }
     if matches!(phase, Phase::All | Phase::Wake) {
         println!(
@@ -210,6 +229,7 @@ fn getrusage_self() -> RusageSelf {
         // The rest of the struct is not needed here; zero it.
         _rest: [u64; 14],
     }
+    // SAFETY: RUsage consists purely of integer primitives, zeroed is valid representation.
     let mut ru: RUsage = unsafe { std::mem::zeroed() };
     // SAFETY: `ru` is a valid RUsage layout for RUSAGE_SELF (macOS/Linux
     // layouts agree on the first two timevals), and libc::getrusage only
@@ -284,7 +304,7 @@ async fn probe_handshake(client: &mut quinn::Endpoint, addr: std::net::SocketAdd
     connection.close(0u32.into(), b"probe");
 }
 
-async fn run_bench(phase: Phase, scale: usize, wake_pace_us: u64) -> BenchReport {
+async fn run_bench(phase: Phase, scale: usize, wake_pace_us: u64, widths: &[usize]) -> BenchReport {
     let spawns = SPAWN_BASE_TASKS * scale;
     let churn_connections = CHURN_CONNECTIONS * scale;
     let concurrent_connections = CONCURRENT_CONNECTIONS * scale;
@@ -293,8 +313,7 @@ async fn run_bench(phase: Phase, scale: usize, wake_pace_us: u64) -> BenchReport
     let mut report = BenchReport {
         spawn_baseline_us: 0.0,
         sequential_churn_us: 0.0,
-        concurrent_c8_us: 0.0,
-        concurrent_c32_us: 0.0,
+        concurrent: Vec::new(),
         wake_p50_us: 0.0,
         wake_p99_us: 0.0,
         idle_cpu_fraction: 0.0,
@@ -387,11 +406,17 @@ async fn run_bench(phase: Phase, scale: usize, wake_pace_us: u64) -> BenchReport
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // 3. Concurrent churn c8 and c32.
+        // 3. Concurrent churn: one measured phase per width (default 8, 32 —
+        // the unmodified T3 behavior; MINISS_T3_WIDTHS replaces the list).
         let concurrent = |client: &quinn::Endpoint, width: usize| {
+            assert!(
+                width <= concurrent_connections,
+                "concurrent churn width {width} cannot exceed total connections {concurrent_connections}"
+            );
             let client = client.clone();
             async move {
                 let per_task = concurrent_connections / width;
+                let total_conns = per_task * width;
                 let start = Instant::now();
                 let mut tasks = Vec::with_capacity(width);
                 for _ in 0..width {
@@ -411,26 +436,21 @@ async fn run_bench(phase: Phase, scale: usize, wake_pace_us: u64) -> BenchReport
                     });
                 }
                 futures::future::join_all(tasks).await;
-                start.elapsed().as_secs_f64() * 1e6 / concurrent_connections as f64
+                start.elapsed().as_secs_f64() * 1e6 / total_conns as f64
             }
         };
         if matches!(phase, Phase::All | Phase::Churn) {
-            if phase != Phase::All {
-                phase_marker("conc churn c8 begin");
+            for width in widths {
+                if phase != Phase::All {
+                    phase_marker(&format!("conc churn c{width} begin"));
+                }
+                let value = concurrent(&client, *width).await;
+                report.concurrent.push((*width, value));
+                if phase != Phase::All {
+                    phase_marker(&format!("conc churn c{width} end"));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            report.concurrent_c8_us = concurrent(&client, 8).await;
-            if phase != Phase::All {
-                phase_marker("conc churn c8 end");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if phase != Phase::All {
-                phase_marker("conc churn c32 begin");
-            }
-            report.concurrent_c32_us = concurrent(&client, 32).await;
-            if phase != Phase::All {
-                phase_marker("conc churn c32 end");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         // 4. Cross-task wake: A's traffic wakes B's task. A dedicated endpoint
