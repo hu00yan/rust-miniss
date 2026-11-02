@@ -668,6 +668,12 @@ pub trait IoProvider: 'static {
     ) -> (usize, bool, usize) {
         (0, false, 0)
     }
+
+    /// Returns an optional cross-thread interrupt callback for backends (like mio/kqueue)
+    /// that need explicit signaling to interrupt a blocking kernel poll.
+    fn interrupt_waker(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
 }
 
 /// Concrete context wrapping the thread-local I/O backend for reactor operations.
@@ -1146,6 +1152,13 @@ impl IoToken {
     #[inline(always)]
     pub(crate) fn slot_index(&self) -> usize {
         (self.id as u32) as usize
+    }
+
+    /// Returns the generation encoded in the high 32 bits of this token.
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn generation(&self) -> u32 {
+        (self.id >> 32) as u32
     }
 }
 

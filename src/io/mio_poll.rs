@@ -15,7 +15,7 @@
 
 use crate::io::{CompletionKind, DescriptorLease, IoError, IoProvider, IoToken, Op};
 use crate::Buffer;
-use mio::{unix::SourceFd, Events, Interest, Poll, Token};
+use mio::{unix::SourceFd, Events, Interest, Poll, Token, Waker};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::io;
@@ -209,6 +209,8 @@ impl BlockingTestGate {
 pub struct MioBackend {
     /// The `mio::Poll` instance, which manages file descriptor readiness.
     poll: UnsafeCell<Poll>,
+    /// Dedicated waker to immediately interrupt `poll.poll()` when cross-core messages arrive.
+    waker: Arc<Waker>,
     /// A buffer for receiving events from `mio::Poll`.
     events: UnsafeCell<Events>,
     /// Pending operations indexed by the `mio::Token` slot.
@@ -230,8 +232,16 @@ pub struct MioBackend {
     mio_tokens: UnsafeCell<Vec<Option<Token>>>,
     /// Direct event-token lookup, bounded by peak concurrent accepted work.
     active_mio_slots: UnsafeCell<HashMap<Token, usize>>,
-    /// Shard-local IoToken counter.
-    next_io_token: std::cell::Cell<u64>,
+    /// Recycled cpu-side slot identities, packed as the next `IoToken` id to
+    /// reissue: `(generation << 32) | slot_index`. An index enters this pool
+    /// only after its completion was consumed and its cpu-side slot cleared
+    /// (`IoProvider::recycle_io_slot`), so a reissued identity can never alias
+    /// a live operation. Owner-thread only. (ledger #45 on Mio)
+    free_io_slots: UnsafeCell<Vec<u64>>,
+    /// Next never-before-issued cpu-side slot index, consumed only when the
+    /// recycle pool is empty. Tracks peak in-flight operations, not cumulative
+    /// operations (ledger #45).
+    next_slot_index: std::cell::Cell<u32>,
     /// Thread pool for blocking file I/O operations
     thread_pool: Arc<ThreadPool>,
     /// Flush requests accepted but not yet handed to the file thread pool.
@@ -292,8 +302,13 @@ impl MioBackend {
         let thread_pool = Arc::new(ThreadPool::new(pool_size));
         let (completed_tx, completed_rx) = sync_channel(COMPLETION_QUEUE_CAPACITY);
 
+        const WAKEUP_TOKEN_VALUE: usize = usize::MAX - 1;
+        let poll = Poll::new()?;
+        let waker = Arc::new(Waker::new(poll.registry(), Token(WAKEUP_TOKEN_VALUE))?);
+
         Ok(Self {
-            poll: UnsafeCell::new(Poll::new()?),
+            poll: UnsafeCell::new(poll),
+            waker,
             events: UnsafeCell::new(Events::with_capacity(1024)),
             pending_ops: UnsafeCell::new(Vec::with_capacity(1024)),
             descriptor_leases: UnsafeCell::new(Vec::with_capacity(1024)),
@@ -303,7 +318,8 @@ impl MioBackend {
             free_slots: UnsafeCell::new(Vec::new()),
             mio_tokens: UnsafeCell::new(Vec::with_capacity(1024)),
             active_mio_slots: UnsafeCell::new(HashMap::new()),
-            next_io_token: std::cell::Cell::new(1),
+            free_io_slots: UnsafeCell::new(Vec::new()),
+            next_slot_index: std::cell::Cell::new(1),
             thread_pool,
             flush_groups: UnsafeCell::new(Vec::new()),
             flush_requests: std::cell::Cell::new(0),
@@ -517,14 +533,38 @@ impl MioBackend {
             });
         }
     }
+
+    fn allocate_io_token(&self) -> Result<IoToken, IoError> {
+        // SAFETY: `free_io_slots` is shard-local; submit runs on the owner thread.
+        let free = unsafe { &mut *self.free_io_slots.get() };
+        if let Some(id) = free.pop() {
+            return Ok(IoToken::from_id(id));
+        }
+        let idx = self.next_slot_index.get();
+        let next = idx
+            .checked_add(1)
+            .ok_or_else(|| IoError::Other("mio io slot index space exhausted".into()))?;
+        self.next_slot_index.set(next);
+        Ok(IoToken::from_id(Self::pack_slot(idx, 1)))
+    }
+
+    #[inline]
+    fn pack_slot(slot: u32, generation: u32) -> u64 {
+        ((generation as u64) << 32) | (slot as u64)
+    }
+
+    #[inline]
+    fn recycled_token_id(token: IoToken) -> u64 {
+        let slot = token.id() & 0xffff_ffff;
+        let generation = ((token.id() >> 32) as u32).wrapping_add(1).max(1);
+        ((generation as u64) << 32) | slot
+    }
 }
 
 impl IoProvider for MioBackend {
     type Completion = (IoToken, Result<CompletionKind, IoError>);
 
     fn submit(&self, op: Op) -> Result<IoToken, IoError> {
-        let io_token = IoToken::next_from(&self.next_io_token);
-
         // Acquire the lease before allocating a slot. File operations retain it
         // there until their worker completion is drained by the owner thread.
         let descriptor_lease = if matches!(&op, Op::Nop | Op::Close { .. }) {
@@ -539,9 +579,12 @@ impl IoProvider for MioBackend {
         // SAFETY: The owner thread is the only accessor to token allocation.
         let next_token = unsafe { &mut *self.next_token.get() };
         let token_value = *next_token;
-        *next_token = next_token
-            .checked_add(1)
-            .ok_or_else(|| IoError::Io(io::Error::other("mio token space exhausted")))?;
+        let Some(incremented) = next_token.checked_add(1) else {
+            return Err(IoError::Io(io::Error::other("mio token space exhausted")));
+        };
+        *next_token = incremented;
+
+        let io_token = self.allocate_io_token()?;
         // SAFETY: mio token, slot, and token-index tables are shard-local and
         // accessed only by this backend's owner thread.
         let poll = unsafe { &mut *self.poll.get() };
@@ -872,6 +915,7 @@ impl IoProvider for MioBackend {
                             free_slots: &mut *free_slots,
                         },
                     );
+                    self.recycle_io_slot(io_token);
                     return Err(IoError::Other(
                         "RecvMultishot requires the io_uring backend".into(),
                     ));
@@ -909,6 +953,7 @@ impl IoProvider for MioBackend {
                     free_slots: &mut *free_slots,
                 },
             );
+            self.recycle_io_slot(io_token);
             return Err(IoError::Io(error));
         }
 
@@ -1062,9 +1107,13 @@ impl IoProvider for MioBackend {
         }
 
         // A zero timeout would busy-loop; mio treats `None` as "block forever".
-        // Use a 1ms floor so the worker still re-runs its budgeted work at a
-        // bounded rate while parking the thread between turns.
-        let wait = timeout.max(Duration::from_millis(1));
+        // When timeout is zero, use a 100µs floor. When timeout > 0, use the requested
+        // timeout directly. Waker interrupts wake immediately without waiting for timeout.
+        let wait = if timeout.is_zero() {
+            Duration::from_micros(100)
+        } else {
+            timeout
+        };
         // `Poll::poll` in mio 1.0 returns `io::Result<()>`, so the event count
         // is read back from the shared buffer instead of from the return value.
         let parked = match poll.poll(events, Some(wait)) {
@@ -1728,6 +1777,19 @@ impl IoProvider for MioBackend {
         } else {
             TaskPoll::Ready(completions)
         }
+    }
+
+    fn recycle_io_slot(&self, token: IoToken) {
+        // SAFETY: `free_io_slots` is shard-local; this trait method is only
+        // reached from cpu-state release paths on the owning thread.
+        unsafe { &mut *self.free_io_slots.get() }.push(Self::recycled_token_id(token));
+    }
+
+    fn interrupt_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let waker = self.waker.clone();
+        Some(Arc::new(move || {
+            let _ = waker.wake();
+        }))
     }
 }
 
@@ -2957,5 +3019,44 @@ mod mio_regression_tests {
         assert!(failed.udp_recv_buffers_empty);
         assert!(failed.pending_empty);
         assert_eq!(failed.free_slots.as_slice(), &[0]);
+    }
+
+    #[test]
+    fn mio_backend_recycles_slot_with_bumped_generation() {
+        let backend = MioBackend::new().expect("mio backend");
+        let first = backend.allocate_io_token().expect("first token");
+        assert_eq!(first.slot_index(), 1);
+        assert_eq!(first.generation(), 1);
+
+        // Recycle the first token: slot 1, generation bumped to 2.
+        backend.recycle_io_slot(first);
+
+        let second = backend.allocate_io_token().expect("second token");
+        assert_eq!(second.slot_index(), 1);
+        assert_eq!(second.generation(), 2);
+        assert_eq!(second.id(), first.id() + (1u64 << 32));
+
+        // Releasing again bumps generation to 3
+        backend.recycle_io_slot(second);
+        let third = backend.allocate_io_token().expect("third token");
+        assert_eq!(third.slot_index(), 1);
+        assert_eq!(third.generation(), 3);
+    }
+
+    #[test]
+    fn mio_backend_recycle_pool_is_lifo() {
+        let backend = MioBackend::new().expect("mio backend");
+        let first = backend.allocate_io_token().expect("first token");
+        let second = backend.allocate_io_token().expect("second token");
+        assert_eq!(first.slot_index(), 1);
+        assert_eq!(second.slot_index(), 2);
+
+        backend.recycle_io_slot(second);
+        backend.recycle_io_slot(first);
+
+        // LIFO: last released is reissued first
+        let pooled = backend.allocate_io_token().expect("pooled token");
+        assert_eq!(pooled.slot_index(), 1);
+        assert_eq!(pooled.generation(), 2);
     }
 }
