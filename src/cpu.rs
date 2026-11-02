@@ -469,10 +469,27 @@ impl CpuIoState {
         let _cancel_requested = self.io_backend.cancel(token);
         let slots = &mut *self.io_slots.get();
         // SAFETY: the contract above says the caller owns the shard, so this thread
-        // has the exclusive `slots` access `live_slot` requires.
-        let Some(slot) = (unsafe { Self::live_slot(slots, token) }) else {
-            return;
-        };
+        // has exclusive `slots` access.
+        // If the slot is live and already holds a completion, no future terminal CQE will
+        // arrive for this operation. Clear the slot and recycle the index immediately.
+        if let Some(slot) = unsafe { Self::live_slot(slots, token) } {
+            if slot.completed.is_some() {
+                slot.token_id = 0;
+                slot.waker = None;
+                slot.completed = None;
+                slot.pending_task = None;
+                slot.discarded = false;
+                self.io_backend.recycle_io_slot(token);
+                return;
+            }
+        }
+
+        // Even if the future was dropped before its first poll (so `live_slot` was None),
+        // prepare the slot so it is marked `discarded = true`. When the late CQE arrives,
+        // `take_discarded` reclaims the completion result and recycles the slot rather
+        // than leaking the buffer and token index permanently.
+        // SAFETY: caller owns the shard-local state on the worker thread, granting exclusive access to `slots`.
+        let slot = unsafe { Self::prepare_slot(slots, token) };
         slot.waker = None;
         slot.pending_task = None;
         slot.completed = None;
@@ -1018,6 +1035,48 @@ mod tests {
             assert_eq!(*recycled.borrow(), vec![token.id()]);
             assert!(!state.take_discarded(token));
             assert_eq!(*recycled.borrow(), vec![token.id()]);
+        }
+    }
+
+    #[test]
+    fn unpolled_future_drop_prepares_slot_and_discards_late_completion() {
+        let (state, recycled) = recording_state();
+        let token = packed(3, 5);
+        // SAFETY: the test owns this shard-local state on one thread.
+        // Drop before first poll: store_waker was never called.
+        unsafe {
+            state.cancel_and_discard(token);
+            assert!(
+                recycled.borrow().is_empty(),
+                "abandonment before poll must retain the slot until the terminal CQE"
+            );
+            assert!(
+                state.take_discarded(token),
+                "terminal CQE must be caught by take_discarded even if unpolled"
+            );
+            assert_eq!(*recycled.borrow(), vec![token.id()]);
+            assert!(!state.take_discarded(token));
+        }
+    }
+
+    #[test]
+    fn cancel_and_discard_on_already_completed_slot_recycles_immediately() {
+        let (state, recycled) = recording_state();
+        let token = packed(1, 9);
+        let waker = futures::task::noop_waker();
+        // SAFETY: the test owns this shard-local state on one thread.
+        unsafe {
+            state.store_waker(token, &waker);
+            state.insert_completed(token, Ok(CompletionKind::Nop));
+            assert!(recycled.borrow().is_empty());
+            // Drop future when completion already arrived in slot:
+            state.cancel_and_discard(token);
+            assert_eq!(
+                *recycled.borrow(),
+                vec![token.id()],
+                "already-completed slot must be recycled immediately on cancel_and_discard"
+            );
+            assert!(!state.take_discarded(token));
         }
     }
 
