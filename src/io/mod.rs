@@ -27,12 +27,13 @@
 //! match; cross-compiling callers should set `MINISS_IO_BACKEND` for the target.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd as StdAsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::buffer::Buffer;
 use smallvec::SmallVec;
@@ -666,6 +667,325 @@ pub trait IoProvider: 'static {
         _batch_limit: usize,
     ) -> (usize, bool, usize) {
         (0, false, 0)
+    }
+}
+
+/// Concrete context wrapping the thread-local I/O backend for reactor operations.
+///
+/// In production, `IoContext` wraps the thread-affine [`IoProvider`] instance
+/// for the current worker core.
+pub struct IoContext<'a> {
+    backend: &'a dyn IoProvider<Completion = (IoToken, Result<CompletionKind, IoError>)>,
+}
+
+impl<'a> IoContext<'a> {
+    /// Create a new `IoContext` borrowing the given I/O backend.
+    #[inline]
+    pub fn new(
+        backend: &'a dyn IoProvider<Completion = (IoToken, Result<CompletionKind, IoError>)>,
+    ) -> Self {
+        Self { backend }
+    }
+
+    /// Access the underlying I/O backend.
+    #[inline]
+    pub fn backend(
+        &self,
+    ) -> &dyn IoProvider<Completion = (IoToken, Result<CompletionKind, IoError>)> {
+        self.backend
+    }
+
+    /// Park the worker thread, blocking until completions arrive or the timeout expires.
+    #[inline]
+    pub fn park(&self, timeout: Duration) -> usize {
+        self.backend.park(timeout)
+    }
+
+    /// Flush any pending I/O submissions to the kernel.
+    #[inline]
+    pub fn flush(&self) {
+        self.backend.flush();
+    }
+
+    /// Number of accepted operations that still require owner-thread drain.
+    #[inline]
+    pub fn pending_operation_count(&self) -> usize {
+        self.backend.pending_operation_count()
+    }
+
+    /// Retrieve and clear park-specific flush metrics: `(flushes, total_us, max_us)`.
+    #[inline]
+    pub fn take_park_flush_stats(&self) -> (u64, u64, u64) {
+        self.backend.take_park_flush_stats()
+    }
+}
+
+/// Seam for driving the worker event loop and reactor.
+///
+/// In production, [`DefaultEventLoopDriver`] wraps [`IoContext`] to drive real OS
+/// I/O via io_uring/kqueue/epoll. In tests and simulations, [`SimulatedLoopDriver`]
+/// advances virtual time steps and simulates completion events without OS park or sleep.
+pub trait EventLoopDriver {
+    /// Park or poll the reactor for completions or timeout.
+    ///
+    /// Returns the number of completions processed / available.
+    fn park(&mut self, timeout: Duration) -> usize;
+
+    /// Flush pending I/O submissions to the kernel or reactor.
+    fn flush(&mut self) {}
+
+    /// Current timestamp (real wall-clock or virtual logical time).
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    /// Retrieve and clear park-specific flush statistics: `(flushes, total_us, max_us)`.
+    fn take_park_flush_stats(&mut self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+
+    /// Total number of times `park` was invoked.
+    fn park_count(&self) -> u64 {
+        0
+    }
+
+    /// Pending operations in the reactor.
+    fn pending_operation_count(&self) -> usize {
+        0
+    }
+}
+
+/// Default production event loop driver wrapping [`IoContext`].
+///
+/// Zero-cost, zero-overhead: inlines directly to the underlying `IoProvider`.
+pub struct DefaultEventLoopDriver<'a> {
+    io_context: IoContext<'a>,
+    park_count: u64,
+}
+
+impl<'a> DefaultEventLoopDriver<'a> {
+    /// Create a new driver wrapping the given `IoContext`.
+    #[inline]
+    pub fn new(io_context: IoContext<'a>) -> Self {
+        Self {
+            io_context,
+            park_count: 0,
+        }
+    }
+
+    /// Reference to the inner `IoContext`.
+    #[inline]
+    pub fn io_context(&self) -> &IoContext<'a> {
+        &self.io_context
+    }
+}
+
+impl<'a> EventLoopDriver for DefaultEventLoopDriver<'a> {
+    #[inline]
+    fn park(&mut self, timeout: Duration) -> usize {
+        self.park_count += 1;
+        self.io_context.park(timeout)
+    }
+
+    #[inline]
+    fn flush(&mut self) {
+        self.io_context.flush();
+    }
+
+    #[inline]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    #[inline]
+    fn take_park_flush_stats(&mut self) -> (u64, u64, u64) {
+        self.io_context.take_park_flush_stats()
+    }
+
+    #[inline]
+    fn park_count(&self) -> u64 {
+        self.park_count
+    }
+
+    #[inline]
+    fn pending_operation_count(&self) -> usize {
+        self.io_context.pending_operation_count()
+    }
+}
+
+impl<'a> EventLoopDriver for IoContext<'a> {
+    #[inline]
+    fn park(&mut self, timeout: Duration) -> usize {
+        self.backend.park(timeout)
+    }
+
+    #[inline]
+    fn flush(&mut self) {
+        self.backend.flush();
+    }
+
+    #[inline]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    #[inline]
+    fn take_park_flush_stats(&mut self) -> (u64, u64, u64) {
+        self.backend.take_park_flush_stats()
+    }
+
+    #[inline]
+    fn park_count(&self) -> u64 {
+        0
+    }
+
+    #[inline]
+    fn pending_operation_count(&self) -> usize {
+        self.backend.pending_operation_count()
+    }
+}
+
+/// Simulated event loop driver for tests and simulation models.
+///
+/// Advances virtual logical time steps and provides synthetic completion counts
+/// without invoking OS park or sleeping.
+#[derive(Debug, Clone)]
+pub struct SimulatedLoopDriver {
+    current_time: Instant,
+    virtual_step: Duration,
+    park_count: u64,
+    flush_count: u64,
+    synthetic_completions: VecDeque<usize>,
+    pending_ops: usize,
+    park_flushes: (u64, u64, u64),
+}
+
+impl SimulatedLoopDriver {
+    /// Create a new simulated driver starting at current instant.
+    pub fn new() -> Self {
+        Self {
+            current_time: Instant::now(),
+            virtual_step: Duration::from_millis(1),
+            park_count: 0,
+            flush_count: 0,
+            synthetic_completions: VecDeque::new(),
+            pending_ops: 0,
+            park_flushes: (0, 0, 0),
+        }
+    }
+
+    /// Create with a custom virtual time step duration.
+    pub fn with_step(step: Duration) -> Self {
+        Self {
+            virtual_step: step,
+            ..Self::new()
+        }
+    }
+
+    /// Feed a synthetic completion event count to be returned by future `park()` calls.
+    pub fn feed_completions(&mut self, count: usize) {
+        self.synthetic_completions.push_back(count);
+    }
+
+    /// Set simulated pending operation count.
+    pub fn set_pending_operations(&mut self, count: usize) {
+        self.pending_ops = count;
+    }
+
+    /// Advance virtual time manually by a duration.
+    pub fn advance_time(&mut self, duration: Duration) {
+        self.current_time += duration;
+    }
+
+    /// Total flushes requested.
+    pub fn flush_count(&self) -> u64 {
+        self.flush_count
+    }
+
+    /// Current virtual time.
+    pub fn virtual_time(&self) -> Instant {
+        self.current_time
+    }
+
+    /// Current timestamp.
+    pub fn now(&self) -> Instant {
+        self.current_time
+    }
+
+    /// Total number of times `park` was invoked.
+    pub fn park_count(&self) -> u64 {
+        self.park_count
+    }
+
+    /// Configure park flush metrics returned by `take_park_flush_stats`.
+    pub fn set_park_flush_stats(&mut self, stats: (u64, u64, u64)) {
+        self.park_flushes = stats;
+    }
+}
+
+impl Default for SimulatedLoopDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventLoopDriver for SimulatedLoopDriver {
+    fn park(&mut self, timeout: Duration) -> usize {
+        self.park_count += 1;
+        // Advance logical virtual time without calling OS sleep or park
+        let step = if timeout < self.virtual_step {
+            timeout
+        } else {
+            self.virtual_step
+        };
+        self.current_time += step;
+        self.synthetic_completions.pop_front().unwrap_or(0)
+    }
+
+    fn flush(&mut self) {
+        self.flush_count += 1;
+    }
+
+    fn now(&self) -> Instant {
+        self.current_time
+    }
+
+    fn take_park_flush_stats(&mut self) -> (u64, u64, u64) {
+        let stats = self.park_flushes;
+        self.park_flushes = (0, 0, 0);
+        stats
+    }
+
+    fn park_count(&self) -> u64 {
+        self.park_count
+    }
+
+    fn pending_operation_count(&self) -> usize {
+        self.pending_ops
+    }
+}
+
+/// A no-op implementation of [`IoProvider`] for tests and synthetic simulation.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopIoProvider;
+
+impl IoProvider for NoopIoProvider {
+    type Completion = (IoToken, Result<CompletionKind, IoError>);
+
+    fn submit(&self, _op: Op) -> Result<IoToken, IoError> {
+        Ok(IoToken::from_id(1))
+    }
+
+    fn drain_completions(&self) -> Poll<Vec<Self::Completion>> {
+        Poll::Pending
+    }
+
+    fn drain_completions_into(&self, _completions: &mut Vec<Self::Completion>) -> Poll<()> {
+        Poll::Pending
+    }
+
+    fn park(&self, _timeout: Duration) -> usize {
+        0
     }
 }
 

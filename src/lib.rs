@@ -70,11 +70,14 @@ pub use http::{
     EchoHandler, HttpConnection, HttpHandler, Method, Request, Response, StaticHandler, StatusCode,
 };
 pub use hyper_rt::{MinissHyperExecutor, MinissHyperTimer};
-pub use io::{CompletionKind, IoError, IoProvider, IoToken, Op, ResourceBalanceSnapshot};
+pub use io::{
+    CompletionKind, DefaultEventLoopDriver, EventLoopDriver, IoContext, IoError, IoProvider,
+    IoToken, NoopIoProvider, Op, ResourceBalanceSnapshot, SimulatedLoopDriver,
+};
 pub use metrics::{MetricsError, MetricsView};
 pub use multicore::{
     join_global, shutdown_global_with_timeout, CoreMetricsSnapshot, MultiCoreRuntime,
-    RuntimeMetrics, ShutdownPhase,
+    RuntimeMetrics, ShutdownPhase, Worker,
 };
 pub use net::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket};
 pub use quic::MinissQuicRuntime;

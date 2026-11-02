@@ -1153,6 +1153,9 @@ pub struct CpuCore {
     termination_report: Arc<std::sync::OnceLock<CoreTerminationSnapshot>>,
 }
 
+/// Type alias for the per-core worker executor.
+pub type Worker = CpuCore;
+
 impl CpuCore {
     /// Create new CPU core. The platform-gated constructor keeps the driver,
     /// wakeup fd, and ownership flags explicit; the argument count is kept
@@ -1421,8 +1424,258 @@ impl CpuCore {
         self.clear_wakeup_poll();
     }
 
+    /// Execute local ready tasks.
+    ///
+    /// Alias: [`Self::execute_tasks`].
+    #[inline]
+    pub fn tick_tasks(&mut self) -> bool {
+        self.execute_tasks()
+    }
+
+    /// Process messages from other cores in inbox.
+    ///
+    /// Alias: [`Self::process_messages`].
+    #[inline]
+    pub fn drain_inbox(&mut self) -> bool {
+        self.process_messages()
+    }
+
+    /// Outer event-loop park: calls `driver.park(self.park_timeout)`, updates metrics,
+    /// and executes any tasks woken by arriving completions.
+    pub fn park_or_poll<D: crate::io::EventLoopDriver>(&mut self, driver: &mut D) -> usize {
+        self.metrics.parks += 1;
+        let park_started = Instant::now();
+        let n_completions = driver.park(self.park_timeout);
+        let park_elapsed_us = park_started.elapsed().as_micros() as u64;
+        let (park_flushes, park_flush_total_us, max_park_flush_us) = driver.take_park_flush_stats();
+        #[cfg(target_os = "linux")]
+        self.sleep_gate.end_sleep();
+        self.metrics.park_total_us += park_elapsed_us;
+        self.metrics.max_park_us = self.metrics.max_park_us.max(park_elapsed_us);
+        self.metrics.park_flushes += park_flushes;
+        self.metrics.park_flush_total_us += park_flush_total_us;
+        self.metrics.max_park_flush_us = self.metrics.max_park_flush_us.max(max_park_flush_us);
+        if n_completions == 0 {
+            self.metrics.park_timeouts += 1;
+        } else {
+            self.metrics.park_completions += n_completions as u64;
+        }
+
+        if n_completions > 0 {
+            let _ = self.process_io_completions(true);
+        }
+        // Execute tasks that were just woken by the park+drain
+        if self.tick_tasks() {
+            self.metrics.flushes += 1;
+            let flush_started = Instant::now();
+            driver.flush();
+            let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
+            self.metrics.flush_total_us += flush_elapsed_us;
+            self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
+        }
+        n_completions
+    }
+
+    /// Inner work loop: process inter-core messages, completions, tasks, and timers
+    /// until queues are drained or productive budget is reached.
+    pub fn tick_work<D: crate::io::EventLoopDriver>(&mut self, driver: &mut D) -> bool {
+        /// Maximum productive inner-loop iterations (a round that polled a
+        /// task, drained a CQE, processed a message, or expired a timer)
+        /// before forcing a park — the anti-starvation backstop for
+        /// continuously self-waking tasks.  Empty check rounds never count:
+        /// they exit to the event-driven park at step 6 (finding #46).
+        const MAX_BUSY_ROUNDS: u32 = 96;
+        const MESSAGE_POLL_TICKS_LIGHT: usize = 3;
+        const MESSAGE_POLL_TICKS_BUSY: usize = 15;
+        let mut ready_timers = Vec::with_capacity(crate::config::EXPECTED_WAKEUP_COUNT);
+        let mut busy_rounds: u32 = 0;
+        let mut any_work_done = false;
+
+        loop {
+            let mut work_done = false;
+            // 1. Process inter-core messages.
+            //    Check immediately when messages are waiting, when the
+            //    ready queue is empty, or every Nth tick under load.
+            //    Reserved I/O retirements bypass that cadence below.
+            if self.draining
+                || self.ready_queue.is_empty()
+                || self.message_poll_ticks == 0
+                || !self.retirement.queue.is_empty()
+            {
+                work_done |= self.drain_inbox();
+                self.message_poll_ticks = if self.ready_queue.len() < 8 {
+                    MESSAGE_POLL_TICKS_LIGHT
+                } else {
+                    MESSAGE_POLL_TICKS_BUSY
+                };
+            } else {
+                self.message_poll_ticks -= 1;
+            }
+
+            // 2. Process I/O completions — may wake tasks into ready_queue.
+            work_done |= self.process_io_completions(false);
+
+            // 3. Execute ready tasks — may submit new SQEs.
+            work_done |= self.tick_tasks();
+
+            // 4. Submit pending SQEs to kernel (no wait).
+            //    During busy periods this lets the kernel start working on
+            //    I/O immediately instead of deferring it to park().
+            if work_done {
+                self.metrics.flushes += 1;
+                let flush_started = Instant::now();
+                driver.flush();
+                let flush_elapsed_us = flush_started.elapsed().as_micros() as u64;
+                self.metrics.flush_total_us += flush_elapsed_us;
+                self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
+            }
+
+            // 5. Process expired timers — they also put tasks into ready_queue.
+            if self.timer_wheel.has_pending() {
+                let now = driver.now();
+                work_done |= self.process_timers(now, &mut ready_timers);
+            }
+
+            // 5b. Republish the runnable-work depth for spawn selection and
+            // the shard's metrics for control-plane scrapes. Placed after
+            // every producer of ready work and before the exit check, so
+            // the stored values reflect this turn's settled state rather
+            // than a mid-turn snapshot.  The metrics publication is
+            // rate-limited to the minimum publication interval (cumulative
+            // counters make staleness safe); the ready-depth hint is not,
+            // because spawn selection always wants fresh balance data.
+            self.publish_ready_hint();
+            self.publish_metrics_if_due();
+
+            any_work_done |= work_done;
+
+            // 6. Nothing left to do — exit inner loop, go park (wait for
+            //    I/O).  This is the event-driven block.  Reaching this
+            //    point with `work_done == false` means the CQ peek found
+            //    nothing, the ready and owner queues are empty, no message
+            //    arrived, and no timer expired: the correct move is to
+            //    block in `park(timeout)`, which also hands deferred SQEs
+            //    below the flush batch threshold to the kernel via its
+            //    submit_and_wait ("submit once via park").  Counting that
+            //    deferral as work here — the removed flush-as-work path —
+            //    made the loop re-scan empty queues once per microsecond
+            //    between events: at 7 workers x 32 keep-alive connections
+            //    the event interval (~20-30µs) dwarfs the per-round cost
+            //    (~1µs), so the loop burned ~1 core per worker re-checking
+            //    nothing (finding #46: busy_rounds/polled ≈ 17:1, ~8k
+            //    parks/s, CPU 4.5x monoio).  Under saturation this branch
+            //    is not reached (the ready queue holds work every round),
+            //    so the syscall-rate rationale of the two-level loop is
+            //    untouched.
+            if !work_done {
+                break;
+            }
+
+            // 7. Bounding: prevent I/O starvation.  `busy_rounds` counts
+            //    only productive rounds — at least one task polled, one
+            //    CQE drained, one message processed, or one timer expired.
+            //    Empty check rounds exited at step 6 and never increment
+            //    it, so MAX_BUSY_ROUNDS is purely the anti-starvation
+            //    backstop for continuously self-waking tasks: after 96
+            //    consecutive productive rounds, force a park to let the
+            //    kernel push completions and timers fire.
+            busy_rounds += 1;
+            self.metrics.busy_rounds += 1;
+            if busy_rounds >= MAX_BUSY_ROUNDS {
+                break;
+            }
+        }
+
+        any_work_done
+    }
+
+    /// Execute one turn of the event loop with runtime context entered.
+    ///
+    /// Returns `(work_done, completions)`.
+    pub fn run_one_turn<D: crate::io::EventLoopDriver>(&mut self, driver: &mut D) -> (bool, usize) {
+        // SAFETY: CpuCore owns io_state and timer_wheel for the duration of the turn.
+        let _guard = unsafe {
+            RuntimeContextGuard::enter(&self.io_state, &mut self.timer_wheel, Some(self.id))
+        };
+        struct LocalSpawnContextGuard;
+        impl Drop for LocalSpawnContextGuard {
+            fn drop(&mut self) {
+                LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().clear());
+                LOCAL_SPAWN_COUNT.with(|count| count.set(0));
+            }
+        }
+        let _local_spawn_context = LocalSpawnContextGuard;
+
+        let work_done = self.tick_work(driver);
+        let completions = self.park_or_poll(driver);
+        (work_done, completions)
+    }
+
+    /// Run event loop with an explicit [`EventLoopDriver`].
+    pub fn run_with_driver<D: crate::io::EventLoopDriver>(&mut self, driver: &mut D) -> Result<()> {
+        // SAFETY: CpuCore owns both fields for the whole run invocation; the
+        // context guard drops before CpuCore can be moved or destroyed.
+        let _runtime_context = unsafe {
+            RuntimeContextGuard::enter(&self.io_state, &mut self.timer_wheel, Some(self.id))
+        };
+        struct LocalSpawnContextGuard;
+        impl Drop for LocalSpawnContextGuard {
+            fn drop(&mut self) {
+                LOCAL_SPAWN_QUEUE.with(|queue| queue.borrow_mut().clear());
+                LOCAL_SPAWN_COUNT.with(|count| count.set(0));
+            }
+        }
+        let _local_spawn_context = LocalSpawnContextGuard;
+
+        loop {
+            if self.force_shutdown.load(Ordering::Acquire) {
+                self.io_state.io_backend.cancel_all();
+                driver.flush();
+                self.reap_pending_operations(CANCEL_REAP_ROUNDS);
+                self.task_queue.clear();
+                while self.ready_queue.pop().is_some() {}
+                self.timer_wheel.clear();
+                self.owner_ready_queue.clear();
+                // SAFETY: the worker owns this completion storage during
+                // forced teardown; no other thread can access it.
+                unsafe { (&mut *self.io_state.owner_completions.get()).clear() };
+                self.local_task_count = 0;
+                self.draining = true;
+                break;
+            }
+            if self.shutdown.load(Ordering::Acquire) {
+                self.draining = true;
+            }
+
+            self.tick_work(driver);
+
+            if self.draining
+                && self.local_task_count == 0
+                && self.ready_queue.is_empty()
+                && self.message_inbox.is_empty()
+                && self.retirement.queue.is_empty()
+                && driver.pending_operation_count() == 0
+            {
+                break;
+            }
+
+            let _n_completions = self.park_or_poll(driver);
+
+            if self.draining
+                && self.local_task_count == 0
+                && self.ready_queue.is_empty()
+                && self.message_inbox.is_empty()
+                && self.retirement.queue.is_empty()
+                && driver.pending_operation_count() == 0
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Main event loop - shared-nothing execution
-    fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self) -> Result<()> {
         // Bind to CPU core for optimal cache locality
         if let Err(err) = self.bind_to_cpu() {
             if let Some(sender) = self.ready_sender.take() {
@@ -1449,11 +1702,6 @@ impl CpuCore {
 
         tracing::info!("CPU core {} started", self.id);
 
-        /// Maximum productive inner-loop iterations (a round that polled a
-        /// task, drained a CQE, processed a message, or expired a timer)
-        /// before forcing a park — the anti-starvation backstop for
-        /// continuously self-waking tasks.  Empty check rounds never count:
-        /// they exit to the event-driven park at step 6 (finding #46).
         const MAX_BUSY_ROUNDS: u32 = 96;
         const MESSAGE_POLL_TICKS_LIGHT: usize = 3;
         const MESSAGE_POLL_TICKS_BUSY: usize = 15;
@@ -1461,10 +1709,6 @@ impl CpuCore {
 
         loop {
             if self.force_shutdown.load(Ordering::Acquire) {
-                // Escalated shutdown is intentionally owner-local: no control
-                // thread touches task futures, timers, or driver state. Ask
-                // the backend to cancel first, then give terminal CQEs a
-                // bounded owner-thread drain window before reclaiming tasks.
                 self.io_state.io_backend.cancel_all();
                 self.io_state.io_backend.flush();
                 self.reap_pending_operations(CANCEL_REAP_ROUNDS);
@@ -1483,20 +1727,15 @@ impl CpuCore {
                 self.draining = true;
             }
 
-            // --- INNER LOOP: process all available work, submit I/O, don't wait ---
             let mut busy_rounds: u32 = 0;
             loop {
                 let mut work_done = false;
-                // 1. Process inter-core messages.
-                //    Check immediately when messages are waiting, when the
-                //    ready queue is empty, or every Nth tick under load.
-                //    Reserved I/O retirements bypass that cadence below.
                 if self.draining
                     || self.ready_queue.is_empty()
                     || self.message_poll_ticks == 0
                     || !self.retirement.queue.is_empty()
                 {
-                    work_done |= self.process_messages();
+                    work_done |= self.drain_inbox();
                     self.message_poll_ticks = if self.ready_queue.len() < 8 {
                         MESSAGE_POLL_TICKS_LIGHT
                     } else {
@@ -1506,15 +1745,9 @@ impl CpuCore {
                     self.message_poll_ticks -= 1;
                 }
 
-                // 2. Process I/O completions — may wake tasks into ready_queue.
                 work_done |= self.process_io_completions(false);
+                work_done |= self.tick_tasks();
 
-                // 3. Execute ready tasks — may submit new SQEs.
-                work_done |= self.execute_tasks();
-
-                // 4. Submit pending SQEs to kernel (no wait).
-                //    During busy periods this lets the kernel start working on
-                //    I/O immediately instead of deferring it to park().
                 if work_done {
                     self.metrics.flushes += 1;
                     let flush_started = Instant::now();
@@ -1524,53 +1757,18 @@ impl CpuCore {
                     self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
                 }
 
-                // 5. Process expired timers — they also put tasks into ready_queue.
                 if self.timer_wheel.has_pending() {
                     let now = Instant::now();
                     work_done |= self.process_timers(now, &mut ready_timers);
                 }
 
-                // 5b. Republish the runnable-work depth for spawn selection and
-                // the shard's metrics for control-plane scrapes. Placed after
-                // every producer of ready work and before the exit check, so
-                // the stored values reflect this turn's settled state rather
-                // than a mid-turn snapshot.  The metrics publication is
-                // rate-limited to the minimum publication interval (cumulative
-                // counters make staleness safe); the ready-depth hint is not,
-                // because spawn selection always wants fresh balance data.
                 self.publish_ready_hint();
                 self.publish_metrics_if_due();
 
-                // 6. Nothing left to do — exit inner loop, go park (wait for
-                //    I/O).  This is the event-driven block.  Reaching this
-                //    point with `work_done == false` means the CQ peek found
-                //    nothing, the ready and owner queues are empty, no message
-                //    arrived, and no timer expired: the correct move is to
-                //    block in `park(timeout)`, which also hands deferred SQEs
-                //    below the flush batch threshold to the kernel via its
-                //    submit_and_wait ("submit once via park").  Counting that
-                //    deferral as work here — the removed flush-as-work path —
-                //    made the loop re-scan empty queues once per microsecond
-                //    between events: at 7 workers x 32 keep-alive connections
-                //    the event interval (~20-30µs) dwarfs the per-round cost
-                //    (~1µs), so the loop burned ~1 core per worker re-checking
-                //    nothing (finding #46: busy_rounds/polled ≈ 17:1, ~8k
-                //    parks/s, CPU 4.5x monoio).  Under saturation this branch
-                //    is not reached (the ready queue holds work every round),
-                //    so the syscall-rate rationale of the two-level loop is
-                //    untouched.
                 if !work_done {
                     break;
                 }
 
-                // 7. Bounding: prevent I/O starvation.  `busy_rounds` counts
-                //    only productive rounds — at least one task polled, one
-                //    CQE drained, one message processed, or one timer expired.
-                //    Empty check rounds exited at step 6 and never increment
-                //    it, so MAX_BUSY_ROUNDS is purely the anti-starvation
-                //    backstop for continuously self-waking tasks: after 96
-                //    consecutive productive rounds, force a park to let the
-                //    kernel push completions and timers fire.
                 busy_rounds += 1;
                 self.metrics.busy_rounds += 1;
                 if busy_rounds >= MAX_BUSY_ROUNDS {
@@ -1589,8 +1787,6 @@ impl CpuCore {
             }
 
             // --- OUTER: park (submit_and_wait, blocks for I/O) ---
-            // We've exhausted local work; block until at least one completion
-            // arrives, a wake message lands, or the timeout fires.
             #[cfg(target_os = "linux")]
             let should_park = self.sleep_gate.begin_sleep();
             #[cfg(target_os = "linux")]
@@ -1599,21 +1795,15 @@ impl CpuCore {
                 continue;
             }
             #[cfg(target_os = "linux")]
-            if self.process_messages() {
+            if self.drain_inbox() {
                 self.sleep_gate.end_sleep();
                 continue;
             }
-            // A draining shard must not arm a fresh parking poll: the poll is an
-            // ordinary pending operation to `pending_operation_count`, which is
-            // exactly what the drain-exit predicate below asks, so re-arming one
-            // races the shard's own exit (and the cancel-and-reap that follows
-            // the park would arm another, forever).  Admission is already closed
-            // by the time `draining` is set, so no control message depends on
-            // the poll to interrupt this park; the park timeout still bounds it.
             #[cfg(target_os = "linux")]
             if !self.draining {
                 self.arm_wakeup_poll();
             }
+
             self.metrics.parks += 1;
             let park_started = Instant::now();
             let n_completions = self.io_state.io_backend.park(self.park_timeout);
@@ -1636,8 +1826,7 @@ impl CpuCore {
             if n_completions > 0 {
                 let _ = self.process_io_completions(true);
             }
-            // Execute tasks that were just woken by the park+drain
-            if self.execute_tasks() {
+            if self.tick_tasks() {
                 self.metrics.flushes += 1;
                 let flush_started = Instant::now();
                 self.io_state.io_backend.flush();
@@ -1646,10 +1835,6 @@ impl CpuCore {
                 self.metrics.max_flush_us = self.metrics.max_flush_us.max(flush_elapsed_us);
             }
 
-            // Cancel the parking poll and reap it *before* the exit check below:
-            // that check counts the poll, so a draining shard whose poll is
-            // still armed can never look quiescent, and the loop would park
-            // forever instead of exiting (finding #40).
             #[cfg(target_os = "linux")]
             if self.draining {
                 self.retire_wakeup_poll();
@@ -1667,6 +1852,61 @@ impl CpuCore {
         }
         tracing::info!("CPU core {} shutting down", self.id);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test(id: usize) -> Self {
+        Self::new_test_with_backend(id, Box::new(crate::io::NoopIoProvider))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test_with_backend(
+        id: usize,
+        io_backend: Box<dyn IoProvider<Completion = IoCompletion>>,
+    ) -> Self {
+        let (ready_sender, _ready_receiver) = std::sync::mpsc::channel();
+        let (_inbox_sender, message_inbox) = crossbeam_channel::bounded(16);
+        let retirement = Arc::new(IoRetirementMailbox::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let force_shutdown = Arc::new(AtomicBool::new(false));
+        let ready_hint = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+        let metrics_slot = Arc::new(CachePadded::new(CoreMetricsSlot::default()));
+        let termination_report = Arc::new(std::sync::OnceLock::new());
+
+        #[cfg(target_os = "linux")]
+        return Self::new(
+            id,
+            0,
+            1,
+            io_backend,
+            shutdown,
+            force_shutdown,
+            ready_hint,
+            metrics_slot,
+            Arc::new(WorkerSleepGate::new()),
+            message_inbox,
+            retirement,
+            ready_sender,
+            Duration::from_millis(10),
+            termination_report,
+            -1,
+        );
+
+        #[cfg(not(target_os = "linux"))]
+        return Self::new(
+            id,
+            1,
+            io_backend,
+            shutdown,
+            force_shutdown,
+            ready_hint,
+            metrics_slot,
+            message_inbox,
+            retirement,
+            ready_sender,
+            Duration::from_millis(10),
+            termination_report,
+        );
     }
 
     /// Bind thread to CPU core (Linux-specific)
@@ -4409,6 +4649,76 @@ mod tests {
             .termination_snapshot()
             .expect("termination snapshot")
             .all_zero());
+    }
+
+    #[test]
+    fn simulated_zero_events_triggers_park_idle_without_spinning() {
+        let mut worker = Worker::new_test(0);
+        let mut driver = crate::io::SimulatedLoopDriver::new();
+
+        // Under empty queue / zero-event conditions, one turn must not spin
+        // (busy_rounds must remain 0) and must immediately trigger park/idle.
+        let (work_done, completions) = worker.run_one_turn(&mut driver);
+
+        assert!(
+            !work_done,
+            "zero-event turn should perform no productive work"
+        );
+        assert_eq!(completions, 0, "zero-event condition has no completions");
+        assert_eq!(
+            worker.metrics.busy_rounds, 0,
+            "Bug #46 regression: empty turn must NOT spin in inner loop (busy_rounds must be 0)"
+        );
+        assert_eq!(
+            driver.park_count(),
+            1,
+            "empty turn must directly trigger park/idle on event loop driver"
+        );
+        assert_eq!(worker.metrics.parks, 1);
+        assert_eq!(worker.metrics.park_timeouts, 1);
+        assert_eq!(worker.metrics.flushes, 0);
+
+        // Run multiple simulated empty turns — verify invariant holds over repeated iterations.
+        for i in 2..=10 {
+            let (work_done, completions) = worker.run_one_turn(&mut driver);
+            assert!(!work_done);
+            assert_eq!(completions, 0);
+            assert_eq!(
+                worker.metrics.busy_rounds, 0,
+                "busy_rounds must remain 0 across idle iterations"
+            );
+            assert_eq!(driver.park_count(), i);
+            assert_eq!(worker.metrics.parks, i);
+        }
+    }
+
+    #[test]
+    fn simulated_driver_advances_virtual_time_and_feeds_synthetic_completions() {
+        let mut worker = Worker::new_test(0);
+        let mut driver = crate::io::SimulatedLoopDriver::new();
+
+        let initial_time = driver.now();
+
+        // Feed synthetic completions
+        driver.feed_completions(5);
+
+        let n = worker.park_or_poll(&mut driver);
+        assert_eq!(n, 5);
+        assert_eq!(driver.park_count(), 1);
+        assert_eq!(worker.metrics.parks, 1);
+        assert_eq!(worker.metrics.park_completions, 5);
+        assert_eq!(worker.metrics.park_timeouts, 0);
+
+        // Verify logical virtual time advanced without calling OS sleep or park
+        let current_time = driver.now();
+        assert!(current_time > initial_time, "virtual time must advance");
+    }
+
+    #[test]
+    fn worker_tick_tasks_and_drain_inbox_contract() {
+        let mut worker = Worker::new_test(0);
+        assert!(!worker.drain_inbox());
+        assert!(!worker.tick_tasks());
     }
 
     #[cfg(loom)]
