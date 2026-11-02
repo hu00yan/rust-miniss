@@ -222,6 +222,8 @@ pub(crate) struct CoreWakeup {
     gate: Arc<WorkerSleepGate>,
     #[cfg(target_os = "linux")]
     fd: OwnedFd,
+    #[cfg(not(target_os = "linux"))]
+    interrupt: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -258,12 +260,21 @@ impl CoreWakeup {
 #[cfg(not(target_os = "linux"))]
 impl CoreWakeup {
     fn new() -> Result<Self> {
-        Ok(Self {})
+        Ok(Self {
+            interrupt: std::sync::OnceLock::new(),
+        })
     }
 
-    /// Non-Linux workers have no parked poll to feed; `unpark` is the whole
-    /// notification path there.
-    pub(crate) fn notify(&self) {}
+    pub(crate) fn set_interrupt(&self, interrupt: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.interrupt.set(interrupt);
+    }
+
+    /// Notify a shard that a control-plane message is waiting for it.
+    pub(crate) fn notify(&self) {
+        if let Some(interrupt) = self.interrupt.get() {
+            interrupt();
+        }
+    }
 }
 
 /// A shard's reserved I/O retirement lane, valid from any thread.
@@ -732,8 +743,11 @@ impl CoreMetricsSlot {
     /// maintains; publication adds no atomics to the request path itself.
     fn publish(&self, snapshot: &CoreMetricsSnapshot) {
         let seq = self.seq.load(Ordering::Relaxed);
-        // Relaxed: no reader trusts an odd value; see the type's coherence notes.
-        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        // SeqCst: on weakly-ordered architectures (such as ARM64), SeqCst
+        // establishes a bidirectional barrier ensuring subsequent relaxed
+        // payload stores cannot execute or become visible before the sequence
+        // transition to odd is published.
+        self.seq.store(seq.wrapping_add(1), Ordering::SeqCst);
         self.local_task_count
             .store(snapshot.local_task_count, Ordering::Relaxed);
         self.ready_queue_len
@@ -2610,6 +2624,10 @@ impl MultiCoreRuntime {
                             return Err(err);
                         }
                     };
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(interrupt) = io_backend.interrupt_waker() {
+                        wakeup.set_interrupt(interrupt);
+                    }
                     #[cfg(target_os = "linux")]
                     let mut core = {
                         let sleep_gate = wakeup.gate();
