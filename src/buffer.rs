@@ -190,6 +190,16 @@ impl Buffer {
         self.inner.resize(new_len, value);
     }
 
+    /// Truncates the buffer to the specified length.
+    pub fn truncate(&mut self, len: usize) {
+        self.inner.truncate(len);
+    }
+
+    /// Appends a slice of bytes to the buffer.
+    pub fn extend_from_slice(&mut self, other: &[u8]) {
+        self.inner.extend_from_slice(other);
+    }
+
     /// Sets the logical length of the buffer without initializing new bytes.
     ///
     /// # Safety

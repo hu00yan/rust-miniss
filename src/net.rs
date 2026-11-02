@@ -16,6 +16,12 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
+pub mod fault;
+pub use fault::{
+    fault_tcp_pair, fault_udp_pair, FaultConfig, FaultInjector, FaultSchedule, FaultStats,
+    FaultTcpStream, FaultUdpSocket, SocketFault,
+};
+
 const TCP_BUFFER_SIZE: usize = 256 * 1024;
 
 /// An asynchronous TCP listener.
