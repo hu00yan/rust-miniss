@@ -569,6 +569,71 @@ impl AsyncWrite for FaultTcpStream {
     }
 }
 
+impl hyper::rt::Read for FaultTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        // SAFETY: `ReadBufCursor` exposes the unwritten tail of hyper's
+        // buffer as a writable chunk for the duration of this call.
+        let raw = unsafe { buf.as_mut() };
+        let slice =
+            // SAFETY: same region, `raw.len()` is its exact capacity.
+            unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<u8>(), raw.len()) };
+
+        match AsyncRead::poll_read(self.as_mut(), cx, slice) {
+            Poll::Ready(Ok(bytes_read)) => {
+                // SAFETY: the underlying AsyncRead initialized exactly `bytes_read` bytes.
+                unsafe {
+                    buf.advance(bytes_read);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl hyper::rt::Write for FaultTcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        hyper::rt::Write::poll_write(Pin::new(&mut this.inner), cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        hyper::rt::Write::poll_flush(Pin::new(&mut this.inner), cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        hyper::rt::Write::poll_shutdown(Pin::new(&mut this.inner), cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        hyper::rt::Write::poll_write_vectored(Pin::new(&mut this.inner), cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
 /// A wrapper around [`AsyncUdpSocket`] that injects synthetic socket faults.
 pub struct FaultUdpSocket {
     inner: AsyncUdpSocket,
@@ -758,4 +823,36 @@ pub fn fault_udp_pair(
         FaultUdpSocket::new(client, client_injector),
         FaultUdpSocket::new(server, server_injector),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::rt::ReadBuf;
+    use std::mem::MaybeUninit;
+
+    #[test]
+    fn fault_tcp_stream_hyper_read_intercepts_reset_fault() {
+        let runtime = crate::Runtime::new();
+        runtime.block_on(async {
+            let client_injector = FaultInjector::from_sequence([SocketFault::Reset]);
+            let server_injector = FaultInjector::pass_through();
+            let (mut client, _server) = fault_tcp_pair(client_injector, server_injector).unwrap();
+
+            let mut storage = [MaybeUninit::uninit(); 128];
+            let mut buf = ReadBuf::uninit(&mut storage);
+            let cursor = buf.unfilled();
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+
+            // Must intercept reset fault and return ECONNRESET
+            let poll_res = hyper::rt::Read::poll_read(Pin::new(&mut client), &mut cx, cursor);
+            match poll_res {
+                Poll::Ready(Err(err)) => {
+                    assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+                }
+                other => panic!("expected ECONNRESET, got {:?}", other),
+            }
+        });
+    }
 }
