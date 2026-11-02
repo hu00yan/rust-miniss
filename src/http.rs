@@ -360,18 +360,36 @@ impl Response {
     }
 }
 
-/// HTTP server connection handler
-pub struct HttpConnection {
-    stream: AsyncTcpStream,
+/// HTTP server connection handler generic over any asynchronous byte stream.
+pub struct HttpConnection<S = AsyncTcpStream> {
+    stream: S,
     read_buf: Vec<u8>,
 }
 
-impl HttpConnection {
-    pub fn new(stream: AsyncTcpStream) -> Self {
+impl<S> HttpConnection<S>
+where
+    S: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin,
+{
+    pub fn new(stream: S) -> Self {
         Self {
             stream,
             read_buf: Vec::with_capacity(4096),
         }
+    }
+
+    /// Returns a shared reference to the underlying stream.
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
+    /// Returns a mutable reference to the underlying stream.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// Consumes the connection, returning the inner stream and buffered bytes.
+    pub fn into_inner(self) -> (S, Vec<u8>) {
+        (self.stream, self.read_buf)
     }
 
     /// Read and parse HTTP request from the connection
@@ -417,31 +435,15 @@ impl HttpConnection {
                 ));
             }
 
-            #[cfg(target_os = "linux")]
-            {
-                let buffer = Buffer::with_capacity(4096);
-                let (n, buffer) = self.stream.read_rent(buffer).await?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "connection closed before a complete HTTP request",
-                    ));
-                }
-                self.read_buf.extend_from_slice(&buffer[..n]);
-                buffer.recycle();
+            let mut buffer = [0u8; 4096];
+            let n = futures::io::AsyncReadExt::read(&mut self.stream, &mut buffer).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before a complete HTTP request",
+                ));
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let mut buffer = [0u8; 4096];
-                let n = futures::io::AsyncReadExt::read(&mut self.stream, &mut buffer).await?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "connection closed before a complete HTTP request",
-                    ));
-                }
-                self.read_buf.extend_from_slice(&buffer[..n]);
-            }
+            self.read_buf.extend_from_slice(&buffer[..n]);
         }
     }
 
@@ -458,11 +460,10 @@ impl HttpConnection {
 /// [`HttpConnection::send_response`], and "write a head, then a body" is the
 /// shape HTTP/1.1 needs. It uses `writev(2)` when both parts are still
 /// outstanding, so the common one-syscall response stays one syscall.
-async fn write_all_slices(
-    stream: &mut AsyncTcpStream,
-    first: &[u8],
-    second: &[u8],
-) -> io::Result<()> {
+async fn write_all_slices<S>(stream: &mut S, first: &[u8], second: &[u8]) -> io::Result<()>
+where
+    S: futures::io::AsyncWrite + Unpin,
+{
     let mut first = first;
     let mut second = second;
 
@@ -1073,5 +1074,23 @@ mod tests {
                 .to_bytes();
             prop_assert!(bytes.ends_with(&body));
         }
+    }
+
+    #[test]
+    fn generic_http_connection_runs_over_in_memory_stream() {
+        let raw = b"GET /generic HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
+        let cursor = futures::io::Cursor::new(raw.to_vec());
+        let mut conn = HttpConnection::new(cursor);
+        let req = futures::executor::block_on(conn.read_request()).unwrap();
+        assert_eq!(req.method, Method::GET);
+        assert_eq!(req.path, "/generic");
+        assert_eq!(req.body, b"hello");
+
+        let resp = Response::new(StatusCode::OK).with_body(b"world".to_vec());
+        futures::executor::block_on(conn.send_response(resp)).unwrap();
+        let (stream, _) = conn.into_inner();
+        let output = stream.into_inner();
+        assert!(output.starts_with(b"GET /generic"));
+        assert!(output.windows(15).any(|w| w == b"HTTP/1.1 200 OK"));
     }
 }

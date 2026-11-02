@@ -24,16 +24,19 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-/// A TLS-encrypted TCP stream.
-pub struct TlsStream {
-    inner: Compat<tokio_rustls::client::TlsStream<Compat<AsyncTcpStream>>>,
+/// A TLS-encrypted stream over any asynchronous transport `S`.
+pub struct TlsStream<S = AsyncTcpStream> {
+    inner: Compat<tokio_rustls::client::TlsStream<Compat<S>>>,
 }
 
-impl TlsStream {
-    /// Performs a TLS handshake over the given TCP stream.
+impl<S> TlsStream<S>
+where
+    S: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin,
+{
+    /// Performs a TLS handshake over the given stream.
     ///
     /// Uses the bundled Mozilla/WebPKI root certificates for server verification.
-    pub async fn connect(domain: &str, stream: AsyncTcpStream) -> io::Result<Self> {
+    pub async fn connect(domain: &str, stream: S) -> io::Result<Self> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -45,7 +48,7 @@ impl TlsStream {
     /// Performs a TLS handshake with a custom [`rustls::ClientConfig`].
     pub async fn connect_with_config(
         domain: &str,
-        stream: AsyncTcpStream,
+        stream: S,
         config: rustls::ClientConfig,
     ) -> io::Result<Self> {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -62,9 +65,23 @@ impl TlsStream {
             inner: tls_stream.compat(),
         })
     }
+
+    /// Returns a reference to the inner transport stream and TLS session.
+    pub fn get_ref(&self) -> (&S, &rustls::ClientConnection) {
+        let (compat_s, session) = self.inner.get_ref().get_ref();
+        (compat_s.get_ref(), session)
+    }
+
+    /// Consumes the `TlsStream`, returning the inner transport stream.
+    pub fn into_inner(self) -> S {
+        self.inner.into_inner().into_inner().0.into_inner()
+    }
 }
 
-impl futures::io::AsyncRead for TlsStream {
+impl<S> futures::io::AsyncRead for TlsStream<S>
+where
+    S: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -74,7 +91,10 @@ impl futures::io::AsyncRead for TlsStream {
     }
 }
 
-impl futures::io::AsyncWrite for TlsStream {
+impl<S> futures::io::AsyncWrite for TlsStream<S>
+where
+    S: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
